@@ -1,0 +1,122 @@
+# Default values for the LidlessEye chart.
+#
+# The chart installs two things:
+#   * a **server** Deployment (ingest + storage + query API + embedded UI), and
+#   * an **agent** DaemonSet that samples every node's CPU and off-CPU stacks
+#     with eBPF and pushes the profiles to that server.
+
+image:
+  repository: ghcr.io/lidlesseye/lidlesseye
+  # Defaults to the chart's appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podSecurityContext: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+server:
+  replicaCount: 1
+
+  service:
+    type: ClusterIP
+    port: 4040
+    annotations: {}
+
+  # Retention is enforced by a background task: segments older than this are
+  # deleted, and the data directory is trimmed to `maxDisk`.
+  retention: 7d
+  maxDisk: 40GB
+
+  # Bearer token required by every API call when set. The agent picks it up
+  # from the same secret, so agents and server stay in sync.
+  auth:
+    enabled: false
+    # Leave empty to have Helm generate one on install (kept across upgrades).
+    token: ""
+    existingSecret: ""
+
+  # Allowed CORS origin; empty disables the CORS layer.
+  cors: ""
+
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    existingClaim: ""
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      memory: 2Gi
+
+  # The server can profile its own node too; the dedicated DaemonSet is usually
+  # the better choice because it survives server restarts.
+  profiling:
+    enabled: false
+
+  metrics:
+    serviceMonitor:
+      enabled: false
+      interval: 30s
+      scrapeTimeout: 10s
+      labels: {}
+
+  extraArgs: []
+
+agent:
+  enabled: true
+
+  # Per-CPU sampling frequency. 99Hz is the usual trade-off; higher gives finer
+  # detail at a roughly linear cost in overhead.
+  frequency: 99
+  flush: 10s
+  collectCpu: true
+  collectOffCpu: true
+
+  # Empty means "one service per process" (the process name is used). Set it to
+  # aggregate a whole node under a single service name.
+  serviceName: ""
+  # Extra labels attached to every report.
+  labels: {}
+
+  # Derive k8s_* labels (namespace/pod/container) from each process's cgroup.
+  enrichKubernetesLabels: true
+
+  # The agent must see the host PID namespace to symbolize stacks, and needs
+  # privileges to load BPF programs. These are the defaults that work; override
+  # only if you know what you are doing.
+  hostPID: true
+  privileged: true
+  # Mounts debugfs, which some kernels need for uprobes.
+  mountDebugfs: true
+
+  tolerations:
+    - operator: Exists
+      effect: NoSchedule
+  nodeSelector: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+  extraArgs: []
+
+  podAnnotations: {}

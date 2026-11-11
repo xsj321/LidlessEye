@@ -1,0 +1,101 @@
+{{- if .Values.agent.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ printf "%s-agent" (include "lidlesseye.fullname" .) }}
+  labels:
+    {{- include "lidlesseye.agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "lidlesseye.agent.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        {{- include "lidlesseye.agent.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Restart the agents when the server address or credentials change.
+        checksum/config: {{ printf "%s|%v|%v|%v" (include "lidlesseye.serverUrl" .) .Values.agent.frequency .Values.agent.serviceName .Values.agent.labels | sha256sum }}
+        {{- with .Values.agent.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "lidlesseye.serviceAccountName" . }}
+      {{- if .Values.agent.hostPID }}
+      # Without the host PID namespace the agent cannot read /proc/<pid> of the
+      # processes it samples, and every stack would symbolize as unknown.
+      hostPID: true
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: agent
+          image: {{ include "lidlesseye.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - collect
+            - --frequency={{ .Values.agent.frequency }}
+            - --flush={{ .Values.agent.flush }}
+            {{- if not .Values.agent.collectCpu }}
+            - --no-cpu
+            {{- end }}
+            {{- if not .Values.agent.collectOffCpu }}
+            - --no-offcpu
+            {{- end }}
+            {{- if .Values.agent.serviceName }}
+            - --service-name={{ .Values.agent.serviceName }}
+            {{- end }}
+            {{- range $key, $value := .Values.agent.labels }}
+            - --label={{ $key }}={{ $value }}
+            {{- end }}
+            {{- range .Values.agent.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: LIDLESSEYE_SERVER
+              value: {{ include "lidlesseye.serverUrl" . | quote }}
+            - name: RUST_LOG
+              value: lidlesseye=info
+            {{- if .Values.server.auth.enabled }}
+            - name: LIDLESSEYE_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lidlesseye.authSecretName" . }}
+                  key: token
+            {{- end }}
+          securityContext:
+            # Loading BPF programs needs CAP_BPF/CAP_PERFMON (or root), and the
+            # stack trace map needs CAP_SYS_ADMIN. `privileged` is the portable
+            # way to get all of them.
+            privileged: {{ .Values.agent.privileged }}
+            readOnlyRootFilesystem: true
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.agent.mountDebugfs }}
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if .Values.agent.mountDebugfs }}
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory
+        {{- end }}
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

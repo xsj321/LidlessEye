@@ -1,7 +1,5 @@
 //! Query-string parsing: time ranges in several formats and label selectors.
 
-use std::collections::BTreeMap;
-
 use axum::extract::Query;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -85,32 +83,6 @@ impl Params {
             matchers.push(Matcher::eq(label, value));
         }
         Ok(Selector::new(matchers))
-    }
-
-    /// Convenience: build a label map from all parameters that are not
-    /// reserved, used by the UI to render "current filters".
-    pub fn reserved_free(&self) -> BTreeMap<String, String> {
-        const RESERVED: &[&str] = &[
-            "from",
-            "until",
-            "selector",
-            "profile_type",
-            "type",
-            "max_nodes",
-            "limit",
-            "step",
-            "format",
-            "service_name",
-            "match[]",
-            "match",
-            "label",
-            "label_value",
-        ];
-        self.0
-            .iter()
-            .filter(|(k, _)| !RESERVED.contains(&k.as_str()))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
     }
 }
 

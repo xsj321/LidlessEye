@@ -372,8 +372,8 @@ fn query(args: QueryArgs) -> anyhow::Result<()> {
     }
     let total = result.total_value.max(1);
     println!(
-        "{:<44} {:>12} {:>12}  {}",
-        "FUNCTION", "SELF", "TOTAL", "MODULE"
+        "{:<44} {:>12} {:>12}  MODULE",
+        "FUNCTION", "SELF", "TOTAL"
     );
     for row in result.items {
         let name = truncate(&row.name, 44);

@@ -1,0 +1,238 @@
+# LidlessEye
+
+**Continuous profiling for Linux, in one Rust binary.**
+
+LidlessEye samples every process on a machine with eBPF, symbolizes the stacks
+in the agent, stores them in an immutable columnar format and serves
+flamegraphs from an embedded dashboard. It is a Pyroscope-shaped product built
+around three deliberate choices:
+
+| Choice | Instead of | Why |
+| --- | --- | --- |
+| A custom columnar segment format (`LESEG`) | an LSM/TSDB or a SQL engine | profiles are append-only blobs queried by time range; immutable mmappable files beat a B-tree and need no C++ dependency |
+| A single Rust workspace, with the server usable as a `cargo` crate | a Go binary you deploy | "profile this process and show me the flamegraph" becomes one `builder().build()` call |
+| Symbolization in the agent | symbolization in the server | the server never needs the profiled machine's filesystem, and profiles of short-lived processes stay readable |
+
+```
+┌─────────────┐   eBPF samples   ┌──────────────┐  LESEG segments  ┌──────────────┐
+│  processes  │ ───────────────► │    agent     │ ───────────────► │    server    │
+│  (any lang) │  perf_event +    │  symbolize   │   POST /ingest   │  store+query │
+└─────────────┘  kprobes         │  (blazesym)  │                  │  + web UI    │
+                                 └──────────────┘                  └──────┬───────┘
+                                                                          │ HTTP
+                                                                   ┌──────▼───────┐
+                                                                   │  dashboard   │
+                                                                   └──────────────┘
+```
+
+## Screenshots
+
+![Flamegraph](docs/images/flamegraph.png)
+
+![Top functions](docs/images/top.png)
+
+## What it does
+
+**Profiles**
+
+- **On-CPU** — one software perf event per CPU (`PERF_COUNT_SW_CPU_CLOCK`) fires
+  `frequency` times per second and captures the user *and* kernel stack.
+- **Off-CPU** — `kprobe:schedule` / `kprobe:finish_task_switch` measure how long
+  each task was blocked and where it was blocked.
+- **`wall`** — a virtual profile type: `cpu` merged with `off_cpu`, so you can
+  see "this request spent 4% on CPU and 96% waiting".
+- Aggregation happens **in the kernel** (`BPF_MAP_TYPE_HASH` keyed by
+  `(tgid, user_stack, kernel_stack)`); user space only drains maps once per
+  flush interval, so overhead does not grow with the sampling rate.
+- Any process, any language: no SDK, no `LD_PRELOAD`, no recompilation. Kernel
+  threads and `[unknown]` frames are first-class citizens.
+
+**Stores and queries**
+
+- Flamegraphs (nested, with self/inclusive values), top-N functions by self or
+  total value, and time series bucketed by service and label set.
+- Labels and PromQL-flavoured selectors: `service_name="api" {env="prod",
+  pod=~"api-*"}`.
+- Retention by age and by disk budget, plus `lidlesseye fsck` to verify every
+  segment's CRC32.
+
+**Ships as**
+
+- one binary (`lidlesseye serve --agent`) — no agent needed for a single host,
+- a Docker image and a `docker-compose.yml`,
+- a Helm chart with a server `Deployment` and a per-node agent `DaemonSet`,
+- a Rust crate you can `use lidlesseye::LidlessEye` inside your own service.
+
+## Quick start
+
+### One binary, one host
+
+```bash
+cargo build --release            # needs clang for the eBPF object
+sudo ./target/release/lidlesseye serve --agent --data-dir ./data
+# dashboard on http://localhost:4040
+```
+
+Prerequisites: Linux ≥ 4.17 with BTF, `clang`, and root (or
+`CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN`). `perf_event_paranoid` must be
+≤ 2 for the perf-event sampler. On a system with `kernel.unprivileged_bpf_disabled`
+the agent still works as root.
+
+### Server + agents
+
+```bash
+# on the storage box
+lidlesseye serve --data-dir /var/lib/lidlesseye --listen 0.0.0.0:4040 --retention 7d
+
+# on every node
+sudo lidlesseye collect --server http://storage:4040 --frequency 99
+```
+
+### Docker
+
+```bash
+docker compose up --build
+open http://localhost:4040
+```
+
+The agent container runs `privileged` with `pid: host`, which is what eBPF
+profiling needs; the server container runs unprivileged.
+
+### Kubernetes
+
+```bash
+helm install lidlesseye deploy/helm/lidlesseye \
+  --namespace observability --create-namespace \
+  --set server.persistence.size=100Gi \
+  --set server.auth.enabled=true
+```
+
+The chart renders a server `Deployment` (PVC, health probes, optional
+`ServiceMonitor`) and an agent `DaemonSet` with `hostPID: true`,
+`privileged: true` and `tolerations: [{operator: Exists}]` so it covers tainted
+nodes too. See [docs/deployment.md](docs/deployment.md).
+
+## Embed it in your own binary
+
+```toml
+[dependencies]
+lidlesseye = "0.1"
+```
+
+```rust
+use lidlesseye::{LidlessEye, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let eye = LidlessEye::builder()
+        .data_dir("./profiles")
+        .listen("127.0.0.1:4040")
+        .agent(true)              // profile this machine
+        .service_name("my-service")
+        .frequency_hz(99)
+        .build()
+        .await?;
+
+    println!("dashboard: {}/", eye.base_url());
+    eye.run().await
+}
+```
+
+`agent(false)` gives you storage plus the HTTP API only — feed it with
+`eye.ingest(report)` or `POST /ingest`. Runnable examples:
+
+```bash
+cargo run --example embed        # embedded server (+ `-- agent` for eBPF)
+cargo run --example synthetic    # build profiles by hand, query them back
+```
+
+More in [docs/embedding.md](docs/embedding.md).
+
+## HTTP API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/ingest` | one report or `{"reports": [...]}` |
+| `GET` | `/api/v1/flamegraph` | flat `names`/`levels`/`values` triples, or `?format=tree` |
+| `GET` | `/api/v1/top` | top functions by self value, with self and total columns |
+| `GET` | `/api/v1/timeseries` | stacked buckets per series |
+| `GET` | `/api/v1/series` | known series in a range |
+| `GET` | `/api/v1/label/{name}/values` | label values, with totals |
+| `GET` | `/api/v1/profile_types` | profile types present (including virtual `wall`) |
+| `GET` | `/api/v1/health` · `/ready` · `/stats` · `/version` | operations |
+| `GET` | `/metrics` | Prometheus text format |
+
+Common query parameters: `profile_type` (aliases `type`), `from` / `until`
+(unix seconds, `1700000000ms`, RFC3339, `now-1h`), `selector`, `max_nodes`,
+`limit`, `step`, `buckets`.
+
+```bash
+# how much CPU did the checkout service burn in the last hour?
+curl -s 'http://localhost:4040/api/v1/top?profile_type=cpu&from=now-1h&limit=5' | jq
+
+# who is blocking, and on what?
+curl -s 'http://localhost:4040/api/v1/flamegraph?profile_type=off_cpu&from=now-15m' \
+  | jq '.names, .total'
+```
+
+Full reference: [docs/api.md](docs/api.md).
+
+## CLI
+
+```
+lidlesseye serve    # HTTP server, optionally with --agent
+lidlesseye collect  # eBPF collector that pushes to a server
+lidlesseye ingest   # import report JSON from files or stdin
+lidlesseye query    # inspect a data directory: --top / --tree
+lidlesseye fsck     # verify segment checksums (--fix to drop corrupt ones)
+lidlesseye info     # build and platform information
+```
+
+`serve` and `collect` accept `--frequency`, `--flush`, `--label k=v`,
+`--service-name`, `--no-cpu`, `--no-offcpu`. Most flags also read environment
+variables (`LIDLESSEYE_DATA_DIR`, `LIDLESSEYE_LISTEN`, `LIDLESSEYE_SERVER`,
+`LIDLESSEYE_AUTH_TOKEN`), which is what the Helm chart uses.
+
+## How it works
+
+- [Architecture and the `LESEG` format](docs/architecture.md) — segment layout,
+  sampling model, query pipeline, concurrency, why not DuckDB.
+- [HTTP API](docs/api.md) — every endpoint, parameter and payload.
+- [Deployment](docs/deployment.md) — single host, Docker, Kubernetes,
+  privileges, storage sizing, monitoring, troubleshooting.
+- [Embedding](docs/embedding.md) — the crate API, custom collectors, direct
+  ingestion.
+
+Repository layout:
+
+```
+crates/lidlesseye-core    data model, LESEG segments, store, query engine, selectors
+crates/lidlesseye-ebpf    aya programs (BPF C), collector, blazesym symbolization
+crates/lidlesseye-server  axum HTTP API, embedded UI, metrics
+crates/lidlesseye         the `LidlessEye` builder, the CLI, the publisher
+web/dist                  the dashboard (plain ES modules, no build step)
+deploy/                   Dockerfile, docker-compose, Helm chart
+```
+
+## Limits
+
+- **Linux only** for collection. The storage server and the query API are
+  portable Rust and run anywhere (the tests run on every platform).
+- **Symbolized at ingest**: a profile whose modules cannot be opened becomes a
+  tree of `[unknown]`/`0x…` frames. Agents therefore need `hostPID` (or
+  `--pid=host`) plus read access to the binaries that are running.
+- **Per-host storage**: the server is a single writer over a local directory.
+  Run one server per storage volume; there is no clustering or replication.
+- **No dynamic tracing yet**: only the built-in CPU/off-CPU profilers. Uprobes,
+  allocations and lock contention are the obvious next steps.
+
+## License
+
+Apache-2.0 for everything in this repository, **except** the BPF program in
+`crates/lidlesseye-ebpf/bpf/profile.bpf.c`, which is GPL-2.0-only: the kernel
+refuses to load a BPF program that calls GPL-only helpers such as
+`bpf_get_stackid` unless it declares a GPL-compatible license. The BPF object
+is a program loaded into the kernel, not a linked library, so it does not
+change the license of the Rust code that loads it — the same split used by
+bpftrace, parca-agent and the OpenTelemetry eBPF profiler. See
+[LICENSE](LICENSE), [LICENSE-BPF](LICENSE-BPF) and [NOTICE](NOTICE).

@@ -1,0 +1,18 @@
+apiVersion: v2
+name: lidlesseye
+description: Continuous eBPF profiling - storage/query server plus a per-node agent
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.24.0-0"
+keywords:
+  - profiling
+  - ebpf
+  - observability
+  - flamegraph
+  - continuous-profiling
+home: https://github.com/lidlesseye/lidlesseye
+sources:
+  - https://github.com/lidlesseye/lidlesseye
+maintainers:
+  - name: LidlessEye authors

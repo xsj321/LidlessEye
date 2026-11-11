@@ -1,0 +1,80 @@
+LidlessEye
+Copyright 2025 The LidlessEye authors
+
+================================================================================
+Main license
+================================================================================
+
+Everything in this repository is licensed under the Apache License, Version 2.0,
+with the single exception described below. The full text is in LICENSE.
+
+================================================================================
+The eBPF programs are GPL-2.0-only
+================================================================================
+
+File: crates/lidlesseye-ebpf/bpf/profile.bpf.c
+License: GNU General Public License, version 2.0 (see LICENSE-BPF)
+
+Reason: the Linux kernel refuses to load a BPF program that calls GPL-only
+helpers unless the program declares a GPL-compatible license string. LidlessEye
+uses `bpf_get_stackid` (perf_event and kprobe stack capture) and
+`bpf_get_ns_current_pid_tgid` (PID namespace translation); both are marked
+`gpl_only` in the kernel. The object therefore carries `SEC("license") = "GPL"`.
+
+Scope: the BPF object is a program that is loaded into the kernel, not a
+library that is linked against this crate or against any user-space code. The
+kernel's own licensing rule ("GPL and explicit license compatible") applies to
+the loaded program; it does not propagate to the Rust processes that load and
+read from it. This is the same split used by bpftrace, parca-agent and the
+OpenTelemetry eBPF profiler, all of which ship GPL-2.0 eBPF programs alongside
+permissively licensed user-space code.
+
+If you build LidlessEye with `LIDLESSEYE_BUILD_BPF=0` and supply your own
+object, only that object's license applies to it.
+
+================================================================================
+Third-party components
+================================================================================
+
+LidlessEye links against the following crates. Each remains under its own
+license; the versions below are the ones in Cargo.lock at the time of writing.
+
+  aya 0.16                 MIT OR Apache-2.0
+  blazesym 0.2             BSD-3-Clause
+  axum 0.8                 MIT
+  tokio 1.5x               MIT
+  tower / tower-http 0.5/0.7  MIT
+  hyper / http 1.x         MIT
+  serde / serde_json 1.x   MIT OR Apache-2.0
+  clap 4.x                 MIT OR Apache-2.0
+  tracing 0.1              MIT
+  tracing-subscriber 0.3   MIT
+  thiserror 2.x            MIT OR Apache-2.0
+  memmap2 0.9              MIT OR Apache-2.0
+  rust-embed 8.x           MIT
+  time 0.3                 MIT OR Apache-2.0
+  crc32fast 1.x            MIT OR Apache-2.0
+  object 0.41              Apache-2.0 OR MIT
+  libc 0.2                 MIT OR Apache-2.0
+  uuid 1.x                 Apache-2.0 OR MIT
+  parking_lot 0.12         MIT OR Apache-2.0
+  num_cpus 1.x             MIT OR Apache-2.0
+  bytes 1.x                MIT
+  futures 0.3              MIT OR Apache-2.0
+  async-stream 0.3         MIT
+  rand 0.10                MIT OR Apache-2.0
+  flate2 1.x               MIT OR Apache-2.0
+
+The generated eBPF object (crates/lidlesseye-ebpf/bpf/profile.bpf.o) is built
+from profile.bpf.c with clang and contains no third-party code.
+
+The dashboard in web/dist is hand-written ES modules and CSS; it bundles no
+third-party JavaScript.
+
+================================================================================
+Trademarks
+================================================================================
+
+"LidlessEye" is the name of this project. Pyroscope, Grafana, Kubernetes and
+Docker are trademarks of their respective owners and are referenced only to
+describe interoperability and design lineage.

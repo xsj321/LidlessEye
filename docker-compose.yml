@@ -1,0 +1,50 @@
+# Single-host setup: one storage/query server plus one agent that profiles the
+# whole machine.
+#
+#   docker compose up --build
+#   open http://localhost:4040
+#
+# The agent needs `privileged` and `pid: host` to load eBPF programs and to read
+# the stacks of every process; the server needs neither.
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    image: lidlesseye:dev
+    command:
+      - serve
+      - --data-dir=/var/lib/lidlesseye
+      - --listen=0.0.0.0:4040
+      - --retention=7d
+      - --max-disk=20GB
+      - --cors=*
+    ports:
+      - "4040:4040"
+    volumes:
+      - lidlesseye-data:/var/lib/lidlesseye
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/lidlesseye", "info"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  agent:
+    image: lidlesseye:dev
+    depends_on:
+      - server
+    command:
+      - collect
+      - --server=http://server:4040
+      - --frequency=99
+      - --flush=10s
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+    restart: unless-stopped
+
+volumes:
+  lidlesseye-data:

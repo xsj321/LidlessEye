@@ -23,33 +23,36 @@ pub struct Metrics {
 impl Metrics {
     pub fn render(&self, extra: &[(&str, String)], uptime_secs: u64) -> String {
         let mut out = String::with_capacity(1024);
+        let counter = |name: &'static str, help: &'static str, value: u64| {
+            (name, help, value.to_string())
+        };
         let counters = [
-            (
+            counter(
                 "lidlesseye_ingest_requests_total",
                 "Profile ingestion requests.",
                 self.ingest_requests.load(Ordering::Relaxed),
             ),
-            (
+            counter(
                 "lidlesseye_ingest_reports_total",
                 "Profile reports accepted.",
                 self.ingest_reports.load(Ordering::Relaxed),
             ),
-            (
+            counter(
                 "lidlesseye_ingest_samples_total",
                 "Aggregated stacks accepted.",
                 self.ingest_samples.load(Ordering::Relaxed),
             ),
-            (
+            counter(
                 "lidlesseye_ingest_bytes_total",
                 "Bytes of report JSON accepted.",
                 self.ingest_bytes.load(Ordering::Relaxed),
             ),
-            (
+            counter(
                 "lidlesseye_ingest_errors_total",
                 "Rejected ingestion requests.",
                 self.ingest_errors.load(Ordering::Relaxed),
             ),
-            (
+            counter(
                 "lidlesseye_queries_total",
                 "Profile queries served.",
                 self.queries.load(Ordering::Relaxed),
@@ -57,19 +60,22 @@ impl Metrics {
             (
                 "lidlesseye_query_duration_seconds_total",
                 "Cumulative query time, in seconds.",
-                self.query_nanos.load(Ordering::Relaxed),
+                format!(
+                    "{:.6}",
+                    self.query_nanos.load(Ordering::Relaxed) as f64 / 1e9
+                ),
             ),
-            (
+            counter(
                 "lidlesseye_query_errors_total",
                 "Failed profile queries.",
                 self.query_errors.load(Ordering::Relaxed),
             ),
-            (
+            counter(
                 "lidlesseye_segments_written_total",
                 "Segments persisted.",
                 self.segments_written.load(Ordering::Relaxed),
             ),
-            (
+            counter(
                 "lidlesseye_segments_pruned_total",
                 "Segments dropped by retention.",
                 self.pruned_segments.load(Ordering::Relaxed),

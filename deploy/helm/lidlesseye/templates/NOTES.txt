@@ -1,0 +1,38 @@
+LidlessEye is installing.
+
+1. Open the dashboard:
+
+{{- if contains "NodePort" .Values.server.service.type }}
+   export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "lidlesseye.fullname" . }})
+   export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+   echo "http://${NODE_IP}:${NODE_PORT}/"
+{{- else if contains "LoadBalancer" .Values.server.service.type }}
+   export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "lidlesseye.fullname" . }} -o jsonpath="{.status.loadBalancer.ingress[0].ip}")
+   echo "http://${SERVICE_IP}:{{ .Values.server.service.port }}/"
+{{- else }}
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "lidlesseye.fullname" . }} {{ .Values.server.service.port }}:{{ .Values.server.service.port }}
+   echo "http://localhost:{{ .Values.server.service.port }}/"
+{{- end }}
+
+2. Check the agents:
+
+   kubectl --namespace {{ .Release.Namespace }} get ds {{ include "lidlesseye.fullname" . }}-agent
+{{- if .Values.agent.enabled }}
+
+   Each agent profiles its own node: `hostPID` plus `privileged` are required,
+   because loading BPF programs needs CAP_BPF/CAP_PERFMON and symbolizing stacks
+   needs the host PID namespace. Pods with a restrictive PodSecurity admission
+   label (for example `restricted`) will refuse the DaemonSet; use the
+   `privileged` profile for the `lidlesseye` namespace.
+{{- end }}
+
+3. Point at it from the CLI:
+
+   lidlesseye collect --server http://{{ include "lidlesseye.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.server.service.port }}
+{{- if .Values.server.auth.enabled }}
+
+   Authentication is on. The token lives in the
+   `{{ printf "%s-auth" (include "lidlesseye.fullname" .) }}` secret:
+
+   kubectl --namespace {{ .Release.Namespace }} get secret {{ printf "%s-auth" (include "lidlesseye.fullname" .) }} -o jsonpath='{.data.token}' | base64 -d
+{{- end }}

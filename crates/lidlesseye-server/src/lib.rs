@@ -353,7 +353,10 @@ fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(max_body))
         .layer(RequestDecompressionLayer::new())
         .layer(CompressionLayer::new())
-        .layer(TimeoutLayer::new(Duration::from_secs(60)))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(60),
+        ))
         .layer(TraceLayer::new_for_http());
 
     if let Some(origin) = &cors_origin {

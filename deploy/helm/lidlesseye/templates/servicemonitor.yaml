@@ -1,0 +1,20 @@
+{{- if .Values.server.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "lidlesseye.fullname" . }}
+  labels:
+    {{- include "lidlesseye.server.labels" . | nindent 4 }}
+    {{- with .Values.server.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "lidlesseye.server.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.server.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.server.metrics.serviceMonitor.scrapeTimeout }}
+{{- end }}

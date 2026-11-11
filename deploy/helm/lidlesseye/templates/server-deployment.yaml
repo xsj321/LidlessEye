@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lidlesseye.fullname" . }}
+  labels:
+    {{- include "lidlesseye.server.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.server.replicaCount }}
+  # The data directory has a single writer; a rolling update would give two
+  # pods the same volume.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "lidlesseye.server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lidlesseye.server.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "lidlesseye.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: server
+          image: {{ include "lidlesseye.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --retention={{ .Values.server.retention }}
+            - --max-disk={{ .Values.server.maxDisk }}
+            {{- if .Values.server.cors }}
+            - --cors={{ .Values.server.cors }}
+            {{- end }}
+            {{- if .Values.server.profiling.enabled }}
+            - --agent
+            - --frequency={{ .Values.agent.frequency }}
+            - --flush={{ .Values.agent.flush }}
+            {{- end }}
+            {{- range .Values.server.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: LIDLESSEYE_DATA_DIR
+              value: /var/lib/lidlesseye
+            - name: LIDLESSEYE_LISTEN
+              value: 0.0.0.0:{{ .Values.server.service.port }}
+            {{- if .Values.server.auth.enabled }}
+            - name: LIDLESSEYE_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lidlesseye.authSecretName" . }}
+                  key: token
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.server.service.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/ready
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.server.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/lidlesseye
+      volumes:
+        - name: data
+          {{- if .Values.server.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.server.persistence.existingClaim | default (printf "%s-data" (include "lidlesseye.fullname" .)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

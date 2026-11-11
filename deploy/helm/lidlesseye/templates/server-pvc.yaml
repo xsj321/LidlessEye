@@ -1,0 +1,19 @@
+{{- if .Values.server.persistence.enabled }}
+{{- if not .Values.server.persistence.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ printf "%s-data" (include "lidlesseye.fullname" .) }}
+  labels:
+    {{- include "lidlesseye.server.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.server.persistence.accessModes | nindent 4 }}
+  {{- if .Values.server.persistence.storageClass }}
+  storageClassName: {{ .Values.server.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.server.persistence.size | quote }}
+{{- end }}
+{{- end }}
