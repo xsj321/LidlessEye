@@ -48,18 +48,33 @@ static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static long (*bpf_get_stackid)(void *ctx, void *map, __u64 flags) = (void *)27;
+struct bpf_pidns_info {
+    __u32 pid;
+    __u32 tgid;
+};
+
+static long (*bpf_get_ns_current_pid_tgid)(__u64 dev, __u64 ino,
+                                           struct bpf_pidns_info *nsdata,
+                                           __u32 size) = (void *)120;
+
+/* Filled in by the loader from /proc/self/ns/pid.
+ *
+ * PIDs are kernel-global, but `/proc` only lists the tasks of the caller's PID
+ * namespace. When the agent runs in a container (or a Kubernetes pod without
+ * `hostPID: true`) the two sets differ, and every symbolization would fail.
+ * Translating through `bpf_get_ns_current_pid_tgid` makes the IDs in the maps
+ * match the ones the agent can actually read. On a normal host, or with
+ * `hostPID: true`, the translation is the identity. */
+struct ns_config {
+    __u64 dev;
+    __u64 ino;
+};
+
+const volatile struct ns_config ns_cfg = {};
 
 /* ---- BTF map definition macros (libbpf compatible) -------------------- */
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) typeof(val) *name
-
-#define MAP_DEF(name)                                                          \
-    struct {                                                                   \
-        __uint(type, BPF_MAP_TYPE_HASH);                                        \
-        __uint(max_entries, name##_MAX);                                        \
-        __type(key, struct stack_key);                                          \
-        __type(value, __u64);                                                   \
-    }
 
 /* Aggregation key: one thread group + one user stack + one kernel stack. */
 struct stack_key {
@@ -111,7 +126,31 @@ struct {
     __type(value, struct offcpu_state);
 } offcpu_inflight SEC(".maps");
 
-static __always_inline __u32 capture_user_stack(void *ctx) {
+/* Typed context for kprobes.
+ *
+ * The verifier rejects `void *ctx` when it is handed to a helper that takes
+ * `ARG_PTR_TO_CTX` ("reference type size cannot be determined"), because it
+ * cannot prove what the pointer points to. Declaring the kernel's `pt_regs`
+ * shape gives it a sized type; the programs never dereference it. */
+struct pt_regs_opaque {
+    unsigned long regs[64];
+};
+
+/* Thread group id as seen from the agent's PID namespace. */
+static __always_inline __u32 current_tgid(void) {
+    if (ns_cfg.ino != 0) {
+        struct bpf_pidns_info info = {};
+        if (bpf_get_ns_current_pid_tgid(ns_cfg.dev, ns_cfg.ino, &info, sizeof(info)) == 0) {
+            return info.tgid;
+        }
+        /* Not visible in the agent's namespace: report 0 so the sample is
+         * dropped instead of being attributed to an unrelated process. */
+        return 0;
+    }
+    return (__u32)(bpf_get_current_pid_tgid() >> 32);
+}
+
+static __always_inline __u32 capture_user_stack(struct pt_regs_opaque *ctx) {
     long id = bpf_get_stackid(ctx, (void *)&stacks, BPF_F_USER_STACK | BPF_F_FAST_STACK_CMP);
     if (id < 0) {
         return (__u32)INVALID_STACK_ID;
@@ -119,7 +158,7 @@ static __always_inline __u32 capture_user_stack(void *ctx) {
     return (__u32)id;
 }
 
-static __always_inline __u32 capture_kernel_stack(void *ctx) {
+static __always_inline __u32 capture_kernel_stack(struct pt_regs_opaque *ctx) {
     long id = bpf_get_stackid(ctx, (void *)&stacks, BPF_F_FAST_STACK_CMP);
     if (id < 0) {
         return (__u32)INVALID_STACK_ID;
@@ -142,9 +181,8 @@ static __always_inline void add_value(void *map, struct stack_key *key, __u64 va
 /* On-CPU sampling                                                        */
 /* --------------------------------------------------------------------- */
 SEC("perf_event")
-int lidlesseye_cpu(void *ctx) {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 tgid = pid_tgid >> 32;
+int lidlesseye_cpu(struct pt_regs_opaque *ctx) {
+    __u32 tgid = current_tgid();
     if (tgid == 0) {
         return 0;
     }
@@ -164,9 +202,8 @@ int lidlesseye_cpu(void *ctx) {
 /* Off-CPU accounting: mark the moment a task leaves the CPU              */
 /* --------------------------------------------------------------------- */
 SEC("kprobe/schedule")
-int lidlesseye_offcpu_start(void *ctx) {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 tgid = pid_tgid >> 32;
+int lidlesseye_offcpu_start(struct pt_regs_opaque *ctx) {
+    __u32 tgid = current_tgid();
     if (tgid == 0) {
         return 0;
     }
@@ -185,9 +222,8 @@ int lidlesseye_offcpu_start(void *ctx) {
 /* Off-CPU accounting: account the blocked interval when the task resumes */
 /* --------------------------------------------------------------------- */
 SEC("kprobe/finish_task_switch")
-int lidlesseye_offcpu_end(void *ctx) {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 tgid = pid_tgid >> 32;
+int lidlesseye_offcpu_end(struct pt_regs_opaque *ctx) {
+    __u32 tgid = current_tgid();
     if (tgid == 0) {
         return 0;
     }
@@ -221,4 +257,9 @@ int lidlesseye_offcpu_end(void *ctx) {
     return 0;
 }
 
-char LICENSE[] SEC("license") = "Apache-2.0";
+/* The kernel requires an explicit license for GPL-only helpers, and
+ * `bpf_get_stackid` is one of them. The eBPF program is therefore licensed
+ * GPL-2.0-only (see LICENSE-BPF); every user space crate in this workspace
+ * remains Apache-2.0. This split is the same one used by bpftrace,
+ * parca-agent and the OpenTelemetry eBPF profiler. */
+char LICENSE[] SEC("license") = "GPL";

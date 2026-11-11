@@ -22,6 +22,15 @@ pub(crate) struct FrameResolver {
     user_cache: HashMap<(u32, u64), Frame>,
     kernel_cache: HashMap<u64, Frame>,
     failed: u64,
+    /// Whether to resolve user addresses through `/proc/<pid>/map_files`.
+    ///
+    /// Those entries are magic links that resolve inside the *target's* mount
+    /// namespace, which is the only reliable way to symbolize a process that
+    /// lives in another container. They need `CAP_SYS_ADMIN` and are refused by
+    /// Docker's default seccomp profile, so the first failure flips this to
+    /// `false` and the resolver falls back to the symbolic paths listed in
+    /// `/proc/<pid>/maps`.
+    map_files: bool,
 }
 
 impl FrameResolver {
@@ -31,6 +40,7 @@ impl FrameResolver {
             user_cache: HashMap::new(),
             kernel_cache: HashMap::new(),
             failed: 0,
+            map_files: true,
         }
     }
 
@@ -58,26 +68,7 @@ impl FrameResolver {
         }
 
         if !missing.is_empty() {
-            let resolved: Vec<Frame> = {
-                let src = Source::Process(Process::new(Pid::from(tgid)));
-                match self.symbolizer.symbolize(&src, Input::AbsAddr(&missing)) {
-                    Ok(symbols) => {
-                        let mut out = Vec::with_capacity(missing.len());
-                        for (ip, sym) in missing.iter().zip(symbols.iter()) {
-                            out.push(frame_from(sym, *ip, false));
-                        }
-                        while out.len() < missing.len() {
-                            let ip = missing[out.len()];
-                            out.push(unknown_frame(ip));
-                        }
-                        out
-                    }
-                    Err(_) => {
-                        self.failed += missing.len() as u64;
-                        missing.iter().map(|ip| unknown_frame(*ip)).collect()
-                    }
-                }
-            };
+            let resolved = self.symbolize_user(tgid, &missing);
             for (ip, frame) in missing.into_iter().zip(resolved) {
                 self.user_cache.insert((tgid, ip), frame);
             }
@@ -87,6 +78,43 @@ impl FrameResolver {
         ips.iter()
             .filter_map(|ip| self.user_cache.get(&(tgid, *ip)).cloned())
             .collect()
+    }
+
+    /// Symbolize `addrs` for `tgid`, never failing: unresolved addresses become
+    /// `[unknown]` frames so that a stack keeps its shape.
+    fn symbolize_user(&mut self, tgid: u32, addrs: &[u64]) -> Vec<Frame> {
+        loop {
+            let mut process = Process::new(Pid::from(tgid));
+            process.map_files = self.map_files;
+            let src = Source::Process(process);
+            match self.symbolizer.symbolize(&src, Input::AbsAddr(addrs)) {
+                Ok(symbols) => {
+                    let mut out: Vec<Frame> = addrs
+                        .iter()
+                        .zip(symbols.iter())
+                        .map(|(ip, sym)| frame_from(sym, *ip, false))
+                        .collect();
+                    while out.len() < addrs.len() {
+                        let ip = addrs[out.len()];
+                        out.push(unknown_frame(ip));
+                    }
+                    return out;
+                }
+                Err(err) => {
+                    if self.map_files {
+                        self.map_files = false;
+                        tracing::debug!(
+                            error = %err,
+                            "map_files unusable, falling back to /proc/<pid>/maps paths"
+                        );
+                        continue;
+                    }
+                    tracing::debug!(error = %err, "symbolization failed");
+                    self.failed += addrs.len() as u64;
+                    return addrs.iter().map(|ip| unknown_frame(*ip)).collect();
+                }
+            }
+        }
     }
 
     /// Resolve a kernel stack of `ips` (leaf first).
@@ -193,6 +221,24 @@ mod tests {
         let f = unknown_frame(0x4011a0);
         assert_eq!(f.symbol, "0x4011a0");
         assert_eq!(f.addr, 0x4011a0);
+    }
+
+    #[inline(never)]
+    fn symbolization_marker(x: u64) -> u64 {
+        std::hint::black_box(x).wrapping_mul(3)
+    }
+
+    #[test]
+    fn symbolizes_the_test_process() {
+        let mut r = FrameResolver::new();
+        let addr = symbolization_marker as *const () as u64;
+        let frames = r.resolve_user(std::process::id(), &[addr]);
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frames[0].symbol.contains("symbolization_marker"),
+            "expected a real symbol, got {:?}",
+            frames[0]
+        );
     }
 
     #[test]

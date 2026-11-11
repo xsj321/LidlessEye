@@ -17,7 +17,7 @@
 //! the maps once per flush interval, so the per-sample cost stays constant no
 //! matter how fast samples arrive.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -35,6 +35,10 @@ use crate::procfs;
 use crate::symbolizer::FrameResolver;
 
 const BPF_OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/profile.bpf.o"));
+
+pub(crate) fn bpf_object() -> &'static [u8] {
+    BPF_OBJECT
+}
 const INVALID_STACK_ID: u32 = u32::MAX;
 
 /// Collector configuration.
@@ -53,8 +57,12 @@ pub struct CollectorConfig {
     pub collect_cpu: bool,
     /// Collect off-CPU (blocked) profiles.
     pub collect_off_cpu: bool,
-    /// Process ids to ignore (the collector always ignores itself).
+    /// Process ids to ignore.
     pub exclude_pids: Vec<u32>,
+    /// Ignore the collector's own process so that the profiler never profiles
+    /// itself. Turn this off when the workload lives in the same process as the
+    /// collector (tests, single-process embedded use).
+    pub exclude_self: bool,
     /// Derive `k8s_*` labels from the cgroup path of each process.
     pub enrich_kubernetes_labels: bool,
     /// Add a `node` label with the host name.
@@ -71,6 +79,7 @@ impl Default for CollectorConfig {
             collect_cpu: true,
             collect_off_cpu: true,
             exclude_pids: Vec::new(),
+            exclude_self: true,
             enrich_kubernetes_labels: true,
             node_label: true,
         }
@@ -225,6 +234,17 @@ struct StackKey {
 // contains no pointers, so it is plain old data.
 unsafe impl aya::Pod for StackKey {}
 
+/// Must match `struct ns_config` in `profile.bpf.c`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct NsConfig {
+    dev: u64,
+    ino: u64,
+}
+
+// SAFETY: two `u64` fields, no padding, no pointers.
+unsafe impl aya::Pod for NsConfig {}
+
 #[derive(Debug, Clone)]
 struct RawRecord {
     tgid: u32,
@@ -246,7 +266,22 @@ where
         debug!("could not raise RLIMIT_MEMLOCK, relying on the kernel's default");
     }
 
-    let mut ebpf = Ebpf::load(BPF_OBJECT).map_err(|err| format!("failed to load eBPF: {err}"))?;
+    // Translate the kernel-global pids reported by the helpers into the agent's
+    // PID namespace, so that they line up with `/proc`. The value has to outlive
+    // the loader because `override_global` keeps a borrow of it until `load`.
+    let ns_cfg = procfs::pid_namespace().map(|(dev, ino)| NsConfig { dev, ino });
+    if let Some(cfg) = &ns_cfg {
+        debug!(dev = cfg.dev, ino = cfg.ino, "using PID namespace translation");
+    }
+    let mut loader = aya::EbpfLoader::new();
+    if let Some(cfg) = ns_cfg.as_ref() {
+        // `must_exist = false` so that an object built without `ns_cfg` still
+        // loads (the pids then stay in the initial namespace).
+        loader.override_global("ns_cfg", cfg, false);
+    }
+    let mut ebpf = loader
+        .load(BPF_OBJECT)
+        .map_err(|err| format!("failed to load eBPF: {err}"))?;
     let cpus = procfs::online_cpus();
     info!(
         cpus = cpus.len(),
@@ -283,12 +318,19 @@ where
 
     let mut offcpu_attached = false;
     if config.collect_off_cpu {
-        let start_ok = attach_kprobe(&mut ebpf, "lidlesseye_offcpu_start", "schedule");
-        let end_ok = start_ok
-            && ["finish_task_switch", "finish_task_switch.isra.0"]
-                .iter()
-                .any(|symbol| attach_kprobe(&mut ebpf, "lidlesseye_offcpu_end", symbol));
-        offcpu_attached = start_ok && end_ok;
+        let start = attach_kprobe(&mut ebpf, "lidlesseye_offcpu_start", &["schedule"]);
+        let end = start.and_then(|_| {
+            attach_kprobe(
+                &mut ebpf,
+                "lidlesseye_offcpu_end",
+                &[
+                    "finish_task_switch",
+                    "finish_task_switch.isra.0",
+                    "finish_task_switch.constprop.0",
+                ],
+            )
+        });
+        offcpu_attached = start.is_some() && end.is_some();
         if !offcpu_attached {
             warn!("could not attach off-CPU probes; continuing with on-CPU only");
         }
@@ -342,29 +384,45 @@ where
     Ok(())
 }
 
-fn attach_kprobe(ebpf: &mut Ebpf, program: &str, symbol: &str) -> bool {
-    let result = (|| -> Result<(), String> {
-        let prog: &mut KProbe = ebpf
-            .program_mut(program)
-            .ok_or_else(|| format!("missing program `{program}`"))?
-            .try_into()
-            .map_err(|err| format!("`{program}` is not a kprobe: {err}"))?;
-        prog.load()
-            .map_err(|err| format!("could not load `{program}`: {err}"))?;
-        prog.attach(symbol, 0)
-            .map_err(|err| format!("could not attach `{program}` to {symbol}: {err}"))?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => {
-            debug!(program, symbol, "attached kprobe");
-            true
+/// Load `program` once and attach it to the first symbol that exists on this
+/// kernel. Returns the symbol that worked, or `None`.
+///
+/// Symbol names move around between kernel versions and compiler settings
+/// (`finish_task_switch` becomes `finish_task_switch.isra.0` once GCC decides
+/// to clone it), so every candidate has to be tried. Loading is separate from
+/// attaching because aya rejects a second `load()` on a program that is
+/// already loaded — the very thing that used to make the fallback list fail.
+fn attach_kprobe(ebpf: &mut Ebpf, program: &str, symbols: &[&'static str]) -> Option<&'static str> {
+    let probe: &mut KProbe = match ebpf.program_mut(program) {
+        Some(raw) => match raw.try_into() {
+            Ok(probe) => probe,
+            Err(err) => {
+                debug!(program, error = %err, "not a kprobe program");
+                return None;
+            }
+        },
+        None => {
+            debug!(program, "program missing from the eBPF object");
+            return None;
         }
-        Err(err) => {
-            debug!(program, symbol, error = %err, "kprobe attach failed");
-            false
+    };
+    if let Err(err) = probe.load() {
+        debug!(program, error = %err, "could not load kprobe");
+        return None;
+    }
+
+    let mut last_error = String::new();
+    for symbol in symbols {
+        match probe.attach(symbol, 0) {
+            Ok(_) => {
+                debug!(program, symbol, "attached kprobe");
+                return Some(symbol);
+            }
+            Err(err) => last_error = format!("{symbol}: {err}"),
         }
     }
+    debug!(program, error = %last_error, "no candidate symbol could be attached");
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -388,13 +446,10 @@ where
         Vec::new()
     };
 
-    let self_pid = std::process::id();
-    let excluded: Vec<u32> = config
-        .exclude_pids
-        .iter()
-        .copied()
-        .chain(std::iter::once(self_pid))
-        .collect();
+    let mut excluded: HashSet<u32> = config.exclude_pids.iter().copied().collect();
+    if config.exclude_self {
+        excluded.insert(std::process::id());
+    }
     cpu_records.retain(|r| !excluded.contains(&r.tgid) && r.tgid != 0);
     offcpu_records.retain(|r| !excluded.contains(&r.tgid) && r.tgid != 0);
 
@@ -447,7 +502,11 @@ where
     let period_ns = 1_000_000_000u64 / config.frequency_hz.max(1);
     let mut cpu_builders: HashMap<GroupKey, ReportBuilder> = HashMap::new();
     let mut offcpu_builders: HashMap<GroupKey, ReportBuilder> = HashMap::new();
-    let mut groups: HashMap<u32, GroupKey> = HashMap::new();
+    // A profile of a process that no longer exists in `/proc` cannot be
+    // symbolized, so those records are skipped instead of being stored as a
+    // wall of `[unknown]` frames.
+    let mut groups: HashMap<u32, Option<GroupKey>> = HashMap::new();
+    let mut skipped = 0u64;
 
     for (records, builders, factor) in [
         (&cpu_records, &mut cpu_builders, period_ns),
@@ -458,6 +517,10 @@ where
                 .entry(record.tgid)
                 .or_insert_with(|| resolve_group(config, record.tgid))
                 .clone();
+            let Some(group) = group else {
+                skipped += 1;
+                continue;
+            };
 
             let mut frames: Vec<Frame> = Vec::new();
             if record.kernel_stack != INVALID_STACK_ID
@@ -509,6 +572,18 @@ where
     stats
         .symbol_failures
         .store(resolver.failed_lookups(), Ordering::Relaxed);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let sample: Vec<String> = groups
+            .iter()
+            .filter_map(|(tgid, group)| {
+                group
+                    .as_ref()
+                    .map(|group| format!("{tgid}:{}", group.service))
+            })
+            .take(6)
+            .collect();
+        debug!(targets = ?sample, skipped, "sample targets");
+    }
     debug!(
         cpu_records = cpu_records.len(),
         offcpu_records = offcpu_records.len(),
@@ -536,8 +611,8 @@ struct GroupKey {
     labels: BTreeMap<String, String>,
 }
 
-fn resolve_group(config: &CollectorConfig, tgid: u32) -> GroupKey {
-    let comm = procfs::read_comm(tgid).unwrap_or_else(|| "unknown".to_string());
+fn resolve_group(config: &CollectorConfig, tgid: u32) -> Option<GroupKey> {
+    let comm = procfs::read_comm(tgid)?;
     let service = config.service_name.clone().unwrap_or_else(|| comm.clone());
     let mut labels = config.labels.clone();
     if config.node_label {
@@ -559,7 +634,7 @@ fn resolve_group(config: &CollectorConfig, tgid: u32) -> GroupKey {
             labels.entry(key).or_insert(value);
         }
     }
-    GroupKey { service, labels }
+    Some(GroupKey { service, labels })
 }
 
 fn drain_map(ebpf: &mut Ebpf, name: &str) -> Result<Vec<RawRecord>, String> {

@@ -38,8 +38,14 @@ pub fn read_cgroup(tgid: u32) -> Option<String> {
 ///   * cgroup v1: `/kubepods/burstable/pod<uid>/<container-id>`
 ///   * containerd: `/kubepods/burstable/pod<uid>/<64 hex chars>`
 pub fn parse_pod_uid(cgroup: &str) -> Option<String> {
-    let idx = cgroup.find("pod")?;
-    let rest = &cgroup[idx + 3..];
+    // Search for the `-pod<uid>`/`/pod<uid>` marker, not the bare string:
+    // `kubepods` contains "pod" too and would match much earlier.
+    let start = ["-pod", "/pod"]
+        .iter()
+        .filter_map(|marker| cgroup.rfind(marker))
+        .max()?
+        + 4;
+    let rest = &cgroup[start..];
     let end = rest
         .find(|c: char| !(c.is_ascii_hexdigit() || c == '-'))
         .unwrap_or(rest.len());
@@ -111,6 +117,16 @@ pub fn online_cpus() -> Vec<u32> {
         }
     }
     (0..num_cpus::get() as u32).collect()
+}
+
+/// `(st_dev, st_ino)` of the agent's PID namespace.
+///
+/// The loader feeds these into the eBPF programs so that the pids stored in the
+/// maps are relative to the namespace the agent can actually read from `/proc`.
+pub fn pid_namespace() -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata("/proc/self/ns/pid").ok()?;
+    Some((metadata.dev(), metadata.ino()))
 }
 
 /// Is the process inside a Kubernetes pod?

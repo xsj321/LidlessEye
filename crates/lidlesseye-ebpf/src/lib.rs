@@ -30,6 +30,13 @@ mod symbolizer;
 #[cfg(target_os = "linux")]
 pub use collector::{CollectorConfig, CollectorHandle, StatsSnapshot, start};
 
+/// The compiled eBPF object, exposed for debugging and for `bpftool` based
+/// inspection (`lidlesseye` embeds the same bytes).
+#[cfg(target_os = "linux")]
+pub fn bpf_object() -> &'static [u8] {
+    collector::bpf_object()
+}
+
 /// Configuration for the eBPF collector.
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug, Clone)]

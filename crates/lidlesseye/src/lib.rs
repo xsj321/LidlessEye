@@ -32,7 +32,7 @@
 //! ## Embedded: feed your own profiles
 //!
 //! ```no_run
-//! use lidlesseye::{Frame, Result};
+//! use lidlesseye::{Frame, LidlessEye, Result};
 //! use lidlesseye::core::ReportBuilder;
 //!
 //! # async fn run() -> Result<()> {
@@ -260,17 +260,16 @@ impl Builder {
                 collector_cfg.enrich_kubernetes_labels = true;
             }
             let state = http.state();
+            // The collector invokes the callback on its own thread, which has
+            // no runtime context: capture the handle before spawning it.
+            let runtime = tokio::runtime::Handle::current();
             let handle = lidlesseye_ebpf::start(collector_cfg, move |report: Report| {
                 let state = state.clone();
-                // The callback runs on the collector thread; hop onto the
-                // runtime to write the segment.
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        if let Err(err) = state.ingest_many(vec![report]).await {
-                            tracing::warn!(error = %err, "failed to store collected report");
-                        }
-                    });
-                }
+                runtime.spawn(async move {
+                    if let Err(err) = state.ingest_many(vec![report]).await {
+                        tracing::warn!(error = %err, "failed to store collected report");
+                    }
+                });
             })
             .map_err(Error::Collector)?;
             Some(handle)
@@ -308,15 +307,14 @@ impl LidlessEye {
             return Err(Error::Collector("collector already running".into()));
         }
         let state = self.http.state();
+        let runtime = tokio::runtime::Handle::current();
         let handle = lidlesseye_ebpf::start(config, move |report: Report| {
             let state = state.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    if let Err(err) = state.ingest_many(vec![report]).await {
-                        tracing::warn!(error = %err, "failed to store collected report");
-                    }
-                });
-            }
+            runtime.spawn(async move {
+                if let Err(err) = state.ingest_many(vec![report]).await {
+                    tracing::warn!(error = %err, "failed to store collected report");
+                }
+            });
         })
         .map_err(Error::Collector)?;
         self.collector = Some(handle);
