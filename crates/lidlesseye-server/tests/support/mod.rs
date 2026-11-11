@@ -47,9 +47,10 @@ pub async fn router_with(dir: &Path, cfg: ServerConfig) -> Router {
     .router()
 }
 
-/// A response split into status and raw bytes.
+/// A response split into status, headers and raw bytes.
 pub struct Raw {
     pub status: StatusCode,
+    pub headers: axum::http::HeaderMap,
     pub body: Vec<u8>,
 }
 
@@ -60,6 +61,13 @@ impl Raw {
 
     pub fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+
+    pub fn header(&self, name: &str) -> &str {
+        self.headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
     }
 }
 
@@ -78,9 +86,11 @@ pub async fn request(
     let request = builder.body(Body::from(body.unwrap_or_default())).unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     Raw {
         status,
+        headers,
         body: body.to_vec(),
     }
 }
@@ -184,7 +194,7 @@ impl Proto {
 
     /// Varint field.
     pub fn uint(&mut self, field: u32, mut value: u64) {
-        self.0.push(((field << 3) | 0) as u8);
+        self.0.push((field << 3) as u8);
         loop {
             let byte = (value & 0x7f) as u8;
             value >>= 7;
@@ -268,4 +278,71 @@ pub fn pprof_fixture() -> Vec<u8> {
 /// A folded-text payload: `main;handle_request` plus `main`.
 pub fn folded_fixture() -> Vec<u8> {
     b"main;handle_request 600000000\nmain 400000000\n".to_vec()
+}
+
+/// The [`pprof_fixture`] profile plus a second sample carrying one pprof
+/// `Label{key,str}` — the way Go's `pprof.Labels` and the Pyroscope SDKs tag
+/// samples.
+pub fn pprof_fixture_labeled(key: &str, value: &str) -> Vec<u8> {
+    let mut table = vec![
+        String::new(),
+        "cpu".into(),
+        "nanoseconds".into(),
+        "main".into(),
+        "handle_request".into(),
+        "/srv/app.go".into(),
+    ];
+    let key_index = table.len();
+    table.push(key.to_string());
+    let value_index = table.len();
+    table.push(value.to_string());
+
+    let mut p = Proto::new();
+    let mut sample_type = Proto::new();
+    sample_type.uint(1, 1);
+    sample_type.uint(2, 2);
+    p.bytes(1, &sample_type.0);
+
+    for (id, name) in [(1u64, 3u64), (2, 4)] {
+        let mut function = Proto::new();
+        function.uint(1, id);
+        function.uint(2, name);
+        function.uint(4, 5);
+        p.bytes(5, &function.0);
+    }
+    for (id, function_id, line) in [(10u64, 2u64, 12u64), (11, 1, 0)] {
+        let mut line_msg = Proto::new();
+        line_msg.uint(1, function_id);
+        line_msg.uint(2, line);
+        let mut location = Proto::new();
+        location.uint(1, id);
+        location.bytes(4, &line_msg.0);
+        p.bytes(4, &location.0);
+    }
+
+    // The labelled sample: 500 ns with `key=value`.
+    let mut label = Proto::new();
+    label.uint(1, key_index as u64);
+    label.uint(2, value_index as u64);
+    let mut sample = Proto::new();
+    sample.uint(1, 10);
+    sample.uint(1, 11);
+    sample.uint(2, 500);
+    sample.bytes(3, &label.0);
+    p.bytes(2, &sample.0);
+
+    // An unlabelled sample: 700 ns.
+    let mut plain = Proto::new();
+    plain.uint(1, 10);
+    plain.uint(1, 11);
+    plain.uint(2, 700);
+    p.bytes(2, &plain.0);
+
+    let now = now_ns();
+    p.uint(9, now - 10_000_000_000);
+    p.uint(10, 10_000_000_000);
+    for entry in &table {
+        p.bytes(6, entry.as_bytes());
+    }
+    p.0
 }

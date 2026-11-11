@@ -419,7 +419,7 @@ async fn query_parameters_are_bounded() {
     let now = now_ns();
     let stack: Vec<Frame> = (0..60)
         .rev()
-        .map(|i| Frame::new("/app/deep", &format!("fn{i}")))
+        .map(|i| Frame::new("/app/deep", format!("fn{i}")))
         .collect();
     let mut builder = ReportBuilder::new("deep", ProfileType::cpu(), now - 1_000, now);
     builder.add_stack(stack, 5_000);

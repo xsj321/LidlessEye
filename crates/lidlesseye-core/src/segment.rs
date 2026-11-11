@@ -275,7 +275,24 @@ pub fn type_slug(profile_type: &str) -> String {
 /// slug that would still be a path traversal — `.`, `..`, or empty — is
 /// replaced. Both the service name and the profile type end up in the
 /// directory layout, so both must go through this.
+///
+/// Three extra passes exist because of how Windows treats names:
+///
+/// * a leading `.` is dropped and a run of dots is collapsed, so no component
+///   can start with `..` and look like a traversal in a log or a shell;
+/// * trailing dots and spaces are trimmed, because Windows silently strips
+///   them — leaving them on would make the directory the metadata records
+///   differ from the one on disk;
+/// * reserved device names (`CON`, `NUL`, `COM1`, …) are prefixed with `_`,
+///   since `CreateDirectory(L"con")` misbehaves in ways that are very hard to
+///   debug from a stack trace.
 fn path_slug(input: &str, max_len: usize) -> String {
+    // Trim before sanitizing: mapping a space to `_` first would turn a blank
+    // name into a directory called `___` instead of `unnamed`.
+    let input = input.trim();
+    if input.is_empty() {
+        return "unnamed".to_string();
+    }
     let mut slug: String = input
         .chars()
         .map(|c| {
@@ -287,10 +304,32 @@ fn path_slug(input: &str, max_len: usize) -> String {
         })
         .collect();
     slug.truncate(max_len);
-    if slug.is_empty() || slug == "." || slug == ".." {
+    // Trim first, so `..` and `...` become empty and end up as `unnamed`
+    // rather than as a directory whose name is a single underscore.
+    let trimmed = slug.trim_matches(|c| c == '.' || c == ' ');
+    if trimmed.is_empty() {
         return "unnamed".to_string();
     }
+    let mut slug = trimmed.to_string();
+    while slug.contains("..") {
+        slug = slug.replace("..", "_");
+    }
+    if is_windows_reserved(&slug) {
+        return format!("_{slug}");
+    }
     slug
+}
+
+/// Windows reserves a handful of names for devices, with or without an
+/// extension (`CON`, `con.txt`, `LPT1`), in every directory.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
 }
 
 /// Write a report as a new immutable segment.
@@ -826,5 +865,70 @@ mod tests {
         std::fs::write(&meta.path, &data).unwrap();
         assert!(Segment::open(&meta.path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A slug is a directory name. It must never be able to leave its parent,
+    /// and it must survive Windows' name rules, which silently rewrite trailing
+    /// dots and refuse device names.
+    #[test]
+    fn slugs_are_safe_and_portable() {
+        assert_eq!(service_slug("checkout"), "checkout");
+        assert_eq!(service_slug("api/v2"), "api_v2");
+        assert_eq!(service_slug(".."), "unnamed");
+        assert_eq!(service_slug("."), "unnamed");
+        assert_eq!(service_slug("   "), "unnamed");
+        assert_eq!(service_slug(""), "unnamed");
+
+        for hostile in [
+            "../../etc/passwd",
+            "..\\..\\windows",
+            "...",
+            ".hidden",
+            "trailing...",
+            "C:\\absolute\\path",
+            "a/b/../../c",
+            "con",
+            "CON.txt",
+            "nul",
+            "COM1",
+            "lpt9",
+            "com0",
+        ] {
+            let slug = service_slug(hostile);
+            assert!(!slug.is_empty(), "`{hostile}` produced an empty slug");
+            assert!(
+                !slug.starts_with('.'),
+                "`{hostile}` produced `{slug}`, which looks like a relative path"
+            );
+            assert!(
+                !slug.contains(".."),
+                "`{hostile}` produced `{slug}`, which contains a traversal"
+            );
+            assert!(
+                !slug.contains('/') && !slug.contains('\\'),
+                "`{hostile}` produced `{slug}`, which contains a separator"
+            );
+            assert!(
+                !slug.ends_with('.') && !slug.ends_with(' '),
+                "`{hostile}` produced `{slug}`, which Windows would rename"
+            );
+            assert!(
+                !is_windows_reserved(&slug),
+                "`{hostile}` produced the reserved name `{slug}`"
+            );
+        }
+
+        // A reserved name keeps its identity but gains a prefix.
+        assert_eq!(service_slug("con"), "_con");
+        assert_eq!(service_slug("NUL.txt"), "_NUL.txt");
+        assert_eq!(service_slug("com0"), "com0", "com0 is a valid file name");
+        assert_eq!(service_slug("com1").len(), 5);
+    }
+
+    #[test]
+    fn slugs_are_bounded() {
+        let long = "x".repeat(10_000);
+        assert_eq!(type_slug(&long).len(), 48);
+        assert_eq!(service_slug(&long).len(), 96);
     }
 }
