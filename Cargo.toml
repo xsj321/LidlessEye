@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/lidlesseye-core",
+    "crates/lidlesseye-ebpf",
+    "crates/lidlesseye-server",
+    "crates/lidlesseye",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/lidlesseye/lidlesseye"
+homepage = "https://github.com/lidlesseye/lidlesseye"
+authors = ["LidlessEye contributors"]
+description = "Continuous eBPF profiling, stored in a columnar format."
+keywords = ["profiling", "ebpf", "flamegraph", "observability"]
+categories = ["development-tools::profiling", "network-programming"]
+
+[workspace.dependencies]
+lidlesseye-core = { path = "crates/lidlesseye-core", version = "0.1.0" }
+lidlesseye-ebpf = { path = "crates/lidlesseye-ebpf", version = "0.1.0" }
+lidlesseye-server = { path = "crates/lidlesseye-server", version = "0.1.0" }
+
+anyhow = "1.0.104"
+async-stream = "0.3.6"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
+aya = "0.16.0"
+blazesym = "0.2.7"
+bytes = "1.10"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+crc32fast = "1.5.5"
+flate2 = "1.1.11"
+futures = "0.3.34"
+http = "1.3"
+http-body-util = "0.1.5"
+libc = "0.2.191"
+memmap2 = "0.9.12"
+num_cpus = "1.17.0"
+object = { version = "0.41.0", features = ["read_core", "elf", "compression"] }
+parking_lot = "0.12"
+rand = "0.10.3"
+rust-embed = { version = "8.14.0", features = ["interpolate-folder-path"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["parsing", "formatting"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
+tower = { version = "0.5.2", features = ["util", "timeout"] }
+tower-http = { version = "0.7.1", features = ["compression-gzip", "cors", "trace", "decompression-gzip", "limit", "request-id", "timeout"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uuid = { version = "1.29.2", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev.package."*"]
+opt-level = 2

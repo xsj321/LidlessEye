@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / frontend
+web/node_modules
+web/.vite
+web/dist/*.map
+
+# Local data and binaries
+lidlesseye-data/
+*.leseg
+*.leseg.tmp
+/dist
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# WorkBuddy workspace metadata
+.workbuddy/
