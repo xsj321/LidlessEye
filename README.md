@@ -51,10 +51,18 @@ around three deliberate choices:
 
 - Flamegraphs (nested, with self/inclusive values), top-N functions by self or
   total value, and time series bucketed by service and label set.
+- A **comparison view** (`/api/v1/diff`): two windows in one tree, so a
+  regression shows up as a red frame instead of a number you have to eyeball.
+- `group_by` any label — pod, container, service — as flamegraph frames or as
+  separate time series.
 - Labels and PromQL-flavoured selectors: `service_name="api" {env="prod",
-  pod=~"api-*"}`.
+  pod=~"api-*"}`, a label explorer, and `label-names` / `label/{name}/values`.
+- Ingest speaks **pprof protobuf** and **folded/collapsed text** as well as its
+  own JSON, so the Pyroscope SDKs and `go tool pprof` output push directly.
+- **Multi-tenancy**: `X-Scope-OrgID`, per-tenant tokens, per-tenant retention,
+  disk budget and series cap.
 - Retention by age and by disk budget, plus `lidlesseye fsck` to verify every
-  segment's CRC32.
+  segment's CRC32 (checksums are also verified on every read).
 
 **Ships as**
 
@@ -159,12 +167,19 @@ More in [docs/embedding.md](docs/embedding.md).
 | `GET` | `/api/v1/series` | known series in a range |
 | `GET` | `/api/v1/label/{name}/values` | label values, with totals |
 | `GET` | `/api/v1/profile_types` | profile types present (including virtual `wall`) |
+| `GET` | `/api/v1/diff` | two windows compared in one tree |
+| `GET` | `/api/v1/label-names` · `/api/v1/labels` | label keys seen in a range |
+| `GET` | `/api/v1/tenants` | tenants with their size and limits |
 | `GET` | `/api/v1/health` · `/ready` · `/stats` · `/version` | operations |
 | `GET` | `/metrics` | Prometheus text format |
 
 Common query parameters: `profile_type` (aliases `type`), `from` / `until`
-(unix seconds, `1700000000ms`, RFC3339, `now-1h`), `selector`, `max_nodes`,
-`limit`, `step`, `buckets`.
+(unix seconds, `1700000000ms`, RFC3339, `now-1h`), `selector`, `group_by`,
+`max_nodes`, `limit`, `step`, `buckets`.
+
+Every request belongs to one tenant, named by `X-Scope-OrgID` (the header
+Pyroscope and the Grafana datasource send). Without it, and without auth, the
+`default` tenant is used.
 
 ```bash
 # how much CPU did the checkout service burn in the last hour?
@@ -173,6 +188,14 @@ curl -s 'http://localhost:4040/api/v1/top?profile_type=cpu&from=now-1h&limit=5' 
 # who is blocking, and on what?
 curl -s 'http://localhost:4040/api/v1/flamegraph?profile_type=off_cpu&from=now-15m' \
   | jq '.names, .total'
+
+# what got slower than the hour before?
+curl -s 'http://localhost:4040/api/v1/diff?from=now-1h&baseline_from=now-2h' \
+  | jq '[.names, .diff] | transpose | sort_by(.[1]) | .[-5:]'
+
+# one tenant's data, grouped by pod
+curl -s -H 'X-Scope-OrgID: acme' \
+  'http://localhost:4040/api/v1/flamegraph?from=now-1h&group_by=pod' | jq .total
 ```
 
 Full reference: [docs/api.md](docs/api.md).
@@ -189,9 +212,25 @@ lidlesseye info     # build and platform information
 ```
 
 `serve` and `collect` accept `--frequency`, `--flush`, `--label k=v`,
-`--service-name`, `--no-cpu`, `--no-offcpu`. Most flags also read environment
-variables (`LIDLESSEYE_DATA_DIR`, `LIDLESSEYE_LISTEN`, `LIDLESSEYE_SERVER`,
-`LIDLESSEYE_AUTH_TOKEN`), which is what the Helm chart uses.
+`--service-name`, `--no-cpu`, `--no-offcpu`. `ingest` accepts `--format
+json|pprof|folded` and `--tenant`; `query` accepts `--tenant`, `--group-by`,
+`--top` / `--tree`.
+
+Multi-tenancy flags on `serve`:
+
+```
+--tenant-header X-Scope-OrgID          # the header carrying the tenant id
+--tenant-token <token>=<tenant>        # repeatable; binds a token to a tenant
+--allowed-tenant acme                  # repeatable; refuse anything else
+--tenant-limit acme:max_series=50000   # retention / max_disk / max_series
+--max-tenants 1000                     # cap on tenants
+--tenant acme                          # where the built-in agent writes
+```
+
+Most flags also read environment variables (`LIDLESSEYE_DATA_DIR`,
+`LIDLESSEYE_LISTEN`, `LIDLESSEYE_SERVER`, `LIDLESSEYE_AUTH_TOKEN`,
+`LIDLESSEYE_TENANT_TOKENS`), which is what the Helm chart uses to keep tokens
+out of the pod spec.
 
 ## How it works
 
@@ -202,6 +241,10 @@ variables (`LIDLESSEYE_DATA_DIR`, `LIDLESSEYE_LISTEN`, `LIDLESSEYE_SERVER`,
   privileges, storage sizing, monitoring, troubleshooting.
 - [Embedding](docs/embedding.md) — the crate API, custom collectors, direct
   ingestion.
+- [Multi-tenancy](docs/multi-tenancy.md) — layout, tenant resolution, tokens,
+  limits, failure modes.
+- [Pyroscope compatibility](docs/compatibility.md) — what matches, what differs,
+  and what is deliberately out of scope.
 
 Repository layout:
 

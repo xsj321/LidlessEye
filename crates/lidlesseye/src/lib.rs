@@ -110,6 +110,7 @@ pub struct Builder {
     allowed_tenants: Option<Vec<String>>,
     tenant_limits: BTreeMap<String, lidlesseye_core::TenantLimits>,
     max_tenants: usize,
+    tenant_header: String,
 
     agent: bool,
     service_name: Option<String>,
@@ -140,6 +141,7 @@ impl Default for Builder {
             allowed_tenants: None,
             tenant_limits: BTreeMap::new(),
             max_tenants: 1000,
+            tenant_header: "X-Scope-OrgID".to_string(),
             agent: false,
             service_name: None,
             labels: BTreeMap::new(),
@@ -226,6 +228,16 @@ impl Builder {
         self
     }
 
+    /// Request header carrying the tenant id.
+    ///
+    /// Defaults to `X-Scope-OrgID`, the header Pyroscope and the Grafana
+    /// datasource send. Change it when a gateway in front already owns that
+    /// name; `x-tenant-id` is always accepted as an alias.
+    pub fn tenant_header(mut self, header: impl Into<String>) -> Self {
+        self.tenant_header = header.into();
+        self
+    }
+
     /// Maximum number of tenants this server will host.
     pub fn max_tenants(mut self, max: usize) -> Self {
         self.max_tenants = max;
@@ -292,6 +304,7 @@ impl Builder {
             allowed_tenants: self.allowed_tenants.clone(),
             tenant_limits: self.tenant_limits.clone(),
             max_tenants: self.max_tenants,
+            tenant_header: self.tenant_header.clone(),
             read_only: self.read_only,
             cors_allow_origin: self.cors.clone(),
             ..Default::default()

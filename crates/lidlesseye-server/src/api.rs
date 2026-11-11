@@ -307,7 +307,9 @@ pub async fn top(
     let profile_type = params.profile_type();
     let opts = QueryOptions::new(profile_type.clone(), from, until, params.selector()?)
         .with_group_by(params.group_by());
-    let limit = params.usize_param("limit", 50);
+    // Clamped: without a ceiling `limit=999999999` would sort and serialize
+    // the whole tree, which is a cheap way for one client to stall a replica.
+    let limit = params.usize_param("limit", 50).clamp(1, 1_000);
 
     let Some(store) = maybe_store(&state, &caller) else {
         return Ok(Json(json!({
@@ -560,12 +562,14 @@ pub async fn stats(
 }
 
 /// `GET /api/v1/version`
-pub async fn version() -> Json<Value> {
+pub async fn version(State(state): State<AppState>) -> Json<Value> {
+    // Read the header name from the running configuration: a client that
+    // discovers it here must be able to trust the answer.
     Json(json!({
         "name": "lidlesseye",
         "version": VERSION,
         "multi_tenant": true,
-        "tenant_header": "X-Scope-OrgID",
+        "tenant_header": state.config().tenant_header,
     }))
 }
 

@@ -50,6 +50,35 @@ server:
   # Allowed CORS origin; empty disables the CORS layer.
   cors: ""
 
+  # Multi-tenancy. Each request names its tenant with a header; the chart
+  # leaves everything open by default so a single-team install needs no
+  # configuration.
+  tenants:
+    # Header carrying the tenant id. The Pyroscope/Grafana default is
+    # X-Scope-OrgID; change it when a gateway in front already owns that name.
+    header: X-Scope-OrgID
+    # Reject every tenant not listed here. Empty means "any valid id, created
+    # by the first write".
+    allowed: []
+    # Maximum number of tenants the server will host.
+    maxTenants: 1000
+    # Per-tenant limits: `<tenant>:<field>=<value>` where field is
+    # `retention`, `max_disk` or `max_series`. Example:
+    #   limits:
+    #     - "acme:max_series=50000"
+    #     - "acme:retention=30d"
+    limits: []
+    # Bind a token to one tenant. Implies authentication is required, and the
+    # token decides the tenant, so the agent no longer sends a header.
+    #   tokens:
+    #     - token: "s3cret"
+    #       tenant: acme
+    # Tokens are stored in a Secret and passed as LIDLESSEYE_TENANT_TOKENS, so
+    # they never appear in the pod spec.
+    tokens: []
+    # Use your own Secret (key: `tenant-tokens`) instead of the generated one.
+    existingSecret: ""
+
   persistence:
     enabled: true
     size: 50Gi

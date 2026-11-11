@@ -42,6 +42,15 @@ spec:
             {{- if .Values.server.cors }}
             - --cors={{ .Values.server.cors }}
             {{- end }}
+            - --tenant-header={{ .Values.server.tenants.header }}
+            - --max-tenants={{ .Values.server.tenants.maxTenants }}
+            {{- range .Values.server.tenants.allowed }}
+            - --allowed-tenant={{ . }}
+            {{- end }}
+            {{- range .Values.server.tenants.limits }}
+            - {{ printf "--tenant-limit=%s" . | quote }}
+            {{- end }}
+
             {{- if .Values.server.profiling.enabled }}
             - --agent
             - --frequency={{ .Values.agent.frequency }}
@@ -55,6 +64,13 @@ spec:
               value: /var/lib/lidlesseye
             - name: LIDLESSEYE_LISTEN
               value: 0.0.0.0:{{ .Values.server.service.port }}
+            {{- if or .Values.server.tenants.tokens .Values.server.tenants.existingSecret }}
+            - name: LIDLESSEYE_TENANT_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lidlesseye.tenantsSecretName" . }}
+                  key: tenant-tokens
+            {{- end }}
             {{- if .Values.server.auth.enabled }}
             - name: LIDLESSEYE_AUTH_TOKEN
               valueFrom:

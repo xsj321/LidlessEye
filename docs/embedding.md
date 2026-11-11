@@ -27,7 +27,53 @@ async fn main() -> Result<()> {
 ```
 
 `build()` binds the socket immediately (errors surface at startup, not on the
-first request) and, with `.agent(true)`, starts the collector.
+first request) and, with `.agent(true)`, starts the collector. It does not
+serve: call `run()` to block, or `spawn()` for a `RunningInstance` with
+`shutdown()`. `ingest()` and `store()` work before either, so a host that only
+wants the storage engine never has to open a port.
+
+The default listen address is **`127.0.0.1:4040`**. An embedded server usually
+has no auth token, so binding every interface by default would publish the
+dashboard and the ingest API to the whole network. Pass `.listen("0.0.0.0:4040")`
+when you mean it.
+
+## Tenants
+
+The builder covers the same multi-tenant surface as the CLI:
+
+```rust
+use lidlesseye_core::TenantLimits;
+
+let eye = LidlessEye::builder()
+    .data_dir("/var/lib/lidlesseye")
+    .tenant("acme")                       // where `ingest()` writes
+    .tenant_token("s3cret", "acme")       // implies authentication
+    .allowed_tenants(vec!["acme".into(), "globex".into()])
+    .tenant_header("X-Scope-OrgID")
+    .max_tenants(50)
+    .tenant_limits("acme", TenantLimits {
+        retention_ns: Some(30 * 86_400_000_000_000),
+        max_disk_bytes: Some(200 * 1024 * 1024 * 1024),
+        max_series: Some(50_000),
+    })
+    .build()
+    .await?;
+```
+
+`eye.ingest(report)` writes to the configured tenant. To write elsewhere
+in-process — a multi-tenant host embedding one server — go through the HTTP
+layer, which keeps the same authorisation path as a request:
+
+```rust
+use lidlesseye_core::TenantId;
+
+let tenant = TenantId::parse("globex")?;
+eye.http().ingest_for(&tenant, report).await?;
+```
+
+`eye.tenant()` reports the configured id and `eye.store()` returns that
+tenant's store. Other tenants are reachable only through `eye.http()`, by
+design: one `Store` handle should never be able to see two tenants' data.
 
 ## Three modes
 
@@ -36,14 +82,15 @@ first request) and, with `.agent(true)`, starts the collector.
 ```rust
 let eye = LidlessEye::builder()
     .data_dir("./profiles")
-    .listen("0.0.0.0:4040")
+    .listen("0.0.0.0:4040")   // explicit: reachable from other hosts
     .build()
     .await?;
 eye.run().await
 ```
 
 Accept profiles over `POST /ingest`, or push them in-process with
-`eye.ingest(report)`.
+`eye.ingest(report)`. Add `.auth_token(...)` before widening the listen
+address.
 
 ### Server + built-in collector — profile this process' machine
 

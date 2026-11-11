@@ -56,15 +56,30 @@ struct ServeArgs {
     #[arg(long, env = "LIDLESSEYE_AUTH_TOKEN")]
     auth_token: Option<String>,
     /// Bind a bearer token to a tenant: `--tenant-token <token>=<tenant>`
-    /// (repeatable). Implies authentication is required.
-    #[arg(long = "tenant-token", value_parser = parse_tenant_token)]
+    /// (repeatable). Implies authentication is required. Also read from
+    /// `LIDLESSEYE_TENANT_TOKENS` as a comma-separated list, so a deployment
+    /// can keep tokens out of the pod spec.
+    #[arg(
+        long = "tenant-token",
+        env = "LIDLESSEYE_TENANT_TOKENS",
+        value_delimiter = ',',
+        value_parser = parse_tenant_token
+    )]
     tenant_tokens: Vec<(String, String)>,
     /// Only allow these tenants (repeatable). Default: any valid id.
     #[arg(long = "allowed-tenant")]
     allowed_tenants: Vec<String>,
+    /// Request header carrying the tenant id.
+    #[arg(long, default_value = "X-Scope-OrgID")]
+    tenant_header: String,
     /// Maximum number of tenants this server will host.
     #[arg(long, default_value_t = 1000)]
     max_tenants: usize,
+    /// Per-tenant limit, `<tenant>:<field>=<value>` (repeatable). Fields:
+    /// `retention` (`30d`), `max_disk` (`200GB`), `max_series` (`50000`).
+    /// `0` means "inherit the server default".
+    #[arg(long = "tenant-limit", value_parser = parse_tenant_limit)]
+    tenant_limit: Vec<(String, String, String)>,
     /// Tenant the built-in agent writes to.
     #[arg(long, default_value = "default")]
     tenant: String,
@@ -255,12 +270,16 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .collect_cpu(!args.no_cpu)
         .collect_off_cpu(!args.no_offcpu)
         .tenant(args.tenant)
+        .tenant_header(args.tenant_header)
         .max_tenants(args.max_tenants);
     for (token, tenant) in args.tenant_tokens {
         builder = builder.tenant_token(token, tenant);
     }
     if !args.allowed_tenants.is_empty() {
         builder = builder.allowed_tenants(args.allowed_tenants);
+    }
+    for (tenant, limits) in assemble_tenant_limits(&args.tenant_limit)? {
+        builder = builder.tenant_limits(tenant, limits);
     }
     if let Some(name) = args.service_name {
         builder = builder.service_name(name);
@@ -669,6 +688,63 @@ fn parse_tenant_token(input: &str) -> Result<(String, String), String> {
     }
     lidlesseye::core::TenantId::parse(tenant).map_err(|err| err.to_string())?;
     Ok((token.trim().to_string(), tenant.trim().to_string()))
+}
+
+/// `--tenant-limit <tenant>:<field>=<value>`.
+///
+/// Split into three parts here so a typo (`retentoin`) fails at startup with a
+/// message naming the field, rather than being silently ignored.
+fn parse_tenant_limit(input: &str) -> Result<(String, String, String), String> {
+    let (tenant, rest) = input
+        .split_once(':')
+        .ok_or_else(|| format!("expected <tenant>:<field>=<value>, got `{input}`"))?;
+    let (field, value) = rest
+        .split_once('=')
+        .ok_or_else(|| format!("expected <field>=<value> after the tenant, got `{rest}`"))?;
+    let tenant = tenant.trim();
+    let field = field.trim().to_ascii_lowercase().replace('-', "_");
+    let value = value.trim();
+    if tenant.is_empty() || value.is_empty() {
+        return Err(format!("`{input}` has an empty tenant or value"));
+    }
+    match field.as_str() {
+        "retention" | "max_disk" | "max_series" => {}
+        other => {
+            return Err(format!(
+                "unknown tenant limit `{other}`; expected `retention`, `max_disk` or `max_series`"
+            ));
+        }
+    }
+    Ok((tenant.to_string(), field, value.to_string()))
+}
+
+/// Fold the repeated `--tenant-limit` flags into one `TenantLimits` per tenant.
+fn assemble_tenant_limits(
+    raw: &[(String, String, String)],
+) -> anyhow::Result<std::collections::BTreeMap<String, lidlesseye::core::TenantLimits>> {
+    let mut out: std::collections::BTreeMap<String, lidlesseye::core::TenantLimits> =
+        std::collections::BTreeMap::new();
+    for (tenant, field, value) in raw {
+        let id = lidlesseye::core::TenantId::parse(tenant)?;
+        let entry = out.entry(id.to_string()).or_default();
+        match field.as_str() {
+            "retention" => {
+                entry.retention_ns = parse_optional_duration(value)?.map(|d| d.as_nanos() as u64);
+            }
+            "max_disk" => entry.max_disk_bytes = parse_optional_bytes(value)?,
+            "max_series" => {
+                entry.max_series = if value == "0" {
+                    None
+                } else {
+                    Some(value.parse::<usize>().with_context(|| {
+                        format!("invalid max_series `{value}` (expected a whole number)")
+                    })?)
+                };
+            }
+            _ => unreachable!("validated by parse_tenant_limit"),
+        }
+    }
+    Ok(out)
 }
 
 fn parse_duration(input: &str) -> anyhow::Result<Duration> {

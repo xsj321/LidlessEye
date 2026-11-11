@@ -79,3 +79,12 @@ app.kubernetes.io/component: agent
 {{- define "lidlesseye.serverUrl" -}}
 {{- printf "http://%s:%v" (include "lidlesseye.fullname" .) .Values.server.service.port -}}
 {{- end -}}
+
+{{/* Secret holding the per-tenant tokens, as a single `token=tenant,…` line. */}}
+{{- define "lidlesseye.tenantsSecretName" -}}
+{{- if .Values.server.tenants.existingSecret -}}
+{{- .Values.server.tenants.existingSecret -}}
+{{- else -}}
+{{- printf "%s-tenants" (include "lidlesseye.fullname" .) -}}
+{{- end -}}
+{{- end -}}

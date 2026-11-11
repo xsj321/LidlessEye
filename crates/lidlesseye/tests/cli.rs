@@ -67,9 +67,16 @@ impl Drop for Serving {
 }
 
 fn serve(args: &[&str]) -> Serving {
-    let mut child = Command::new(BIN)
-        .arg("serve")
-        .args(args)
+    serve_env(args, &[])
+}
+
+fn serve_env(args: &[&str], env: &[(&str, &str)]) -> Serving {
+    let mut command = Command::new(BIN);
+    command.arg("serve").args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command
         // An ephemeral port keeps the test suite parallel-safe; the binary
         // prints the address it actually bound.
         .args([
@@ -521,4 +528,236 @@ fn ingest_can_push_to_a_running_server() {
         other["total"], 0,
         "the push went to the wrong tenant: {other}"
     );
+}
+
+#[test]
+fn tenant_flags_are_wired_up() {
+    let dir = temp_dir("tenants");
+    let data = dir.join("data");
+    // One tenant, one series, one token.
+    let server = serve(&[
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--tenant-token",
+        "acme-token=acme",
+        "--allowed-tenant",
+        "acme",
+        "--tenant-limit",
+        "acme:max_series=1",
+        "--tenant-limit",
+        "acme:retention=1h",
+        "--max-tenants",
+        "1",
+    ]);
+    let base = server.base_url.clone();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    let body = |pod: &str| {
+        serde_json::json!({
+            "service_name": "api",
+            "labels": { "pod": pod },
+            "profile_type": "cpu",
+            "start_ns": now - 1_000_000,
+            "end_ns": now,
+            "strings": ["", "work"],
+            "stacks": [{ "frames": [[0, 1, 0, 0]], "value": 100 }],
+        })
+    };
+
+    // No token: the per-tenant token made authentication mandatory.
+    let unauthenticated = client
+        .post(format!("{base}/ingest"))
+        .json(&body("p1"))
+        .send()
+        .unwrap();
+    assert_eq!(unauthenticated.status().as_u16(), 401);
+
+    let first = client
+        .post(format!("{base}/ingest"))
+        .bearer_auth("acme-token")
+        .json(&body("p1"))
+        .send()
+        .unwrap();
+    assert_eq!(first.status().as_u16(), 200, "{}", first.text().unwrap());
+
+    // A second series exceeds max_series=1.
+    let second = client
+        .post(format!("{base}/ingest"))
+        .bearer_auth("acme-token")
+        .json(&body("p2"))
+        .send()
+        .unwrap();
+    assert_eq!(
+        second.status().as_u16(),
+        429,
+        "max_series was not applied: {}",
+        second.text().unwrap()
+    );
+
+    // The allow-list refuses everything else.
+    let other = client
+        .get(format!("{base}/api/v1/flamegraph?from=now-1h"))
+        .bearer_auth("acme-token")
+        .header("X-Scope-OrgID", "globex")
+        .send()
+        .unwrap();
+    assert_eq!(other.status().as_u16(), 403);
+
+    // The limits surface through the admin endpoint.
+    let tenants: Value = client
+        .get(format!("{base}/api/v1/tenants"))
+        .bearer_auth("acme-token")
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let entry = &tenants["tenants"][0];
+    assert_eq!(entry["id"], "acme", "{tenants}");
+    assert_eq!(entry["limits"]["max_series"], 1, "{tenants}");
+    assert_eq!(entry["limits"]["retention_ns"], 3_600_000_000_000u64);
+}
+
+#[test]
+fn a_bad_tenant_limit_fails_at_startup() {
+    let dir = temp_dir("bad-limit");
+    let data = dir.join("data");
+    let out = run(
+        &[
+            "serve",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--tenant-limit",
+            "acme:retentoin=30d",
+        ],
+        None,
+    );
+    assert_ne!(out.code, Some(0), "a typo in a limit must not be ignored");
+    assert!(
+        out.stderr.contains("unknown tenant limit"),
+        "{}",
+        out.stderr
+    );
+
+    let out = run(
+        &[
+            "serve",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--tenant-limit",
+            "../evil:max_series=5",
+        ],
+        None,
+    );
+    assert_ne!(out.code, Some(0), "an invalid tenant id must not start");
+}
+
+#[test]
+fn a_custom_tenant_header_is_honoured() {
+    let dir = temp_dir("tenant-header");
+    let data = dir.join("data");
+    let server = serve(&[
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--tenant-header",
+        "X-Org",
+    ]);
+    let base = server.base_url.clone();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    let body = serde_json::json!({
+        "service_name": "api",
+        "profile_type": "cpu",
+        "start_ns": now - 1_000_000,
+        "end_ns": now,
+        "strings": ["", "work"],
+        "stacks": [{ "frames": [[0, 1, 0, 0]], "value": 250 }],
+    });
+    let response = client
+        .post(format!("{base}/ingest"))
+        .header("X-Org", "Acme")
+        .json(&body)
+        .send()
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    let scoped: Value = client
+        .get(format!("{base}/api/v1/flamegraph?from=now-1h"))
+        .header("X-Org", "acme")
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        scoped["total"], 250,
+        "the custom header was ignored: {scoped}"
+    );
+
+    // The Pyroscope header is not special any more, so it lands in `default`.
+    let other: Value = client
+        .get(format!("{base}/api/v1/flamegraph?from=now-1h"))
+        .header("X-Scope-OrgID", "acme")
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(other["total"], 0, "{other}");
+
+    let version: Value = client
+        .get(format!("{base}/api/v1/version"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(version["tenant_header"], "X-Org", "{version}");
+}
+
+#[test]
+fn tenant_tokens_can_come_from_the_environment() {
+    let dir = temp_dir("tenant-env");
+    let data = dir.join("data");
+    // What the Helm chart does: tokens in a Secret, never in the pod spec.
+    let server = serve_env(
+        &["--data-dir", data.to_str().unwrap()],
+        &[("LIDLESSEYE_TENANT_TOKENS", "env-token=acme,other=globex")],
+    );
+    let base = server.base_url.clone();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    let unauthorized = client
+        .get(format!("{base}/api/v1/flamegraph?from=now-1h"))
+        .send()
+        .unwrap();
+    assert_eq!(
+        unauthorized.status().as_u16(),
+        401,
+        "an env-provided token must still enable authentication"
+    );
+
+    let authorized = client
+        .get(format!("{base}/api/v1/flamegraph?from=now-1h"))
+        .bearer_auth("env-token")
+        .send()
+        .unwrap();
+    assert!(authorized.status().is_success());
 }
