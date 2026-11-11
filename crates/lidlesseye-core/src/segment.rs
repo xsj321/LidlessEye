@@ -576,7 +576,26 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Open a segment and verify its checksum.
+    ///
+    /// Verification is not optional: a segment is immutable, so a checksum
+    /// mismatch means the file was damaged after it was written (torn write,
+    /// bad sector, a stray `sed -i`). Without the check the reader would
+    /// happily interpret garbage as sample values — including enormous or
+    /// negative ones — and a query would return a plausible-looking but wrong
+    /// profile. `crc32fast` runs at GB/s, so one pass costs far less than the
+    /// expensive part of a query.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let segment = Self::open_unverified(path)?;
+        segment.check_checksum()?;
+        Ok(segment)
+    }
+
+    /// Open a segment without verifying the checksum.
+    ///
+    /// Only `fsck` should use this: it wants to *report* the mismatch (and
+    /// distinguish it from a bad sortedness flag) instead of failing the open.
+    pub fn open_unverified(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
         let file_len = file.metadata()?.len();
@@ -773,8 +792,8 @@ impl Segment {
         frames
     }
 
-    /// Verify the payload checksum. Used by `lidlesseye fsck`.
-    pub fn verify(&self) -> Result<()> {
+    /// Compare the stored checksum with the bytes on disk.
+    pub fn check_checksum(&self) -> Result<()> {
         let actual = crc32fast::hash(&self.mmap[HEADER_SIZE..]);
         if actual != self.header.crc32 {
             return Err(Error::corrupt(
@@ -785,6 +804,13 @@ impl Segment {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    /// Verify the checksum and the invariants the writer promised. Used by
+    /// `lidlesseye fsck`.
+    pub fn verify(&self) -> Result<()> {
+        self.check_checksum()?;
         if self.is_sorted() {
             let mut prev = u64::MAX;
             for i in 0..self.sample_count() {

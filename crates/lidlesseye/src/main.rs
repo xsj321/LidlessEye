@@ -608,13 +608,17 @@ fn format_value(value: i64, unit: &str) -> String {
         "bytes" => human_bytes(value.max(0) as u64),
         "count" => format!("{value}"),
         _ => {
-            let seconds = value as f64 / 1e9;
-            if seconds >= 1.0 {
-                format!("{seconds:.2}s")
-            } else if seconds >= 0.001 {
-                format!("{:.1}ms", seconds * 1e3)
+            let nanos = value as f64;
+            if nanos >= 1e9 {
+                format!("{:.2}s", nanos / 1e9)
+            } else if nanos >= 1e6 {
+                format!("{:.1}ms", nanos / 1e6)
+            } else if nanos >= 1e3 {
+                format!("{:.1}µs", nanos / 1e3)
             } else {
-                format!("{:.0}µs", seconds * 1e6)
+                // Sub-microsecond values are normal for a 99 Hz sampler, and
+                // rounding them to `0µs` would read as "no time at all".
+                format!("{:.0}ns", nanos)
             }
         }
     }

@@ -33,3 +33,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+
+[dev-dependencies]
+# The CLI tests use the blocking client so a `#[test]` can talk to the
+# spawned server without dragging a runtime in.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }

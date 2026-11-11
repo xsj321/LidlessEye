@@ -430,7 +430,10 @@ impl Store {
         self.segments()
             .into_iter()
             .map(|meta| {
-                let result = segment::Segment::open(&meta.path).and_then(|s| s.verify());
+                // `open_unverified` first: `open` would fail on a checksum
+                // mismatch and hide whether the sortedness flag is also wrong.
+                let result = segment::Segment::open_unverified(&meta.path)
+                    .and_then(|segment| segment.verify());
                 (meta.path.clone(), result)
             })
             .collect()
