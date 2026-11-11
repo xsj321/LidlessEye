@@ -145,7 +145,9 @@ impl Store {
                             bytes += meta.size_bytes;
                             metas.push(Arc::new(meta));
                         }
-                        Err(err) => warn!(path = %entry.display(), error = %err, "skipping unreadable segment"),
+                        Err(err) => {
+                            warn!(path = %entry.display(), error = %err, "skipping unreadable segment")
+                        }
                     }
                 }
             }
@@ -200,7 +202,10 @@ impl Store {
             .segments
             .iter()
             .filter(|meta| {
-                profile_type.source_types().iter().any(|t| t == &meta.profile_type)
+                profile_type
+                    .source_types()
+                    .iter()
+                    .any(|t| t == &meta.profile_type)
                     && meta.overlaps(from_ns, until_ns)
                     && selector.matches_meta(&meta.service_name, &meta.labels)
             })
@@ -220,9 +225,15 @@ impl Store {
     }
 
     /// Aggregate known series, optionally restricted to a time window.
-    pub fn series(&self, from_ns: u64, until_ns: u64, selector: &crate::selector::Selector) -> Vec<SeriesInfo> {
+    pub fn series(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+        selector: &crate::selector::Selector,
+    ) -> Vec<SeriesInfo> {
         let index = self.index.read();
-        let mut map: HashMap<(String, String, BTreeMap<String, String>), SeriesInfo> = HashMap::new();
+        let mut map: HashMap<(String, String, BTreeMap<String, String>), SeriesInfo> =
+            HashMap::new();
         for meta in &index.segments {
             if !meta.overlaps(from_ns, until_ns) {
                 continue;
@@ -347,7 +358,13 @@ impl Store {
 
     /// Delete every segment (used by tests and `fsck --fix`).
     pub fn clear(&self) -> Result<()> {
-        let paths: Vec<PathBuf> = self.index.read().segments.iter().map(|m| m.path.clone()).collect();
+        let paths: Vec<PathBuf> = self
+            .index
+            .read()
+            .segments
+            .iter()
+            .map(|m| m.path.clone())
+            .collect();
         for path in paths {
             let _ = std::fs::remove_file(path);
         }
@@ -390,19 +407,20 @@ mod tests {
     use crate::selector::Selector;
 
     fn temp_store(name: &str) -> (Store, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "lidlesseye-store-{name}-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("lidlesseye-store-{name}-{}", uuid::Uuid::new_v4()));
         let store = Store::open(StoreConfig::new(&dir)).unwrap();
         (store, dir)
     }
 
     fn report(service: &str, start: u64, pod: &str) -> Report {
-        let mut b = ReportBuilder::new(service, "cpu", start, start + 10_000_000_000)
-            .label("pod", pod);
+        let mut b =
+            ReportBuilder::new(service, "cpu", start, start + 10_000_000_000).label("pod", pod);
         b.add_stack(
-            [Frame::new("/bin/app", "hot"), Frame::new("/bin/app", "main")],
+            [
+                Frame::new("/bin/app", "hot"),
+                Frame::new("/bin/app", "main"),
+            ],
             1_000,
         );
         b.finish()

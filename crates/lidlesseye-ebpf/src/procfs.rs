@@ -169,7 +169,9 @@ mod tests {
             Some("9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f60")
         );
         assert_eq!(
-            kubernetes_labels(cg).get("k8s_qos_class").map(String::as_str),
+            kubernetes_labels(cg)
+                .get("k8s_qos_class")
+                .map(String::as_str),
             Some("burstable")
         );
     }

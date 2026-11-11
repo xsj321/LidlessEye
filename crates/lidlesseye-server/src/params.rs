@@ -120,7 +120,9 @@ pub fn parse_time_ns(input: &str, now_ns: u64) -> Result<u64, ApiError> {
     if let Ok(dt) = OffsetDateTime::parse(value, &Rfc3339) {
         let nanos = dt.unix_timestamp_nanos();
         if nanos < 0 {
-            return Err(ApiError::bad_request("timestamps before 1970 are not supported"));
+            return Err(ApiError::bad_request(
+                "timestamps before 1970 are not supported",
+            ));
         }
         return Ok(nanos as u64);
     }
@@ -134,7 +136,9 @@ pub fn parse_time_ns(input: &str, now_ns: u64) -> Result<u64, ApiError> {
         .parse()
         .map_err(|_| ApiError::bad_request(format!("invalid timestamp `{input}`")))?;
     if number < 0.0 {
-        return Err(ApiError::bad_request("timestamps before 1970 are not supported"));
+        return Err(ApiError::bad_request(
+            "timestamps before 1970 are not supported",
+        ));
     }
     let multiplier = match unit {
         "ns" => 1.0,
@@ -173,7 +177,10 @@ mod tests {
 
     #[test]
     fn parses_unix_seconds() {
-        assert_eq!(parse_time_ns("1700000000", NOW).unwrap(), 1_700_000_000_000_000_000);
+        assert_eq!(
+            parse_time_ns("1700000000", NOW).unwrap(),
+            1_700_000_000_000_000_000
+        );
     }
 
     #[test]
@@ -182,7 +189,10 @@ mod tests {
             parse_time_ns("1700000000000", NOW).unwrap(),
             1_700_000_000_000_000_000
         );
-        assert_eq!(parse_time_ns("1700000000000ms", NOW).unwrap(), 1_700_000_000_000_000_000);
+        assert_eq!(
+            parse_time_ns("1700000000000ms", NOW).unwrap(),
+            1_700_000_000_000_000_000
+        );
     }
 
     #[test]

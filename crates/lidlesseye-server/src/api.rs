@@ -12,9 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use lidlesseye_core::model::{Report, Unit};
-use lidlesseye_core::{
-    ProfileType, QueryOptions, Selector, TimeSeriesOptions, now_ns,
-};
+use lidlesseye_core::{ProfileType, QueryOptions, Selector, TimeSeriesOptions, now_ns};
 
 use crate::error::ApiError;
 use crate::params::Params;
@@ -115,13 +113,8 @@ pub async fn flamegraph(
     state.authorize(&headers)?;
     let now = now_ns();
     let (from, until) = params.range(now)?;
-    let opts = QueryOptions::new(
-        params.profile_type(),
-        from,
-        until,
-        params.selector()?,
-    )
-    .with_max_nodes(params.usize_param("max_nodes", 1024));
+    let opts = QueryOptions::new(params.profile_type(), from, until, params.selector()?)
+        .with_max_nodes(params.usize_param("max_nodes", 1024));
 
     let store = state.store().clone();
     let started = Instant::now();
@@ -253,9 +246,7 @@ pub async fn profile_types(
     let selector: Selector = params.selector()?;
     let mut totals: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
     for row in state.store().series(from, until, &selector) {
-        let entry = totals
-            .entry(row.profile_type.clone())
-            .or_insert((0, 0));
+        let entry = totals.entry(row.profile_type.clone()).or_insert((0, 0));
         entry.0 += row.total_value;
         entry.1 += row.segment_count;
     }
@@ -311,7 +302,10 @@ pub async fn stats(
 ) -> Result<Response, ApiError> {
     state.authorize(&headers)?;
     let store = state.store().stats();
-    let series = state.store().series(0, u64::MAX, &Selector::default()).len();
+    let series = state
+        .store()
+        .series(0, u64::MAX, &Selector::default())
+        .len();
     let metrics = state.metrics();
     Ok(Json(StatsResponse {
         version: VERSION,
@@ -341,14 +335,8 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         ("lidlesseye_storage_bytes", store.total_bytes.to_string()),
         ("lidlesseye_stored_value", store.total_value.to_string()),
     ];
-    let body = state
-        .metrics()
-        .render(&extra, state.uptime().as_secs());
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        body,
-    )
-        .into_response()
+    let body = state.metrics().render(&extra, state.uptime().as_secs());
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
 impl AppState {

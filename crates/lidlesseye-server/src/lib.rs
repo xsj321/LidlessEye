@@ -90,13 +90,20 @@ impl AppState {
                 .zip(expected.bytes())
                 .fold(0u8, |acc, (a, b)| acc | (a ^ b))
                 == 0;
-        if ok { Ok(()) } else { Err(ApiError::unauthorized()) }
+        if ok {
+            Ok(())
+        } else {
+            Err(ApiError::unauthorized())
+        }
     }
 }
 
 impl AppState {
     /// Persist several reports in one blocking file-system task.
-    pub async fn ingest_many(&self, reports: Vec<Report>) -> Result<Vec<Arc<SegmentMeta>>, ApiError> {
+    pub async fn ingest_many(
+        &self,
+        reports: Vec<Report>,
+    ) -> Result<Vec<Arc<SegmentMeta>>, ApiError> {
         if self.inner.cfg.read_only {
             return Err(ApiError::forbidden("server is read-only"));
         }
@@ -121,7 +128,10 @@ impl AppState {
         .map_err(|err| ApiError::internal(format!("ingest task failed: {err}")))?;
 
         let (metas, errors) = result;
-        self.inner.metrics.ingest_samples.fetch_add(samples, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .ingest_samples
+            .fetch_add(samples, Ordering::Relaxed);
         self.inner
             .metrics
             .segments_written
@@ -134,7 +144,11 @@ impl AppState {
             if metas.is_empty() {
                 return Err(ApiError::bad_request(errors.join("; ")));
             }
-            warn!(rejected = errors.len(), accepted = metas.len(), "some reports were rejected");
+            warn!(
+                rejected = errors.len(),
+                accepted = metas.len(),
+                "some reports were rejected"
+            );
         }
         Ok(metas)
     }
@@ -232,7 +246,10 @@ impl LidlessEye {
     }
 
     /// Persist several reports in one blocking file-system task.
-    pub async fn ingest_many(&self, reports: Vec<Report>) -> Result<Vec<Arc<SegmentMeta>>, ApiError> {
+    pub async fn ingest_many(
+        &self,
+        reports: Vec<Report>,
+    ) -> Result<Vec<Arc<SegmentMeta>>, ApiError> {
         self.state.ingest_many(reports).await
     }
 

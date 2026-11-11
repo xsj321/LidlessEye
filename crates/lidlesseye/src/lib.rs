@@ -222,10 +222,9 @@ impl Builder {
     }
 
     fn server_config(&self) -> Result<ServerConfig> {
-        let listen: SocketAddr = self
-            .listen
-            .parse()
-            .map_err(|err| Error::Config(format!("invalid listen address `{}`: {err}", self.listen)))?;
+        let listen: SocketAddr = self.listen.parse().map_err(|err| {
+            Error::Config(format!("invalid listen address `{}`: {err}", self.listen))
+        })?;
         Ok(ServerConfig {
             listen,
             data_dir: self.data_dir.clone(),
@@ -349,7 +348,10 @@ impl LidlessEye {
 
     /// Ingest a report directly, without an HTTP round trip.
     pub async fn ingest(&self, report: Report) -> Result<Arc<SegmentMeta>> {
-        self.http.ingest(report).await.map_err(|err| Error::Server(err.to_string()))
+        self.http
+            .ingest(report)
+            .await
+            .map_err(|err| Error::Server(err.to_string()))
     }
 
     /// Ingest a batch of reports.
@@ -417,8 +419,8 @@ impl RunningInstance {
 /// Initialise tracing with a sane default (`RUST_LOG` honoured).
 pub fn init_tracing(default_filter: &str) {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_filter));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

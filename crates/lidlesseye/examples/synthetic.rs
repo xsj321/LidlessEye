@@ -49,7 +49,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.append(&report)?;
     }
 
-    println!("stored {} segments in {}", store.stats().segment_count, dir.display());
+    println!(
+        "stored {} segments in {}",
+        store.stats().segment_count,
+        dir.display()
+    );
 
     let opts = QueryOptions::new(ProfileType::cpu(), 0, u64::MAX, Selector::default());
     let fg = flamegraph(&store, &opts)?;
@@ -88,7 +92,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Selector::parse(r#"{region="eu-west"}"#)?,
     );
     let filtered = flamegraph(&store, &only_eu)?;
-    println!("\n{} matches {{region=\"eu-west\"}}", format_ns(filtered.total));
+    println!(
+        "\n{} matches {{region=\"eu-west\"}}",
+        format_ns(filtered.total)
+    );
 
     std::fs::remove_dir_all(&dir)?;
     Ok(())

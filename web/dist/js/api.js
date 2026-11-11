@@ -80,8 +80,10 @@ export const api = {
   labelValues: (name, params) =>
     request(`/api/v1/label/${encodeURIComponent(name)}/values`, params),
 
+  // 50k nodes is the server-side ceiling (`QueryOptions::with_max_nodes`); the
+  // canvas is happy with that, and it keeps the response in the low megabytes.
   flamegraph: (params) =>
-    request("/api/v1/flamegraph", { max_nodes: 200000, ...params }),
+    request("/api/v1/flamegraph", { max_nodes: 50000, ...params }),
   top: (params) => request("/api/v1/top", { limit: 100, ...params }),
   timeseries: (params) => request("/api/v1/timeseries", { buckets: 90, ...params }),
 };

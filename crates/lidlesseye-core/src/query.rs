@@ -243,7 +243,7 @@ impl TreeBuilder {
                 None => {
                     if self.node_frame.len() >= MAX_NODES {
                         self.truncated = true;
-                        let idx = match self.truncated_node {
+                        match self.truncated_node {
                             Some(idx) => idx,
                             None => {
                                 let idx = self.node_frame.len();
@@ -255,8 +255,7 @@ impl TreeBuilder {
                                 self.truncated_node = Some(idx);
                                 idx
                             }
-                        };
-                        idx
+                        }
                     } else {
                         let idx = self.node_frame.len();
                         self.node_frame.push(frame);
@@ -367,7 +366,12 @@ impl TreeBuilder {
 /// Build a flamegraph from every segment matching `opts`.
 pub fn flamegraph(store: &Store, opts: &QueryOptions) -> Result<Flamegraph> {
     opts.validate()?;
-    let metas = store.select(&opts.profile_type, opts.from_ns, opts.until_ns, &opts.selector);
+    let metas = store.select(
+        &opts.profile_type,
+        opts.from_ns,
+        opts.until_ns,
+        &opts.selector,
+    );
     let mut builder = TreeBuilder::new();
     if metas.is_empty() {
         return Ok(Flamegraph::empty(opts.profile_type.unit()));
@@ -428,7 +432,12 @@ pub struct TopResult {
 pub fn top(store: &Store, opts: &QueryOptions, limit: usize) -> Result<TopResult> {
     opts.validate()?;
     let limit = limit.clamp(1, 1000);
-    let metas = store.select(&opts.profile_type, opts.from_ns, opts.until_ns, &opts.selector);
+    let metas = store.select(
+        &opts.profile_type,
+        opts.from_ns,
+        opts.until_ns,
+        &opts.selector,
+    );
     let mut dict = FrameDict::new();
     let mut self_values: Vec<u64> = Vec::new();
     let mut total_values: Vec<u64> = Vec::new();
@@ -539,7 +548,12 @@ pub fn timeseries(store: &Store, opts: &TimeSeriesOptions) -> Result<TimeSeries>
     let buckets = ((opts.until_ns - opts.from_ns) / step_ns).max(1) as usize;
     let buckets = buckets.min(10_000);
 
-    let metas = store.select(&opts.profile_type, opts.from_ns, opts.until_ns, &opts.selector);
+    let metas = store.select(
+        &opts.profile_type,
+        opts.from_ns,
+        opts.until_ns,
+        &opts.selector,
+    );
     let mut map: HashMap<(String, std::collections::BTreeMap<String, String>), SeriesPoints> =
         HashMap::new();
 
@@ -576,7 +590,8 @@ pub fn timeseries(store: &Store, opts: &TimeSeriesOptions) -> Result<TimeSeries>
     series.sort_unstable_by(|a, b| {
         let sa: i64 = a.points.iter().sum();
         let sb: i64 = b.points.iter().sum();
-        sb.cmp(&sa).then_with(|| a.service_name.cmp(&b.service_name))
+        sb.cmp(&sa)
+            .then_with(|| a.service_name.cmp(&b.service_name))
     });
 
     Ok(TimeSeries {
@@ -594,7 +609,8 @@ mod tests {
     use crate::store::{Store, StoreConfig};
 
     fn store_with_data(name: &str) -> (Store, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("lidlesseye-q-{name}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("lidlesseye-q-{name}-{}", uuid::Uuid::new_v4()));
         let store = Store::open(StoreConfig::new(&dir)).unwrap();
         let mut b = ReportBuilder::new("checkout", "cpu", 1_000, 2_000).label("pod", "p1");
         b.add_stack(
@@ -668,12 +684,7 @@ mod tests {
 
         let filtered = flamegraph(
             &store,
-            &QueryOptions::new(
-                "cpu",
-                0,
-                10_000,
-                Selector::parse(r#"{pod="p2"}"#).unwrap(),
-            ),
+            &QueryOptions::new("cpu", 0, 10_000, Selector::parse(r#"{pod="p2"}"#).unwrap()),
         )
         .unwrap();
         assert_eq!(filtered.total, 100);

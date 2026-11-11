@@ -30,13 +30,13 @@ pub mod time;
 
 pub use error::{Error, Result};
 pub use model::{
-    Frame, FrameRef, ProfileType, Report, ReportBuilder, StackSample, Unit, SERVICE_NAME_LABEL,
+    Frame, FrameRef, ProfileType, Report, ReportBuilder, SERVICE_NAME_LABEL, StackSample, Unit,
 };
 pub use query::{
-    flamegraph, timeseries, top, Flamegraph, QueryOptions, SeriesPoints, TimeSeries,
-    TimeSeriesOptions, TopEntry, TopResult, TreeNode,
+    Flamegraph, QueryOptions, SeriesPoints, TimeSeries, TimeSeriesOptions, TopEntry, TopResult,
+    TreeNode, flamegraph, timeseries, top,
 };
 pub use segment::{Segment, SegmentMeta};
-pub use selector::{glob_match, MatchOp, Matcher, Selector};
+pub use selector::{MatchOp, Matcher, Selector, glob_match};
 pub use store::{PruneStats, SeriesInfo, Store, StoreConfig, StoreStats};
 pub use time::{now_ns, parse_duration_ns};

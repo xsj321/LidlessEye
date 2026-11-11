@@ -176,9 +176,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Fsck(args) => fsck(args),
         Command::Info => {
             println!("lidlesseye {}", env!("CARGO_PKG_VERSION"));
-            println!("profile format: LESEG v{}", lidlesseye::core::segment::FORMAT_VERSION);
-            println!("ebpf support: {}", if cfg!(target_os = "linux") { "yes" } else { "no (Linux only)" });
-            println!("ui assets embedded: {}", !lidlesseye::server::ui_assets().is_empty());
+            println!(
+                "profile format: LESEG v{}",
+                lidlesseye::core::segment::FORMAT_VERSION
+            );
+            println!(
+                "ebpf support: {}",
+                if cfg!(target_os = "linux") {
+                    "yes"
+                } else {
+                    "no (Linux only)"
+                }
+            );
+            println!(
+                "ui assets embedded: {}",
+                !lidlesseye::server::ui_assets().is_empty()
+            );
             Ok(())
         }
     }
@@ -209,7 +222,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let eye = builder.build().await?;
-    println!("LidlessEye {} listening on {}", env!("CARGO_PKG_VERSION"), eye.base_url());
+    println!(
+        "LidlessEye {} listening on {}",
+        env!("CARGO_PKG_VERSION"),
+        eye.base_url()
+    );
     println!("  data dir : {}", eye.data_dir().display());
     println!("  dashboard: {}/", eye.base_url());
     if args.agent {
@@ -288,8 +305,8 @@ async fn ingest(args: IngestArgs) -> anyhow::Result<()> {
     }
 
     if let Some(dir) = args.data_dir {
-        let store = Store::open(StoreConfig::new(&dir))
-            .context("failed to open the data directory")?;
+        let store =
+            Store::open(StoreConfig::new(&dir)).context("failed to open the data directory")?;
         let mut count = 0;
         for report in &reports {
             let meta = store.append(report)?;
@@ -371,10 +388,7 @@ fn query(args: QueryArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     let total = result.total_value.max(1);
-    println!(
-        "{:<44} {:>12} {:>12}  MODULE",
-        "FUNCTION", "SELF", "TOTAL"
-    );
+    println!("{:<44} {:>12} {:>12}  MODULE", "FUNCTION", "SELF", "TOTAL");
     for row in result.items {
         let name = truncate(&row.name, 44);
         println!(
@@ -579,7 +593,9 @@ fn resolve_time(input: &str, now: u64) -> anyhow::Result<u64> {
         let secs: u64 = input.parse()?;
         return Ok(now.saturating_sub(secs * 1_000_000_000));
     }
-    if input.ends_with(|c: char| c.is_ascii_alphabetic()) && input.chars().any(|c| c.is_ascii_digit()) {
+    if input.ends_with(|c: char| c.is_ascii_alphabetic())
+        && input.chars().any(|c| c.is_ascii_digit())
+    {
         let delta = lidlesseye::core::parse_duration_ns(input)?;
         return Ok(now.saturating_sub(delta));
     }

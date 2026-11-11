@@ -28,7 +28,9 @@ pub fn parse_duration_ns(input: &str) -> Result<u64> {
         .parse()
         .map_err(|_| Error::InvalidArgument(format!("invalid duration `{input}`")))?;
     if value < 0.0 || !value.is_finite() {
-        return Err(Error::InvalidArgument(format!("invalid duration `{input}`")));
+        return Err(Error::InvalidArgument(format!(
+            "invalid duration `{input}`"
+        )));
     }
     let multiplier: f64 = match unit.trim() {
         "ns" => 1.0,

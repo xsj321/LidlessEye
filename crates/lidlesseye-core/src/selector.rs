@@ -82,10 +82,7 @@ impl Selector {
     }
 
     pub fn service(name: impl Into<String>) -> Self {
-        Selector::new(vec![Matcher::eq(
-            crate::model::SERVICE_NAME_LABEL,
-            name,
-        )])
+        Selector::new(vec![Matcher::eq(crate::model::SERVICE_NAME_LABEL, name)])
     }
 
     pub fn is_empty(&self) -> bool {
@@ -95,14 +92,9 @@ impl Selector {
     /// Does a label set satisfy every matcher?
     pub fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
         self.matchers.iter().all(|m| {
-            let value = labels
-                .get(&m.label)
-                .map(|s| s.as_str())
-                .or_else(|| {
-                    // `service_name` is stored as its own field in segments;
-                    // callers inject it, but be forgiving.
-                    None
-                });
+            // `service_name` is stored as its own field in segments; callers
+            // inject it into `labels`, but a missing key simply never matches.
+            let value = labels.get(&m.label).map(|s| s.as_str());
             m.op.matches(&m.value, value)
         })
     }
@@ -211,9 +203,8 @@ fn parse_matcher(input: &str) -> Result<Matcher> {
             _ => i += 1,
         }
     }
-    let label_end = label_end.ok_or_else(|| {
-        Error::Selector(format!("matcher `{input}` is missing an operator"))
-    })?;
+    let label_end = label_end
+        .ok_or_else(|| Error::Selector(format!("matcher `{input}` is missing an operator")))?;
     let label = input[..label_end].trim();
     if label.is_empty() {
         return Err(Error::Selector(format!(
@@ -236,9 +227,8 @@ fn parse_matcher(input: &str) -> Result<Matcher> {
     };
     // `=` consumes one byte, `!=`, `=~` and `!~` consume two.
     rest = &rest[if op == MatchOp::Eq { 1 } else { 2 }..];
-    let value = unquote(rest.trim()).ok_or_else(|| {
-        Error::Selector(format!("matcher `{input}` has an unterminated value"))
-    })?;
+    let value = unquote(rest.trim())
+        .ok_or_else(|| Error::Selector(format!("matcher `{input}` has an unterminated value")))?;
     Ok(Matcher {
         label: label.to_string(),
         op,
@@ -318,8 +308,9 @@ mod tests {
 
     #[test]
     fn parses_full_selector() {
-        let s = Selector::parse(r#"{service_name="checkout", namespace='shop', pod=~"checkout-*"}"#)
-            .unwrap();
+        let s =
+            Selector::parse(r#"{service_name="checkout", namespace='shop', pod=~"checkout-*"}"#)
+                .unwrap();
         assert_eq!(s.matchers.len(), 3);
         assert_eq!(s.matchers[0].label, "service_name");
         assert_eq!(s.matchers[0].op, MatchOp::Eq);

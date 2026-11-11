@@ -23,9 +23,8 @@ pub struct Metrics {
 impl Metrics {
     pub fn render(&self, extra: &[(&str, String)], uptime_secs: u64) -> String {
         let mut out = String::with_capacity(1024);
-        let counter = |name: &'static str, help: &'static str, value: u64| {
-            (name, help, value.to_string())
-        };
+        let counter =
+            |name: &'static str, help: &'static str, value: u64| (name, help, value.to_string());
         let counters = [
             counter(
                 "lidlesseye_ingest_requests_total",
@@ -82,15 +81,15 @@ impl Metrics {
             ),
         ];
         for (name, help, value) in counters {
-            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"));
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+            ));
         }
         out.push_str(&format!(
             "# HELP lidlesseye_uptime_seconds Process uptime.\n# TYPE lidlesseye_uptime_seconds gauge\nlidlesseye_uptime_seconds {uptime_secs}\n"
         ));
         for (name, value) in extra {
-            out.push_str(&format!(
-                "# TYPE {name} gauge\n{name} {value}\n"
-            ));
+            out.push_str(&format!("# TYPE {name} gauge\n{name} {value}\n"));
         }
         out
     }

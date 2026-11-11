@@ -192,13 +192,19 @@ impl Header {
     fn sections(&self) -> [(u32, u64); 5] {
         [
             (self.strtab_off, self.strtab_len as u64),
-            (self.frames_off, self.frames_count as u64 * FRAME_SIZE as u64),
             (
-                self.stack_frames_off,
-                self.stack_frames_count as u64 * 4,
+                self.frames_off,
+                self.frames_count as u64 * FRAME_SIZE as u64,
             ),
-            (self.stacks_off, self.stacks_count as u64 * STACK_SIZE as u64),
-            (self.samples_off, self.samples_count as u64 * SAMPLE_SIZE as u64),
+            (self.stack_frames_off, self.stack_frames_count as u64 * 4),
+            (
+                self.stacks_off,
+                self.stacks_count as u64 * STACK_SIZE as u64,
+            ),
+            (
+                self.samples_off,
+                self.samples_count as u64 * SAMPLE_SIZE as u64,
+            ),
         ]
     }
 
@@ -213,7 +219,10 @@ impl Header {
             }
         }
         if self.type_off >= self.strtab_len || self.service_off >= self.strtab_len {
-            return Err(Error::corrupt(path, "string table references are out of range"));
+            return Err(Error::corrupt(
+                path,
+                "string table references are out of range",
+            ));
         }
         if self.labels_off as u64 + self.labels_len as u64 > self.strtab_len as u64 {
             return Err(Error::corrupt(path, "labels blob is out of range"));
@@ -304,9 +313,21 @@ pub fn write_segment(dir: &Path, report: &Report) -> Result<SegmentMeta> {
         }
         let mut frame_ids = Vec::with_capacity(stack.frames.len());
         for frame in &stack.frames {
-            let module = report.strings.get(frame[0] as usize).map(String::as_str).unwrap_or("");
-            let symbol = report.strings.get(frame[1] as usize).map(String::as_str).unwrap_or("");
-            let file = report.strings.get(frame[2] as usize).map(String::as_str).unwrap_or("");
+            let module = report
+                .strings
+                .get(frame[0] as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            let symbol = report
+                .strings
+                .get(frame[1] as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            let file = report
+                .strings
+                .get(frame[2] as usize)
+                .map(String::as_str)
+                .unwrap_or("");
             let line = frame[3];
             let key = (
                 dict.intern(module),
@@ -345,12 +366,8 @@ pub fn write_segment(dir: &Path, report: &Report) -> Result<SegmentMeta> {
     let stack_frames_size = stack_frames.len() * 4;
     let stacks_size = stacks.len() * STACK_SIZE;
     let samples_size = samples.len() * SAMPLE_SIZE;
-    let total_size = HEADER_SIZE
-        + strtab_size
-        + frames_size
-        + stack_frames_size
-        + stacks_size
-        + samples_size;
+    let total_size =
+        HEADER_SIZE + strtab_size + frames_size + stack_frames_size + stacks_size + samples_size;
     if total_size as u64 > MAX_SEGMENT_BYTES {
         return Err(Error::SegmentTooLarge {
             size: total_size as u64,
@@ -517,8 +534,8 @@ impl Segment {
         let header = Header::decode(&mmap[..HEADER_SIZE], &path)?;
         header.validate_layout(mmap.len() as u64, &path)?;
 
-        let strtab = &mmap[header.strtab_off as usize
-            ..header.strtab_off as usize + header.strtab_len as usize];
+        let strtab = &mmap
+            [header.strtab_off as usize..header.strtab_off as usize + header.strtab_len as usize];
         let read_str = |off: u32| -> String {
             if off as usize >= strtab.len() {
                 return String::new();
@@ -650,8 +667,13 @@ impl Segment {
     /// words are decoded explicitly instead of being cast to `&[u32]`.
     pub fn for_each_frame_id(&self, stack_id: u32, mut f: impl FnMut(u32)) {
         if let Some(range) = self.stack_range(stack_id) {
-            for chunk in self.mmap[range].chunks_exact(4) {
-                f(u32::from_le_bytes(chunk.try_into().unwrap()));
+            let (words, remainder) = self.mmap[range].as_chunks::<4>();
+            debug_assert!(
+                remainder.is_empty(),
+                "stack_frames section is not a multiple of 4"
+            );
+            for word in words {
+                f(u32::from_le_bytes(*word));
             }
         }
     }
@@ -728,10 +750,8 @@ mod tests {
     use crate::model::{Frame, ReportBuilder};
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "lidlesseye-seg-{name}-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("lidlesseye-seg-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

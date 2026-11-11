@@ -50,7 +50,11 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
-    println!("LidlessEye {} listening on {}", env!("CARGO_PKG_VERSION"), eye.base_url());
+    println!(
+        "LidlessEye {} listening on {}",
+        env!("CARGO_PKG_VERSION"),
+        eye.base_url()
+    );
     println!("  dashboard: {}/", eye.base_url());
     println!("  data dir : {}", eye.data_dir().display());
     if with_agent {

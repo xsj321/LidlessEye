@@ -65,9 +65,12 @@ pub async fn index() -> Response {
 pub async fn fallback(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     if path.starts_with("api/") || path == "ingest" || path == "metrics" {
-        return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({
-            "error": format!("unknown endpoint /{path}"),
-        })))
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": format!("unknown endpoint /{path}"),
+            })),
+        )
             .into_response();
     }
     if !path.is_empty()

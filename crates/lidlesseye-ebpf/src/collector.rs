@@ -102,7 +102,9 @@ impl CollectorConfig {
             return Err("flush_interval must be at most 1h".to_string());
         }
         if !self.collect_cpu && !self.collect_off_cpu {
-            return Err("at least one of collect_cpu / collect_off_cpu must be enabled".to_string());
+            return Err(
+                "at least one of collect_cpu / collect_off_cpu must be enabled".to_string(),
+            );
         }
         if let Some(name) = &self.service_name
             && (name.trim().is_empty() || name.len() > 256)
@@ -271,7 +273,11 @@ where
     // the loader because `override_global` keeps a borrow of it until `load`.
     let ns_cfg = procfs::pid_namespace().map(|(dev, ino)| NsConfig { dev, ino });
     if let Some(cfg) = &ns_cfg {
-        debug!(dev = cfg.dev, ino = cfg.ino, "using PID namespace translation");
+        debug!(
+            dev = cfg.dev,
+            ino = cfg.ino,
+            "using PID namespace translation"
+        );
     }
     let mut loader = aya::EbpfLoader::new();
     if let Some(cfg) = ns_cfg.as_ref() {
@@ -538,14 +544,9 @@ where
             }
 
             let builder = builders.entry(group.clone()).or_insert_with(|| {
-                ReportBuilder::new(
-                    group.service.clone(),
-                    ProfileType::cpu(),
-                    start_ns,
-                    end_ns,
-                )
-                .sample_rate_hz(config.frequency_hz as u32)
-                .with_labels(group.labels.clone())
+                ReportBuilder::new(group.service.clone(), ProfileType::cpu(), start_ns, end_ns)
+                    .sample_rate_hz(config.frequency_hz as u32)
+                    .with_labels(group.labels.clone())
             });
             builder.add_stack(frames, record.value.saturating_mul(factor));
         }
@@ -644,10 +645,7 @@ fn drain_map(ebpf: &mut Ebpf, name: &str) -> Result<Vec<RawRecord>, String> {
     let mut map: AyaHashMap<&mut MapData, StackKey, u64> =
         AyaHashMap::try_from(map).map_err(|err| format!("invalid map `{name}`: {err}"))?;
 
-    let keys: Vec<StackKey> = map
-        .keys()
-        .filter_map(|key| key.ok())
-        .collect();
+    let keys: Vec<StackKey> = map.keys().filter_map(|key| key.ok()).collect();
 
     let mut records = Vec::with_capacity(keys.len());
     for key in &keys {

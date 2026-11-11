@@ -425,7 +425,14 @@ impl ReportBuilder {
             let refs = stack
                 .frames
                 .iter()
-                .map(|f| [remap[f[0] as usize], remap[f[1] as usize], remap[f[2] as usize], f[3]])
+                .map(|f| {
+                    [
+                        remap[f[0] as usize],
+                        remap[f[1] as usize],
+                        remap[f[2] as usize],
+                        f[3],
+                    ]
+                })
                 .collect::<Vec<_>>();
             self.add_refs(refs, stack.value);
         }

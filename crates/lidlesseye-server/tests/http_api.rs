@@ -68,10 +68,15 @@ async fn call(
 /// A two-frame report worth `total` nanoseconds.
 fn report(service: &str, profile_type: &str, total: u64) -> Value {
     let now = now_ns();
-    let mut builder = ReportBuilder::new(service, ProfileType::new(profile_type), now - 1_000_000, now)
-        .label("env", "test")
-        .label("region", "eu-west")
-        .sample_rate_hz(99);
+    let mut builder = ReportBuilder::new(
+        service,
+        ProfileType::new(profile_type),
+        now - 1_000_000,
+        now,
+    )
+    .label("env", "test")
+    .label("region", "eu-west")
+    .sample_rate_hz(99);
     builder.add_stack(
         vec![
             Frame::new("/app/server", "handle_request"),
@@ -79,10 +84,7 @@ fn report(service: &str, profile_type: &str, total: u64) -> Value {
         ],
         total / 2,
     );
-    builder.add_stack(
-        vec![Frame::new("/app/server", "main")],
-        total - total / 2,
-    );
+    builder.add_stack(vec![Frame::new("/app/server", "main")], total - total / 2);
     serde_json::to_value(builder.finish()).unwrap()
 }
 
@@ -126,7 +128,14 @@ async fn ingest_then_query_roundtrip() {
     assert_eq!(names.len(), fg["levels"].as_array().unwrap().len());
 
     // Top: the leaf function owns all of its self time.
-    let (status, top) = call(&app, "GET", "/api/v1/top?profile_type=cpu&limit=5", None, None).await;
+    let (status, top) = call(
+        &app,
+        "GET",
+        "/api/v1/top?profile_type=cpu&limit=5",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(top["total_value"], 1_000_000_000i64);
     let rows = top["items"].as_array().unwrap();
@@ -160,11 +169,25 @@ async fn wall_is_the_sum_of_cpu_and_off_cpu() {
     let app = router(dir.path()).await;
 
     for (kind, value) in [("cpu", 200_000_000u64), ("off_cpu", 800_000_000u64)] {
-        let (status, body) = call(&app, "POST", "/ingest", Some(report("api", kind, value)), None).await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/ingest",
+            Some(report("api", kind, value)),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
-    let (status, fg) = call(&app, "GET", "/api/v1/flamegraph?profile_type=wall", None, None).await;
+    let (status, fg) = call(
+        &app,
+        "GET",
+        "/api/v1/flamegraph?profile_type=wall",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{fg}");
     assert_eq!(fg["total"], 1_000_000_000i64);
 
@@ -224,7 +247,14 @@ async fn rejects_malformed_requests() {
     let app = router(dir.path()).await;
 
     // Unterminated selector.
-    let (status, body) = call(&app, "GET", "/api/v1/flamegraph?selector=%7Benv%3D%22a%22", None, None).await;
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/api/v1/flamegraph?selector=%7Benv%3D%22a%22",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body["error"].is_string());
 
@@ -286,7 +316,12 @@ async fn auth_is_enforced_everywhere_that_matters() {
     assert_eq!(status, StatusCode::OK);
     let response = app
         .clone()
-        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -322,12 +357,23 @@ async fn metrics_use_the_prometheus_exposition_format() {
     call(&app, "GET", "/api/v1/top", None, None).await;
 
     let response = app
-        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = String::from_utf8(
-        response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
     )
     .unwrap();
 
@@ -404,14 +450,25 @@ async fn the_dashboard_is_embedded() {
         .to_string();
     assert!(content_type.starts_with("text/html"), "{content_type}");
     let body = String::from_utf8(
-        response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
     )
     .unwrap();
     assert!(body.contains("LidlessEye"), "the index page is served");
 
     // An unknown client-side route falls back to the SPA shell.
     let response = app
-        .oneshot(Request::builder().uri("/flamegraph").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/flamegraph")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
