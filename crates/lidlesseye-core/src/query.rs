@@ -420,11 +420,13 @@ pub fn flamegraph(store: &Store, opts: &QueryOptions) -> Result<Flamegraph> {
                 continue;
             }
         };
+        // Name the synthetic frame `label=value`, not just the value: the tree
+        // can be grouped by any label, so a bare value would not say which one
+        // produced it.
         let group = opts
             .group_by
             .as_deref()
-            .and_then(|label| meta.label(label))
-            .map(|value| value.to_string());
+            .and_then(|label| meta.label(label).map(|value| format!("{label}={value}")));
         let remap = build_remap(&seg, &mut builder.dict);
         for i in 0..seg.sample_count() {
             let Some((stack_id, value)) = seg.sample_at(i) else {
@@ -606,13 +608,14 @@ pub fn timeseries(store: &Store, opts: &TimeSeriesOptions) -> Result<TimeSeries>
     let mut map: HashMap<Key, SeriesPoints> = HashMap::new();
 
     for meta in &metas {
-        let group = match &opts.group_by {
-            Some(label) => meta.label(label).map(|value| value.to_string()),
+        // `label=value`, matching the group frame in the flamegraph.
+        let group_name = match &opts.group_by {
+            Some(label) => meta.label(label).map(|value| format!("{label}={value}")),
             None => None,
         };
         let key: Key = match &opts.group_by {
             Some(_) => (
-                group.clone(),
+                group_name.clone(),
                 String::new(),
                 std::collections::BTreeMap::new(),
             ),
@@ -620,8 +623,13 @@ pub fn timeseries(store: &Store, opts: &TimeSeriesOptions) -> Result<TimeSeries>
         };
         let grouped = opts.group_by.is_some();
         let series = map.entry(key).or_insert_with(|| SeriesPoints {
+            // The bare label value stays available as a display name.
             service_name: if grouped {
-                group.clone().unwrap_or_else(|| "(none)".to_string())
+                opts.group_by
+                    .as_deref()
+                    .and_then(|label| meta.label(label))
+                    .unwrap_or("(none)")
+                    .to_string()
             } else {
                 meta.service_name.clone()
             },
@@ -630,7 +638,7 @@ pub fn timeseries(store: &Store, opts: &TimeSeriesOptions) -> Result<TimeSeries>
             } else {
                 meta.labels.clone()
             },
-            group,
+            group: group_name,
             points: vec![0; buckets],
         });
 
@@ -1126,8 +1134,8 @@ mod tests {
             .map(|(i, _)| fg.names[i].as_str())
             .collect();
         assert_eq!(groups.len(), 2);
-        assert!(groups.contains(&"p1"));
-        assert!(groups.contains(&"p2"));
+        assert!(groups.contains(&"pod=p1"), "{groups:?}");
+        assert!(groups.contains(&"pod=p2"), "{groups:?}");
 
         // service_name works as a group-by key too.
         let by_service = flamegraph(
@@ -1220,8 +1228,11 @@ mod tests {
             .iter()
             .map(|s| s.group.as_deref().unwrap_or(""))
             .collect();
-        assert!(groups.contains(&"p1"));
-        assert!(groups.contains(&"p2"));
+        assert!(groups.contains(&"pod=p1"), "{groups:?}");
+        assert!(groups.contains(&"pod=p2"), "{groups:?}");
+        // The bare value stays available as the series display name.
+        let names: Vec<&str> = ts.series.iter().map(|s| s.service_name.as_str()).collect();
+        assert!(names.contains(&"p1"), "{names:?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

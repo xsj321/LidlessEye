@@ -1040,8 +1040,8 @@ async fn group_by_adds_one_frame_per_label_value() {
         .map(|(_, name)| name.as_str().unwrap())
         .collect();
     assert!(
-        groups.contains(&"api-1") && groups.contains(&"api-2"),
-        "{groups:?}"
+        groups.contains(&"pod=api-1") && groups.contains(&"pod=api-2"),
+        "group frames must name the label: {groups:?}"
     );
 
     let (status, ts) = call(

@@ -124,7 +124,12 @@ impl Default for Builder {
     fn default() -> Self {
         Builder {
             data_dir: PathBuf::from("./lidlesseye-data"),
-            listen: "0.0.0.0:4040".to_string(),
+            // Loopback by default. An embedded server usually has no auth
+            // token, and binding every interface would publish the dashboard
+            // and the ingest API to the whole network. The `lidlesseye` binary
+            // keeps `0.0.0.0` as its own default, where the operator makes
+            // that choice explicitly.
+            listen: "127.0.0.1:4040".to_string(),
             retention: Some(Duration::from_secs(7 * 24 * 3600)),
             max_disk_bytes: Some(50 * 1024 * 1024 * 1024),
             auth_token: None,
@@ -294,6 +299,14 @@ impl Builder {
     }
 
     /// Bind the HTTP server and, when requested, start the collector.
+    ///
+    /// This **binds** but does not **serve**: nothing answers requests until
+    /// you call [`LidlessEye::run`] (blocking) or [`LidlessEye::spawn`]
+    /// (background). `ingest` and `store` work before either, so a caller that
+    /// only wants the storage engine can skip serving entirely.
+    ///
+    /// The default listen address is `127.0.0.1:4040`; pass
+    /// [`Builder::listen`] to widen it.
     pub async fn build(self) -> Result<LidlessEye> {
         let cfg = self.server_config()?;
         let tenant = lidlesseye_core::TenantId::parse(&self.tenant)

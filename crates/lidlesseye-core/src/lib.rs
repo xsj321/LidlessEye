@@ -34,8 +34,8 @@ pub mod time;
 pub use error::{Error, Result};
 pub use folded::{FoldedOptions, decode as decode_folded};
 pub use model::{
-    Frame, FrameRef, MAX_LABELS, ProfileType, Report, ReportBuilder, SERVICE_NAME_LABEL,
-    StackSample, Unit,
+    Frame, FrameRef, MAX_LABEL_KEY_LEN, MAX_LABEL_VALUE_LEN, MAX_LABELS, ProfileType, Report,
+    ReportBuilder, SERVICE_NAME_LABEL, StackSample, Unit,
 };
 pub use pprof::{PprofOptions, decode as decode_pprof};
 pub use query::{

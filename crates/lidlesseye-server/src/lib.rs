@@ -125,24 +125,36 @@ impl AppState {
         // An explicitly empty header is a malformed request, not "use the
         // default tenant": silently writing into `default` is exactly the kind
         // of cross-tenant surprise this feature exists to prevent.
-        let requested = match headers
-            .get(cfg.tenant_header.as_str())
-            .or_else(|| headers.get("x-tenant-id"))
-        {
-            Some(value) => {
-                let value = value.to_str().map_err(|_| {
-                    ApiError::bad_request(format!("`{}` must be ASCII", cfg.tenant_header))
-                })?;
+        //
+        // Repeating the header with different values is refused rather than
+        // resolved: a proxy that appends `X-Scope-OrgID` would otherwise let
+        // whichever value the map happens to return decide the tenant.
+        let mut seen: Vec<&str> = Vec::new();
+        for name in [cfg.tenant_header.as_str(), "x-tenant-id"] {
+            for value in headers.get_all(name).iter() {
+                let value = value
+                    .to_str()
+                    .map_err(|_| ApiError::bad_request(format!("`{name}` must be ASCII")))?;
                 let value = value.trim();
                 if value.is_empty() {
                     return Err(ApiError::bad_request(format!(
-                        "`{}` is present but empty",
-                        cfg.tenant_header
+                        "`{name}` is present but empty"
                     )));
                 }
-                Some(value.to_string())
+                if !seen.contains(&value) {
+                    seen.push(value);
+                }
             }
-            None => None,
+        }
+        let requested = match seen.len() {
+            0 => None,
+            1 => Some(seen[0].to_string()),
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "conflicting tenant headers: {}",
+                    seen.join(", ")
+                )));
+            }
         };
 
         let tenant = match (&bound, requested) {

@@ -46,6 +46,13 @@ impl TenantId {
     pub const DEFAULT: &'static str = "default";
 
     /// Validate and normalize a tenant id.
+    ///
+    /// Ids are case-insensitive: they are lowercased before use. That is not
+    /// cosmetic. The id becomes a directory name, and both NTFS (Windows) and
+    /// APFS (macOS, default) are case-insensitive, so keeping `Acme` and `acme`
+    /// distinct in memory would point both at the *same* directory on disk —
+    /// two tenants silently sharing one store. Normalizing at the boundary
+    /// makes the in-memory model agree with the filesystem on every platform.
     pub fn parse(raw: &str) -> Result<Self> {
         let raw = raw.trim();
         if raw.is_empty() {
@@ -69,7 +76,7 @@ impl TenantId {
                 "tenant id `{raw}` may only contain ASCII letters, digits, `-`, `_` and `.`"
             )));
         }
-        Ok(TenantId(raw.to_string()))
+        Ok(TenantId(raw.to_ascii_lowercase()))
     }
 
     pub fn default_tenant() -> Self {
@@ -433,6 +440,36 @@ mod tests {
             assert!(TenantId::parse(bad).is_err(), "`{bad}` should be rejected");
         }
         assert!(TenantId::parse(&"a".repeat(MAX_TENANT_LEN + 1)).is_err());
+    }
+
+    /// Ids differing only by case must land in the same tenant, because that
+    /// is what the filesystem does. Keeping them separate in memory would mean
+    /// two tenants sharing one directory on Windows and macOS.
+    #[test]
+    fn tenant_ids_are_case_insensitive() {
+        let lower = TenantId::parse("acme").unwrap();
+        for spelling in ["Acme", "ACME", "aCmE", "  Acme  "] {
+            assert_eq!(
+                TenantId::parse(spelling).unwrap(),
+                lower,
+                "`{spelling}` did not normalize to `acme`"
+            );
+        }
+
+        let dir = temp_dir("case");
+        let registry = TenantStore::open(&dir, StoreConfig::new(&dir)).unwrap();
+        let upper = TenantId::parse("Acme").unwrap();
+        registry.open_tenant(&upper).unwrap();
+        assert_eq!(
+            registry.tenant_dir(&upper),
+            registry.tenant_dir(&lower),
+            "one tenant must have exactly one directory"
+        );
+        let names: Vec<String> = std::fs::read_dir(registry.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["acme".to_string()]);
     }
 
     #[test]
