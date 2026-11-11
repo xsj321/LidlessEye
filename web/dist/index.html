@@ -1,1 +1,64 @@
-<!doctype html><title>LidlessEye</title>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LidlessEye</title>
+    <meta name="description" content="Continuous profiling for Linux, powered by eBPF." />
+    <link rel="stylesheet" href="/styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='15' fill='%230f1115'/%3E%3Cpath d='M6 16c3-6 7-6 10 0s7 6 10 0' stroke='%23f2a65a' stroke-width='2.4' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='16' r='3' fill='%23e05c5c'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M4 16c3.4-7 7.6-7 12 0s8.6 7 12 0" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" />
+          <circle cx="16" cy="16" r="3.4" fill="currentColor" />
+        </svg>
+        <span>LidlessEye</span>
+      </div>
+
+      <nav class="tabs" id="tabs">
+        <a href="#/flamegraph" data-view="flamegraph">Flamegraph</a>
+        <a href="#/top" data-view="top">Top functions</a>
+        <a href="#/timeseries" data-view="timeseries">Time series</a>
+        <a href="#/overview" data-view="overview">Overview</a>
+      </nav>
+
+      <div class="topbar-right">
+        <span class="build" id="build-info"></span>
+        <button class="ghost" id="refresh" title="Reload (R)">Refresh</button>
+      </div>
+    </header>
+
+    <div class="filterbar">
+      <label class="field">
+        <span>Profile</span>
+        <select id="profile-type"></select>
+      </label>
+      <label class="field grow">
+        <span>Selector</span>
+        <input id="selector" type="text" spellcheck="false" placeholder='service_name="api" {env="prod", pod=~"api-*"}' />
+      </label>
+      <label class="field">
+        <span>Range</span>
+        <select id="range"></select>
+      </label>
+      <label class="field checkbox" title="Reload every 30 seconds">
+        <input id="auto-refresh" type="checkbox" />
+        <span>Auto</span>
+      </label>
+      <button class="primary" id="apply">Apply</button>
+    </div>
+
+    <main id="main" class="main"></main>
+
+    <div id="tooltip" class="tooltip" hidden></div>
+    <div id="banner" class="banner" hidden></div>
+
+    <script type="module" src="/js/app.js"></script>
+  </body>
+</html>

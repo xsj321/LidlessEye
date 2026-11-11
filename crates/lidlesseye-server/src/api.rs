@@ -157,7 +157,7 @@ pub async fn top(
 
     let store = state.store().clone();
     let started = Instant::now();
-    let rows = tokio::task::spawn_blocking(move || lidlesseye_core::top(&store, &opts, limit))
+    let result = tokio::task::spawn_blocking(move || lidlesseye_core::top(&store, &opts, limit))
         .await
         .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
@@ -165,7 +165,8 @@ pub async fn top(
 
     Ok(Json(json!({
         "unit": profile_type.unit().as_str(),
-        "items": rows,
+        "total_value": result.total_value,
+        "items": result.items,
     }))
     .into_response())
 }

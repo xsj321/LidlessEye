@@ -34,7 +34,7 @@ pub use model::{
 };
 pub use query::{
     flamegraph, timeseries, top, Flamegraph, QueryOptions, SeriesPoints, TimeSeries,
-    TimeSeriesOptions, TopEntry, TreeNode,
+    TimeSeriesOptions, TopEntry, TopResult, TreeNode,
 };
 pub use segment::{Segment, SegmentMeta};
 pub use selector::{glob_match, MatchOp, Matcher, Selector};

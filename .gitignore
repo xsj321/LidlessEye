@@ -19,5 +19,8 @@ lidlesseye-data/
 .vscode/
 *.swp
 
+# Scratch space for UI smoke tests and screenshots
+.tmp/
+
 # WorkBuddy workspace metadata
 .workbuddy/

@@ -3,6 +3,7 @@
 #
 #   ./scripts/dev.sh cargo test --workspace
 #   DEV_PRIVILEGED=1 ./scripts/dev.sh cargo run -- serve
+#   DEV_PORTS=4040:4040 ./scripts/dev.sh cargo run -- serve --listen 0.0.0.0:4040
 #
 # Notes:
 #  * the cargo registry and the target directory live in docker volumes so
@@ -33,6 +34,11 @@ fi
 
 if [[ -n "${DEV_ENV:-}" ]]; then
   for kv in $DEV_ENV; do ARGS+=(-e "$kv"); done
+fi
+
+# Publish ports, e.g. DEV_PORTS="4040:4040 4317:4317".
+if [[ -n "${DEV_PORTS:-}" ]]; then
+  for mapping in $DEV_PORTS; do ARGS+=(-p "$mapping"); done
 fi
 
 # MSYS/Git Bash would rewrite container paths such as /work into C:\...

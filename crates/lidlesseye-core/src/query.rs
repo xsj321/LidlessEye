@@ -414,8 +414,18 @@ pub struct TopEntry {
     pub total_value: i64,
 }
 
+/// The result of [`top`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopResult {
+    pub items: Vec<TopEntry>,
+    /// Value of every stack in the selection, i.e. the denominator for the
+    /// "share of total" of each row. It is *not* the sum of `items`, which is
+    /// truncated to the requested limit.
+    pub total_value: i64,
+}
+
 /// Aggregate the most expensive functions, by self value.
-pub fn top(store: &Store, opts: &QueryOptions, limit: usize) -> Result<Vec<TopEntry>> {
+pub fn top(store: &Store, opts: &QueryOptions, limit: usize) -> Result<TopResult> {
     opts.validate()?;
     let limit = limit.clamp(1, 1000);
     let metas = store.select(&opts.profile_type, opts.from_ns, opts.until_ns, &opts.selector);
@@ -462,6 +472,7 @@ pub fn top(store: &Store, opts: &QueryOptions, limit: usize) -> Result<Vec<TopEn
         }
     }
 
+    let total_value: u64 = self_values.iter().sum();
     let mut rows: Vec<TopEntry> = dict
         .frames
         .iter()
@@ -483,7 +494,10 @@ pub fn top(store: &Store, opts: &QueryOptions, limit: usize) -> Result<Vec<TopEn
             .then_with(|| a.name.cmp(&b.name))
     });
     rows.truncate(limit);
-    Ok(rows)
+    Ok(TopResult {
+        items: rows,
+        total_value: total_value as i64,
+    })
 }
 
 /// Parameters for [`timeseries`].
@@ -669,12 +683,14 @@ mod tests {
     #[test]
     fn top_sorts_by_self_value() {
         let (store, dir) = store_with_data("top");
-        let rows = top(
+        let result = top(
             &store,
             &QueryOptions::new("cpu", 0, 10_000, Selector::default()),
             10,
         )
         .unwrap();
+        let rows = &result.items;
+        assert_eq!(result.total_value, 1000);
         assert_eq!(rows[0].name, "handle");
         assert_eq!(rows[0].self_value, 500);
         assert_eq!(rows[0].total_value, 500);

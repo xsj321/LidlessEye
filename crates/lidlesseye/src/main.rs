@@ -365,17 +365,17 @@ fn query(args: QueryArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let rows = lidlesseye::core::top(&store, &opts, args.limit)?;
-    if rows.is_empty() {
+    let result = lidlesseye::core::top(&store, &opts, args.limit)?;
+    if result.items.is_empty() {
         println!("no samples in the selected range");
         return Ok(());
     }
-    let total: i64 = rows.iter().map(|r| r.total_value).max().unwrap_or(1).max(1);
+    let total = result.total_value.max(1);
     println!(
         "{:<44} {:>12} {:>12}  {}",
         "FUNCTION", "SELF", "TOTAL", "MODULE"
     );
-    for row in rows {
+    for row in result.items {
         let name = truncate(&row.name, 44);
         println!(
             "{:<44} {:>12} {:>12}  {}",
@@ -385,7 +385,7 @@ fn query(args: QueryArgs) -> anyhow::Result<()> {
             truncate(&row.module, 60)
         );
     }
-    println!("\ntotal (max inclusive): {}", format_value(total, "nanoseconds"));
+    println!("\ntotal: {}", format_value(total, "nanoseconds"));
     Ok(())
 }
 
