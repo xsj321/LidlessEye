@@ -93,10 +93,36 @@ export class Flamegraph {
     this.crumbs = [];
     this.loadedAt = performance.now();
 
+    // A diff payload carries two windows per node. The layout is driven by the
+    // larger of the two so that both a hot spot that disappeared and one that
+    // appeared keep a visible width; colour carries the delta.
+    const isDiff = Array.isArray(data.diff) && Array.isArray(data.left);
+    this.diff = isDiff ? { left: data.left, right: data.right, diff: data.diff } : null;
     const n = data.names.length;
+    const rawValues = isDiff
+      ? data.names.map((_, i) => Math.max(data.left[i] ?? 0, data.right[i] ?? 0))
+      : data.values;
+    const total = isDiff
+      ? rawValues[0] || 1
+      : data.total > 0
+        ? data.total
+        : 1;
+    this.total = total;
+
+    if (isDiff) {
+      let maxAbs = 0;
+      for (let i = 0; i < n; i += 1) {
+        const d = Math.abs(data.diff[i] ?? 0);
+        if (d > maxAbs) maxAbs = d;
+      }
+      this.maxAbsDiff = maxAbs || 1;
+    } else {
+      this.maxAbsDiff = 0;
+    }
+
     this.n = n;
     const parent = Int32Array.from(data.levels);
-    const value = Float64Array.from(data.values);
+    const value = Float64Array.from(rawValues);
     this.parent = parent;
     this.value = value;
 
@@ -134,7 +160,6 @@ export class Flamegraph {
     const x = new Float64Array(n);
     const w = new Float64Array(n);
     const depth = new Int32Array(n).fill(-1);
-    const total = value[0] > 0 ? value[0] : 1;
     x[0] = 0;
     w[0] = 1;
     depth[0] = 0;
@@ -218,12 +243,25 @@ export class Flamegraph {
       this.legendEl.textContent = "";
       return;
     }
-    const parts = [
-      `total ${formatValue(data.total, data.unit)}`,
-      `${data.samples ?? 0} samples`,
-      `${data.names.length} frames`,
-    ];
-    if (data.truncated) parts.push("truncated — lower max_nodes? see docs");
+    let parts;
+    if (this.diff) {
+      const delta = (data.total_right ?? 0) - (data.total_left ?? 0);
+      const ratio = data.total_left ? (delta / data.total_left) * 100 : 0;
+      const sign = delta > 0 ? "+" : delta < 0 ? "−" : "";
+      parts = [
+        `<span class="legend-swatch diff-up"></span>baseline ${formatValue(data.total_left, data.unit)}`,
+        `<span class="legend-swatch diff-down"></span>comparison ${formatValue(data.total_right, data.unit)}`,
+        `delta ${sign}${formatValue(Math.abs(delta), data.unit)} (${sign}${Math.abs(ratio).toFixed(1)}%)`,
+        `${data.names.length} frames`,
+      ];
+    } else {
+      parts = [
+        `total ${formatValue(data.total, data.unit)}`,
+        `${data.samples ?? 0} samples`,
+        `${data.names.length} frames`,
+      ];
+      if (data.truncated) parts.push("truncated — lower max_nodes? see docs");
+    }
     this.legendEl.innerHTML = parts
       .map((text) => `<span>${text}</span>`)
       .join("");
@@ -248,7 +286,21 @@ export class Flamegraph {
   color(index) {
     let color = this.colors[index];
     if (!color) {
-      color = frameColor(this.data.names[index], this.depth[index]);
+      if (this.diff) {
+        const delta = this.diff.diff[index] ?? 0;
+        if (delta === 0) {
+          color = "hsl(220 8% 30%)";
+        } else {
+          const scale = Math.min(1, Math.abs(delta) / this.maxAbsDiff);
+          const light = 24 + scale * 18;
+          // Red means "more time here", green means "less": the same
+          // convention every profiler's comparison view uses.
+          const hue = delta > 0 ? 358 : 148;
+          color = `hsl(${hue} 60% ${light}%)`;
+        }
+      } else {
+        color = frameColor(this.data.names[index], this.depth[index]);
+      }
       this.colors[index] = color;
     }
     return color;
@@ -285,7 +337,7 @@ export class Flamegraph {
     const { x, w, byDepth } = this;
     const { x0, x1 } = this.view;
     const scale = width / (x1 - x0);
-    const base = this.data.total > 0 ? this.data.total : 1;
+    const base = this.total > 0 ? this.total : 1;
 
     ctx.textBaseline = "middle";
     ctx.font = FONT;
@@ -464,14 +516,34 @@ export class Flamegraph {
       return;
     }
     this.canvas.style.cursor = "pointer";
-    const total = this.data.total || 1;
+    const total = this.total || 1;
     const value = this.value[index];
     const self = this.selfValue[index];
+    let detail;
+    if (this.diff) {
+      const left = this.diff.left[index] ?? 0;
+      const right = this.diff.right[index] ?? 0;
+      const delta = right - left;
+      const ratio = left ? (delta / left) * 100 : null;
+      const sign = delta > 0 ? "+" : delta < 0 ? "−" : "";
+      detail = `
+        <div class="tt-row"><span class="tt-key">baseline</span>${formatValue(left, this.data.unit)}</div>
+        <div class="tt-row"><span class="tt-key">comparison</span>${formatValue(right, this.data.unit)}</div>
+        <div class="tt-row"><span class="tt-key">delta</span>${sign}${formatValue(Math.abs(delta), this.data.unit)}${
+          ratio === null ? "" : ` · ${sign}${Math.abs(ratio).toFixed(1)}%`
+        }</div>
+        <div class="tt-row"><span class="tt-key">share</span>${formatPercent(value / total)} of max window</div>
+      `;
+    } else {
+      detail = `
+        <div class="tt-row"><span class="tt-key">total</span>${formatValue(value, this.data.unit)} · ${formatPercent(value / total)}</div>
+        <div class="tt-row"><span class="tt-key">self</span>${formatValue(self, this.data.unit)} · ${formatPercent(self / total)}</div>
+        <div class="tt-row"><span class="tt-key">depth</span>${this.depth[index]}</div>
+      `;
+    }
     tooltip.innerHTML = `
       <div class="tt-title">${escape(this.data.names[index])}</div>
-      <div class="tt-row"><span class="tt-key">total</span>${formatValue(value, this.data.unit)} · ${formatPercent(value / total)}</div>
-      <div class="tt-row"><span class="tt-key">self</span>${formatValue(self, this.data.unit)} · ${formatPercent(self / total)}</div>
-      <div class="tt-row"><span class="tt-key">depth</span>${this.depth[index]}</div>
+      ${detail}
     `;
     tooltip.hidden = false;
     const pad = 14;

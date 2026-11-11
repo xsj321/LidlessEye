@@ -194,3 +194,122 @@ export function emptyState(host, { title, hint, command }) {
     </div>
   `;
 }
+
+/**
+ * Tag explorer: the label names on the left, the values of the selected label
+ * on the right. Clicking a value narrows the selector, which is how you go from
+ * "something is slow" to "it is slow on this pod".
+ */
+export class LabelExplorer {
+  constructor(host, { onFilter } = {}) {
+    this.host = host;
+    this.onFilter = onFilter ?? (() => {});
+    this.names = [];
+    this.active = null;
+    this.values = [];
+    this.search = "";
+
+    host.classList.add("panel");
+    host.innerHTML = `
+      <div class="fg-toolbar">
+        <input type="search" placeholder="Filter values…" aria-label="Filter label values" />
+        <span class="muted" data-role="count"></span>
+        <span class="spacer"></span>
+        <span class="faint">Click a value to add it to the selector.</span>
+      </div>
+      <div class="labels-layout">
+        <aside class="label-names" data-role="names"></aside>
+        <div class="label-values" data-role="values"></div>
+      </div>
+    `;
+    this.namesEl = host.querySelector('[data-role="names"]');
+    this.valuesEl = host.querySelector('[data-role="values"]');
+    this.countEl = host.querySelector('[data-role="count"]');
+    const search = host.querySelector('input[type="search"]');
+    search.addEventListener("input", () => {
+      this.search = search.value.trim().toLowerCase();
+      this.renderValues();
+    });
+    this.namesEl.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-name]");
+      if (!button) return;
+      this.select(button.dataset.name);
+    });
+    this.valuesEl.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-value]");
+      if (!button) return;
+      this.onFilter(this.active, button.dataset.value);
+    });
+  }
+
+  setNames(names) {
+    this.names = names ?? [];
+    if (!this.active || !this.names.includes(this.active)) {
+      this.active = this.names.find((name) => name !== "service_name") ?? this.names[0] ?? null;
+    }
+    this.renderNames();
+  }
+
+  select(name) {
+    if (!name || name === this.active) return;
+    this.active = name;
+    this.values = [];
+    this.renderNames();
+    this.renderValues();
+    this.onSelect?.(name);
+  }
+
+  setValues(label, values) {
+    if (label !== this.active) return;
+    this.values = values ?? [];
+    this.renderValues();
+  }
+
+  renderNames() {
+    this.namesEl.innerHTML = this.names
+      .map(
+        (name) => `<button data-name="${escapeHtml(name)}" class="${
+          name === this.active ? "active" : ""
+        }">${escapeHtml(name)}</button>`,
+      )
+      .join("");
+  }
+
+  renderValues() {
+    if (!this.active) {
+      this.valuesEl.innerHTML = `<div class="empty"><h3>No labels</h3><p>Ingest a profile first.</p></div>`;
+      this.countEl.textContent = "";
+      return;
+    }
+    const filtered = this.search
+      ? this.values.filter((row) => row.value.toLowerCase().includes(this.search))
+      : this.values;
+    const max = filtered.reduce((acc, row) => Math.max(acc, row.total ?? 0), 0) || 1;
+    this.countEl.textContent = `${filtered.length} value${filtered.length === 1 ? "" : "s"} for ${this.active}`;
+    this.valuesEl.innerHTML = `
+      <table class="label-table">
+        <thead><tr><th>Value</th><th class="bar-cell"></th><th class="num">Value</th><th></th></tr></thead>
+        <tbody>
+          ${
+            filtered
+              .map(
+                (row) => `<tr>
+                  <td class="mono">${escapeHtml(row.value)}</td>
+                  <td class="bar-cell"><div class="bar" style="width:${Math.max(
+                    1,
+                    Math.round((row.total / max) * 100),
+                  )}%"></div></td>
+                  <td class="num">${formatCount(row.total)}</td>
+                  <td class="num"><button class="ghost" data-value="${escapeHtml(
+                    row.value,
+                  )}">Filter</button></td>
+                </tr>`,
+              )
+              .join("") || `<tr><td colspan="4" class="empty">No values.</td></tr>`
+          }
+        </tbody>
+      </table>
+    `;
+  }
+}
+

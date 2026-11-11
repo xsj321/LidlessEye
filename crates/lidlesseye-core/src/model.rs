@@ -26,6 +26,15 @@ pub const MAX_STRINGS: usize = 4_000_000;
 /// Maximum number of stacks accepted in one report.
 pub const MAX_STACKS: usize = 2_000_000;
 
+/// Maximum number of labels on one report.
+pub const MAX_LABELS: usize = 64;
+
+/// Maximum length of a label name.
+pub const MAX_LABEL_KEY_LEN: usize = 128;
+
+/// Maximum length of a label value.
+pub const MAX_LABEL_VALUE_LEN: usize = 1024;
+
 /// The unit of a profile's sample values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,16 +95,26 @@ impl ProfileType {
         &self.0
     }
 
-    /// `wall` is a virtual type: it is computed by merging `cpu` and `off_cpu`
-    /// at query time and is never written to disk on its own.
+    /// `wall` is a *computed* type: a query for it merges every wall-clock
+    /// input that exists. It is also a real, storable type, because SDKs ship
+    /// wall-clock profiles (pprof `wall`) and rejecting them would lose data.
     pub fn is_virtual(&self) -> bool {
         self.0 == Self::WALL
     }
 
     /// The concrete types that have to be read to answer a query for `self`.
+    ///
+    /// For `wall` this is `cpu`, `off_cpu` **and** stored `wall` profiles. A
+    /// deployment should pick one source — either the eBPF agent (cpu plus
+    /// off_cpu) or an SDK sending wall-clock profiles — otherwise the two are
+    /// added together and the numbers double count.
     pub fn source_types(&self) -> Vec<ProfileType> {
         if self.is_virtual() {
-            vec![ProfileType::cpu(), ProfileType::off_cpu()]
+            vec![
+                ProfileType::cpu(),
+                ProfileType::off_cpu(),
+                ProfileType::wall(),
+            ]
         } else {
             vec![self.clone()]
         }
@@ -247,11 +266,6 @@ impl Report {
         if self.profile_type.as_str().len() > 128 {
             return Err(Error::InvalidReport("profile_type is too long".into()));
         }
-        if self.profile_type.is_virtual() {
-            return Err(Error::InvalidReport(
-                "`wall` is a virtual profile type and cannot be ingested directly".into(),
-            ));
-        }
         if self.end_ns <= self.start_ns {
             return Err(Error::InvalidReport(format!(
                 "end_ns ({}) must be greater than start_ns ({})",
@@ -269,6 +283,25 @@ impl Report {
                 "too many stacks ({}, max {MAX_STACKS})",
                 self.stacks.len()
             )));
+        }
+        if self.labels.len() > MAX_LABELS {
+            return Err(Error::InvalidReport(format!(
+                "too many labels ({}, max {MAX_LABELS})",
+                self.labels.len()
+            )));
+        }
+        for (key, value) in &self.labels {
+            if key.is_empty() || key.len() > MAX_LABEL_KEY_LEN {
+                return Err(Error::InvalidReport(format!(
+                    "label name `{key}` must be 1..={MAX_LABEL_KEY_LEN} bytes"
+                )));
+            }
+            if value.len() > MAX_LABEL_VALUE_LEN {
+                return Err(Error::InvalidReport(format!(
+                    "label `{key}` has a {} byte value, max is {MAX_LABEL_VALUE_LEN}",
+                    value.len()
+                )));
+            }
         }
         let max_index = self.strings.len() as u32;
         for (i, stack) in self.stacks.iter().enumerate() {
@@ -482,7 +515,14 @@ mod tests {
     #[test]
     fn wall_expands_to_cpu_and_off_cpu() {
         let types = ProfileType::wall().source_types();
-        assert_eq!(types, vec![ProfileType::cpu(), ProfileType::off_cpu()]);
+        assert_eq!(
+            types,
+            vec![
+                ProfileType::cpu(),
+                ProfileType::off_cpu(),
+                ProfileType::wall()
+            ]
+        );
         assert_eq!(ProfileType::wall().unit(), Unit::Nanoseconds);
     }
 }

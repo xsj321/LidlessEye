@@ -18,6 +18,8 @@ pub struct PublisherConfig {
     pub server_url: String,
     /// Bearer token, when the server requires one.
     pub auth_token: Option<String>,
+    /// Tenant to write to, sent as `X-Scope-OrgID`.
+    pub tenant: Option<String>,
     /// Maximum number of reports per HTTP request.
     pub max_batch: usize,
     /// Maximum time a report waits before being flushed.
@@ -31,6 +33,7 @@ impl PublisherConfig {
         PublisherConfig {
             server_url: server_url.into().trim_end_matches('/').to_string(),
             auth_token: None,
+            tenant: None,
             max_batch: 64,
             max_delay: Duration::from_millis(250),
             timeout: Duration::from_secs(30),
@@ -73,6 +76,11 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
             .map_err(|err| Error::Config(format!("invalid auth token: {err}")))?;
         value.set_sensitive(true);
         headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    if let Some(tenant) = &cfg.tenant {
+        let value = reqwest::header::HeaderValue::from_str(tenant)
+            .map_err(|err| Error::Config(format!("invalid tenant id: {err}")))?;
+        headers.insert("x-scope-orgid", value);
     }
     let client = reqwest::Client::builder()
         .timeout(cfg.timeout)

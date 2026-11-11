@@ -23,8 +23,10 @@
 
       <nav class="tabs" id="tabs">
         <a href="#/flamegraph" data-view="flamegraph">Flamegraph</a>
+        <a href="#/compare" data-view="compare">Compare</a>
         <a href="#/top" data-view="top">Top functions</a>
         <a href="#/timeseries" data-view="timeseries">Time series</a>
+        <a href="#/labels" data-view="labels">Labels</a>
         <a href="#/overview" data-view="overview">Overview</a>
       </nav>
 
@@ -36,8 +38,18 @@
 
     <div class="filterbar">
       <label class="field">
+        <span>Tenant</span>
+        <select id="tenant"></select>
+      </label>
+      <label class="field">
         <span>Profile</span>
         <select id="profile-type"></select>
+      </label>
+      <label class="field">
+        <span>Group by</span>
+        <select id="group-by">
+          <option value="">none</option>
+        </select>
       </label>
       <label class="field grow">
         <span>Selector</span>
@@ -46,6 +58,10 @@
       <label class="field">
         <span>Range</span>
         <select id="range"></select>
+      </label>
+      <label class="field" id="baseline-field" hidden>
+        <span>Baseline</span>
+        <select id="baseline"></select>
       </label>
       <label class="field checkbox" title="Reload every 30 seconds">
         <input id="auto-refresh" type="checkbox" />

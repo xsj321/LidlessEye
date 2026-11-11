@@ -103,6 +103,10 @@ pub struct QueryOptions {
     pub until_ns: u64,
     pub selector: Selector,
     pub max_nodes: usize,
+    /// Optional label to split the profile on. Each distinct value becomes a
+    /// frame directly under the root, which is how Pyroscope's "group by"
+    /// renders.
+    pub group_by: Option<String>,
 }
 
 impl QueryOptions {
@@ -118,11 +122,17 @@ impl QueryOptions {
             until_ns,
             selector,
             max_nodes: 1024,
+            group_by: None,
         }
     }
 
     pub fn with_max_nodes(mut self, max_nodes: usize) -> Self {
         self.max_nodes = max_nodes.clamp(16, 50_000);
+        self
+    }
+
+    pub fn with_group_by(mut self, label: Option<String>) -> Self {
+        self.group_by = label.filter(|label| !label.trim().is_empty());
         self
     }
 
@@ -215,6 +225,10 @@ struct TreeBuilder {
     children: Vec<HashMap<u32, usize>>,
     truncated_node: Option<usize>,
     truncated: bool,
+    /// Nodes whose display name is not derived from a frame (group-by nodes).
+    overrides: HashMap<usize, String>,
+    /// Group label value -> node directly under the root.
+    group_nodes: HashMap<String, usize>,
 }
 
 impl TreeBuilder {
@@ -227,11 +241,39 @@ impl TreeBuilder {
             children: vec![HashMap::new()],
             truncated_node: None,
             truncated: false,
+            overrides: HashMap::new(),
+            group_nodes: HashMap::new(),
         }
     }
 
-    fn add_stack(&mut self, frames: &[u32], value: u64) {
-        let mut node = 0usize;
+    /// Node directly under the root holding the given group label value.
+    fn group_node(&mut self, group: &str) -> usize {
+        if let Some(&idx) = self.group_nodes.get(group) {
+            return idx;
+        }
+        let idx = self.new_node(u32::MAX, 0);
+        self.overrides.insert(idx, group.to_string());
+        self.group_nodes.insert(group.to_string(), idx);
+        idx
+    }
+
+    fn new_node(&mut self, frame: u32, parent: usize) -> usize {
+        let idx = self.node_frame.len();
+        self.node_frame.push(frame);
+        self.parent.push(parent as i32);
+        self.self_value.push(0);
+        self.children.push(HashMap::new());
+        if frame != u32::MAX {
+            self.children[parent].insert(frame, idx);
+        }
+        idx
+    }
+
+    fn add_stack(&mut self, group: Option<&str>, frames: &[u32], value: u64) {
+        let mut node = match group {
+            Some(group) => self.group_node(group),
+            None => 0usize,
+        };
         // Stacks are stored leaf-first; the tree is built root-first.
         for &frame in frames.iter().rev() {
             if frame == u32::MAX {
@@ -246,24 +288,14 @@ impl TreeBuilder {
                         match self.truncated_node {
                             Some(idx) => idx,
                             None => {
-                                let idx = self.node_frame.len();
-                                self.node_frame.push(u32::MAX);
-                                self.parent.push(0);
-                                self.self_value.push(0);
-                                self.children.push(HashMap::new());
-                                self.children[0].insert(u32::MAX, idx);
+                                let idx = self.new_node(u32::MAX, 0);
+                                self.overrides.insert(idx, "(truncated)".to_string());
                                 self.truncated_node = Some(idx);
                                 idx
                             }
                         }
                     } else {
-                        let idx = self.node_frame.len();
-                        self.node_frame.push(frame);
-                        self.parent.push(node as i32);
-                        self.self_value.push(0);
-                        self.children.push(HashMap::new());
-                        self.children[node].insert(frame, idx);
-                        idx
+                        self.new_node(frame, node)
                     }
                 }
             };
@@ -335,6 +367,8 @@ impl TreeBuilder {
             index_map[node] = new_idx as u32;
             let name = if node == 0 {
                 "root".to_string()
+            } else if let Some(name) = self.overrides.get(&node) {
+                name.clone()
             } else if self.node_frame[node] == u32::MAX {
                 "(truncated)".to_string()
             } else {
@@ -386,6 +420,11 @@ pub fn flamegraph(store: &Store, opts: &QueryOptions) -> Result<Flamegraph> {
                 continue;
             }
         };
+        let group = opts
+            .group_by
+            .as_deref()
+            .and_then(|label| meta.label(label))
+            .map(|value| value.to_string());
         let remap = build_remap(&seg, &mut builder.dict);
         for i in 0..seg.sample_count() {
             let Some((stack_id, value)) = seg.sample_at(i) else {
@@ -396,7 +435,7 @@ pub fn flamegraph(store: &Store, opts: &QueryOptions) -> Result<Flamegraph> {
                 let mapped = remap.get(fid as usize).copied().unwrap_or(u32::MAX);
                 stack_buf.push(mapped);
             });
-            builder.add_stack(&stack_buf, value);
+            builder.add_stack(group.as_deref(), &stack_buf, value);
         }
     }
 
@@ -518,12 +557,17 @@ pub struct TimeSeriesOptions {
     pub selector: Selector,
     /// Width of a bucket in nanoseconds.
     pub step_ns: u64,
+    /// Split each service into one series per value of this label.
+    pub group_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeriesPoints {
     pub service_name: String,
     pub labels: std::collections::BTreeMap<String, String>,
+    /// Value of the group-by label, when the query asked for one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub points: Vec<i64>,
 }
 
@@ -554,14 +598,39 @@ pub fn timeseries(store: &Store, opts: &TimeSeriesOptions) -> Result<TimeSeries>
         opts.until_ns,
         &opts.selector,
     );
-    let mut map: HashMap<(String, std::collections::BTreeMap<String, String>), SeriesPoints> =
-        HashMap::new();
+    type Key = (
+        Option<String>,
+        String,
+        std::collections::BTreeMap<String, String>,
+    );
+    let mut map: HashMap<Key, SeriesPoints> = HashMap::new();
 
     for meta in &metas {
-        let key = (meta.service_name.clone(), meta.labels.clone());
+        let group = match &opts.group_by {
+            Some(label) => meta.label(label).map(|value| value.to_string()),
+            None => None,
+        };
+        let key: Key = match &opts.group_by {
+            Some(_) => (
+                group.clone(),
+                String::new(),
+                std::collections::BTreeMap::new(),
+            ),
+            None => (None, meta.service_name.clone(), meta.labels.clone()),
+        };
+        let grouped = opts.group_by.is_some();
         let series = map.entry(key).or_insert_with(|| SeriesPoints {
-            service_name: meta.service_name.clone(),
-            labels: meta.labels.clone(),
+            service_name: if grouped {
+                group.clone().unwrap_or_else(|| "(none)".to_string())
+            } else {
+                meta.service_name.clone()
+            },
+            labels: if grouped {
+                std::collections::BTreeMap::new()
+            } else {
+                meta.labels.clone()
+            },
+            group,
             points: vec![0; buckets],
         });
 
@@ -600,6 +669,257 @@ pub fn timeseries(store: &Store, opts: &TimeSeriesOptions) -> Result<TimeSeries>
         step_ns,
         series,
     })
+}
+
+/// Options for a baseline-versus-comparison diff.
+#[derive(Debug, Clone)]
+pub struct DiffOptions {
+    pub profile_type: ProfileType,
+    /// Start of the "before" window.
+    pub baseline_from_ns: u64,
+    /// End of the "before" window.
+    pub baseline_until_ns: u64,
+    /// Start of the "after" window.
+    pub from_ns: u64,
+    /// End of the "after" window.
+    pub until_ns: u64,
+    pub selector: Selector,
+    pub max_nodes: usize,
+}
+
+/// A flamegraph annotated with two windows, Pyroscope's "comparison view".
+///
+/// `left` is the baseline, `right` the comparison, and `diff` is
+/// `right - left`, so a positive value is a regression and a negative value an
+/// improvement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiffFlamegraph {
+    pub names: Vec<String>,
+    pub levels: Vec<i64>,
+    pub left: Vec<i64>,
+    pub right: Vec<i64>,
+    pub diff: Vec<i64>,
+    pub total_left: i64,
+    pub total_right: i64,
+    pub unit: String,
+    pub truncated: bool,
+}
+
+impl DiffFlamegraph {
+    pub fn is_empty(&self) -> bool {
+        self.total_left == 0 && self.total_right == 0
+    }
+
+    /// Relative change of the whole profile, in percent.
+    pub fn total_ratio(&self) -> f64 {
+        if self.total_left == 0 {
+            if self.total_right == 0 {
+                0.0
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            (self.total_right - self.total_left) as f64 / self.total_left as f64 * 100.0
+        }
+    }
+}
+
+struct DiffTree {
+    dict: FrameDict,
+    node_frame: Vec<u32>,
+    parent: Vec<i32>,
+    left_self: Vec<u64>,
+    right_self: Vec<u64>,
+    children: Vec<HashMap<u32, usize>>,
+}
+
+impl DiffTree {
+    fn new() -> Self {
+        DiffTree {
+            dict: FrameDict::new(),
+            node_frame: vec![u32::MAX],
+            parent: vec![-1],
+            left_self: vec![0],
+            right_self: vec![0],
+            children: vec![HashMap::new()],
+        }
+    }
+
+    fn add_stack(&mut self, frames: &[u32], left: u64, right: u64) {
+        let mut node = 0usize;
+        for &frame in frames.iter().rev() {
+            if frame == u32::MAX {
+                continue;
+            }
+            let existing = self.children[node].get(&frame).copied();
+            node = match existing {
+                Some(child) => child,
+                None => {
+                    if self.node_frame.len() >= MAX_NODES {
+                        // Stop growing the tree; the value still lands on the
+                        // deepest node we already have, so totals stay exact.
+                        break;
+                    }
+                    let idx = self.node_frame.len();
+                    self.node_frame.push(frame);
+                    self.parent.push(node as i32);
+                    self.left_self.push(0);
+                    self.right_self.push(0);
+                    self.children.push(HashMap::new());
+                    self.children[node].insert(frame, idx);
+                    idx
+                }
+            };
+        }
+        self.left_self[node] = self.left_self[node].saturating_add(left);
+        self.right_self[node] = self.right_self[node].saturating_add(right);
+    }
+
+    fn finish(self, max_nodes: usize) -> DiffFlamegraph {
+        let mut left = self.left_self.clone();
+        let mut right = self.right_self.clone();
+        for i in (1..left.len()).rev() {
+            let p = self.parent[i] as usize;
+            left[p] = left[p].saturating_add(left[i]);
+            right[p] = right[p].saturating_add(right[i]);
+        }
+        let total_left = left[0];
+        let total_right = right[0];
+
+        // Prune the smallest leaves until the tree fits, measuring importance
+        // by the sum of both windows so a node that only exists on one side
+        // still survives when it matters.
+        let max_nodes = max_nodes.max(2);
+        let mut alive = vec![true; left.len()];
+        let mut alive_children = vec![0u32; left.len()];
+        for i in 1..left.len() {
+            alive_children[self.parent[i] as usize] += 1;
+        }
+        let mut alive_count = left.len();
+        let mut heap = std::collections::BinaryHeap::new();
+        for i in 1..left.len() {
+            if alive_children[i] == 0 {
+                heap.push(std::cmp::Reverse((left[i].saturating_add(right[i]), i)));
+            }
+        }
+        while alive_count > max_nodes {
+            let Some(std::cmp::Reverse((_, idx))) = heap.pop() else {
+                break;
+            };
+            if !alive[idx] {
+                continue;
+            }
+            alive[idx] = false;
+            alive_count -= 1;
+            let p = self.parent[idx] as usize;
+            alive_children[p] = alive_children[p].saturating_sub(1);
+            if alive_children[p] == 0 && p != 0 {
+                heap.push(std::cmp::Reverse((left[p].saturating_add(right[p]), p)));
+            }
+        }
+
+        let mut children_alive: Vec<Vec<usize>> = vec![Vec::new(); left.len()];
+        for i in 1..left.len() {
+            if alive[i] {
+                children_alive[self.parent[i] as usize].push(i);
+            }
+        }
+        let mut names = Vec::with_capacity(alive_count);
+        let mut levels = Vec::with_capacity(alive_count);
+        let mut left_out = Vec::with_capacity(alive_count);
+        let mut right_out = Vec::with_capacity(alive_count);
+        let mut stack: Vec<(usize, i64)> = vec![(0, -1)];
+        while let Some((node, parent_new)) = stack.pop() {
+            let new_idx = names.len();
+            names.push(if node == 0 {
+                "root".to_string()
+            } else {
+                self.dict.name(self.node_frame[node]).to_string()
+            });
+            levels.push(parent_new);
+            left_out.push(left[node] as i64);
+            right_out.push(right[node] as i64);
+            children_alive[node]
+                .sort_unstable_by(|a, b| (left[*b] + right[*b]).cmp(&(left[*a] + right[*a])));
+            for &child in children_alive[node].iter().rev() {
+                stack.push((child, new_idx as i64));
+            }
+        }
+        let diff = left_out
+            .iter()
+            .zip(right_out.iter())
+            .map(|(l, r)| r.saturating_sub(*l))
+            .collect();
+        DiffFlamegraph {
+            names,
+            levels,
+            left: left_out,
+            right: right_out,
+            diff,
+            total_left: total_left as i64,
+            total_right: total_right as i64,
+            unit: Unit::Nanoseconds.as_str().to_string(),
+            truncated: self.left_self.len() > alive_count,
+        }
+    }
+}
+
+/// Compare two time windows and return the merged, annotated flamegraph.
+pub fn diff(store: &Store, opts: &DiffOptions) -> Result<DiffFlamegraph> {
+    if opts.until_ns <= opts.from_ns {
+        return Err(Error::InvalidRange {
+            from: opts.from_ns,
+            until: opts.until_ns,
+        });
+    }
+    if opts.baseline_until_ns <= opts.baseline_from_ns {
+        return Err(Error::InvalidRange {
+            from: opts.baseline_from_ns,
+            until: opts.baseline_until_ns,
+        });
+    }
+    let baseline = store.select(
+        &opts.profile_type,
+        opts.baseline_from_ns,
+        opts.baseline_until_ns,
+        &opts.selector,
+    );
+    let comparison = store.select(
+        &opts.profile_type,
+        opts.from_ns,
+        opts.until_ns,
+        &opts.selector,
+    );
+
+    let mut tree = DiffTree::new();
+    let mut stack_buf: Vec<u32> = Vec::with_capacity(160);
+    for (metas, is_baseline) in [(baseline, true), (comparison, false)] {
+        for meta in &metas {
+            let seg = match Segment::open(&meta.path) {
+                Ok(seg) => seg,
+                Err(err) => {
+                    warn!(path = %meta.path.display(), error = %err, "skipping unreadable segment");
+                    continue;
+                }
+            };
+            let remap = build_remap(&seg, &mut tree.dict);
+            for i in 0..seg.sample_count() {
+                let Some((stack_id, value)) = seg.sample_at(i) else {
+                    continue;
+                };
+                stack_buf.clear();
+                seg.for_each_frame_id(stack_id, |fid| {
+                    stack_buf.push(remap.get(fid as usize).copied().unwrap_or(u32::MAX));
+                });
+                let (left, right) = if is_baseline { (value, 0) } else { (0, value) };
+                tree.add_stack(&stack_buf, left, right);
+            }
+        }
+    }
+
+    let mut result = tree.finish(opts.max_nodes);
+    result.unit = opts.profile_type.unit().as_str().to_string();
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -759,6 +1079,7 @@ mod tests {
                 until_ns: 10_000,
                 selector: Selector::default(),
                 step_ns: 1_000,
+                group_by: None,
             },
         )
         .unwrap();
@@ -779,6 +1100,128 @@ mod tests {
         .unwrap();
         assert!(fg.is_empty());
         assert_eq!(fg.names, vec!["root"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn group_by_adds_a_frame_per_label_value() {
+        let (store, dir) = store_with_data("group");
+        let mut b = ReportBuilder::new("checkout", "cpu", 3_000, 4_000).label("pod", "p2");
+        b.add_stack([Frame::new("/bin/app", "main")], 250);
+        store.append(&b.finish()).unwrap();
+
+        let fg = flamegraph(
+            &store,
+            &QueryOptions::new("cpu", 0, 10_000, Selector::default())
+                .with_group_by(Some("pod".to_string())),
+        )
+        .unwrap();
+        assert_eq!(fg.total, 1250);
+        // Root's children are the two pods.
+        let groups: Vec<&str> = fg
+            .levels
+            .iter()
+            .enumerate()
+            .filter(|(_, level)| **level == 0)
+            .map(|(i, _)| fg.names[i].as_str())
+            .collect();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains(&"p1"));
+        assert!(groups.contains(&"p2"));
+
+        // service_name works as a group-by key too.
+        let by_service = flamegraph(
+            &store,
+            &QueryOptions::new("cpu", 0, 10_000, Selector::default())
+                .with_group_by(Some("service_name".to_string())),
+        )
+        .unwrap();
+        assert_eq!(
+            by_service
+                .levels
+                .iter()
+                .filter(|level| **level == 0)
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn diff_reports_both_windows() {
+        let (store, dir) = store_with_data("diff");
+        // A second window where handle got twice as expensive and idle halved.
+        let mut b = ReportBuilder::new("checkout", "cpu", 5_000, 6_000).label("pod", "p1");
+        b.add_stack(
+            [
+                Frame::new("/bin/app", "handle"),
+                Frame::new("/bin/app", "serve"),
+                Frame::new("/bin/app", "main"),
+            ],
+            1_000,
+        );
+        b.add_stack(
+            [
+                Frame::new("/bin/app", "idle"),
+                Frame::new("/bin/app", "main"),
+            ],
+            100,
+        );
+        store.append(&b.finish()).unwrap();
+
+        let result = diff(
+            &store,
+            &DiffOptions {
+                profile_type: ProfileType::cpu(),
+                baseline_from_ns: 0,
+                baseline_until_ns: 2_000,
+                from_ns: 4_000,
+                until_ns: 7_000,
+                selector: Selector::default(),
+                max_nodes: 1000,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.total_left, 1000);
+        assert_eq!(result.total_right, 1100);
+        assert_eq!(result.diff[0], 100);
+        let handle = result.names.iter().position(|n| n == "handle").unwrap();
+        assert_eq!(result.left[handle], 500);
+        assert_eq!(result.right[handle], 1000);
+        assert_eq!(result.diff[handle], 500);
+        let idle = result.names.iter().position(|n| n == "idle").unwrap();
+        assert_eq!(result.diff[idle], -100);
+        assert!((result.total_ratio() - 10.0).abs() < 1e-9);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn timeseries_group_by_splits_series() {
+        let (store, dir) = store_with_data("ts-group");
+        let mut b = ReportBuilder::new("checkout", "cpu", 3_000, 4_000).label("pod", "p2");
+        b.add_stack([Frame::new("/bin/app", "main")], 100);
+        store.append(&b.finish()).unwrap();
+
+        let ts = timeseries(
+            &store,
+            &TimeSeriesOptions {
+                profile_type: ProfileType::cpu(),
+                from_ns: 0,
+                until_ns: 10_000,
+                selector: Selector::default(),
+                step_ns: 1_000,
+                group_by: Some("pod".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(ts.series.len(), 2);
+        let groups: Vec<&str> = ts
+            .series
+            .iter()
+            .map(|s| s.group.as_deref().unwrap_or(""))
+            .collect();
+        assert!(groups.contains(&"p1"));
+        assert!(groups.contains(&"p2"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

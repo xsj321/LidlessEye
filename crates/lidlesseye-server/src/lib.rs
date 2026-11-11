@@ -18,6 +18,7 @@ mod metrics;
 mod params;
 mod ui;
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderMap, header};
 use axum::routing::{get, post};
 use serde::Serialize;
 use tokio::net::TcpListener;
@@ -37,7 +39,7 @@ use tracing::{info, warn};
 
 use lidlesseye_core::model::Report;
 use lidlesseye_core::store::{StoreConfig, StoreStats};
-use lidlesseye_core::{SegmentMeta, Store};
+use lidlesseye_core::{SegmentMeta, Store, TenantId, TenantStore};
 
 pub use config::ServerConfig;
 pub use error::ApiError;
@@ -50,15 +52,26 @@ pub struct AppState {
 }
 
 struct Inner {
-    store: Arc<Store>,
+    registry: Arc<TenantStore>,
     cfg: ServerConfig,
     metrics: Arc<Metrics>,
     started: Instant,
+    allowed_tenants: Option<Vec<TenantId>>,
+}
+
+/// Who is calling, and on which tenant.
+#[derive(Debug, Clone)]
+pub struct Caller {
+    /// Tenant the request is scoped to.
+    pub tenant: TenantId,
+    /// True when the credential itself pins the tenant (a per-tenant token),
+    /// in which case cross-tenant administration is not allowed.
+    pub scoped: bool,
 }
 
 impl AppState {
-    pub fn store(&self) -> &Arc<Store> {
-        &self.inner.store
+    pub fn registry(&self) -> &Arc<TenantStore> {
+        &self.inner.registry
     }
 
     pub fn config(&self) -> &ServerConfig {
@@ -73,41 +86,141 @@ impl AppState {
         self.inner.started.elapsed()
     }
 
-    /// Check the bearer token, if one is configured.
-    fn authorize(&self, headers: &axum::http::HeaderMap) -> Result<(), ApiError> {
-        let Some(expected) = &self.inner.cfg.auth_token else {
-            return Ok(());
-        };
-        let header = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        let token = header.strip_prefix("Bearer ").unwrap_or_default();
-        // Constant-time comparison: the token is a shared secret.
-        let ok = token.len() == expected.len()
-            && token
-                .bytes()
-                .zip(expected.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0;
-        if ok {
-            Ok(())
+    /// Authenticate a request and resolve the tenant it may touch.
+    ///
+    /// * No authentication configured: open access, tenant from the header.
+    /// * Global bearer token: any tenant, chosen by the header.
+    /// * Per-tenant token: the token pins the tenant and a conflicting header
+    ///   is rejected, so a tenant can never read another one.
+    pub fn authorize(&self, headers: &HeaderMap) -> Result<Caller, ApiError> {
+        let cfg = &self.inner.cfg;
+        let token = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default()
+            .trim();
+
+        let mut bound: Option<TenantId> = None;
+        if cfg.auth_token.is_none() && cfg.tenant_tokens.is_empty() {
+            // Open server.
         } else {
-            Err(ApiError::unauthorized())
+            for (candidate, tenant) in &cfg.tenant_tokens {
+                if constant_time_eq(token, candidate) {
+                    bound =
+                        Some(TenantId::parse(tenant).map_err(|err| {
+                            ApiError::internal(format!("bad tenant token: {err}"))
+                        })?);
+                }
+            }
+            let global = cfg
+                .auth_token
+                .as_deref()
+                .is_some_and(|expected| constant_time_eq(token, expected));
+            if bound.is_none() && !global {
+                return Err(ApiError::unauthorized());
+            }
         }
+
+        // An explicitly empty header is a malformed request, not "use the
+        // default tenant": silently writing into `default` is exactly the kind
+        // of cross-tenant surprise this feature exists to prevent.
+        let requested = match headers
+            .get(cfg.tenant_header.as_str())
+            .or_else(|| headers.get("x-tenant-id"))
+        {
+            Some(value) => {
+                let value = value.to_str().map_err(|_| {
+                    ApiError::bad_request(format!("`{}` must be ASCII", cfg.tenant_header))
+                })?;
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(ApiError::bad_request(format!(
+                        "`{}` is present but empty",
+                        cfg.tenant_header
+                    )));
+                }
+                Some(value.to_string())
+            }
+            None => None,
+        };
+
+        let tenant = match (&bound, requested) {
+            (Some(bound), Some(requested)) => {
+                let requested = TenantId::parse(&requested)?;
+                if &requested != bound {
+                    return Err(ApiError::forbidden(format!(
+                        "this token is scoped to tenant `{bound}`"
+                    )));
+                }
+                bound.clone()
+            }
+            (Some(bound), None) => bound.clone(),
+            (None, Some(requested)) => TenantId::parse(&requested)?,
+            (None, None) => TenantId::default_tenant(),
+        };
+
+        if let Some(allowed) = &self.inner.allowed_tenants
+            && !allowed.contains(&tenant)
+        {
+            return Err(ApiError::forbidden(format!(
+                "tenant `{tenant}` is not allowed on this server"
+            )));
+        }
+
+        Ok(Caller {
+            tenant,
+            scoped: bound.is_some(),
+        })
+    }
+
+    /// Store of a tenant that must already exist (read path).
+    pub fn tenant_store(&self, tenant: &TenantId) -> Result<Arc<Store>, ApiError> {
+        self.inner.registry.tenant(tenant).ok_or_else(|| {
+            ApiError::not_found(format!(
+                "tenant `{tenant}` has no data; `GET /api/v1/tenants` lists the known ones"
+            ))
+        })
+    }
+
+    /// Store of a tenant, creating it when needed (write path).
+    pub fn writable_tenant(&self, tenant: &TenantId) -> Result<Arc<Store>, ApiError> {
+        if self.inner.cfg.read_only {
+            return Err(ApiError::forbidden("server is read-only"));
+        }
+        Ok(self.inner.registry.open_tenant(tenant)?)
     }
 }
 
 impl AppState {
-    /// Persist several reports in one blocking file-system task.
+    /// Persist several reports of one tenant in a single blocking task.
     pub async fn ingest_many(
         &self,
+        tenant: &TenantId,
         reports: Vec<Report>,
     ) -> Result<Vec<Arc<SegmentMeta>>, ApiError> {
         if self.inner.cfg.read_only {
             return Err(ApiError::forbidden("server is read-only"));
         }
-        let store = self.inner.store.clone();
+        let store = self.writable_tenant(tenant)?;
+        let limits = self.inner.registry.limits(tenant);
+
+        // Enforce the per-tenant series limit before writing anything, so a
+        // rejected batch leaves no partial state behind.
+        if let Some(max_series) = limits.max_series {
+            let current = store.series_count();
+            let fresh = distinct_new_series(&store, &reports);
+            if current.saturating_add(fresh) > max_series {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "tenant `{tenant}` is at its series limit ({max_series}); \
+                         raise `tenant_limits.{tenant}.max_series` to accept more"
+                    ),
+                ));
+            }
+        }
+
         let metrics = self.inner.metrics.clone();
         let samples: u64 = reports.iter().map(|r| r.stacks.len() as u64).sum();
         let result = tokio::task::spawn_blocking(move || {
@@ -154,6 +267,48 @@ impl AppState {
     }
 }
 
+/// Number of reports that would introduce a series the store has never seen.
+fn distinct_new_series(store: &Store, reports: &[Report]) -> usize {
+    let mut seen: Vec<(
+        &str,
+        &lidlesseye_core::ProfileType,
+        BTreeMap<String, String>,
+    )> = Vec::new();
+    let mut fresh = 0usize;
+    for report in reports {
+        if store.contains_series(report) {
+            continue;
+        }
+        let key = (
+            report.service_name.as_str(),
+            &report.profile_type,
+            report.all_labels(),
+        );
+        if seen
+            .iter()
+            .any(|existing| existing.0 == key.0 && existing.1 == key.1 && existing.2 == key.2)
+        {
+            continue;
+        }
+        fresh += 1;
+        seen.push((key.0, key.1, key.2));
+    }
+    fresh
+}
+
+/// Compare two secrets without leaking their length or content through timing.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let mut diff = (a.len() ^ b.len()) as u64;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as u64;
+    }
+    diff == 0
+}
+
 /// A running (or ready to run) LidlessEye HTTP server.
 pub struct LidlessEye {
     state: AppState,
@@ -168,33 +323,30 @@ impl LidlessEye {
             retention_ns: cfg.retention.map(|d| d.as_nanos() as u64),
             max_disk_bytes: cfg.max_disk_bytes,
         };
-        let store = Store::open(store_cfg).map_err(|err| format!("failed to open store: {err}"))?;
+        let registry = TenantStore::open_with_limits(
+            &cfg.data_dir,
+            store_cfg,
+            cfg.parsed_tenant_limits(),
+            cfg.max_tenants,
+        )
+        .map_err(|err| format!("failed to open tenant registry: {err}"))?;
         let listener = TcpListener::bind(cfg.listen)
             .await
             .map_err(|err| format!("failed to bind {}: {err}", cfg.listen))?;
-        let stats = store.stats();
+        let stats = registry.total_stats();
         info!(
             addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             data_dir = %cfg.data_dir.display(),
+            tenants = registry.tenant_ids().len(),
             segments = stats.segment_count,
             bytes = stats.total_bytes,
             "store opened"
         );
-        Ok(LidlessEye {
-            state: AppState {
-                inner: Arc::new(Inner {
-                    store: Arc::new(store),
-                    cfg,
-                    metrics: Arc::new(Metrics::default()),
-                    started: Instant::now(),
-                }),
-            },
-            listener,
-        })
+        Ok(Self::from_registry_inner(Arc::new(registry), cfg, listener))
     }
 
-    /// Build a server around an existing store (used for tests and embedding).
-    pub fn from_store(store: Arc<Store>, cfg: ServerConfig) -> Result<Self, String> {
+    /// Build a server around an existing tenant registry (tests, embedding).
+    pub fn from_registry(registry: Arc<TenantStore>, cfg: ServerConfig) -> Result<Self, String> {
         let listener = std::net::TcpListener::bind(cfg.listen)
             .map_err(|err| format!("failed to bind {}: {err}", cfg.listen))?;
         listener
@@ -202,17 +354,27 @@ impl LidlessEye {
             .map_err(|err| format!("failed to configure listener: {err}"))?;
         let listener = TcpListener::from_std(listener)
             .map_err(|err| format!("failed to register listener: {err}"))?;
-        Ok(LidlessEye {
+        Ok(Self::from_registry_inner(registry, cfg, listener))
+    }
+
+    fn from_registry_inner(
+        registry: Arc<TenantStore>,
+        cfg: ServerConfig,
+        listener: TcpListener,
+    ) -> Self {
+        let allowed_tenants = cfg.parsed_allowed_tenants();
+        LidlessEye {
             state: AppState {
                 inner: Arc::new(Inner {
-                    store,
+                    registry,
                     cfg,
                     metrics: Arc::new(Metrics::default()),
                     started: Instant::now(),
+                    allowed_tenants,
                 }),
             },
             listener,
-        })
+        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -225,8 +387,17 @@ impl LidlessEye {
         self.state.clone()
     }
 
+    /// Registry of every tenant.
+    pub fn registry(&self) -> Arc<TenantStore> {
+        self.state.inner.registry.clone()
+    }
+
+    /// Store of the default tenant, for callers that do not care about
+    /// multi-tenancy.
     pub fn store(&self) -> Arc<Store> {
-        self.state.inner.store.clone()
+        self.state
+            .writable_tenant(&TenantId::default_tenant())
+            .expect("default tenant store")
     }
 
     /// The HTTP router, without a listener. Useful for tests and for mounting
@@ -235,22 +406,31 @@ impl LidlessEye {
         build_router(self.state.clone())
     }
 
-    /// Persist a report directly, bypassing HTTP. This is what embedded users
-    /// call after their own profiler produced a batch of samples.
+    /// Persist a report for the default tenant, bypassing HTTP.
     pub async fn ingest(&self, report: Report) -> Result<Arc<SegmentMeta>, ApiError> {
-        self.ingest_many(vec![report])
+        self.ingest_for(&TenantId::default_tenant(), report).await
+    }
+
+    /// Persist a report for one tenant, bypassing HTTP.
+    pub async fn ingest_for(
+        &self,
+        tenant: &TenantId,
+        report: Report,
+    ) -> Result<Arc<SegmentMeta>, ApiError> {
+        self.ingest_many(tenant, vec![report])
             .await?
             .into_iter()
             .next()
             .ok_or_else(|| ApiError::bad_request("no report supplied"))
     }
 
-    /// Persist several reports in one blocking file-system task.
+    /// Persist several reports for one tenant.
     pub async fn ingest_many(
         &self,
+        tenant: &TenantId,
         reports: Vec<Report>,
     ) -> Result<Vec<Arc<SegmentMeta>>, ApiError> {
-        self.state.ingest_many(reports).await
+        self.state.ingest_many(tenant, reports).await
     }
 
     /// Run until the process is terminated.
@@ -265,7 +445,7 @@ impl LidlessEye {
     {
         let app = self.router();
         let addr = self.local_addr();
-        let store = self.store();
+        let registry = self.state.inner.registry.clone();
         let cfg = self.state.inner.cfg.clone();
         let metrics = self.state.inner.metrics.clone();
 
@@ -274,19 +454,22 @@ impl LidlessEye {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                let store = store.clone();
+                let registry = registry.clone();
                 let metrics = metrics.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    match store.prune(lidlesseye_core::now_ns()) {
-                        Ok(stats) if stats.removed_segments > 0 => {
-                            metrics
-                                .pruned_segments
-                                .fetch_add(stats.removed_segments as u64, Ordering::Relaxed);
-                            info!(
-                                segments = stats.removed_segments,
-                                bytes = stats.removed_bytes,
-                                "pruned old segments"
-                            );
+                    match registry.prune(lidlesseye_core::now_ns()) {
+                        Ok(per_tenant) if !per_tenant.is_empty() => {
+                            for (tenant, stats) in per_tenant {
+                                metrics
+                                    .pruned_segments
+                                    .fetch_add(stats.removed_segments as u64, Ordering::Relaxed);
+                                info!(
+                                    tenant = %tenant,
+                                    segments = stats.removed_segments,
+                                    bytes = stats.removed_bytes,
+                                    "pruned old segments"
+                                );
+                            }
                         }
                         Ok(_) => {}
                         Err(err) => warn!(error = %err, "prune failed"),
@@ -357,10 +540,14 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/health", get(api::health))
         .route("/api/v1/ready", get(api::ready))
         .route("/api/v1/stats", get(api::stats))
+        .route("/api/v1/tenants", get(api::tenants))
         .route("/api/v1/series", get(api::series))
         .route("/api/v1/profile_types", get(api::profile_types))
+        .route("/api/v1/label-names", get(api::label_names))
+        .route("/api/v1/labels", get(api::label_names))
         .route("/api/v1/label/{name}/values", get(api::label_values))
         .route("/api/v1/flamegraph", get(api::flamegraph))
+        .route("/api/v1/diff", get(api::diff))
         .route("/api/v1/top", get(api::top))
         .route("/api/v1/timeseries", get(api::timeseries))
         .route("/api/v1/version", get(api::version))
@@ -389,6 +576,7 @@ fn build_router(state: AppState) -> Router {
         router = router.layer(
             CorsLayer::new()
                 .allow_origin(origin)
+                .allow_headers(tower_http::cors::AllowHeaders::mirror_request())
                 .allow_methods([axum::http::Method::GET, axum::http::Method::POST]),
         );
     }
@@ -405,9 +593,11 @@ pub struct HealthResponse {
 #[derive(Debug, Serialize)]
 pub struct StatsResponse {
     pub version: &'static str,
+    pub tenant: String,
     pub uptime_seconds: u64,
     pub store: StoreStats,
     pub series: usize,
+    pub tenants: usize,
     pub ingest_reports: u64,
     pub ingest_samples: u64,
     pub queries: u64,

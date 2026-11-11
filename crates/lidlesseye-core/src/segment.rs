@@ -260,7 +260,23 @@ impl StringTable {
 
 /// Turn a service name into something safe for a directory name.
 pub fn service_slug(service_name: &str) -> String {
-    let mut slug: String = service_name
+    path_slug(service_name, 96)
+}
+
+/// Turn a profile type into something safe for a directory name.
+pub fn type_slug(profile_type: &str) -> String {
+    path_slug(profile_type, 48)
+}
+
+/// Sanitize an arbitrary string into a single path component.
+///
+/// Everything outside `[A-Za-z0-9._-]` becomes `_`, the result is truncated
+/// (on a boundary that is always valid, since the mapping is ASCII) and a
+/// slug that would still be a path traversal — `.`, `..`, or empty — is
+/// replaced. Both the service name and the profile type end up in the
+/// directory layout, so both must go through this.
+fn path_slug(input: &str, max_len: usize) -> String {
+    let mut slug: String = input
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
@@ -270,9 +286,9 @@ pub fn service_slug(service_name: &str) -> String {
             }
         })
         .collect();
-    slug.truncate(96);
-    if slug.is_empty() {
-        slug.push_str("unnamed");
+    slug.truncate(max_len);
+    if slug.is_empty() || slug == "." || slug == ".." {
+        return "unnamed".to_string();
     }
     slug
 }

@@ -596,11 +596,135 @@ td .sub {
   }
 }
 
+/* ---- label explorer --------------------------------------------------- */
+
+.labels-layout {
+  display: grid;
+  grid-template-columns: minmax(140px, 200px) 1fr;
+  gap: 0;
+  min-height: 220px;
+}
+
+.label-names {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  border-right: 1px solid var(--border);
+  overflow: auto;
+  max-height: 60vh;
+}
+
+.label-names button {
+  height: auto;
+  padding: 5px 8px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.label-names button:hover {
+  background: var(--bg-hover);
+  color: inherit;
+}
+
+.label-names button.active {
+  background: var(--bg-raised);
+  border-color: var(--border-strong);
+  color: var(--accent);
+}
+
+.label-values {
+  overflow: auto;
+  max-height: 60vh;
+  padding: 0 4px 4px;
+}
+
+.label-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.label-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-raised);
+  text-align: left;
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-faint);
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.label-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.label-table tr:hover td {
+  background: var(--bg-hover);
+}
+
+.label-table td.mono {
+  font-family: var(--mono);
+  word-break: break-all;
+}
+
+.label-table button {
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+/* Diff legend swatches: red is "more in comparison", green is "less". */
+.legend-swatch.diff-up {
+  background: hsl(358 60% 34%);
+}
+
+.legend-swatch.diff-down {
+  background: hsl(148 60% 34%);
+}
+
+/* Tenant / group-by / baseline selects sit inside the filter bar. */
+.filterbar .field select,
+.filterbar #tenant,
+.filterbar #group-by,
+.filterbar #baseline {
+  max-width: 190px;
+}
+
+.filterbar .field[hidden] {
+  display: none;
+}
+
 @media (max-width: 820px) {
   .tabs {
     display: none;
   }
   .filterbar {
     flex-wrap: wrap;
+  }
+  .labels-layout {
+    grid-template-columns: 1fr;
+  }
+  .label-names {
+    flex-direction: row;
+    flex-wrap: wrap;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    max-height: none;
   }
 }

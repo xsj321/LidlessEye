@@ -105,6 +105,12 @@ pub struct Builder {
     read_only: bool,
     cors: Option<String>,
 
+    tenant: String,
+    tenant_tokens: Vec<(String, String)>,
+    allowed_tenants: Option<Vec<String>>,
+    tenant_limits: BTreeMap<String, lidlesseye_core::TenantLimits>,
+    max_tenants: usize,
+
     agent: bool,
     service_name: Option<String>,
     labels: BTreeMap<String, String>,
@@ -124,6 +130,11 @@ impl Default for Builder {
             auth_token: None,
             read_only: false,
             cors: None,
+            tenant: lidlesseye_core::TenantId::DEFAULT.to_string(),
+            tenant_tokens: Vec::new(),
+            allowed_tenants: None,
+            tenant_limits: BTreeMap::new(),
+            max_tenants: 1000,
             agent: false,
             service_name: None,
             labels: BTreeMap::new(),
@@ -181,6 +192,41 @@ impl Builder {
         self
     }
 
+    /// Tenant the built-in collector writes to, and the default tenant of the
+    /// embedded ingestion API. Defaults to `default`.
+    pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = tenant.into();
+        self
+    }
+
+    /// Bind a bearer token to a tenant. Implies authentication is required.
+    pub fn tenant_token(mut self, token: impl Into<String>, tenant: impl Into<String>) -> Self {
+        self.tenant_tokens.push((token.into(), tenant.into()));
+        self
+    }
+
+    /// Restrict the server to these tenants.
+    pub fn allowed_tenants(mut self, tenants: Vec<String>) -> Self {
+        self.allowed_tenants = Some(tenants);
+        self
+    }
+
+    /// Per-tenant storage limits.
+    pub fn tenant_limits(
+        mut self,
+        tenant: impl Into<String>,
+        limits: lidlesseye_core::TenantLimits,
+    ) -> Self {
+        self.tenant_limits.insert(tenant.into(), limits);
+        self
+    }
+
+    /// Maximum number of tenants this server will host.
+    pub fn max_tenants(mut self, max: usize) -> Self {
+        self.max_tenants = max;
+        self
+    }
+
     /// Start the built-in eBPF collector. Requires root and Linux.
     pub fn agent(mut self, enabled: bool) -> Self {
         self.agent = enabled;
@@ -225,12 +271,22 @@ impl Builder {
         let listen: SocketAddr = self.listen.parse().map_err(|err| {
             Error::Config(format!("invalid listen address `{}`: {err}", self.listen))
         })?;
+        let mut tenant_tokens = BTreeMap::new();
+        for (token, tenant) in &self.tenant_tokens {
+            lidlesseye_core::TenantId::parse(tenant)
+                .map_err(|err| Error::Config(err.to_string()))?;
+            tenant_tokens.insert(token.clone(), tenant.clone());
+        }
         Ok(ServerConfig {
             listen,
             data_dir: self.data_dir.clone(),
             retention: self.retention,
             max_disk_bytes: self.max_disk_bytes,
             auth_token: self.auth_token.clone(),
+            tenant_tokens,
+            allowed_tenants: self.allowed_tenants.clone(),
+            tenant_limits: self.tenant_limits.clone(),
+            max_tenants: self.max_tenants,
             read_only: self.read_only,
             cors_allow_origin: self.cors.clone(),
             ..Default::default()
@@ -240,6 +296,8 @@ impl Builder {
     /// Bind the HTTP server and, when requested, start the collector.
     pub async fn build(self) -> Result<LidlessEye> {
         let cfg = self.server_config()?;
+        let tenant = lidlesseye_core::TenantId::parse(&self.tenant)
+            .map_err(|err| Error::Config(err.to_string()))?;
         let http = lidlesseye_server::LidlessEye::bind(cfg)
             .await
             .map_err(Error::Server)?;
@@ -259,13 +317,15 @@ impl Builder {
                 collector_cfg.enrich_kubernetes_labels = true;
             }
             let state = http.state();
+            let tenant = tenant.clone();
             // The collector invokes the callback on its own thread, which has
             // no runtime context: capture the handle before spawning it.
             let runtime = tokio::runtime::Handle::current();
             let handle = lidlesseye_ebpf::start(collector_cfg, move |report: Report| {
                 let state = state.clone();
+                let tenant = tenant.clone();
                 runtime.spawn(async move {
-                    if let Err(err) = state.ingest_many(vec![report]).await {
+                    if let Err(err) = state.ingest_many(&tenant, vec![report]).await {
                         tracing::warn!(error = %err, "failed to store collected report");
                     }
                 });
@@ -280,6 +340,7 @@ impl Builder {
             http,
             collector,
             data_dir: self.data_dir,
+            tenant,
         })
     }
 }
@@ -290,6 +351,7 @@ pub struct LidlessEye {
     http: lidlesseye_server::LidlessEye,
     collector: Option<lidlesseye_ebpf::CollectorHandle>,
     data_dir: PathBuf,
+    tenant: lidlesseye_core::TenantId,
 }
 
 impl LidlessEye {
@@ -306,11 +368,13 @@ impl LidlessEye {
             return Err(Error::Collector("collector already running".into()));
         }
         let state = self.http.state();
+        let tenant = self.tenant.clone();
         let runtime = tokio::runtime::Handle::current();
         let handle = lidlesseye_ebpf::start(config, move |report: Report| {
             let state = state.clone();
+            let tenant = tenant.clone();
             runtime.spawn(async move {
-                if let Err(err) = state.ingest_many(vec![report]).await {
+                if let Err(err) = state.ingest_many(&tenant, vec![report]).await {
                     tracing::warn!(error = %err, "failed to store collected report");
                 }
             });
@@ -338,6 +402,11 @@ impl LidlessEye {
         self.http.store()
     }
 
+    /// Store of the tenant this instance was built for.
+    pub fn tenant(&self) -> &lidlesseye_core::TenantId {
+        &self.tenant
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -349,7 +418,7 @@ impl LidlessEye {
     /// Ingest a report directly, without an HTTP round trip.
     pub async fn ingest(&self, report: Report) -> Result<Arc<SegmentMeta>> {
         self.http
-            .ingest(report)
+            .ingest_for(&self.tenant, report)
             .await
             .map_err(|err| Error::Server(err.to_string()))
     }
@@ -357,7 +426,7 @@ impl LidlessEye {
     /// Ingest a batch of reports.
     pub async fn ingest_many(&self, reports: Vec<Report>) -> Result<Vec<Arc<SegmentMeta>>> {
         self.http
-            .ingest_many(reports)
+            .ingest_many(&self.tenant, reports)
             .await
             .map_err(|err| Error::Server(err.to_string()))
     }

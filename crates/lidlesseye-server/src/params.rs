@@ -63,6 +63,30 @@ impl Params {
             .unwrap_or_else(ProfileType::cpu)
     }
 
+    /// Optional label to split a flamegraph or time series on.
+    pub fn group_by(&self) -> Option<String> {
+        self.get("group_by")
+            .or_else(|| self.get("groupBy"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Extra labels supplied as repeated `?label=key=value` parameters.
+    pub fn labels(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for raw in self.get_all("label") {
+            let Some((key, value)) = raw.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.is_empty() || key == lidlesseye_core::SERVICE_NAME_LABEL {
+                continue;
+            }
+            out.insert(key.to_string(), value.trim().to_string());
+        }
+        out
+    }
+
     /// Accepts `selector={service_name="x"}` as well as `service_name=x` and
     /// repeated `match[]` parameters.
     pub fn selector(&self) -> Result<Selector, ApiError> {

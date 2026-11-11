@@ -26,6 +26,15 @@ pub enum Error {
     #[error("selector parse error: {0}")]
     Selector(String),
 
+    #[error("invalid tenant id: {0}")]
+    InvalidTenant(String),
+
+    #[error("tenant {tenant} is over its limit: {reason}")]
+    LimitExceeded { tenant: String, reason: String },
+
+    #[error("malformed profile payload: {0}")]
+    Malformed(String),
+
     #[error("time range is invalid: from={from} until={until}")]
     InvalidRange { from: u64, until: u64 },
 

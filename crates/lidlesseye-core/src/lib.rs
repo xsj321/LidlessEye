@@ -21,22 +21,29 @@
 //! ```
 
 pub mod error;
+pub mod folded;
 pub mod model;
+pub mod pprof;
 pub mod query;
 pub mod segment;
 pub mod selector;
 pub mod store;
+pub mod tenant;
 pub mod time;
 
 pub use error::{Error, Result};
+pub use folded::{FoldedOptions, decode as decode_folded};
 pub use model::{
-    Frame, FrameRef, ProfileType, Report, ReportBuilder, SERVICE_NAME_LABEL, StackSample, Unit,
+    Frame, FrameRef, MAX_LABELS, ProfileType, Report, ReportBuilder, SERVICE_NAME_LABEL,
+    StackSample, Unit,
 };
+pub use pprof::{PprofOptions, decode as decode_pprof};
 pub use query::{
-    Flamegraph, QueryOptions, SeriesPoints, TimeSeries, TimeSeriesOptions, TopEntry, TopResult,
-    TreeNode, flamegraph, timeseries, top,
+    DiffFlamegraph, DiffOptions, Flamegraph, QueryOptions, SeriesPoints, TimeSeries,
+    TimeSeriesOptions, TopEntry, TopResult, TreeNode, diff, flamegraph, timeseries, top,
 };
 pub use segment::{Segment, SegmentMeta};
 pub use selector::{MatchOp, Matcher, Selector, glob_match};
 pub use store::{PruneStats, SeriesInfo, Store, StoreConfig, StoreStats};
+pub use tenant::{MAX_TENANT_LEN, TenantId, TenantInfo, TenantLimits, TenantStore};
 pub use time::{now_ns, parse_duration_ns};

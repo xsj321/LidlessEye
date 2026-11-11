@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 crc32fast = { workspace = true }
+flate2 = { workspace = true }
 memmap2 = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }

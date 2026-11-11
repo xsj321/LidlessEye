@@ -882,6 +882,7 @@ name = "lidlesseye-core"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "flate2",
  "memmap2",
  "parking_lot",
  "serde",

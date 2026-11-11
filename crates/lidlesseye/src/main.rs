@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
-use lidlesseye::core::{ProfileType, QueryOptions, Selector, Store, StoreConfig};
+use lidlesseye::core::{ProfileType, QueryOptions, Selector, StoreConfig};
 use lidlesseye::{Builder, PublisherConfig};
 
 #[derive(Debug, Parser)]
@@ -55,6 +55,19 @@ struct ServeArgs {
     max_disk: String,
     #[arg(long, env = "LIDLESSEYE_AUTH_TOKEN")]
     auth_token: Option<String>,
+    /// Bind a bearer token to a tenant: `--tenant-token <token>=<tenant>`
+    /// (repeatable). Implies authentication is required.
+    #[arg(long = "tenant-token", value_parser = parse_tenant_token)]
+    tenant_tokens: Vec<(String, String)>,
+    /// Only allow these tenants (repeatable). Default: any valid id.
+    #[arg(long = "allowed-tenant")]
+    allowed_tenants: Vec<String>,
+    /// Maximum number of tenants this server will host.
+    #[arg(long, default_value_t = 1000)]
+    max_tenants: usize,
+    /// Tenant the built-in agent writes to.
+    #[arg(long, default_value = "default")]
+    tenant: String,
     /// CORS origin, `*` for any.
     #[arg(long)]
     cors: Option<String>,
@@ -89,6 +102,9 @@ struct CollectArgs {
     server: String,
     #[arg(long, env = "LIDLESSEYE_AUTH_TOKEN")]
     auth_token: Option<String>,
+    /// Tenant to write to on the server.
+    #[arg(long, default_value = "default")]
+    tenant: String,
     #[arg(long)]
     service_name: Option<String>,
     #[arg(long = "label", value_parser = parse_label)]
@@ -116,6 +132,18 @@ struct IngestArgs {
     server: Option<String>,
     #[arg(long, env = "LIDLESSEYE_AUTH_TOKEN")]
     auth_token: Option<String>,
+    /// Tenant to import into.
+    #[arg(long, default_value = "default")]
+    tenant: String,
+    /// Input format: `json`, `pprof` or `folded`.
+    #[arg(long, default_value = "json")]
+    format: String,
+    /// Service name, required by `folded` and used for `pprof` without one.
+    #[arg(long)]
+    service_name: Option<String>,
+    /// Profile type override (`cpu`, `wall`, `alloc_space`, ...).
+    #[arg(long)]
+    profile_type: Option<String>,
     /// Report files; reads stdin when empty.
     files: Vec<PathBuf>,
 }
@@ -124,6 +152,9 @@ struct IngestArgs {
 struct QueryArgs {
     #[arg(long, env = "LIDLESSEYE_DATA_DIR", default_value = "./lidlesseye-data")]
     data_dir: PathBuf,
+    /// Tenant to inspect.
+    #[arg(long, default_value = "default")]
+    tenant: String,
     #[arg(long, default_value = "cpu")]
     profile_type: String,
     /// Start of the range: `1h`, `30m`, `7d` (relative) or RFC3339.
@@ -146,12 +177,18 @@ struct QueryArgs {
     /// Hide nodes below this percentage of total.
     #[arg(long, default_value_t = 1.0)]
     min_percent: f64,
+    /// Split the profile on this label (`service_name`, `pod`, ...).
+    #[arg(long)]
+    group_by: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct FsckArgs {
     #[arg(long, env = "LIDLESSEYE_DATA_DIR", default_value = "./lidlesseye-data")]
     data_dir: PathBuf,
+    /// Only check this tenant (default: every tenant).
+    #[arg(long)]
+    tenant: Option<String>,
     /// Delete segments that fail verification.
     #[arg(long)]
     fix: bool,
@@ -216,7 +253,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .frequency_hz(args.frequency)
         .flush_interval(parse_duration(&args.flush)?)
         .collect_cpu(!args.no_cpu)
-        .collect_off_cpu(!args.no_offcpu);
+        .collect_off_cpu(!args.no_offcpu)
+        .tenant(args.tenant)
+        .max_tenants(args.max_tenants);
+    for (token, tenant) in args.tenant_tokens {
+        builder = builder.tenant_token(token, tenant);
+    }
+    if !args.allowed_tenants.is_empty() {
+        builder = builder.allowed_tenants(args.allowed_tenants);
+    }
     if let Some(name) = args.service_name {
         builder = builder.service_name(name);
     }
@@ -243,8 +288,13 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
     }
     let mut cfg = PublisherConfig::new(&args.server);
     cfg.auth_token = args.auth_token;
+    cfg.tenant = Some(args.tenant.clone());
     let (publisher, uploader) = lidlesseye::publisher::start(cfg)?;
-    println!("pushing profiles to {}", publisher.endpoint());
+    println!(
+        "pushing profiles to {} as tenant `{}`",
+        publisher.endpoint(),
+        args.tenant
+    );
 
     let labels: BTreeMap<String, String> = args.labels.into_iter().collect();
     let collector_cfg = lidlesseye::ebpf::CollectorConfig {
@@ -283,30 +333,74 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
 
 async fn ingest(args: IngestArgs) -> anyhow::Result<()> {
     lidlesseye::init_tracing("lidlesseye=warn");
-    let mut documents: Vec<String> = Vec::new();
+    let tenant = lidlesseye::core::TenantId::parse(&args.tenant)?;
+
+    // Read the payloads once; they are either JSON or a binary profile format.
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
     if args.files.is_empty() {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         std::io::stdin()
-            .read_to_string(&mut buf)
+            .read_to_end(&mut buf)
             .context("failed to read stdin")?;
-        documents.push(buf);
+        blobs.push(buf);
     } else {
         for file in &args.files {
-            documents.push(
-                std::fs::read_to_string(file)
+            blobs.push(
+                std::fs::read(file)
                     .with_context(|| format!("failed to read {}", file.display()))?,
             );
         }
     }
 
-    let reports = parse_reports(&documents)?;
+    let now = lidlesseye::core::now_ns();
+    let format = args.format.to_ascii_lowercase();
+    let mut reports = Vec::new();
+    for blob in &blobs {
+        match format.as_str() {
+            "json" => {
+                let document =
+                    std::str::from_utf8(blob).context("JSON input is not valid UTF-8")?;
+                reports.extend(parse_reports(&[document.to_string()])?);
+            }
+            "pprof" | "protobuf" | "proto" => {
+                let opts = lidlesseye::core::PprofOptions {
+                    service_name: args.service_name.clone(),
+                    profile_type: args.profile_type.clone(),
+                    labels: BTreeMap::new(),
+                    start_ns: None,
+                    end_ns: None,
+                };
+                reports.extend(lidlesseye::core::decode_pprof(blob, &opts)?);
+            }
+            "folded" | "collapsed" => {
+                let service_name = args.service_name.clone().ok_or_else(|| {
+                    anyhow::anyhow!("--service-name is required for folded input")
+                })?;
+                let text = std::str::from_utf8(blob).context("folded input is not valid UTF-8")?;
+                let opts = lidlesseye::core::FoldedOptions {
+                    service_name,
+                    profile_type: ProfileType::new(
+                        args.profile_type
+                            .clone()
+                            .unwrap_or_else(|| "cpu".to_string()),
+                    ),
+                    start_ns: now.saturating_sub(10_000_000_000),
+                    end_ns: now,
+                    labels: BTreeMap::new(),
+                };
+                reports.push(lidlesseye::core::decode_folded(text, &opts)?);
+            }
+            other => bail!("unsupported --format `{other}`; expected json, pprof or folded"),
+        }
+    }
     if reports.is_empty() {
         bail!("no reports found in the input");
     }
 
     if let Some(dir) = args.data_dir {
-        let store =
-            Store::open(StoreConfig::new(&dir)).context("failed to open the data directory")?;
+        let registry = lidlesseye::core::TenantStore::open(&dir, StoreConfig::new(&dir))
+            .context("failed to open the data directory")?;
+        let store = registry.open_tenant(&tenant)?;
         let mut count = 0;
         for report in &reports {
             let meta = store.append(report)?;
@@ -318,7 +412,10 @@ async fn ingest(args: IngestArgs) -> anyhow::Result<()> {
             );
             count += 1;
         }
-        println!("imported {count} reports into {}", dir.display());
+        println!(
+            "imported {count} reports into {} as tenant `{tenant}`",
+            dir.display()
+        );
         return Ok(());
     }
 
@@ -327,18 +424,27 @@ async fn ingest(args: IngestArgs) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("either --data-dir or --server is required"))?;
     let mut cfg = PublisherConfig::new(server);
     cfg.auth_token = args.auth_token;
+    cfg.tenant = Some(tenant.to_string());
     let (publisher, uploader) = lidlesseye::publisher::start(cfg)?;
     for report in reports {
         publisher.send_now(report).await?;
     }
     uploader.abort();
-    println!("uploaded to {}", publisher.endpoint());
+    println!("uploaded to {} as tenant `{tenant}`", publisher.endpoint());
     Ok(())
 }
 
 fn query(args: QueryArgs) -> anyhow::Result<()> {
-    let store = Store::open(StoreConfig::new(&args.data_dir))
-        .context("failed to open the data directory")?;
+    let tenant = lidlesseye::core::TenantId::parse(&args.tenant)?;
+    let registry =
+        lidlesseye::core::TenantStore::open(&args.data_dir, StoreConfig::new(&args.data_dir))
+            .context("failed to open the data directory")?;
+    let store = registry.tenant(&tenant).ok_or_else(|| {
+        anyhow::anyhow!(
+            "tenant `{tenant}` has no data in {}",
+            args.data_dir.display()
+        )
+    })?;
     let now = lidlesseye::core::now_ns();
     let until = match &args.until {
         Some(value) => resolve_time(value, now)?,
@@ -362,7 +468,8 @@ fn query(args: QueryArgs) -> anyhow::Result<()> {
         from,
         until,
         selector.clone(),
-    );
+    )
+    .with_group_by(args.group_by.clone());
 
     if args.tree || !args.top {
         let flamegraph = lidlesseye::core::flamegraph(&store, &opts)?;
@@ -404,12 +511,21 @@ fn query(args: QueryArgs) -> anyhow::Result<()> {
 }
 
 fn fsck(args: FsckArgs) -> anyhow::Result<()> {
-    let store = Store::open(StoreConfig::new(&args.data_dir))
-        .context("failed to open the data directory")?;
-    let results = store.fsck();
+    let registry =
+        lidlesseye::core::TenantStore::open(&args.data_dir, StoreConfig::new(&args.data_dir))
+            .context("failed to open the data directory")?;
+    let only = match &args.tenant {
+        Some(raw) => Some(lidlesseye::core::TenantId::parse(raw)?),
+        None => None,
+    };
+    let results: Vec<_> = registry
+        .fsck()
+        .into_iter()
+        .filter(|(tenant, _, _)| only.as_ref().is_none_or(|want| want == tenant))
+        .collect();
     let mut failures = 0;
     let mut bytes = 0u64;
-    for (path, result) in &results {
+    for (tenant, path, result) in &results {
         match result {
             Ok(()) => {
                 if let Ok(meta) = std::fs::metadata(path) {
@@ -418,7 +534,7 @@ fn fsck(args: FsckArgs) -> anyhow::Result<()> {
             }
             Err(err) => {
                 failures += 1;
-                eprintln!("FAIL {}: {err}", path.display());
+                eprintln!("FAIL [{tenant}] {}: {err}", path.display());
                 if args.fix {
                     std::fs::remove_file(path)
                         .with_context(|| format!("failed to delete {}", path.display()))?;
@@ -536,6 +652,19 @@ fn parse_label(input: &str) -> Result<(String, String), String> {
         return Err("label key is empty".to_string());
     }
     Ok((key.trim().to_string(), value.trim().to_string()))
+}
+
+/// `--tenant-token <token>=<tenant>`; the tenant is validated here so a typo
+/// fails at startup rather than on the first request.
+fn parse_tenant_token(input: &str) -> Result<(String, String), String> {
+    let (token, tenant) = input
+        .split_once('=')
+        .ok_or_else(|| format!("expected token=tenant, got `{input}`"))?;
+    if token.trim().is_empty() {
+        return Err("token is empty".to_string());
+    }
+    lidlesseye::core::TenantId::parse(tenant).map_err(|err| err.to_string())?;
+    Ok((token.trim().to_string(), tenant.trim().to_string()))
 }
 
 fn parse_duration(input: &str) -> anyhow::Result<Duration> {

@@ -5,6 +5,7 @@
 // server's own error message.
 
 const TOKEN_KEY = "lidlesseye.token";
+const TENANT_KEY = "lidlesseye.tenant";
 
 export class ApiError extends Error {
   constructor(message, status) {
@@ -31,6 +32,24 @@ export function setToken(token) {
   }
 }
 
+/** Tenant the dashboard reads and writes. Empty means "server default". */
+export function getTenant() {
+  try {
+    return localStorage.getItem(TENANT_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function setTenant(tenant) {
+  try {
+    if (tenant) localStorage.setItem(TENANT_KEY, tenant);
+    else localStorage.removeItem(TENANT_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
 function buildQuery(params) {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params ?? {})) {
@@ -45,6 +64,8 @@ async function request(path, params, init) {
   const headers = new Headers(init?.headers);
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
+  const tenant = getTenant();
+  if (tenant) headers.set("X-Scope-OrgID", tenant);
 
   let response;
   try {
@@ -74,9 +95,11 @@ export const api = {
   health: () => request("/api/v1/health"),
   version: () => request("/api/v1/version"),
   stats: () => request("/api/v1/stats"),
+  tenants: () => request("/api/v1/tenants"),
 
   profileTypes: (params) => request("/api/v1/profile_types", params),
   series: (params) => request("/api/v1/series", params),
+  labelNames: (params) => request("/api/v1/label-names", params),
   labelValues: (name, params) =>
     request(`/api/v1/label/${encodeURIComponent(name)}/values`, params),
 
@@ -84,6 +107,7 @@ export const api = {
   // canvas is happy with that, and it keeps the response in the low megabytes.
   flamegraph: (params) =>
     request("/api/v1/flamegraph", { max_nodes: 50000, ...params }),
+  diff: (params) => request("/api/v1/diff", { max_nodes: 50000, ...params }),
   top: (params) => request("/api/v1/top", { limit: 100, ...params }),
   timeseries: (params) => request("/api/v1/timeseries", { buckets: 90, ...params }),
 };

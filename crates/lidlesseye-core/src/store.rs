@@ -47,7 +47,7 @@ impl StoreConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct StoreStats {
     pub segment_count: usize,
     pub total_bytes: u64,
@@ -175,7 +175,7 @@ impl Store {
         let dir = self
             .cfg
             .root
-            .join(report.profile_type.as_str())
+            .join(segment::type_slug(report.profile_type.as_str()))
             .join(segment::service_slug(&report.service_name));
         let meta = Arc::new(segment::write_segment(&dir, report)?);
 
@@ -293,6 +293,59 @@ impl Store {
         let mut out: Vec<(String, u64)> = map.into_iter().collect();
         out.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
+    }
+
+    /// Distinct label *names* seen in the window, sorted.
+    ///
+    /// `service_name` is a real label even though it lives in its own column,
+    /// and Pyroscope-compatible clients expect it in this list.
+    pub fn label_names(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+        selector: &crate::selector::Selector,
+    ) -> Vec<String> {
+        let index = self.index.read();
+        let mut set: std::collections::BTreeSet<String> = Default::default();
+        for meta in &index.segments {
+            if !meta.overlaps(from_ns, until_ns) {
+                continue;
+            }
+            if !selector.matches_meta(&meta.service_name, &meta.labels) {
+                continue;
+            }
+            set.insert(crate::model::SERVICE_NAME_LABEL.to_string());
+            for key in meta.labels.keys() {
+                set.insert(key.clone());
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Number of distinct series (service + profile type + label set).
+    pub fn series_count(&self) -> usize {
+        let index = self.index.read();
+        let mut set: std::collections::HashSet<(
+            &str,
+            &crate::model::ProfileType,
+            &BTreeMap<String, String>,
+        )> = Default::default();
+        for meta in &index.segments {
+            set.insert((&meta.service_name, &meta.profile_type, &meta.labels));
+        }
+        set.len()
+    }
+
+    /// Is this exact series already known? Used to let an existing series keep
+    /// writing once a tenant has hit its series limit.
+    pub fn contains_series(&self, report: &Report) -> bool {
+        let labels = report.all_labels();
+        let index = self.index.read();
+        index.segments.iter().any(|meta| {
+            meta.service_name == report.service_name
+                && meta.profile_type == report.profile_type
+                && meta.labels == labels
+        })
     }
 
     /// Drop segments older than the retention window and, if configured,
