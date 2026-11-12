@@ -290,6 +290,8 @@ out of the pod spec.
 - [Pyroscope compatibility](docs/compatibility.md) — what matches, what differs,
   and what is deliberately out of scope.
 
+All documents, with the audience for each: [docs/](docs/README.md).
+
 Repository layout:
 
 ```
