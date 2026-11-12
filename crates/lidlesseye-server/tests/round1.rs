@@ -663,17 +663,52 @@ async fn dashboard_assets_are_served() {
     let dir = tempfile::tempdir().unwrap();
     let app = router(dir.path()).await;
 
-    for path in ["/", "/js/app.js", "/styles.css"] {
-        let response = get_raw(&app, path).await;
-        assert_eq!(response.status, StatusCode::OK, "GET {path}");
-        assert!(!response.body.is_empty(), "GET {path} returned nothing");
+    let response = get_raw(&app, "/").await;
+    assert_eq!(response.status, StatusCode::OK, "GET /");
+    assert!(!response.body.is_empty(), "GET / returned nothing");
+    let index = response.text();
+
+    assert!(index.contains("id=\"main\""), "dashboard HTML changed");
+
+    // The shell is a static export, so the chunk names are content-hashed.
+    // Follow what the HTML actually references rather than hard-coding a name.
+    let script = index
+        .split("src=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|src| src.starts_with("/_next/static/") && src.ends_with(".js"))
+        .expect("dashboard HTML references no JS chunk");
+    let stylesheet = index
+        .split("href=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|href| href.starts_with("/_next/static/") && href.ends_with(".css"))
+        .expect("dashboard HTML references no stylesheet");
+
+    for path in [script, stylesheet, "/icon.svg"] {
+        let asset = get_raw(&app, path).await;
+        assert_eq!(asset.status, StatusCode::OK, "GET {path}");
+        assert!(!asset.body.is_empty(), "GET {path} returned nothing");
     }
 
-    let index = get_raw(&app, "/").await.text();
-    assert!(index.contains("id=\"main\""), "dashboard HTML changed");
-    assert!(
-        index.contains("/js/app.js"),
-        "dashboard lost its script tags"
+    // Hashed assets are served as immutable; the shell must not be.
+    let asset = get_raw(&app, script).await;
+    assert_eq!(
+        asset
+            .headers
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=31536000, immutable"),
+        "hashed chunk is not cacheable"
+    );
+    let shell = get_raw(&app, "/").await;
+    assert_eq!(
+        shell
+            .headers
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache"),
+        "the shell must be revalidated"
     );
 }
 
