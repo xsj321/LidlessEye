@@ -1,10 +1,10 @@
 # Development image for LidlessEye.
 #
 # Provides a full Linux toolchain for building and *running* the eBPF
-# profiler: clang/llvm for the BPF target and the C++ compiler for the
-# statically linked DuckDB (cmake is installed for the optional
-# `bundled-cmake` path), rust, node for the UI build and the usual suspects
-# for native dependencies.
+# profiler: clang/llvm for the BPF target, rust, node for the UI build and the
+# usual suspects for native dependencies. DuckDB is linked against the
+# prebuilt shared library downloaded at build time; cmake and g++ are kept
+# only for the optional `bundled-cmake` path.
 #
 #   docker build -t lidlesseye-dev .devcontainer
 #   docker run --rm -it --privileged --pid=host -v "$PWD:/work" lidlesseye-dev

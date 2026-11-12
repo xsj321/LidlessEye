@@ -76,17 +76,21 @@ choices:
 ### One binary, one host
 
 ```bash
-cargo build --release            # needs clang for eBPF, a C++ compiler for DuckDB
+cargo build --release            # needs clang for eBPF; DuckDB's library is fetched once
 sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 # dashboard on http://localhost:4040
 ```
 
-Prerequisites: Linux ≥ 4.17 with BTF, `clang`, a C++ compiler (`g++`), and root
-(or `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN`). DuckDB is statically linked
-(`duckdb` crate `bundled` feature), so its C++ sources are compiled into the
-binary by the `cc` crate and the resulting `lidlesseye` needs no `libduckdb.so`
-at runtime. `perf_event_paranoid` must be ≤ 2 for the perf-event sampler. On a
-system with `kernel.unprivileged_bpf_disabled` the agent still works as root.
+Prerequisites: Linux ≥ 4.17 with BTF, `clang`, and root (or `CAP_BPF` +
+`CAP_PERFMON` + `CAP_SYS_ADMIN`). The first build downloads the prebuilt
+`libduckdb.so` matching `duckdb = "1.20000.1"`, so it needs network access once;
+set `DUCKDB_LIB_DIR` to a directory holding a vendored copy for offline builds.
+The binary loads that shared library at runtime: `target/release/lidlesseye`
+runs in place, but copying it to another host means shipping `libduckdb.so` on
+the loader path too — or just using the Docker image, which installs it under
+`/usr/local/lib`. `perf_event_paranoid` must be ≤ 2 for the perf-event sampler.
+On a system with `kernel.unprivileged_bpf_disabled` the agent still works as
+root.
 
 ### Server + agents
 

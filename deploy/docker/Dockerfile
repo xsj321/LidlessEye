@@ -1,10 +1,9 @@
 # Build stage.
 #
 # The eBPF object is compiled here, so the builder needs clang/llvm even though
-# the final image only runs a static Rust binary. The Rust image already ships
-# g++, which is what the statically linked DuckDB 2.0 build needs; no cmake is
-# involved (that is only for the optional `bundled-cmake` feature). The runtime
-# image needs no `libduckdb.so`.
+# the runtime image does not. `cargo build` also downloads the prebuilt
+# `libduckdb.so` into target/release/build/.../out; copy it to a fixed path so
+# the runtime stage can install it next to the binary.
 FROM rust:1.98-bookworm AS builder
 
 RUN apt-get update \
@@ -26,7 +25,9 @@ COPY web ./web
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     LIDLESSEYE_BUILD_BPF=1 cargo build --release -p lidlesseye \
-    && cp target/release/lidlesseye /usr/local/bin/lidlesseye
+    && cp target/release/lidlesseye /usr/local/bin/lidlesseye \
+    && cp "$(find target/release/build -name libduckdb.so -type f -print -quit)" \
+          /usr/local/lib/libduckdb.so
 
 # Runtime stage.
 FROM debian:bookworm-slim
@@ -36,15 +37,20 @@ LABEL org.opencontainers.image.title="LidlessEye" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tini \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/lidlesseye /usr/local/bin/lidlesseye
+COPY --from=builder /usr/local/lib/libduckdb.so /usr/local/lib/libduckdb.so
+# libduckdb.so is a C++ library; /usr/local/lib is in Debian's default
+# loader path once ldconfig has refreshed the cache.
+RUN ldconfig
 
 # The default data directory; mount a volume here in production.
 VOLUME ["/var/lib/lidlesseye"]
 
-ENV RUST_LOG=lidlesseye=info
+ENV RUST_LOG=lidlesseye=info \
+    LD_LIBRARY_PATH=/usr/local/lib
 EXPOSE 4040
 
 # `tini` reaps the zombie processes the eBPF collector can inherit in a

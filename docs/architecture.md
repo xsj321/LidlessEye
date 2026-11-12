@@ -143,12 +143,15 @@ The trade-offs are real:
 - **One process per database file.** DuckDB takes a file lock, so two
   `lidlesseye serve` processes cannot share a data directory. The old format
   allowed that, at the price of two writers racing on the same index.
-- **The binary is larger, and the first build is slow.** DuckDB is statically
-  linked (`features = ["bundled"]`), so the `cc` crate compiles its C++ sources
-  into the binary once; that needs nothing more than a C++ compiler. The
-  alternative — linking the prebuilt `libduckdb.so` — produces a binary that
-  fails to start unless the loader path is arranged for it, which is not
-  something a `cargo install` user should have to discover.
+- **The binary needs `libduckdb.so` at runtime.** DuckDB is linked against the
+  prebuilt shared library that `libduckdb-sys` downloads at build time. That
+  keeps a cold build to seconds instead of compiling the whole C++ engine, at
+  the cost of a build-time network fetch and a runtime loader dependency. The
+  release image installs the library under `/usr/local/lib`; a bare-metal
+  install has to ship it alongside the binary. Offline builds can point
+  `DUCKDB_LIB_DIR` at a vendored copy. Changing the dependency to
+  `features = ["bundled"]` produces a self-contained binary instead, but a
+  cold build then takes tens of minutes and several GB of RAM.
 - **Queries that used to early-terminate now scan.** The old format sorted
   samples by value so `top` could stop early; SQL has to aggregate the whole
   window. Zone maps still skip row groups outside the time range, and the
@@ -253,8 +256,7 @@ and packed frame ids occupy a few MiB, not a few hundred MiB of JSON. Query time
 is dominated by CLI startup plus DuckDB's scan; `--top` and `--tree` read the
 same `samples` rows and differ only in the Rust-side fold.
 
-These numbers were measured with DuckDB's prebuilt shared library. The shipped
-configuration links DuckDB statically (`bundled`), which is the same engine and
-the same schema; the difference is only how the library is loaded. Treat the
-figures as an order-of-magnitude guide for a single tenant on a laptop-class
-machine, not as a production SLO — the host was a Windows Docker Desktop VM.
+These numbers were measured with the shipped configuration — DuckDB 2.0.0
+linked against its prebuilt shared library. Treat the figures as an
+order-of-magnitude guide for a single tenant on a laptop-class machine, not as
+a production SLO — the host was a Windows Docker Desktop VM.
