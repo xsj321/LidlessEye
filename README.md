@@ -85,10 +85,12 @@ Prerequisites: Linux ≥ 4.17 with BTF, `clang`, and root (or `CAP_BPF` +
 `CAP_PERFMON` + `CAP_SYS_ADMIN`). The first build downloads the prebuilt
 `libduckdb.so` matching `duckdb = "1.20000.1"`, so it needs network access once;
 set `DUCKDB_LIB_DIR` to a directory holding a vendored copy for offline builds.
-The binary loads that shared library at runtime: `target/release/lidlesseye`
-runs in place, but copying it to another host means shipping `libduckdb.so` on
-the loader path too — or just using the Docker image, which installs it under
-`/usr/local/lib`. `perf_event_paranoid` must be ≤ 2 for the perf-event sampler.
+The binary loads that shared library at runtime: set `LD_LIBRARY_PATH` to the
+`target/release/build/libduckdb-sys-*/out` directory when running from the
+build tree, and ship `libduckdb.so` alongside the binary (or install it under
+`/usr/local/lib` and run `ldconfig`) when copying it to another host. The
+Docker image does this for you. `perf_event_paranoid` must be ≤ 2 for the
+perf-event sampler.
 On a system with `kernel.unprivileged_bpf_disabled` the agent still works as
 root.
 
