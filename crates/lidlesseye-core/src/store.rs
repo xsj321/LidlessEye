@@ -437,8 +437,9 @@ impl Store {
         let labels_text = encode_labels(&report.all_labels());
         let batch_id = {
             let mut ids = self.ids.lock();
-            ids.next_batch += 1;
-            ids.next_batch
+            let id = ids.next_batch;
+            ids.next_batch = ids.next_batch.saturating_add(1);
+            id
         };
 
         // Intern frames and stacks before opening the transaction so a bad

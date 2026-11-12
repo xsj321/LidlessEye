@@ -233,3 +233,27 @@ interval, not to the number of samples, so a busy machine costs roughly the same
 as an idle one. The default 99 Hz is the usual trade-off; 999 Hz is fine on
 modern hardware, and the sample rate is recorded in each report
 (`sample_rate_hz`).
+
+## Storage benchmark
+
+One folded file with 20 000 stacks, ingested through the CLI into a fresh tenant
+(release build, Docker Desktop / WSL, DuckDB v2.0.0, no tuning). Each number is
+a whole CLI invocation, so it includes process startup and opening the database:
+
+| Operation | Runs | Median |
+| --- | --- | --- |
+| `ingest` 20 000 stacks | 2203 / 2122 / 2084 ms | 2122 ms |
+| `query --top` | 200 / 122 / 124 ms | 124 ms |
+| `query --tree` | 127 / 125 / 123 ms | 125 ms |
+| database file after ingest | — | 2.6 MiB |
+
+The interesting part is the size: 20 000 stacks with a shared frame dictionary
+and packed frame ids occupy a few MiB, not a few hundred MiB of JSON. Query time
+is dominated by CLI startup plus DuckDB's scan; `--top` and `--tree` read the
+same `samples` rows and differ only in the Rust-side fold.
+
+These numbers were measured with DuckDB's prebuilt shared library. The shipped
+configuration links DuckDB statically (`bundled`), which is the same engine and
+the same schema; the difference is only how the library is loaded. Treat the
+figures as an order-of-magnitude guide for a single tenant on a laptop-class
+machine, not as a production SLO — the host was a Windows Docker Desktop VM.
