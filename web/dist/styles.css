@@ -365,6 +365,13 @@ button.ghost {
   cursor: pointer;
 }
 
+/* The flamegraph animates on its canvas (load-in, zoom, hover); these are the
+ * chrome transitions around it, kept short so the two read as one motion. */
+.fg-crumbs button,
+.fg-legend span {
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
 .fg-legend {
   display: flex;
   gap: 16px;
@@ -726,5 +733,18 @@ td .sub {
     border-right: none;
     border-bottom: 1px solid var(--border);
     max-height: none;
+  }
+}
+
+/* The dashboard is a diagnostic tool: someone reading it may be motion
+ * sensitive, and every effect here is decoration on top of a legible chart.
+ * The canvas checks this media query itself (see flamegraph.js). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

@@ -6,6 +6,13 @@
 // pass over the frames that are actually on screen. DOM-based flamegraphs fall
 // over somewhere around 20k nodes; this one stays smooth at the 200k nodes the
 // query engine is willing to hand out.
+//
+// Motion is drawn, not CSS: the bars grow out of their parents' left edges on
+// load, zooms interpolate their viewport, and hovering traces the ancestry of
+// the frame under the cursor. Everything is skippable — under
+// `prefers-reduced-motion: reduce` each effect renders its final state in one
+// frame — and `canvas[data-motion]` is set while an animation is running so a
+// test can wait for the graph to settle instead of racing it.
 
 import { formatPercent, formatValue } from "./format.js";
 
@@ -14,7 +21,16 @@ const FONT = '11px ui-monospace, "SF Mono", Menlo, Consolas, monospace';
 const MIN_FRAME_PX = 0.4;
 const MIN_LABEL_PX = 32;
 
+const INTRO_MS = 420;
+const INTRO_STAGGER_MS = 45;
+const INTRO_MAX_MS = 900;
+const ZOOM_MS = 260;
+
 const HUES = [22, 38, 8, 46, 190, 210, 265, 320, 160, 350];
+
+const easeOutCubic = (t) => 1 - (1 - t) ** 3;
+const easeInOutCubic = (t) => (t < 0.5 ? 4 * t ** 3 : 1 - (-2 * t + 2) ** 3 / 2);
+const lerp = (a, b, t) => a + (b - a) * t;
 
 function hashString(text) {
   let h = 0x811c9dc5;
@@ -40,6 +56,21 @@ export class Flamegraph {
     this.crumbs = [];
     this.search = "";
     this.tooltip = document.getElementById("tooltip");
+
+    // Motion state. `intro` grows the bars in, `zoomAnim` interpolates the
+    // viewport, `frame` is the single pending paint, and `hovered` is the frame
+    // under the cursor plus the ancestry highlighted behind it.
+    this.intro = null;
+    this.zoomAnim = null;
+    this.frame = null;
+    this.hovered = -1;
+
+    const motionQuery = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    this.reducedMotion = motionQuery?.matches ?? false;
+    motionQuery?.addEventListener?.("change", (event) => {
+      this.reducedMotion = event.matches;
+      if (this.reducedMotion) this.finishMotion();
+    });
 
     host.classList.add("panel");
     host.innerHTML = `
@@ -80,8 +111,92 @@ export class Flamegraph {
   }
 
   destroy() {
+    this.cancelFrame();
     this.resizeObserver?.disconnect();
     this.host.innerHTML = "";
+  }
+
+  // ---- motion ----------------------------------------------------------
+
+  /** One pending paint at a time, however many callers ask for it. */
+  scheduleFrame() {
+    if (this.frame !== null) return;
+    this.frame = requestAnimationFrame(() => {
+      this.frame = null;
+      this.draw();
+    });
+  }
+
+  cancelFrame() {
+    if (this.frame !== null) cancelAnimationFrame(this.frame);
+    this.frame = null;
+  }
+
+  /** `canvas[data-motion]` tells a test when the graph is still moving. */
+  syncMotion() {
+    const kind = this.zoomAnim ? "zoom" : this.intro ? "intro" : null;
+    if (kind) this.canvas.dataset.motion = kind;
+    else delete this.canvas.dataset.motion;
+  }
+
+  /** Jump every in-flight animation to its final state. */
+  finishMotion() {
+    this.intro = null;
+    this.zoomAnim = null;
+    this.cancelFrame();
+    this.syncMotion();
+    this.draw();
+  }
+
+  startIntro() {
+    this.hovered = -1;
+    const rows = this.byDepth.length;
+    if (this.reducedMotion || !rows) {
+      this.intro = null;
+      this.syncMotion();
+      return;
+    }
+    this.intro = {
+      start: performance.now(),
+      // A 60-row stack should not take three seconds to appear.
+      stagger: Math.min(INTRO_STAGGER_MS, INTRO_MAX_MS / rows),
+    };
+    this.syncMotion();
+  }
+
+  /** 0..1 for row `depth`, eased and staggered behind the row above it. */
+  introProgress(depth, now) {
+    const intro = this.intro;
+    if (!intro) return 1;
+    const elapsed = now - intro.start - depth * intro.stagger;
+    if (elapsed <= 0) return 0;
+    return easeOutCubic(Math.min(1, elapsed / INTRO_MS));
+  }
+
+  /** Interpolate the viewport instead of snapping to it. */
+  animateView(target, duration = ZOOM_MS) {
+    if (this.reducedMotion) {
+      this.zoomAnim = null;
+      this.view = { ...target };
+      this.syncMotion();
+      this.draw();
+      return;
+    }
+    this.zoomAnim = {
+      from: { ...this.view },
+      to: { ...target },
+      start: performance.now(),
+      duration,
+    };
+    this.syncMotion();
+    this.scheduleFrame();
+  }
+
+  /** A pan or a wheel zoom has to win over a running transition. */
+  cancelViewAnimation() {
+    if (!this.zoomAnim) return;
+    this.zoomAnim = null;
+    this.syncMotion();
   }
 
   // ---- data ------------------------------------------------------------
@@ -91,7 +206,7 @@ export class Flamegraph {
     this.data = data;
     this.view = { x0: 0, x1: 1 };
     this.crumbs = [];
-    this.loadedAt = performance.now();
+    this.zoomAnim = null;
 
     // A diff payload carries two windows per node. The layout is driven by the
     // larger of the two so that both a hot spot that disappeared and one that
@@ -203,6 +318,7 @@ export class Flamegraph {
     this.computeMatches();
     this.renderCrumbs();
     this.renderLegend();
+    this.startIntro();
     this.draw();
   }
 
@@ -318,6 +434,23 @@ export class Flamegraph {
     const height = Math.max(ROW_HEIGHT, rows * ROW_HEIGHT);
     const dpr = window.devicePixelRatio || 1;
 
+    // Advance the viewport transition before anything reads `this.view`.
+    const now = performance.now();
+    if (this.zoomAnim) {
+      const zoom = this.zoomAnim;
+      const t = Math.min(1, (now - zoom.start) / zoom.duration);
+      const eased = easeInOutCubic(t);
+      this.view = {
+        x0: lerp(zoom.from.x0, zoom.to.x0, eased),
+        x1: lerp(zoom.from.x1, zoom.to.x1, eased),
+      };
+      if (t >= 1) {
+        this.view = { ...zoom.to };
+        this.zoomAnim = null;
+        this.syncMotion();
+      }
+    }
+
     if (this.canvas.width !== Math.round(width * dpr) || this.canvas.height !== Math.round(height * dpr)) {
       this.canvas.width = Math.round(width * dpr);
       this.canvas.height = Math.round(height * dpr);
@@ -330,6 +463,11 @@ export class Flamegraph {
     ctx.clearRect(0, 0, width, height);
 
     if (!this.n) {
+      // Nothing to animate towards: an empty graph must not stay "moving".
+      this.intro = null;
+      this.zoomAnim = null;
+      this.syncMotion();
+      ctx.globalAlpha = 1;
       ctx.fillStyle = "#96a0b2";
       ctx.font = '13px system-ui, sans-serif';
       ctx.textAlign = "center";
@@ -346,9 +484,27 @@ export class Flamegraph {
     ctx.textBaseline = "middle";
     ctx.font = FONT;
 
+    // The hovered frame and its ancestors: the chain is what the cursor is
+    // actually inside, so highlighting all of it explains where the number
+    // comes from without reading the tooltip.
+    let chain = null;
+    if (this.hovered >= 0 && this.hovered < this.n) {
+      chain = new Set();
+      for (let i = this.hovered; i >= 0 && chain.size <= rows; i = this.parent[i]) {
+        chain.add(i);
+        if (this.parent[i] < 0) break;
+      }
+    }
+
     for (let d = 0; d < rows; d += 1) {
       const nodes = byDepth[d];
       const y = d * ROW_HEIGHT;
+
+      // Bars grow out of the left edge of the row above them, one row behind
+      // the next, so the graph assembles top-down instead of blinking in.
+      const grow = this.intro ? this.introProgress(d, now) : 1;
+      if (grow <= 0) continue;
+      ctx.globalAlpha = 0.35 + 0.65 * grow;
 
       // First frame whose right edge is still on screen.
       let lo = 0;
@@ -364,12 +520,19 @@ export class Flamegraph {
         const i = nodes[j];
         if (x[i] > x1) break;
         const px = (x[i] - x0) * scale;
-        const pw = w[i] * scale;
+        const pw = w[i] * scale * grow;
         if (pw < MIN_FRAME_PX) continue;
 
         const matched = this.matches && this.matches[i] === 1;
         ctx.fillStyle = matched ? "#f8e7c8" : this.color(i);
         ctx.fillRect(px, y + 1, Math.max(pw - 0.6, 0.6), ROW_HEIGHT - 2);
+
+        if (chain && chain.has(i)) {
+          // The ancestry is the explanation for the number in the tooltip, so
+          // it is lit as one continuous column rather than one bar at a time.
+          ctx.fillStyle = i === this.hovered ? "rgba(255, 255, 255, 0.16)" : "rgba(255, 255, 255, 0.08)";
+          ctx.fillRect(px, y + 1, Math.max(pw - 0.6, 0.6), ROW_HEIGHT - 2);
+        }
 
         if (matched) {
           ctx.strokeStyle = "#ffd489";
@@ -377,7 +540,13 @@ export class Flamegraph {
           ctx.strokeRect(px + 0.5, y + 1.5, Math.max(pw - 1.6, 0.6), ROW_HEIGHT - 3);
         }
 
-        if (pw >= MIN_LABEL_PX) {
+        if (i === this.hovered) {
+          ctx.strokeStyle = "rgba(242, 166, 90, 0.95)";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(px + 1, y + 2, Math.max(pw - 2, 0.6), ROW_HEIGHT - 4);
+        }
+
+        if (grow >= 1 && pw >= MIN_LABEL_PX) {
           const name = this.data.names[i];
           const pct = w[i];
           ctx.save();
@@ -393,10 +562,22 @@ export class Flamegraph {
     }
 
     // Hairline separators make deep stacks readable.
+    ctx.globalAlpha = 1;
     ctx.fillStyle = "rgba(10, 12, 16, 0.55)";
     for (let d = 1; d < rows; d += 1) ctx.fillRect(0, d * ROW_HEIGHT - 1, width, 1);
 
     this.renderAxisNote(base);
+
+    // Keep painting while something is still moving, then let the canvas rest.
+    if (this.zoomAnim) {
+      this.scheduleFrame();
+    } else if (this.intro) {
+      if (this.introProgress(rows - 1, now) < 1) this.scheduleFrame();
+      else {
+        this.intro = null;
+        this.syncMotion();
+      }
+    }
   }
 
   renderAxisNote() {
@@ -448,6 +629,10 @@ export class Flamegraph {
       moved = 0;
       lastX = event.clientX;
       canvas.style.cursor = "grabbing";
+      if (this.hovered !== -1) {
+        this.hovered = -1;
+        this.draw();
+      }
     });
 
     window.addEventListener("mouseup", () => {
@@ -467,6 +652,10 @@ export class Flamegraph {
 
     canvas.addEventListener("mouseleave", () => {
       this.tooltip.hidden = true;
+      if (this.hovered !== -1) {
+        this.hovered = -1;
+        this.draw();
+      }
     });
 
     // Wheel events are passive by default in some browsers; preventDefault
@@ -514,6 +703,10 @@ export class Flamegraph {
   hover(cx, cy, event) {
     const index = this.hitTest(cx, cy);
     const tooltip = this.tooltip;
+    if (index !== this.hovered) {
+      this.hovered = index;
+      this.draw();
+    }
     if (index < 0) {
       tooltip.hidden = true;
       this.canvas.style.cursor = "default";
@@ -562,18 +755,21 @@ export class Flamegraph {
 
   zoomTo(index) {
     this.crumbs.push(index);
-    this.view = { x0: this.x[index], x1: this.x[index] + this.w[index] };
+    this.revealFrame(index);
     this.renderCrumbs();
-    this.draw();
     this.onSelect?.(this.data.names[index]);
+  }
+
+  /** Fly to a frame's extent instead of cutting to it. */
+  revealFrame(index) {
+    this.hovered = -1;
+    this.animateView({ x0: this.x[index], x1: this.x[index] + this.w[index] });
   }
 
   focusCrumb(position) {
     this.crumbs = this.crumbs.slice(0, position + 1);
-    const index = this.crumbs[position];
-    this.view = { x0: this.x[index], x1: this.x[index] + this.w[index] };
+    this.revealFrame(this.crumbs[position]);
     this.renderCrumbs();
-    this.draw();
   }
 
   zoomOut() {
@@ -586,12 +782,15 @@ export class Flamegraph {
 
   reset() {
     this.crumbs = [];
-    this.view = { x0: 0, x1: 1 };
     this.renderCrumbs();
-    this.draw();
+    // Slightly slower than a zoom: pulling back to the whole graph reads as a
+    // change of context, not a jump within one.
+    this.hovered = -1;
+    this.animateView({ x0: 0, x1: 1 }, 320);
   }
 
   zoomAt(fraction, factor) {
+    this.cancelViewAnimation();
     const span = this.span();
     const nextSpan = Math.min(1, Math.max(1e-6, span / factor));
     const anchor = this.view.x0 + fraction * span;
@@ -602,6 +801,7 @@ export class Flamegraph {
   }
 
   pan(deltaPx) {
+    this.cancelViewAnimation();
     const shift = (-deltaPx / this.width()) * this.span();
     let x0 = this.view.x0 + shift;
     x0 = Math.min(Math.max(x0, 0), 1 - this.span());

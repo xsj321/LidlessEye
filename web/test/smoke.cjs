@@ -29,6 +29,20 @@ function check(ok, message, detail) {
   console.log(`${ok ? "ok  " : "FAIL"} ${message}`);
 }
 
+// Mirrors ROW_HEIGHT in web/dist/js/flamegraph.js: hit tests are row-based.
+const ROW = 22;
+
+/** Wait until the flamegraph stops moving (load-in or zoom transition). */
+async function settle(page, timeout = 4000) {
+  await page
+    .waitForFunction(
+      () => !document.querySelector("canvas.fg-canvas")?.dataset.motion,
+      null,
+      { timeout },
+    )
+    .catch(() => {});
+}
+
 /** Wait until the server answers, so a slow start is not a test failure. */
 async function waitForServer(deadlineMs = 20000) {
   const deadline = Date.now() + deadlineMs;
@@ -184,7 +198,35 @@ async function main() {
 
   const box = await page.locator("canvas.fg-canvas").boundingBox();
   check(box !== null && box.width > 100 && box.height > 100, "flamegraph canvas has a size", JSON.stringify(box));
-  await page.waitForTimeout(300);
+
+  // The bars grow in on load and every zoom interpolates its viewport. The
+  // canvas marks itself with `data-motion` while it is moving, so the checks
+  // below can wait for a still frame instead of racing the animation.
+  const introMotion = await page.evaluate(
+    () => document.querySelector("canvas.fg-canvas")?.dataset.motion ?? null,
+  );
+  check(introMotion === "intro", "the flamegraph animates into place", String(introMotion));
+  await settle(page);
+
+  // Clicking a child frame must fly to it rather than cut to it. Row 3 at a
+  // quarter of the width is `checkoutCharge` in this seed (61% wide), so the
+  // click is inside a frame no matter how the canvas is sized.
+  await page.mouse.click(box.x + box.width * 0.25, box.y + ROW * 3 + ROW / 2);
+  const zoomMotion = await page.evaluate(
+    () => document.querySelector("canvas.fg-canvas")?.dataset.motion ?? null,
+  );
+  check(zoomMotion === "zoom", "clicking a frame starts a viewport transition", String(zoomMotion));
+  await settle(page);
+  const zoomNote = await page.locator('.fg-legend [data-role="zoom"]').innerText().catch(() => "");
+  check(/% of total shown/.test(zoomNote), "the zoom landed on the clicked frame", zoomNote);
+
+  await page.keyboard.press("Escape");
+  await settle(page);
+  check(
+    (await page.locator('.fg-legend [data-role="zoom"]').count()) === 0,
+    "Escape animates back to the whole graph",
+  );
+
   await shot(page, "1-flamegraph");
 
   // The tenant selector is only shown when more than one tenant exists.
@@ -213,6 +255,7 @@ async function main() {
   await page.waitForSelector("canvas.fg-canvas", { timeout: 20000 });
   await checkActiveTab(page, "compare");
   check(!(await page.locator("#baseline-field").isHidden()), "compare reveals the baseline control");
+  await settle(page);
   await shot(page, "4-compare");
 
   // ---- labels ----------------------------------------------------------
@@ -248,6 +291,7 @@ async function main() {
   // Clicking a value navigates to the flamegraph, so the tab has to follow.
   await page.waitForSelector("canvas.fg-canvas", { timeout: 20000 });
   await checkActiveTab(page, "flamegraph");
+  await settle(page);
   await shot(page, "5b-label-filtered");
 
   // ---- overview --------------------------------------------------------
