@@ -94,6 +94,17 @@ perf-event sampler.
 On a system with `kernel.unprivileged_bpf_disabled` the agent still works as
 root.
 
+### Look at the dashboard without profiling anything
+
+```bash
+./scripts/demo.sh                # build, run, seed two tenants, print the URL
+```
+
+The demo seeds three services over 45 one-minute windows with `cpu` and
+`off_cpu` profiles, so every tab has something real to draw. It runs detached
+on `127.0.0.1:4040` with a throwaway data directory; `./scripts/demo.sh --stop`
+removes the container. Requires Docker only — no root, no eBPF, no local Rust.
+
 ### Server + agents
 
 ```bash

@@ -818,7 +818,7 @@ impl Store {
         };
         StoreStats {
             segment_count: count.max(0) as usize,
-            total_bytes: self.disk_bytes(&conn).unwrap_or(0),
+            total_bytes: self.disk_bytes(),
             logical_bytes: logical.max(0) as u64,
             total_value: value.max(0) as u64,
             earliest_ns: earliest.map(|v| v.max(0) as u64),
@@ -826,16 +826,23 @@ impl Store {
         }
     }
 
-    fn disk_bytes(&self, conn: &Connection) -> Result<u64> {
-        let size: i64 = conn
-            .query_row(
-                "SELECT database_size FROM pragma_database_size() \
-                 WHERE database_name = current_database()",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(db_err)?;
-        Ok(size.max(0) as u64)
+    /// Physical footprint of the tenant's database: the file DuckDB keeps its
+    /// blocks in, plus the write-ahead log.
+    ///
+    /// `pragma_database_size()` is the tempting source, but its
+    /// `database_size` only covers what has been checkpointed — right after a
+    /// burst of ingest it reports 0 while the WAL holds every byte — so the
+    /// number shown next to `logical_bytes` would look broken. The filesystem
+    /// does not guess, and it matches what an operator sees with `du`.
+    fn disk_bytes(&self) -> u64 {
+        let path = self.path();
+        let main = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mut wal = path.into_os_string();
+        wal.push(".wal");
+        let wal = std::fs::metadata(Path::new(&wal))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        main.saturating_add(wal)
     }
 
     pub fn series(&self, from_ns: u64, until_ns: u64, selector: &Selector) -> Vec<SeriesInfo> {
@@ -1450,6 +1457,24 @@ mod tests {
         let store2 = Store::open(StoreConfig::new(&dir)).unwrap();
         assert_eq!(store2.stats().segment_count, 3);
         assert_eq!(store2.stats().total_value, 3_000);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn physical_size_is_reported_while_the_data_sits_in_the_wal() {
+        let (store, dir) = temp_store("disk-bytes");
+        // Nothing has checkpointed or pruned yet, so every byte is in the
+        // write-ahead log — the window in which `pragma_database_size()`
+        // reported 0 and the dashboard showed "0 B" next to a non-zero
+        // logical size.
+        store
+            .append(&report("checkout", 1_000, "a", &["hot", "main"], 1_000))
+            .unwrap();
+
+        let stats = store.stats();
+        assert!(stats.logical_bytes > 0, "{stats:?}");
+        assert!(stats.total_bytes > 0, "{stats:?}");
 
         std::fs::remove_dir_all(dir).unwrap();
     }

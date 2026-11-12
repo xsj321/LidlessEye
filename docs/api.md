@@ -399,13 +399,15 @@ Every counter here belongs to the caller's tenant. Process-wide totals are on
 must not be able to read another tenant's ingest volume. `tenants` and
 `uptime_seconds` are the only process-level numbers, and neither is sensitive.
 
-Inside `store`, `total_bytes` is the physical size DuckDB reports for the
-tenant's database and `logical_bytes` is `SUM(batches.bytes)`, the
-estimated size of the data still retained. They diverge after retention or
-eviction: DuckDB frees rows inside existing row groups without shrinking the
-file, so `total_bytes` stays at its high-water mark while `logical_bytes`
-falls. The disk cap is enforced against `logical_bytes`; use `total_bytes` for
-actual volume provisioning.
+Inside `store`, `total_bytes` is the physical footprint of the tenant's
+database on disk — the database file plus its `.wal` — and `logical_bytes` is
+`SUM(batches.bytes)`, the estimated size of the data still retained. They
+diverge after retention or eviction: DuckDB frees rows inside existing row
+groups without shrinking the file, so `total_bytes` stays at its high-water
+mark while `logical_bytes` falls. They also diverge in the other direction
+right after a burst of ingest, when the rows are still in the write-ahead log.
+The disk cap is enforced against `logical_bytes`; use `total_bytes` for actual
+volume provisioning.
 
 ## Operations
 
