@@ -37,6 +37,10 @@ pub fn read_cgroup(tgid: u32) -> Option<String> {
 ///   * cgroup v2: `/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/...`
 ///   * cgroup v1: `/kubepods/burstable/pod<uid>/<container-id>`
 ///   * containerd: `/kubepods/burstable/pod<uid>/<64 hex chars>`
+///
+/// The systemd driver replaces the dashes inside the UID with underscores
+/// (`pod26fdedc9_3f6d_4bd1_a1c2_e5b7a1f2c3d4.slice`); both spellings map back
+/// to the UID the API server uses.
 pub fn parse_pod_uid(cgroup: &str) -> Option<String> {
     // Search for the `-pod<uid>`/`/pod<uid>` marker, not the bare string:
     // `kubepods` contains "pod" too and would match much earlier.
@@ -47,13 +51,13 @@ pub fn parse_pod_uid(cgroup: &str) -> Option<String> {
         + 4;
     let rest = &cgroup[start..];
     let end = rest
-        .find(|c: char| !(c.is_ascii_hexdigit() || c == '-'))
+        .find(|c: char| !(c.is_ascii_hexdigit() || c == '-' || c == '_'))
         .unwrap_or(rest.len());
-    let uid = &rest[..end];
+    let uid = rest[..end].replace('_', "-");
     if uid.len() < 8 {
         return None;
     }
-    Some(uid.to_string())
+    Some(uid)
 }
 
 /// Derive a few low-cardinality Kubernetes labels from a cgroup path.
@@ -77,7 +81,18 @@ pub fn kubernetes_labels(cgroup: &str) -> BTreeMap<String, String> {
 
 /// Host name, used as the `node` label so that multi-node deployments can tell
 /// reports apart.
+///
+/// Inside a pod the hostname is the *pod* name, which changes on every restart
+/// and would add a new `node` value — a new series — per rollout. Kubernetes
+/// deployments therefore set `LIDLESSEYE_NODE_NAME` from the Downward API
+/// (`spec.nodeName`); it wins over the hostname when present.
 pub fn hostname() -> String {
+    if let Ok(node) = std::env::var("LIDLESSEYE_NODE_NAME") {
+        let node = node.trim().to_string();
+        if !node.is_empty() {
+            return node;
+        }
+    }
     if let Ok(host) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
         let host = host.trim().to_string();
         if !host.is_empty() {
@@ -195,6 +210,24 @@ mod tests {
         assert_eq!(
             parse_pod_uid(cg).as_deref(),
             Some("1234abcd-1111-2222-3333-444455556666")
+        );
+    }
+
+    #[test]
+    fn parses_systemd_slice_with_underscored_uid() {
+        // The systemd cgroup driver rewrites the UID's dashes as underscores.
+        // Stopping at the first `_` used to truncate the label to eight
+        // characters, so two containers of the same pod looked unrelated.
+        let cg = "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod26fdedc9_3f6d_4bd1_a1c2_e5b7a1f2c3d4.slice/cri-containerd-77b.scope";
+        assert_eq!(
+            parse_pod_uid(cg).as_deref(),
+            Some("26fdedc9-3f6d-4bd1-a1c2-e5b7a1f2c3d4")
+        );
+        assert_eq!(
+            kubernetes_labels(cg)
+                .get("k8s_qos_class")
+                .map(String::as_str),
+            Some("besteffort")
         );
     }
 

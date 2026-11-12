@@ -23,6 +23,11 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "lidlesseye.serviceAccountName" . }}
+      {{- if .Values.server.profiling.enabled }}
+      # The built-in collector needs the host PID namespace to read the
+      # processes it samples, exactly like the agent DaemonSet.
+      hostPID: true
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -55,6 +60,7 @@ spec:
             - --agent
             - --frequency={{ .Values.agent.frequency }}
             - --flush={{ .Values.agent.flush }}
+            - --tenant={{ .Values.agent.tenant }}
             {{- end }}
             {{- range .Values.server.extraArgs }}
             - {{ . | quote }}
@@ -64,6 +70,12 @@ spec:
               value: /var/lib/lidlesseye
             - name: LIDLESSEYE_LISTEN
               value: 0.0.0.0:{{ .Values.server.service.port }}
+            {{- if .Values.server.profiling.enabled }}
+            - name: LIDLESSEYE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
             {{- if or .Values.server.tenants.tokens .Values.server.tenants.existingSecret }}
             - name: LIDLESSEYE_TENANT_TOKENS
               valueFrom:
@@ -97,9 +109,22 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
+          {{- if .Values.server.profiling.enabled }}
+          # Loading BPF programs needs CAP_BPF/CAP_PERFMON and CAP_SYS_ADMIN;
+          # without them `--agent` serves an empty profile set forever.
+          securityContext:
+            privileged: true
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/lidlesseye
+            {{- if .Values.server.profiling.enabled }}
+            {{- if .Values.agent.mountDebugfs }}
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+              readOnly: true
+            {{- end }}
+            {{- end }}
       volumes:
         - name: data
           {{- if .Values.server.persistence.enabled }}
@@ -108,6 +133,14 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if .Values.server.profiling.enabled }}
+        {{- if .Values.agent.mountDebugfs }}
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory
+        {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

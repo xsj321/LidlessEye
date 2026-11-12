@@ -111,6 +111,9 @@ struct ServeArgs {
     no_cpu: bool,
     #[arg(long)]
     no_offcpu: bool,
+    /// Do not attach the `k8s_*` labels derived from each process's cgroup.
+    #[arg(long)]
+    no_k8s_labels: bool,
 }
 
 #[derive(Debug, Args)]
@@ -123,6 +126,10 @@ struct CollectArgs {
     /// Tenant to write to on the server.
     #[arg(long, default_value = "default")]
     tenant: String,
+    /// Header the server reads the tenant from. Defaults to the alias the
+    /// server always accepts, so it survives a server-side rename.
+    #[arg(long, default_value = "X-Tenant-Id")]
+    tenant_header: String,
     #[arg(long)]
     service_name: Option<String>,
     #[arg(long = "label", value_parser = parse_label)]
@@ -135,6 +142,9 @@ struct CollectArgs {
     no_cpu: bool,
     #[arg(long)]
     no_offcpu: bool,
+    /// Do not attach the `k8s_*` labels derived from each process's cgroup.
+    #[arg(long)]
+    no_k8s_labels: bool,
     /// Stop after this long (used by tests); run forever by default.
     #[arg(long)]
     duration: Option<String>,
@@ -153,6 +163,9 @@ struct IngestArgs {
     /// Tenant to import into.
     #[arg(long, default_value = "default")]
     tenant: String,
+    /// Header the server reads the tenant from, when `--server` is used.
+    #[arg(long, default_value = "X-Tenant-Id")]
+    tenant_header: String,
     /// Input format: `json`, `pprof` or `folded`.
     #[arg(long, default_value = "json")]
     format: String,
@@ -274,6 +287,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .flush_interval(parse_duration(&args.flush)?)
         .collect_cpu(!args.no_cpu)
         .collect_off_cpu(!args.no_offcpu)
+        .enrich_kubernetes_labels(!args.no_k8s_labels)
         .tenant(args.tenant)
         .tenant_header(args.tenant_header)
         .max_tenants(args.max_tenants);
@@ -313,12 +327,25 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
     let mut cfg = PublisherConfig::new(&args.server);
     cfg.auth_token = args.auth_token;
     cfg.tenant = Some(args.tenant.clone());
+    cfg.tenant_header = args.tenant_header.clone();
     let (publisher, uploader) = lidlesseye::publisher::start(cfg)?;
     println!(
         "pushing profiles to {} as tenant `{}`",
         publisher.endpoint(),
         args.tenant
     );
+    // Wait for the server before sampling: on a fresh cluster the DaemonSet is
+    // scheduled before the Service has endpoints, and profiles produced in that
+    // window are dropped after their retries run out.
+    if !publisher
+        .wait_until_ready(std::time::Duration::from_secs(60))
+        .await
+    {
+        eprintln!(
+            "warning: {} did not answer within 60s, collecting anyway",
+            publisher.endpoint()
+        );
+    }
 
     let labels: BTreeMap<String, String> = args.labels.into_iter().collect();
     let collector_cfg = lidlesseye::ebpf::CollectorConfig {
@@ -328,6 +355,7 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
         flush_interval: parse_duration(&args.flush)?,
         collect_cpu: !args.no_cpu,
         collect_off_cpu: !args.no_offcpu,
+        enrich_kubernetes_labels: !args.no_k8s_labels,
         ..Default::default()
     };
     let sink = publisher.clone();
@@ -468,6 +496,7 @@ async fn ingest(args: IngestArgs) -> anyhow::Result<()> {
     let mut cfg = PublisherConfig::new(server);
     cfg.auth_token = args.auth_token;
     cfg.tenant = Some(tenant.to_string());
+    cfg.tenant_header = args.tenant_header.clone();
     let (publisher, uploader) = lidlesseye::publisher::start(cfg)?;
     for report in reports {
         publisher.send_now(report).await?;

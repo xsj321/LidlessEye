@@ -65,7 +65,9 @@ async function request(path, params, init) {
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
   const tenant = getTenant();
-  if (tenant) headers.set("X-Scope-OrgID", tenant);
+  // `X-Tenant-Id` is the alias the server accepts whatever `--tenant-header`
+  // is set to, so the dashboard keeps working when the header is renamed.
+  if (tenant) headers.set("X-Tenant-Id", tenant);
 
   let response;
   try {

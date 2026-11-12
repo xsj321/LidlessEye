@@ -18,8 +18,12 @@ pub struct PublisherConfig {
     pub server_url: String,
     /// Bearer token, when the server requires one.
     pub auth_token: Option<String>,
-    /// Tenant to write to, sent as `X-Scope-OrgID`.
+    /// Tenant to write to, sent in [`PublisherConfig::tenant_header`].
     pub tenant: Option<String>,
+    /// Header carrying the tenant id. Defaults to `X-Tenant-Id`, the alias the
+    /// server accepts whatever `--tenant-header` is set to, so a deployment
+    /// that renames the header for a gateway cannot desync the agents.
+    pub tenant_header: String,
     /// Maximum number of reports per HTTP request.
     pub max_batch: usize,
     /// Maximum time a report waits before being flushed.
@@ -34,6 +38,7 @@ impl PublisherConfig {
             server_url: server_url.into().trim_end_matches('/').to_string(),
             auth_token: None,
             tenant: None,
+            tenant_header: "X-Tenant-Id".to_string(),
             max_batch: 64,
             max_delay: Duration::from_millis(250),
             timeout: Duration::from_secs(30),
@@ -62,6 +67,41 @@ impl PublisherHandle {
         post_batch(&self.client, &self.url, None, vec![report]).await
     }
 
+    /// Poll `/api/v1/health` until the server answers, or `budget` runs out.
+    ///
+    /// A cluster schedules the agent DaemonSet before the server's Service has
+    /// endpoints, and kube-proxy needs a moment to program the rules. Collecting
+    /// during that window only produces batches that exhaust their retries and
+    /// get dropped, so the caller waits here first. Returns `false` when the
+    /// budget expired; the caller starts collecting anyway and the uploader
+    /// keeps retrying per batch.
+    pub async fn wait_until_ready(&self, budget: Duration) -> bool {
+        let health = format!(
+            "{}/api/v1/health",
+            self.url.trim_end_matches("/ingest").trim_end_matches('/')
+        );
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            // A connect to a ClusterIP whose endpoint just disappeared is
+            // blackholed rather than refused, and the client's 30s request
+            // timeout would swallow the whole budget in one attempt.
+            let probe =
+                tokio::time::timeout(Duration::from_secs(3), self.client.get(&health).send()).await;
+            match probe {
+                Ok(Ok(response)) if response.status().is_success() => return true,
+                Ok(Ok(response)) => {
+                    tracing::debug!(status = %response.status(), "server not ready yet");
+                }
+                Ok(Err(err)) => tracing::debug!(error = %err, "server not reachable yet"),
+                Err(_) => tracing::debug!("server did not answer the health probe in 3s"),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     pub fn endpoint(&self) -> &str {
         &self.url
     }
@@ -78,11 +118,22 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
         headers.insert(reqwest::header::AUTHORIZATION, value);
     }
     if let Some(tenant) = &cfg.tenant {
+        let name = reqwest::header::HeaderName::from_bytes(cfg.tenant_header.as_bytes()).map_err(
+            |err| {
+                Error::Config(format!(
+                    "invalid tenant header `{}`: {err}",
+                    cfg.tenant_header
+                ))
+            },
+        )?;
         let value = reqwest::header::HeaderValue::from_str(tenant)
             .map_err(|err| Error::Config(format!("invalid tenant id: {err}")))?;
-        headers.insert("x-scope-orgid", value);
+        headers.insert(name, value);
     }
     let client = reqwest::Client::builder()
+        // Without a connect timeout a blackholed Service IP keeps the batch in
+        // flight for the full request timeout, which stalls every later batch.
+        .connect_timeout(Duration::from_secs(5))
         .timeout(cfg.timeout)
         .user_agent(format!("lidlesseye/{}", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
@@ -122,6 +173,13 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
 
             let batch = std::mem::take(&mut buffer);
             let count = batch.len();
+            // Retries cover the startup race in a cluster: the agent DaemonSet
+            // is usually scheduled before the server Deployment is listening,
+            // and dropping the first batches would leave a hole at every
+            // rollout. Five backoffs of 0.5–4s ride out ~12s of downtime; past
+            // that the server is genuinely unreachable and the batch is
+            // dropped rather than buffered without bound.
+            const MAX_ATTEMPTS: u32 = 6;
             let mut attempt = 0u32;
             loop {
                 match post_batch(&client, &url, None, batch.clone()).await {
@@ -131,7 +189,7 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
                     }
                     Err(err) => {
                         attempt += 1;
-                        if attempt >= 4 {
+                        if attempt >= MAX_ATTEMPTS {
                             tracing::warn!(
                                 reports = count,
                                 error = %err,
@@ -139,8 +197,13 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
                             );
                             break;
                         }
-                        let backoff = Duration::from_millis(250 * 2u64.pow(attempt));
-                        tracing::debug!(error = %err, "upload failed, retrying");
+                        let backoff = Duration::from_millis(250 * 2u64.pow((attempt - 1).min(4)));
+                        tracing::debug!(
+                            error = %err,
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            "upload failed, retrying"
+                        );
                         tokio::time::sleep(backoff).await;
                     }
                 }

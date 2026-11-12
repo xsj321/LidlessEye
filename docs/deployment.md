@@ -44,13 +44,21 @@ sudo lidlesseye collect --server http://storage:4040 --frequency 99 --flush 10s 
 ```
 
 `collect` symbolizes locally and pushes `POST /ingest` every `--flush` seconds
-(default 10s), with exponential backoff on failure. Nothing is spooled to disk:
-if the server is unreachable the batch is retried, then dropped, so a long
+(default 10s), with exponential backoff on failure. Before it starts sampling it
+polls `/api/v1/health` for up to 60s, because a fresh install schedules the
+agent DaemonSet before the server's Service has endpoints. Nothing is spooled to
+disk: if the server is unreachable the batch is retried, then dropped, so a long
 outage loses data rather than filling the node's disk.
 
-Labels worth setting: `env`, `region`, `cluster`, `node`. Kubernetes labels
-(`namespace`, `pod`, `container`) are derived automatically from each process's
-cgroup when the agent runs with `hostPID`.
+Labels worth setting: `env`, `region`, `cluster`, `node`. The `node` label
+defaults to the machine's hostname; inside a pod that is the pod name, which
+changes on every rollout, so the Helm chart passes `spec.nodeName` as
+`LIDLESSEYE_NODE_NAME` and the agent prefers it.
+
+Kubernetes labels come from each process's cgroup when the agent runs with
+`hostPID`: `k8s_pod_uid`, `k8s_qos_class` and `k8s_container`. They identify
+*where* a stack was sampled without talking to the API server, which is why the
+set stops at the UID — pod and namespace names are not in the cgroup path.
 
 ### Authentication
 
@@ -106,6 +114,23 @@ What the chart creates:
 | `ServiceMonitor` (optional) | scrapes `/metrics` |
 | `ServiceAccount` | shared by both workloads |
 
+### Local clusters (Docker Desktop, kind, minikube)
+
+There is no registry to push to, so build the image locally and give every
+build a **distinct tag**. A cluster caches the image by tag at pod creation, and
+`imagePullPolicy: IfNotPresent` will happily keep running the previous build:
+
+```bash
+docker build -f deploy/docker/Dockerfile -t ghcr.io/lidlesseye/lidlesseye:0.1.0-dev1 .
+helm install lidlesseye deploy/helm/lidlesseye -n lidlesseye --create-namespace \
+  --set image.tag=0.1.0-dev1 \
+  --set server.persistence.size=5Gi
+```
+
+Reach the dashboard with `kubectl -n lidlesseye port-forward svc/lidlesseye 4040:4040`.
+`NodePort` and `LoadBalancer` services are not reliably exposed on the host by
+these distributions, so port-forward is the dependable option.
+
 ### Privileges the agent needs
 
 The DaemonSet is privileged on purpose: `CAP_BPF`/`CAP_PERFMON` to load
@@ -116,7 +141,17 @@ Standard label will reject the DaemonSet; label the namespace
 `pod-security.kubernetes.io/enforce=privileged` or install the agent separately.
 
 The server needs none of this — run it unprivileged, on a node pool with a real
-disk.
+disk. The exception is `server.profiling.enabled`, which makes the server sample
+its own node; the chart then adds `hostPID`, a privileged container and the
+debugfs mount to that pod, because the BPF programs cannot load without them.
+
+### Tenants
+
+Agents write to `agent.tenant` (default `default`). If `server.tenants.allowed`
+is non-empty, that tenant has to be in the list or the server rejects every
+upload with `403`. Agents and the dashboard always send the header alias
+`X-Tenant-Id`, never the configured `server.tenants.header`, so renaming the
+header for a gateway in front of the server cannot divert their traffic.
 
 ### Multi-node without `hostPID`?
 

@@ -57,7 +57,8 @@ directory — two tenants silently sharing a store. Normalizing at the boundary
 makes memory and disk agree on every platform.
 
 `--tenant-header` changes the header name; `x-tenant-id` is always accepted as an
-alias.
+alias. The agent (`collect`) and the dashboard send the alias, so they keep
+working after a rename — which is the point of keeping it stable.
 
 ## Authentication models
 

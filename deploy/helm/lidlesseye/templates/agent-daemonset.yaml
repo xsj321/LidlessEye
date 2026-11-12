@@ -42,11 +42,19 @@ spec:
             - collect
             - --frequency={{ .Values.agent.frequency }}
             - --flush={{ .Values.agent.flush }}
+            # The tenant header is left at its default, `X-Tenant-Id`: the
+            # server always accepts that alias, so renaming
+            # `server.tenants.header` for a gateway does not silently divert
+            # every upload to the `default` tenant.
+            - --tenant={{ .Values.agent.tenant }}
             {{- if not .Values.agent.collectCpu }}
             - --no-cpu
             {{- end }}
             {{- if not .Values.agent.collectOffCpu }}
             - --no-offcpu
+            {{- end }}
+            {{- if not .Values.agent.enrichKubernetesLabels }}
+            - --no-k8s-labels
             {{- end }}
             {{- if .Values.agent.serviceName }}
             - --service-name={{ .Values.agent.serviceName }}
@@ -60,6 +68,13 @@ spec:
           env:
             - name: LIDLESSEYE_SERVER
               value: {{ include "lidlesseye.serverUrl" . | quote }}
+            # Inside a pod the hostname is the pod name, and a pod name changes
+            # on every rollout — using it as the `node` label would add a new
+            # series per restart. The node name is stable.
+            - name: LIDLESSEYE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: RUST_LOG
               value: lidlesseye=info
             {{- if .Values.server.auth.enabled }}

@@ -39,7 +39,8 @@ X-Scope-OrgID: acme
 ```
 
 The header name is configurable (`--tenant-header`). `x-tenant-id` is accepted
-as an alias. Rules:
+as an alias; the bundled agent and dashboard use the alias, so renaming the
+header for a gateway does not divert their traffic. Rules:
 
 - No header on an unauthenticated server → the `default` tenant.
 - No header with a tenant-scoped token → the token's tenant.

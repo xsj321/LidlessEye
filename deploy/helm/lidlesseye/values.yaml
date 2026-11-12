@@ -100,7 +100,9 @@ server:
       memory: 2Gi
 
   # The server can profile its own node too; the dedicated DaemonSet is usually
-  # the better choice because it survives server restarts.
+  # the better choice because it survives server restarts. Enabling this adds
+  # `hostPID`, a privileged container and the debugfs mount to the server pod,
+  # because the BPF programs cannot load without them.
   profiling:
     enabled: false
 
@@ -126,10 +128,15 @@ agent:
   # Empty means "one service per process" (the process name is used). Set it to
   # aggregate a whole node under a single service name.
   serviceName: ""
+  # Tenant the agents write to. It must be listed in `server.tenants.allowed`
+  # (when that is non-empty) or the server refuses every upload.
+  tenant: default
   # Extra labels attached to every report.
   labels: {}
 
-  # Derive k8s_* labels (namespace/pod/container) from each process's cgroup.
+  # Attach the `k8s_*` labels the agent derives from each process's cgroup
+  # (`k8s_pod_uid`, `k8s_qos_class`, `k8s_container`). Set to false when the
+  # series count matters more than telling containers apart.
   enrichKubernetesLabels: true
 
   # The agent must see the host PID namespace to symbolize stacks, and needs

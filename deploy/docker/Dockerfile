@@ -49,8 +49,12 @@ RUN ldconfig
 # The default data directory; mount a volume here in production.
 VOLUME ["/var/lib/lidlesseye"]
 
+# The agent DaemonSet runs with `hostPID`, so PID 1 inside the container is the
+# node's init rather than tini. Registering tini as a child subreaper keeps it
+# reaping the collector's children there too (and silences its warning).
 ENV RUST_LOG=lidlesseye=info \
-    LD_LIBRARY_PATH=/usr/local/lib
+    LD_LIBRARY_PATH=/usr/local/lib \
+    TINI_SUBREAPER=1
 EXPOSE 4040
 
 # `tini` reaps the zombie processes the eBPF collector can inherit in a

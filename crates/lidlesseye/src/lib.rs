@@ -120,6 +120,7 @@ pub struct Builder {
     flush_interval: Duration,
     collect_cpu: bool,
     collect_off_cpu: bool,
+    enrich_kubernetes_labels: bool,
 }
 
 impl Default for Builder {
@@ -151,6 +152,7 @@ impl Default for Builder {
             flush_interval: Duration::from_secs(10),
             collect_cpu: true,
             collect_off_cpu: true,
+            enrich_kubernetes_labels: true,
         }
     }
 }
@@ -293,6 +295,12 @@ impl Builder {
         self
     }
 
+    /// Attach the `k8s_*` labels derived from each process's cgroup.
+    pub fn enrich_kubernetes_labels(mut self, enabled: bool) -> Self {
+        self.enrich_kubernetes_labels = enabled;
+        self
+    }
+
     fn server_config(&self) -> Result<ServerConfig> {
         let listen: SocketAddr = self.listen.parse().map_err(|err| {
             Error::Config(format!("invalid listen address `{}`: {err}", self.listen))
@@ -339,19 +347,16 @@ impl Builder {
             .map_err(Error::Server)?;
 
         let collector = if self.agent {
-            let mut collector_cfg = lidlesseye_ebpf::CollectorConfig {
+            let collector_cfg = lidlesseye_ebpf::CollectorConfig {
                 service_name: self.service_name.clone(),
                 labels: self.labels.clone(),
                 frequency_hz: self.frequency_hz,
                 flush_interval: self.flush_interval,
                 collect_cpu: self.collect_cpu,
                 collect_off_cpu: self.collect_off_cpu,
+                enrich_kubernetes_labels: self.enrich_kubernetes_labels,
                 ..Default::default()
             };
-            // A configured service name means "aggregate everything under it".
-            if collector_cfg.service_name.is_some() {
-                collector_cfg.enrich_kubernetes_labels = true;
-            }
             let state = http.state();
             let tenant = tenant.clone();
             // The collector invokes the callback on its own thread, which has
