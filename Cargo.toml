@@ -15,7 +15,7 @@ license = "Apache-2.0"
 repository = "https://github.com/lidlesseye/lidlesseye"
 homepage = "https://github.com/lidlesseye/lidlesseye"
 authors = ["LidlessEye contributors"]
-description = "Continuous eBPF profiling, stored in a columnar format."
+description = "Continuous eBPF profiling, stored in DuckDB."
 keywords = ["profiling", "ebpf", "flamegraph", "observability"]
 categories = ["development-tools::profiling", "network-programming"]
 
@@ -31,13 +31,19 @@ aya = "0.16.0"
 blazesym = "0.2.7"
 bytes = "1.10"
 clap = { version = "4.6.7", features = ["derive", "env"] }
-crc32fast = "1.5.5"
+# DuckDB 2.0.0 LTS ("Cinnamon Teal"), statically linked.
+#
+# `bundled` compiles DuckDB into the binary instead of linking the prebuilt
+# shared object: a binary produced with the default features starts with
+# "error while loading shared libraries: libduckdb.so" unless the loader path
+# is arranged for it, which is not something a `cargo install` user should
+# have to know. The cost is a one-off C++ compile (needs cmake).
+duckdb = { version = "1.20000.1", default-features = false, features = ["bundled"] }
 flate2 = "1.1.11"
 futures = "0.3.34"
 http = "1.3"
 http-body-util = "0.1.5"
 libc = "0.2.191"
-memmap2 = "0.9.12"
 num_cpus = "1.17.0"
 object = { version = "0.41.0", features = ["read_core", "elf", "compression"] }
 parking_lot = "0.12"

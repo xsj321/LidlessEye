@@ -370,6 +370,7 @@ impl LidlessEye {
             root: cfg.data_dir.clone(),
             retention_ns: cfg.retention.map(|d| d.as_nanos() as u64),
             max_disk_bytes: cfg.max_disk_bytes,
+            threads: cfg.duckdb_threads,
         };
         let registry = TenantStore::open_with_limits(
             &cfg.data_dir,
@@ -386,7 +387,7 @@ impl LidlessEye {
             addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             data_dir = %cfg.data_dir.display(),
             tenants = registry.tenant_ids().len(),
-            segments = stats.segment_count,
+            batches = stats.segment_count,
             bytes = stats.total_bytes,
             "store opened"
         );
@@ -514,9 +515,9 @@ impl LidlessEye {
                                     .fetch_add(stats.removed_segments as u64, Ordering::Relaxed);
                                 info!(
                                     tenant = %tenant,
-                                    segments = stats.removed_segments,
+                                    batches = stats.removed_segments,
                                     bytes = stats.removed_bytes,
-                                    "pruned old segments"
+                                    "pruned old batches"
                                 );
                             }
                         }

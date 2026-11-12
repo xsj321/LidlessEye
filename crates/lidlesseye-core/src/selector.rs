@@ -92,7 +92,7 @@ impl Selector {
     /// Does a label set satisfy every matcher?
     pub fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
         self.matchers.iter().all(|m| {
-            // `service_name` is stored as its own field in segments; callers
+            // `service_name` has its own column in the database; callers
             // inject it into `labels`, but a missing key simply never matches.
             let value = labels.get(&m.label).map(|s| s.as_str());
             m.op.matches(&m.value, value)

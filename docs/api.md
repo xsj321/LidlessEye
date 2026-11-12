@@ -106,8 +106,8 @@ service_name="checkout"
 ```
 
 Operators: `=` (equal), `!=` (not equal), `=~` / `!~` (**glob** match with `*`
-and `?`). `service_name` is matched against the report's service name, every
-other label against the segment's label map.
+and `?`). `service_name` is matched against the batch's service column, every
+other label against its encoded label set.
 
 Repeated `match[]=` parameters are ANDed, and `service_name=` /
 `label=`+`label_value=` are accepted as shorthands.
@@ -145,8 +145,14 @@ Response:
 ```json
 { "accepted": 1, "segments": 1, "samples": 2, "bytes": 812, "format": "json",
   "tenant": "acme",
-  "files": ["1700000000000000000-1700000010000000000.leseg"] }
+  "files": ["batch-7"] }
 ```
+
+`segments` and `files` are kept for compatibility with the previous file-backed
+store: one accepted report is one row in `batches`, so `files` now contains the
+batch ids (`batch-<id>`) rather than filenames. The ids are also the primary key
+of the `batches` table and can be looked up with any DuckDB client. `bytes` is
+the size of the request body, not the space the batch occupies in the database.
 
 A batch is all-or-nothing: if any report is invalid, or a per-tenant limit would
 be exceeded, nothing is written and the response is `400` / `429`. That keeps a
@@ -248,8 +254,8 @@ every stack containing it. `total_value` at the top level is the denominator for
 }
 ```
 
-A segment contributes proportionally to every bucket its window overlaps, so a
-10-second segment spread over a 60-second bucket does not spike.
+A batch contributes proportionally to every bucket its window overlaps, so a
+10-second batch spread over a 60-second bucket does not spike.
 
 With `group_by=pod`, `group` is `pod=<value>` (matching the flamegraph frame)
 and `service_name` holds the bare label value.
@@ -295,6 +301,11 @@ Known `(service, profile_type, labels)` combinations in the range:
 
 `wall` is offered whenever `cpu` or `off_cpu` data exists, and is flagged
 `"virtual": true`.
+
+`segment_count` appears in `/series`, `/profile_types`, `/stats`, `/tenants`
+and the `lidlesseye_segments*` metrics. The name is kept for compatibility with
+clients written against the earlier file-backed store; it now counts rows in
+`batches`, i.e. ingest batches, one per accepted report.
 
 ## `GET /api/v1/diff`
 
@@ -351,7 +362,9 @@ Administration endpoint. A tenant-scoped token only ever sees its own tenant.
     {
       "id": "acme",
       "series": 12,
-      "stats": { "segment_count": 480, "total_bytes": 8416712, "total_value": 991233 },
+      "stats": { "segment_count": 480, "total_bytes": 8416712,
+                 "logical_bytes": 6093120, "total_value": 991233,
+                 "earliest_ns": 1700000000000000000, "latest_ns": 1700003600000000000 },
       "limits": { "retention_ns": 604800000000000, "max_disk_bytes": null, "max_series": 5000 }
     }
   ],
@@ -370,7 +383,8 @@ has been written to it.
   "version": "0.1.0",
   "tenant": "acme",
   "uptime_seconds": 812,
-  "store": { "segment_count": 480, "total_bytes": 8416712, "total_value": 991233,
+  "store": { "segment_count": 480, "total_bytes": 8416712,
+             "logical_bytes": 6093120, "total_value": 991233,
              "earliest_ns": 1700000000000000000, "latest_ns": 1700003600000000000 },
   "series": 12,
   "tenants": 3,
@@ -385,13 +399,21 @@ Every counter here belongs to the caller's tenant. Process-wide totals are on
 must not be able to read another tenant's ingest volume. `tenants` and
 `uptime_seconds` are the only process-level numbers, and neither is sensitive.
 
+Inside `store`, `total_bytes` is the physical size DuckDB reports for the
+tenant's database and `logical_bytes` is `SUM(batches.bytes)`, the
+estimated size of the data still retained. They diverge after retention or
+eviction: DuckDB frees rows inside existing row groups without shrinking the
+file, so `total_bytes` stays at its high-water mark while `logical_bytes`
+falls. The disk cap is enforced against `logical_bytes`; use `total_bytes` for
+actual volume provisioning.
+
 ## Operations
 
 | Endpoint | Response |
 | --- | --- |
 | `GET /api/v1/health` | `{"status":"ok","version":"0.1.0","uptime_seconds":42}`, always 200 |
-| `GET /api/v1/ready` | `204` when the store holds no segments yet, `200` otherwise — both mean "ready to serve" |
-| `GET /api/v1/stats` | store counters (segments, bytes, value, earliest/latest), series count, tenant count, and ingest/query counters — all for the caller's tenant |
+| `GET /api/v1/ready` | `204` when the store holds no batches yet, `200` otherwise — both mean "ready to serve" |
+| `GET /api/v1/stats` | store counters (batches, physical/logical bytes, value, earliest/latest), series count, tenant count, and ingest/query counters — all for the caller's tenant |
 | `GET /api/v1/version` | `{"name":"lidlesseye","version":"0.1.0","multi_tenant":true,"tenant_header":"X-Scope-OrgID"}` |
 | `GET /metrics` | Prometheus text format |
 
@@ -415,9 +437,12 @@ lidlesseye_stored_value        (gauge)
 lidlesseye_tenants             (gauge)
 ```
 
-Metrics are deliberately tenant-agnostic: a label carrying `X-Scope-OrgID`
-would let any scraper enumerate customers. Per-tenant numbers are available
-from `/api/v1/tenants` to an operator holding the right token.
+The `lidlesseye_segments*` series are named for the previous file-backed store;
+they count ingest batches (rows in `batches`). `lidlesseye_storage_bytes` is the
+physical size of all tenant database files combined. There is deliberately no
+`segment`-per-tenant label: metrics are tenant-agnostic, a label carrying
+`X-Scope-OrgID` would let any scraper enumerate customers. Per-tenant numbers
+are available from `/api/v1/tenants` to an operator holding the right token.
 
 ## Compression and limits
 

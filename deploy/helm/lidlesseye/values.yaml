@@ -27,6 +27,9 @@ tolerations: []
 affinity: {}
 
 server:
+  # DuckDB takes an exclusive lock on each tenant database file. Two replicas
+  # sharing a PVC would fail at startup, so the Deployment uses `Recreate` and
+  # this must stay 1. Scale by sharding tenants across independent deployments.
   replicaCount: 1
 
   service:
@@ -34,8 +37,10 @@ server:
     port: 4040
     annotations: {}
 
-  # Retention is enforced by a background task: segments older than this are
-  # deleted, and the data directory is trimmed to `maxDisk`.
+  # Retention is enforced by a background task: batches older than this are
+  # deleted, and the estimate of the retained data is trimmed to `maxDisk`.
+  # DuckDB does not shrink the file, so the PVC must be sized for the
+  # high-water mark rather than for `maxDisk` alone.
   retention: 7d
   maxDisk: 40GB
 

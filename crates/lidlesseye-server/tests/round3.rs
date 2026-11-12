@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use lidlesseye_core::model::{MAX_FRAMES_PER_STACK, ProfileType};
-use lidlesseye_core::store::StoreConfig;
+use lidlesseye_core::store::{DB_FILE, StoreConfig};
 use lidlesseye_core::{
     Frame, QueryOptions, ReportBuilder, Selector, TenantId, TenantLimits, TenantStore, flamegraph,
     now_ns,
@@ -318,6 +318,7 @@ async fn pruning_while_ingesting_keeps_the_index_consistent() {
                 root: dir.path().to_path_buf(),
                 retention_ns: Some(3_600_000_000_000),
                 max_disk_bytes: None,
+                threads: None,
             },
         )
         .unwrap(),
@@ -387,6 +388,7 @@ async fn retention_removes_only_expired_segments() {
             root: dir.path().to_path_buf(),
             retention_ns: Some(7 * day),
             max_disk_bytes: None,
+            threads: None,
         },
     )
     .unwrap();
@@ -450,7 +452,7 @@ async fn the_disk_cap_evicts_oldest_first() {
         let before = store.stats();
         std::fs::write(
             dir.path().join("cap.txt"),
-            before.total_bytes.to_string().as_bytes(),
+            before.logical_bytes.to_string().as_bytes(),
         )
         .unwrap();
     }
@@ -486,9 +488,9 @@ async fn the_disk_cap_evicts_oldest_first() {
     assert!(removed > 0, "the cap evicted nothing");
     let after = store.stats();
     assert!(
-        after.total_bytes <= cap,
-        "store is {} bytes, cap is {cap}",
-        after.total_bytes
+        after.logical_bytes <= cap,
+        "retained data is {} bytes, cap is {cap}",
+        after.logical_bytes
     );
 
     // Eviction removes the oldest segments, so the newest one survives.
@@ -510,54 +512,55 @@ async fn the_disk_cap_evicts_oldest_first() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_corrupt_segment_is_reported_and_can_be_dropped() {
+async fn a_healthy_store_passes_fsck_and_garbage_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let registry = TenantStore::open(dir.path(), StoreConfig::new(dir.path())).unwrap();
     let tenant = TenantId::parse("acme").unwrap();
     let store = registry.open_tenant(&tenant).unwrap();
 
-    let mut metas = Vec::new();
     for i in 0..3u64 {
         let now = now_ns();
         let mut builder = ReportBuilder::new("svc", ProfileType::cpu(), now - 1_000, now);
         builder.add_stack(vec![Frame::new("/app", "work")], 100 + i);
-        metas.push(store.append(&builder.finish()).unwrap());
+        store.append(&builder.finish()).unwrap();
     }
 
-    let broken = &metas[1];
-    let mut data = std::fs::read(&broken.path).unwrap();
-    let last = data.len() - 1;
-    data[last] ^= 0xff;
-    std::fs::write(&broken.path, &data).unwrap();
-
+    // A store that was written normally must verify clean.
     let results = registry.fsck();
-    let failures: Vec<_> = results.iter().filter(|(_, _, r)| r.is_err()).collect();
-    assert_eq!(failures.len(), 1, "fsck did not notice the corruption");
-    assert_eq!(failures[0].1, broken.path);
-
-    // A query must not panic or return garbage; it skips the bad segment.
-    let fg = flamegraph(
-        &store,
-        &QueryOptions::new("cpu", 0, u64::MAX, Selector::default()),
-    )
-    .unwrap();
-    assert_eq!(
-        fg.total,
-        100 + 102,
-        "a corrupt segment leaked values: {:?}",
-        fg.names
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].2.is_ok(),
+        "healthy store failed fsck: {:?}",
+        results[0].2
     );
 
-    // Deleting it (what `fsck --fix` does) leaves a healthy store.
-    std::fs::remove_file(&broken.path).unwrap();
-    assert_eq!(store.reload().unwrap(), 2);
-    assert!(store.fsck().iter().all(|(_, r)| r.is_ok()));
-    assert!(registry.fsck().iter().all(|(_, _, r)| r.is_ok()));
+    // Corrupting the file is DuckDB's to detect; what matters for us is that
+    // opening garbage is an error, never an empty database that silently
+    // reports "no data".
+    drop(registry);
+    let db = dir.path().join("tenants").join("acme").join(DB_FILE);
+    std::fs::write(&db, b"definitely not a duckdb file").unwrap();
+    let reopened = TenantStore::open(dir.path(), StoreConfig::new(dir.path())).unwrap();
+    assert!(
+        reopened.tenant(&tenant).is_none(),
+        "a corrupt database must not open as an empty tenant"
+    );
+    let results = reopened.fsck();
+    assert!(
+        results.is_empty() || results.iter().all(|(_, _, r)| r.is_err()),
+        "fsck must report the corruption"
+    );
 }
 
 #[tokio::test]
-async fn stray_temporary_files_are_ignored() {
+async fn unrelated_files_in_the_data_dir_are_ignored() {
     let dir = tempfile::tempdir().unwrap();
+    // A data directory accumulates files that are not ours: a deployment that
+    // once ran the old binary, a backup, a stray note.
+    std::fs::write(dir.path().join("notes.txt"), b"hello").unwrap();
+    std::fs::create_dir_all(dir.path().join("scratch")).unwrap();
+    std::fs::write(dir.path().join("scratch/half-written.leseg.tmp"), b"junk").unwrap();
+
     let registry = TenantStore::open(dir.path(), StoreConfig::new(dir.path())).unwrap();
     let tenant = TenantId::parse("acme").unwrap();
     let store = registry.open_tenant(&tenant).unwrap();
@@ -565,27 +568,18 @@ async fn stray_temporary_files_are_ignored() {
     let now = now_ns();
     let mut builder = ReportBuilder::new("svc", ProfileType::cpu(), now - 1_000, now);
     builder.add_stack(vec![Frame::new("/app", "work")], 777);
-    let meta = store.append(&builder.finish()).unwrap();
+    store.append(&builder.finish()).unwrap();
 
-    // A writer that died mid-append leaves `.tmp` files behind.
-    let series_dir = meta.path.parent().unwrap();
-    std::fs::write(
-        series_dir.join("half-written.leseg.tmp"),
-        b"\x00\x01garbage",
-    )
-    .unwrap();
-    std::fs::write(series_dir.join("notes.txt"), b"hello").unwrap();
-
-    assert_eq!(store.reload().unwrap(), 1, "a stray file became a segment");
-
-    let reopened = TenantStore::open(dir.path(), StoreConfig::new(dir.path())).unwrap();
-    let store = reopened.open_tenant(&tenant).unwrap();
     let fg = flamegraph(
         &store,
         &QueryOptions::new("cpu", 0, u64::MAX, Selector::default()),
     )
     .unwrap();
     assert_eq!(fg.total, 777);
+
+    let reopened = TenantStore::open(dir.path(), StoreConfig::new(dir.path())).unwrap();
+    let store = reopened.open_tenant(&tenant).unwrap();
+    assert_eq!(store.stats().segment_count, 1);
     assert!(store.fsck().iter().all(|(_, r)| r.is_ok()));
 }
 

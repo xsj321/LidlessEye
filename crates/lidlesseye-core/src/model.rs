@@ -225,7 +225,7 @@ pub struct StackSample {
 /// The format is intentionally columnar-friendly: all symbols live in a
 /// deduplicated string table, stacks reference it by index. That makes the
 /// JSON roughly 10x smaller than an object-per-frame encoding and maps
-/// one-to-one onto the on-disk segment format.
+/// directly onto the `batches`/`samples`/`stacks`/`frames` tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     /// Name of the profiled service. Also injected into the labels as

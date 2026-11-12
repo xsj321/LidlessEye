@@ -14,9 +14,9 @@ use lidlesseye::{Builder, PublisherConfig};
 #[command(
     name = "lidlesseye",
     version,
-    about = "Continuous eBPF profiling with a columnar store",
+    about = "Continuous eBPF profiling with a DuckDB store",
     long_about = "LidlessEye profiles Linux processes with eBPF, stores the symbolized stacks in \
-                  immutable columnar segments and serves flamegraphs over HTTP.\n\n\
+                  a DuckDB database and serves flamegraphs over HTTP.\n\n\
                   Serve and profile this machine:\n  lidlesseye serve --agent --data-dir ./data\n\n\
                   Run a central server and per-node agents:\n  lidlesseye serve --data-dir /var/lib/lidlesseye\n  lidlesseye collect --server http://lidlesseye:4040"
 )]
@@ -35,7 +35,7 @@ enum Command {
     Ingest(IngestArgs),
     /// Inspect a data directory from the terminal.
     Query(QueryArgs),
-    /// Verify the checksum of every segment.
+    /// Verify every tenant database and its stack/frame references.
     Fsck(FsckArgs),
     /// Print build and platform information.
     Info,
@@ -50,9 +50,12 @@ struct ServeArgs {
     /// Delete profiles older than this (`7d`, `24h`, `0` to keep everything).
     #[arg(long, default_value = "7d")]
     retention: String,
-    /// Soft cap for the data directory (`50GB`, `0` for unlimited).
+    /// Soft cap for retained data (`50GB`, `0` for unlimited).
     #[arg(long, default_value = "50GB")]
     max_disk: String,
+    /// Worker threads DuckDB may use per tenant (default: all cores).
+    #[arg(long)]
+    duckdb_threads: Option<usize>,
     #[arg(long, env = "LIDLESSEYE_AUTH_TOKEN")]
     auth_token: Option<String>,
     /// Bind a bearer token to a tenant: `--tenant-token <token>=<tenant>`
@@ -204,7 +207,7 @@ struct FsckArgs {
     /// Only check this tenant (default: every tenant).
     #[arg(long)]
     tenant: Option<String>,
-    /// Delete segments that fail verification.
+    /// Drop rows with dangling stack/frame references (keeps the database file).
     #[arg(long)]
     fix: bool,
 }
@@ -229,8 +232,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Info => {
             println!("lidlesseye {}", env!("CARGO_PKG_VERSION"));
             println!(
-                "profile format: LESEG v{}",
-                lidlesseye::core::segment::FORMAT_VERSION
+                "storage: DuckDB {} (schema v{})",
+                lidlesseye::core::duckdb_version(),
+                lidlesseye::core::SCHEMA_VERSION
             );
             println!(
                 "ebpf support: {}",
@@ -260,6 +264,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .listen(&args.listen)
         .retention(retention)
         .max_disk_bytes(max_disk)
+        .duckdb_threads(args.duckdb_threads)
         .auth_token(args.auth_token.clone())
         .cors(args.cors.clone())
         .read_only(args.read_only)
@@ -445,10 +450,8 @@ async fn ingest(args: IngestArgs) -> anyhow::Result<()> {
         for report in &reports {
             let meta = store.append(report)?;
             println!(
-                "wrote {} ({} samples, {} bytes)",
-                meta.path.display(),
-                meta.sample_count,
-                meta.size_bytes
+                "wrote {} batch {} ({} samples, ~{} bytes)",
+                report.service_name, meta.batch_id, meta.sample_count, meta.bytes
             );
             count += 1;
         }
@@ -564,6 +567,7 @@ fn fsck(args: FsckArgs) -> anyhow::Result<()> {
         .filter(|(tenant, _, _)| only.as_ref().is_none_or(|want| want == tenant))
         .collect();
     let mut failures = 0;
+    let mut repair_failures = 0;
     let mut bytes = 0u64;
     for (tenant, path, result) in &results {
         match result {
@@ -576,20 +580,35 @@ fn fsck(args: FsckArgs) -> anyhow::Result<()> {
                 failures += 1;
                 eprintln!("FAIL [{tenant}] {}: {err}", path.display());
                 if args.fix {
-                    std::fs::remove_file(path)
-                        .with_context(|| format!("failed to delete {}", path.display()))?;
-                    eprintln!("  removed");
+                    // A tenant is one database file. Deleting it — what the old
+                    // file-backed store did with a corrupt segment — would drop
+                    // all of the tenant's good data, so repair by removing the
+                    // dangling rows instead.
+                    match registry.tenant(tenant).map(|store| store.repair()) {
+                        Some(Ok(rows)) => eprintln!("  removed {rows} dangling rows"),
+                        Some(Err(err)) => {
+                            repair_failures += 1;
+                            eprintln!("  repair failed: {err}");
+                        }
+                        None => {
+                            repair_failures += 1;
+                            eprintln!("  tenant could not be opened; no repair applied");
+                        }
+                    }
                 }
             }
         }
     }
     println!(
-        "checked {} segments ({}), {failures} failed",
+        "checked {} databases ({}), {failures} inconsistent",
         results.len(),
         human_bytes(bytes)
     );
     if failures > 0 && !args.fix {
-        bail!("{failures} segments are corrupt; re-run with --fix to delete them");
+        bail!("{failures} databases are inconsistent; re-run with --fix to drop dangling rows");
+    }
+    if repair_failures > 0 {
+        bail!("{repair_failures} databases could not be repaired");
     }
     Ok(())
 }

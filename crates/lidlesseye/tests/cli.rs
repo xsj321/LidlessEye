@@ -126,7 +126,7 @@ fn info_reports_the_build() {
     let out = run(&["info"], None);
     assert_eq!(out.code, Some(0), "{}", out.stderr);
     assert!(out.stdout.contains("lidlesseye"), "{}", out.stdout);
-    assert!(out.stdout.contains("LESEG v"), "{}", out.stdout);
+    assert!(out.stdout.contains("DuckDB"), "{}", out.stdout);
     assert!(
         out.stdout.contains("ui assets embedded: true"),
         "the dashboard is not embedded: {}",

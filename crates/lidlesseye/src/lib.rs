@@ -101,6 +101,7 @@ pub struct Builder {
     listen: String,
     retention: Option<Duration>,
     max_disk_bytes: Option<u64>,
+    duckdb_threads: Option<usize>,
     auth_token: Option<String>,
     read_only: bool,
     cors: Option<String>,
@@ -133,6 +134,7 @@ impl Default for Builder {
             listen: "127.0.0.1:4040".to_string(),
             retention: Some(Duration::from_secs(7 * 24 * 3600)),
             max_disk_bytes: Some(50 * 1024 * 1024 * 1024),
+            duckdb_threads: None,
             auth_token: None,
             read_only: false,
             cors: None,
@@ -158,7 +160,7 @@ impl Builder {
         Builder::default()
     }
 
-    /// Directory where profile segments are stored.
+    /// Directory where the tenant databases are stored.
     pub fn data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.data_dir = dir.into();
         self
@@ -176,9 +178,16 @@ impl Builder {
         self
     }
 
-    /// Soft cap for the data directory.
+    /// Soft cap for the estimated size of retained batches.
     pub fn max_disk_bytes(mut self, bytes: Option<u64>) -> Self {
         self.max_disk_bytes = bytes;
+        self
+    }
+
+    /// Worker threads DuckDB may use per tenant connection.
+    /// `None` (the default) lets DuckDB use every core.
+    pub fn duckdb_threads(mut self, threads: Option<usize>) -> Self {
+        self.duckdb_threads = threads;
         self
     }
 
@@ -299,6 +308,7 @@ impl Builder {
             data_dir: self.data_dir.clone(),
             retention: self.retention,
             max_disk_bytes: self.max_disk_bytes,
+            duckdb_threads: self.duckdb_threads,
             auth_token: self.auth_token.clone(),
             tenant_tokens,
             allowed_tenants: self.allowed_tenants.clone(),

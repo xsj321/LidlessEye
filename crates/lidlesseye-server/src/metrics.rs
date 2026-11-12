@@ -1,7 +1,7 @@
 //! Prometheus-style metrics without a metrics framework.
 //!
 //! The server exposes a handful of counters that matter for operating a
-//! profiling backend (ingest rate, query latency, segment count). Hand-rolling
+//! profiling backend (ingest rate, query latency, batch count). Hand-rolling
 //! them keeps the dependency tree small and the exposition format explicit.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,12 +71,12 @@ impl Metrics {
             ),
             counter(
                 "lidlesseye_segments_written_total",
-                "Segments persisted.",
+                "Ingest batches persisted (metric name kept for compatibility).",
                 self.segments_written.load(Ordering::Relaxed),
             ),
             counter(
                 "lidlesseye_segments_pruned_total",
-                "Segments dropped by retention.",
+                "Ingest batches dropped by retention or eviction.",
                 self.pruned_segments.load(Ordering::Relaxed),
             ),
         ];

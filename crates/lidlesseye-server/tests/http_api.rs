@@ -471,21 +471,21 @@ async fn time_series_buckets_a_segment_across_its_window() {
     let app = router(dir.path()).await;
 
     // One 60-second window worth 1s of CPU, asked for in 6 buckets of 10s.
-    let now = now_ns();
-    let mut builder = ReportBuilder::new("ts", ProfileType::cpu(), now - 60_000_000_000, now);
+    //
+    // The window is absolute rather than `now-60s`..`now` on purpose: a
+    // relative window is a few milliseconds wider than the data by the time
+    // the request is parsed, and the buckets must divide the *data* window
+    // for each one to hold exactly a sixth.
+    let end = now_ns() - 120_000_000_000;
+    let start = end - 60_000_000_000;
+    let mut builder = ReportBuilder::new("ts", ProfileType::cpu(), start, end);
     builder.add_stack(vec![Frame::new("/app", "work")], 1_000_000_000);
     let value = serde_json::to_value(builder.finish()).unwrap();
     let (status, body) = call(&app, "POST", "/ingest", Some(value), &[]).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let (status, series) = call(
-        &app,
-        "GET",
-        "/api/v1/timeseries?from=now-60s&until=now&buckets=6",
-        None,
-        &[],
-    )
-    .await;
+    let url = format!("/api/v1/timeseries?from={start}ns&until={end}ns&buckets=6");
+    let (status, series) = call(&app, "GET", &url, None, &[]).await;
     assert_eq!(status, StatusCode::OK, "{series}");
     assert_eq!(series["step_ns"], 10_000_000_000i64);
     let points = series["series"][0]["points"].as_array().unwrap();

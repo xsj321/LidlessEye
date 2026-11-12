@@ -3,18 +3,18 @@
 **Continuous profiling for Linux, in one Rust binary.**
 
 LidlessEye samples every process on a machine with eBPF, symbolizes the stacks
-in the agent, stores them in an immutable columnar format and serves
-flamegraphs from an embedded dashboard. It is a Pyroscope-shaped product built
-around three deliberate choices:
+in the agent, stores them in DuckDB and serves flamegraphs from an embedded
+dashboard. It is a Pyroscope-shaped product built around three deliberate
+choices:
 
 | Choice | Instead of | Why |
 | --- | --- | --- |
-| A custom columnar segment format (`LESEG`) | an LSM/TSDB or a SQL engine | profiles are append-only blobs queried by time range; immutable mmappable files beat a B-tree and need no C++ dependency |
+| DuckDB 2.0 as the storage engine | a hand-written columnar format, an LSM or a TSDB | profiles are append-only rows filtered by time and grouped by stack; DuckDB already does that, plus compression, transactions and recovery, so this project keeps only the schema |
 | A single Rust workspace, with the server usable as a `cargo` crate | a Go binary you deploy | "profile this process and show me the flamegraph" becomes one `builder().build()` call |
 | Symbolization in the agent | symbolization in the server | the server never needs the profiled machine's filesystem, and profiles of short-lived processes stay readable |
 
 ```
-┌─────────────┐   eBPF samples   ┌──────────────┐  LESEG segments  ┌──────────────┐
+┌─────────────┐   eBPF samples   ┌──────────────┐  profile batches ┌──────────────┐
 │  processes  │ ───────────────► │    agent     │ ───────────────► │    server    │
 │  (any lang) │  perf_event +    │  symbolize   │   POST /ingest   │  store+query │
 └─────────────┘  kprobes         │  (blazesym)  │                  │  + web UI    │
@@ -61,8 +61,8 @@ around three deliberate choices:
   own JSON, so the Pyroscope SDKs and `go tool pprof` output push directly.
 - **Multi-tenancy**: `X-Scope-OrgID`, per-tenant tokens, per-tenant retention,
   disk budget and series cap.
-- Retention by age and by disk budget, plus `lidlesseye fsck` to verify every
-  segment's CRC32 (checksums are also verified on every read).
+- Retention by age and by disk budget, plus `lidlesseye fsck` to verify the
+  database's integrity and the references between its tables.
 
 **Ships as**
 
@@ -76,15 +76,17 @@ around three deliberate choices:
 ### One binary, one host
 
 ```bash
-cargo build --release            # needs clang for the eBPF object
+cargo build --release            # needs clang for eBPF, cmake for bundled DuckDB
 sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 # dashboard on http://localhost:4040
 ```
 
-Prerequisites: Linux ≥ 4.17 with BTF, `clang`, and root (or
-`CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN`). `perf_event_paranoid` must be
-≤ 2 for the perf-event sampler. On a system with `kernel.unprivileged_bpf_disabled`
-the agent still works as root.
+Prerequisites: Linux ≥ 4.17 with BTF, `clang`, `cmake`, and root (or
+`CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN`). `cmake` is needed because DuckDB
+is statically linked (`duckdb` crate `bundled` feature): it compiles into the
+binary, so the resulting `lidlesseye` needs no `libduckdb.so` at runtime.
+`perf_event_paranoid` must be ≤ 2 for the perf-event sampler. On a system with
+`kernel.unprivileged_bpf_disabled` the agent still works as root.
 
 ### Server + agents
 
@@ -207,7 +209,7 @@ lidlesseye serve    # HTTP server, optionally with --agent
 lidlesseye collect  # eBPF collector that pushes to a server
 lidlesseye ingest   # import report JSON from files or stdin
 lidlesseye query    # inspect a data directory: --top / --tree
-lidlesseye fsck     # verify segment checksums (--fix to drop corrupt ones)
+lidlesseye fsck     # verify database integrity and cross-table references
 lidlesseye info     # build and platform information
 ```
 
@@ -234,8 +236,8 @@ out of the pod spec.
 
 ## How it works
 
-- [Architecture and the `LESEG` format](docs/architecture.md) — segment layout,
-  sampling model, query pipeline, concurrency, why not DuckDB.
+- [Architecture and storage](docs/architecture.md) — the DuckDB schema, why it
+  replaced a hand-written format, sampling model, query pipeline, concurrency.
 - [HTTP API](docs/api.md) — every endpoint, parameter and payload.
 - [Deployment](docs/deployment.md) — single host, Docker, Kubernetes,
   privileges, storage sizing, monitoring, troubleshooting.
@@ -249,7 +251,7 @@ out of the pod spec.
 Repository layout:
 
 ```
-crates/lidlesseye-core    data model, LESEG segments, store, query engine, selectors
+crates/lidlesseye-core    data model, DuckDB store, query engine, selectors
 crates/lidlesseye-ebpf    aya programs (BPF C), collector, blazesym symbolization
 crates/lidlesseye-server  axum HTTP API, embedded UI, metrics
 crates/lidlesseye         the `LidlessEye` builder, the CLI, the publisher

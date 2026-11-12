@@ -14,13 +14,13 @@ use lidlesseye_core::{TenantId, TenantLimits};
 pub struct ServerConfig {
     /// Address to listen on.
     pub listen: SocketAddr,
-    /// Directory holding the profile segments. Each tenant gets a
-    /// subdirectory under `<data_dir>/tenants/`.
+    /// Directory holding the databases. Each tenant gets one
+    /// `lidlesseye.duckdb` under `<data_dir>/tenants/`.
     pub data_dir: PathBuf,
     /// Delete profiles older than this. Per-tenant overrides live in
     /// [`ServerConfig::tenant_limits`].
     pub retention: Option<Duration>,
-    /// Soft cap for the data directory.
+    /// Soft cap for the estimated size of retained batches.
     pub max_disk_bytes: Option<u64>,
     /// Maximum accepted request body, in bytes.
     pub max_body_bytes: usize,
@@ -45,6 +45,11 @@ pub struct ServerConfig {
     pub cors_allow_origin: Option<String>,
     /// How often retention/eviction runs.
     pub prune_interval: Duration,
+    /// Worker threads DuckDB may use per connection (i.e. per tenant).
+    /// `None` lets it use every core, which is right for a single-tenant
+    /// deployment and generous for a busy multi-tenant one.
+    #[serde(default)]
+    pub duckdb_threads: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -64,6 +69,7 @@ impl Default for ServerConfig {
             read_only: false,
             cors_allow_origin: None,
             prune_interval: Duration::from_secs(60),
+            duckdb_threads: None,
         }
     }
 }

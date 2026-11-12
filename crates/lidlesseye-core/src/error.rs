@@ -14,8 +14,14 @@ pub enum Error {
     #[error("invalid profile report: {0}")]
     InvalidReport(String),
 
-    #[error("corrupt segment {path}: {reason}")]
+    /// A database whose rows violate the schema's own invariants.
+    /// The variant name is kept for source compatibility with the file-backed
+    /// store; the message describes what is actually wrong now.
+    #[error("inconsistent database {path}: {reason}")]
     CorruptSegment { path: PathBuf, reason: String },
+
+    #[error("database error: {0}")]
+    Db(String),
 
     #[error("unsupported segment version {version} in {path}")]
     UnsupportedVersion { version: u32, path: PathBuf },

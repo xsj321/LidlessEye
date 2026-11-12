@@ -150,14 +150,10 @@ pub async fn ingest(
         .ingest_bytes
         .fetch_add(body.len() as u64, Ordering::Relaxed);
 
+    // One accepted batch used to be one file; the id is what identifies it now.
     let segments: Vec<String> = metas
         .iter()
-        .map(|m| {
-            m.path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        })
+        .map(|m| format!("batch-{}", m.batch_id))
         .collect();
     Ok(Json(json!({
         "accepted": count,

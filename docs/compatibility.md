@@ -3,9 +3,8 @@
 LidlessEye is a drop-in *backend* for Pyroscope-style profiling: the same push
 protocol, the same tenant header, the same query concepts. It is not a
 reimplementation of Pyroscope's distributed storage, and it does not ship
-language SDKs — the collector is eBPF, in-process, and the storage is a local
-immutable-segment format designed to be faster than a block store on the same
-disk.
+language SDKs — the collector is eBPF, in-process, and the storage is one local
+DuckDB database per tenant, queried with SQL rather than a custom reader.
 
 Everything below was verified against the code in this repository, not against a
 roadmap. `partial` means "does the job, with a documented difference"; `no`
@@ -134,10 +133,11 @@ number as `in another PID namespace`.
 ## What the differences mean in practice
 
 - **Storage.** Pyroscope ships blocks to object storage and compacts them;
-  LidlessEye writes one immutable segment per report and memory-maps it. A query
-  touches exactly the segments whose time window overlaps, with no compaction
-  step and no background rewrite. The trade is that there is no cross-node
-  deduplication and no cold tier.
+  LidlessEye writes one transactional batch per report into a local DuckDB file.
+  A query is an aggregation over `samples` filtered by time and profile type,
+  with zone maps skipping row groups outside the window. There is no compaction
+  step and no background rewrite — but also no cross-node deduplication and no
+  cold tier, and the file is single-writer.
 - **Scaling.** Pyroscope scales horizontally into microservices. LidlessEye
   scales by running one instance per node (or per tenant group) — which is what
   an eBPF agent needs anyway, since the profiles are node-local.

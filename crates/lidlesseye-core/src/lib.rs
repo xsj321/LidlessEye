@@ -1,8 +1,10 @@
-//! Core building blocks of LidlessEye: the profile model, the `LESEG`
-//! columnar segment format, the on-disk store and the query engine.
+//! Core building blocks of LidlessEye: the profile model, the DuckDB-backed
+//! store and the query engine.
 //!
 //! ```no_run
-//! use lidlesseye_core::{Frame, ProfileType, QueryOptions, ReportBuilder, Selector, Store, StoreConfig};
+//! use lidlesseye_core::{
+//!     Frame, ProfileType, QueryOptions, ReportBuilder, Selector, Store, StoreConfig,
+//! };
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let store = Store::open(StoreConfig::new("./data"))?;
@@ -25,7 +27,6 @@ pub mod folded;
 pub mod model;
 pub mod pprof;
 pub mod query;
-pub mod segment;
 pub mod selector;
 pub mod store;
 pub mod tenant;
@@ -42,8 +43,13 @@ pub use query::{
     DiffFlamegraph, DiffOptions, Flamegraph, QueryOptions, SeriesPoints, TimeSeries,
     TimeSeriesOptions, TopEntry, TopResult, TreeNode, diff, flamegraph, timeseries, top,
 };
-pub use segment::{Segment, SegmentMeta};
 pub use selector::{MatchOp, Matcher, Selector, glob_match};
-pub use store::{PruneStats, SeriesInfo, Store, StoreConfig, StoreStats};
+pub use store::{
+    BatchMeta, DB_FILE, MAX_SCAN_ROWS, PruneStats, SCHEMA_VERSION, SampleRow, ScanQuery,
+    ScanResult, SeriesInfo, Store, StoreConfig, StoreStats, duckdb_version,
+};
 pub use tenant::{MAX_TENANT_LEN, TenantId, TenantInfo, TenantLimits, TenantStore};
 pub use time::{now_ns, parse_duration_ns};
+
+/// Compatibility alias: one batch is what used to be one `.leseg` segment.
+pub type SegmentMeta = BatchMeta;

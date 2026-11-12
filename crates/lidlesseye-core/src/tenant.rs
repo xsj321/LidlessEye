@@ -1,17 +1,18 @@
 //! Multi-tenancy.
 //!
-//! A tenant is a hard isolation boundary: it owns a directory, an index and a
-//! retention policy. Nothing in a query path can reach across tenants, because
-//! a query only ever holds the [`Store`] of the tenant it was resolved for.
+//! A tenant is a hard isolation boundary: it owns a database file, a retention
+//! policy and a set of limits. Nothing in a query path can reach across
+//! tenants, because a query only ever holds the [`Store`] of the tenant it was
+//! resolved for.
 //!
 //! Layout:
 //!
 //! ```text
-//! <data-dir>/tenants/<tenant>/<profile-type>/<service>/*.leseg
+//! <data-dir>/tenants/<tenant>/lidlesseye.duckdb
 //! ```
 //!
-//! Data written by versions before multi-tenancy lived at
-//! `<data-dir>/<profile-type>/<service>/*.leseg`; [`TenantStore::open`] moves
+//! One database per tenant. Data written before multi-tenancy existed lived
+//! in that same file directly under `<data-dir>`; [`TenantStore::open`] moves
 //! it under `tenants/default/` once, so an upgrade does not lose history.
 //!
 //! Tenant ids follow the same rule as Pyroscope's `X-Scope-OrgID`: a short,
@@ -112,9 +113,9 @@ impl std::str::FromStr for TenantId {
 /// global retention and override it for a single noisy tenant.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantLimits {
-    /// Delete segments older than this.
+    /// Delete batches older than this.
     pub retention_ns: Option<u64>,
-    /// Soft cap for the tenant's directory.
+    /// Soft cap for the tenant's retained data (not the database file size).
     pub max_disk_bytes: Option<u64>,
     /// Maximum number of distinct series. Ingestion of a new series beyond
     /// this limit is rejected; existing series keep working.
@@ -235,10 +236,14 @@ impl TenantStore {
             root: self.tenant_dir(tenant),
             retention_ns: limits.retention_ns,
             max_disk_bytes: limits.max_disk_bytes,
+            // A process-wide budget, not a per-tenant one: DuckDB's thread
+            // pool is per connection, and letting one tenant size its own
+            // would let a noisy tenant starve the others.
+            threads: self.base.threads,
         };
         let store = Arc::new(Store::open(cfg)?);
         stores.insert(tenant.clone(), store.clone());
-        debug!(tenant = %tenant, segments = store.stats().segment_count, "tenant opened");
+        debug!(tenant = %tenant, batches = store.stats().segment_count, "tenant opened");
         Ok(store)
     }
 
@@ -302,6 +307,7 @@ impl TenantStore {
                 let stats = store.stats();
                 total.segment_count += stats.segment_count;
                 total.total_bytes += stats.total_bytes;
+                total.logical_bytes += stats.logical_bytes;
                 total.total_value += stats.total_value;
                 total.earliest_ns = match (total.earliest_ns, stats.earliest_ns) {
                     (Some(a), Some(b)) => Some(a.min(b)),
@@ -334,7 +340,7 @@ impl TenantStore {
         Ok(out)
     }
 
-    /// Verify every segment of every tenant.
+    /// Verify every tenant database.
     pub fn fsck(&self) -> Vec<(TenantId, PathBuf, Result<()>)> {
         let mut out = Vec::new();
         for id in self.tenant_ids() {
@@ -368,7 +374,16 @@ fn migrate_legacy_layout(data_dir: &Path, tenants_dir: &Path) -> Result<()> {
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == "tenants" || !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if name == "tenants" {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            // A pre-multi-tenancy DuckDB store is a single file next to its
+            // write-ahead log; both belong to the default tenant.
+            if name.ends_with(".duckdb") || name.ends_with(".duckdb.wal") {
+                candidates.push(path);
+            }
             continue;
         }
         let children = match std::fs::read_dir(&path) {
@@ -419,6 +434,7 @@ mod tests {
     use super::*;
     use crate::model::{Frame, ProfileType, ReportBuilder};
     use crate::selector::Selector;
+    use crate::store::DB_FILE;
 
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("lidlesseye-tenant-{name}-{}", uuid::Uuid::new_v4()))
@@ -528,13 +544,11 @@ mod tests {
     #[test]
     fn legacy_layout_is_migrated_once() {
         let dir = temp_dir("legacy");
-        // Old layout: <data>/cpu/api/segment.
-        let old = dir.join("cpu").join("api");
-        std::fs::create_dir_all(&old).unwrap();
+        // A store written before multi-tenancy: one database in the data dir.
         let store = Store::open(StoreConfig::new(&dir)).unwrap();
         store.append(&report("api", 1_000)).unwrap();
         drop(store);
-        assert!(dir.join("cpu").join("api").is_dir());
+        assert!(dir.join(DB_FILE).is_file());
 
         let registry = TenantStore::open(&dir, StoreConfig::new(&dir)).unwrap();
         let default = TenantId::default_tenant();
@@ -546,7 +560,8 @@ mod tests {
                 .len(),
             1
         );
-        assert!(!dir.join("cpu").exists(), "the old directory is gone");
+        assert!(!dir.join(DB_FILE).exists(), "the old database file is gone");
+        assert!(registry.tenant_dir(&default).join(DB_FILE).is_file());
 
         // Re-opening is idempotent.
         drop(registry);

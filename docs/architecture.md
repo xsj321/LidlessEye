@@ -3,7 +3,7 @@
 ## Crates
 
 ```
-lidlesseye-core      data model, LESEG segments, store, query engine, selectors
+lidlesseye-core      data model, DuckDB store, query engine, selectors
 lidlesseye-ebpf      aya loader, BPF C programs, collector loop, symbolization
 lidlesseye-server    axum router, HTTP handlers, embedded UI, metrics
 lidlesseye           the embeddable `LidlessEye` builder + the `lidlesseye` CLI
@@ -33,10 +33,10 @@ kprobe:finish_task_switch ┘   (tgid, ustack,  (user space thread)        (blaz
                                 (same process)                (remote agent)
                                        └─────────────┬─────────────┘
                                                      ▼
-                                     LESEG segment per (type, service, labels, window)
+                                     profile batch per (type, service, labels, window)
                                                      │
                                                      ▼
-                                       query engine (mmap, no decode)
+                                       query engine (SQL over samples)
 ```
 
 ## Sampling model
@@ -89,63 +89,105 @@ The agent owns symbolization (`blazesym`), not the server:
 - results are cached per `(tgid, address)`, and the cache is dropped wholesale
   past 200k entries (a container restart invalidates it anyway).
 
-Because every frame is resolved *before* storage, a stored segment is
+Because every frame is resolved *before* storage, a stored batch is
 self-contained: no `vmlinux`, no build ids, no `.debug` files are needed to read
 it back, and a profile of a process that has already exited remains readable.
 
-## The `LESEG` format
+## Storage: DuckDB
 
-```
-┌────────┬────────┬─────────────┬─────────────┬───────────────┬─────────┐
-│ header │ strtab │   frames    │ stack_frames│     stacks    │ samples │
-│ 128 B  │ UTF-8  │ 16 B/frame  │  4 B/entry  │   8 B/stack   │ 16 B/ea │
-└────────┴────────┴─────────────┴─────────────┴───────────────┴─────────┘
+Samples live in DuckDB 2.0 LTS ("Cinnamon Teal"), one database file per tenant:
+
+```text
+<data-dir>/tenants/<tenant>/lidlesseye.duckdb
 ```
 
-| Section | Layout | Notes |
+Four tables:
+
+| Table | Columns | Role |
 | --- | --- | --- |
-| header | magic `LESEG\0\0\x01`, version, offsets, time window, `total_value`, `sample_count`, `crc32` | 128 bytes, enough to plan a query without touching the rest |
-| strtab | UTF-8 | one copy of every module / symbol / file name used in the segment |
-| frames | `u32 module, u32 symbol, u32 file, u32 line` | dictionary-encoded: 16 bytes per distinct frame |
-| stack_frames | `u32[]` | all stacks concatenated; a stack is an `(offset, len)` slice |
-| stacks | `u32 offset, u32 len` | 8 bytes per distinct stack, however deep |
-| samples | `u32 stack_id, u32 pad, u64 value` | sorted by value descending |
+| `batches` | `batch_id, profile_type, service_name, labels, start_ns, end_ns, total_value, sample_count, bytes, created_ns` | one row per ingest; what a query plans against and what `/metrics` counts |
+| `samples` | `batch_id, profile_type, service_name, labels, start_ns, end_ns, stack_id, value` | one row per stored `(stack, value)` |
+| `stacks` | `stack_id, frames BLOB` | frame ids packed little-endian, leaf first |
+| `frames` | `frame_id, module, symbol, file, line` | global dictionary, one row per distinct frame |
 
-Design consequences:
+`samples` repeats the series columns instead of joining `batches` on every
+query. A batch is one `(service, type, label set, window)`, so those values are
+constant over a contiguous run of rows and DuckDB's run-length compression makes
+them nearly free. What that buys is a read path with no join at all.
 
-- **Zero-copy reads.** The query engine `mmap`s the file and walks the arrays in
-  place. There is no deserialization step and no per-sample allocation, so a
-  256 MiB segment costs no heap.
-- **Early termination.** Samples are value-sorted, so `top` and truncated
-  flamegraphs can stop scanning once the remaining rows cannot make the cut.
-- **Cheap planning.** `SegmentMeta::overlaps` and label matching need only the
-  128-byte header plus the labels blob; the store keeps an in-memory index of
-  all segments and never opens a file to reject it.
-- **Crash safety.** A segment is written to `*.leseg.tmp`, `fsync`'d, then
-  `rename`d into place — an interrupted write leaves a `.tmp` file, never a
-  half-valid segment. `lidlesseye fsck` re-verifies every CRC32.
+Stacks are packed ids rather than a delimited string because a stack is walked
+on every flamegraph query. Converting text into frame ids at query time would
+move work from ingest (once) to query (every time).
 
-Files live at `<root>/<profile_type>/<service_slug>/<start_ns>-<end_ns>.leseg`.
+### Why DuckDB, and why it replaced the previous format
 
-### Why not DuckDB / Parquet / an LSM?
+Version 0.1 wrote its own columnar segment format (`.leseg`). It worked and it
+was fast, but it was a storage engine: header layout, dictionary encoding,
+CRC32, crash-safe `fsync` + `rename`, retention by deleting files, and a `fsck`
+that re-verified every checksum. Every one of those had to be re-verified
+whenever anything around it changed.
 
-A profile query is "scan the segments overlapping this time window and
-aggregate three integer columns". That is sequential I/O over immutable files —
-exactly what mmap + columnar layout does best — and it needs no query planner,
-no SQL parser, no C++ runtime in the server process. Parquet would work, but its
-row-group/page indirection is overhead for 100 KiB files, and an embedded
-analytical engine would multiply the binary size and the cold-start time of an
-embedded library. The format is versioned (`FORMAT_VERSION`), so a future
-version can add compression or per-frame deduplication without a migration.
+DuckDB takes that list over: transactional writes, compression, zone maps,
+checkpointing and recovery. What is left here is the schema above, which is the
+part that is genuinely specific to profiling.
+
+The trade-offs are real:
+
+- **Writes are slower.** A batch is a transaction with a WAL append, not an
+  `fsync` + `rename` of a file nobody else has open.
+- **The file does not shrink.** DuckDB marks deleted rows free inside existing
+  row groups instead of returning blocks to the filesystem. `prune` therefore
+  measures the disk cap against the estimated size of the *retained* batches
+  (`SUM(batches.bytes)`), not against the file size; the file grows to the
+  high-water mark and stays there.
+- **One process per database file.** DuckDB takes a file lock, so two
+  `lidlesseye serve` processes cannot share a data directory. The old format
+  allowed that, at the price of two writers racing on the same index.
+- **The binary is larger.** DuckDB is statically linked
+  (`features = ["bundled"]`), which needs `cmake` at build time. The
+  alternative — linking the prebuilt `libduckdb.so` — produces a binary that
+  fails to start unless the loader path is arranged for it, which is not
+  something a `cargo install` user should have to discover.
+- **Queries that used to early-terminate now scan.** The old format sorted
+  samples by value so `top` could stop early; SQL has to aggregate the whole
+  window. Zone maps still skip row groups outside the time range, and the
+  aggregation happens in the engine rather than in a Rust loop.
+
+What it buys: the samples are queryable with plain SQL by anyone with a DuckDB
+client, aggregation is the engine's job rather than hand-written code, and
+future questions ("how much CPU per namespace last Tuesday") do not need a new
+columnar reader.
+
+### Integrity checks
+
+`lidlesseye fsck` runs `CHECKPOINT` (which fails loudly on a damaged file) and
+then verifies the two invariants only this schema can violate: every
+`samples.stack_id` resolves to a row in `stacks`, and every frame id packed into
+a stack blob resolves to a row in `frames`. `--fix` drops the offending rows in
+one transaction and rolls back on error. It never deletes the database file: a
+tenant is one file, and the old file-backed store's "delete the bad segment"
+behaviour would destroy all of its good data.
+
+### Migrating from `.leseg`
+
+The store detects leftover `.leseg` files and logs a warning; it does not read
+them. There is no converter, because the old format and the new schema carry the
+same information and the sampler can simply re-ingest. A deployment that must
+keep old history should export it with the version that wrote it.
 
 ## Query engine
 
 `flamegraph`, `top` and `timeseries` share one pipeline:
 
-1. **Select** — the store's index yields segments whose window overlaps the
-   request and whose service/labels match the selector.
-2. **Remap** — each segment's local frame ids are mapped into a query-wide
-   `FrameDict`, so the same function from different segments collapses.
+1. **Select** — one SQL pass over `samples` filters the time window and the
+   profile type, groups by `(stack_id, service_name, labels)` and sums the
+   values. Matchers on `service_name` are pushed into the `WHERE` clause;
+   matchers on other labels (glob included) run in Rust afterwards, because the
+   label set is one encoded string and `label != value` cannot be expressed on
+   it correctly.
+2. **Remap** — the frames those stacks reference are loaded once and interned
+   into a query-wide `FrameDict`, so the same function coming from different
+   batches collapses.
 3. **Fold** — stacks are walked leaf-first and accumulated:
    - `flamegraph` inserts them into a `TreeBuilder` (capped at 400k nodes; the
      excess is folded into a `(truncated)` node instead of being dropped
@@ -153,8 +195,9 @@ version can add compression or per-frame deduplication without a migration.
      `names`/`levels`/`values` triple the UI consumes;
    - `top` accumulates `self` (leaf frame only) and `total` (every frame in the
      stack) per frame, then sorts by self value;
-   - `timeseries` splits a segment's total value proportionally over the
-     buckets it overlaps, per series (`service_name` + labels).
+   - `timeseries` reads `batches` only — no samples — and splits a batch's
+     total value proportionally over the buckets it overlaps, per series
+     (`service_name` + labels).
 4. **Serve** — the result structs are `Serialize`, so the HTTP layer is a
    `Json(...)` call.
 
@@ -167,15 +210,19 @@ so nothing is duplicated on disk.
 
 ## Concurrency
 
-- The store keeps an `RwLock<Index>`; ingest takes the write lock only to
-  insert the new segment metadata, queries take the read lock for the segment
-  list and then work outside it.
-- Ingestion is `spawn_blocking` (file I/O), queries are `spawn_blocking` too, so
-  a slow flamegraph cannot stall the accept loop.
+- One `Connection` per tenant behind a mutex. DuckDB's Rust binding has no
+  separate `Database` handle, and opening the same file twice inside one
+  process is a lock conflict rather than a second reader — so serializing
+  access is the only option, not a design choice. Queries still run in
+  parallel *inside* DuckDB (`threads`, all cores by default; `--duckdb-threads`
+  caps it per connection and applies to every tenant); what the mutex
+  serializes is the short per-query setup and the aggregation call itself.
+- Ingestion is `spawn_blocking` (file I/O and the transaction), queries are
+  `spawn_blocking` too, so a slow flamegraph cannot stall the accept loop.
 - The collector runs on its own OS thread; it captures a `tokio::runtime::Handle`
   before starting because the callback has no runtime context of its own.
-- Retention runs as a periodic background task: drop expired segments, then
-  trim oldest-first until `max_disk_bytes` is satisfied.
+- Retention runs as a periodic background task: delete expired batches, then
+  trim oldest-first until the retained batches fit under `max_disk_bytes`.
 
 ## Overhead
 

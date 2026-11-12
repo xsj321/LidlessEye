@@ -69,7 +69,20 @@ A CPU profile of a busy 32-core node at 99 Hz produces roughly
 `100–300 KiB` per flush after symbolization, i.e. a few hundred MiB per node per
 day. 10 nodes for 7 days fits comfortably in 20–50 GiB. Retention is enforced
 two ways — `--retention 7d` (age) and `--max-disk 50GB` (oldest-first trim) —
-and `lidlesseye fsck --fix` re-verifies every segment's CRC32.
+and `lidlesseye fsck` verifies each tenant database plus the schema's referential
+invariants (`--fix` drops dangling rows rather than the file).
+
+Two sizing caveats come from DuckDB rather than from the sampler:
+
+- The cap is measured against the estimated size of the *retained* batches
+  (`/api/v1/stats` → `logical_bytes`), not the file size. DuckDB frees deleted
+  rows inside existing row groups without returning blocks to the filesystem,
+  so `total_bytes` stays at its high-water mark. Provision the volume for that
+  high-water mark; freed space is reused by later writes.
+- A database file is locked by one process. The Helm chart uses a single replica
+  with the `Recreate` strategy for that reason; do not point two servers, or a
+  `serve` process and a CLI `fsck`, at the same data directory. Use a read-only
+  replica with its own copy instead.
 
 ## 3. Kubernetes
 
@@ -144,11 +157,12 @@ tenant isolation, the diff endpoint, and that `/metrics` carries no tenant ids.
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--frequency` | 99 | samples per second per CPU. 99 is plenty for flamegraphs; 999 gives finer detail at ~10x the samples and proportional storage |
-| `--flush` | 10s | how often the kernel maps are drained. Shorter = fresher data, more segments |
+| `--flush` | 10s | how often the kernel maps are drained. Shorter = fresher data, more batches (one transaction per batch) |
 | `--no-cpu` / `--no-offcpu` | both on | off-CPU needs kprobes; disable it on locked-down kernels |
 | `--service-name` | process name | set it to aggregate a node under one service; the process name stays as a `process_name` label |
-| `--max-disk` | 50GB | soft cap; oldest segments are dropped first |
-| `--read-only` | off | rejects ingest, useful for a query-only replica of a data directory |
+| `--max-disk` | 50GB | soft cap on retained data; oldest batches are dropped first |
+| `--duckdb-threads` | all cores | threads DuckDB may use per query. All tenants share this process-wide setting |
+| `--read-only` | off | rejects ingest, useful for a query-only server with its own copy of the data directory |
 
 ## Monitoring
 
@@ -157,10 +171,14 @@ Scrape `/metrics`. The two metrics that matter operationally:
 - `lidlesseye_ingest_errors_total` — agents failing to push (check auth, disk
   full, body limit)
 - `lidlesseye_query_duration_seconds_total` / `lidlesseye_queries_total` — mean
-  query latency; a rising mean means the segment count per query is growing
-  (raise retention trimming or narrow the dashboard's default range)
+  query latency; a rising mean means more batches (more rows in `samples`) fall
+  inside the dashboard's default range (lower `--retention`, narrow the range,
+  or give DuckDB more threads)
 
 `lidlesseye_storage_bytes` vs your volume size is the other one to alert on.
+Compare it with `logical_bytes` from `/api/v1/stats`: a large gap means freed
+space is sitting in the file waiting to be reused, not that retention has
+stopped working.
 
 ## Troubleshooting
 
@@ -189,6 +207,15 @@ Check the profile type: agents produce `cpu` and `off_cpu`, the UI defaults to
 switch to `wall` to see blocked time.
 
 **`open_files` / memory grows forever**
-Each segment is a file; a pathological cardinality in service names (one
-service per short-lived process) creates many small segments. Set
-`--service-name` to aggregate, or lower `--retention`.
+With DuckDB there is one file per tenant, never one per report, so service-name
+cardinality cannot create files — but it does create distinct label strings in
+`samples`, which cost dictionary space. Set `--service-name` to aggregate, or
+lower `--retention`. If the resident set grows with the number of distinct
+frames, that is the `frames` dictionary plus the in-memory frame cache;
+`--duckdb-threads` bounds DuckDB's own worker memory.
+
+**`database is locked` / `Could not set lock on file …`**
+Another process has the tenant database open. DuckDB allows one writer per
+file: stop the second `serve` instance (or the CLI `query`/`fsck` running
+against the same data dir) and retry. Two replicas must each have their own
+volume.

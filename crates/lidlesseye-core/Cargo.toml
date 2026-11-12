@@ -1,6 +1,6 @@
 [package]
 name = "lidlesseye-core"
-description = "Profile data model, columnar segment format and query engine for LidlessEye"
+description = "Profile data model, DuckDB-backed storage and query engine for LidlessEye"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,12 +12,13 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-crc32fast = { workspace = true }
+duckdb = { workspace = true }
 flate2 = { workspace = true }
-memmap2 = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
 uuid = { workspace = true }

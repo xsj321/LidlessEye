@@ -126,7 +126,7 @@ export function renderOverview(host, { stats, types, series }) {
   const store = stats?.store ?? {};
   const cards = [
     ["Uptime", formatUptime(stats?.uptime_seconds ?? 0), `version ${stats?.version ?? "?"}`],
-    ["Segments", formatCount(store.segment_count ?? 0), formatBytes(store.total_bytes ?? 0)],
+    ["Batches", formatCount(store.segment_count ?? 0), formatBytes(store.total_bytes ?? 0)],
     [
       "Series",
       formatCount(stats?.series ?? 0),
@@ -149,7 +149,7 @@ export function renderOverview(host, { stats, types, series }) {
       (type) => `<div class="card">
         <div class="k">${escapeHtml(type.name)}${type.virtual ? " (virtual)" : ""}</div>
         <div class="v">${formatValue(type.total_value, type.unit)}</div>
-        <div class="s">${type.segment_count} segments · ${escapeHtml(type.unit)}</div>
+        <div class="s">${type.segment_count} batches · ${escapeHtml(type.unit)}</div>
       </div>`,
     )
     .join("");
@@ -180,7 +180,7 @@ export function renderOverview(host, { stats, types, series }) {
       <div class="panel-head"><h2>Series</h2><span class="spacer"></span>
         <span class="faint">${(series ?? []).length} combinations in the selected range</span></div>
       <div class="tbl-wrap"><table>
-        <thead><tr><th>Service</th><th>Profile</th><th>Labels</th><th class="num">Value</th><th class="num">Segments</th><th>Range</th></tr></thead>
+        <thead><tr><th>Service</th><th>Profile</th><th>Labels</th><th class="num">Value</th><th class="num">Batches</th><th>Range</th></tr></thead>
         <tbody>${rows || `<tr><td colspan="6" class="empty">No series yet.</td></tr>`}</tbody>
       </table></div>
     </div>

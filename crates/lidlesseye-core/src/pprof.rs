@@ -504,7 +504,9 @@ fn normalize_profile_type(name: &str) -> String {
         "block_count" => "block_count",
         "block_duration" => "block_duration",
         other => {
-            // Keep unknown types, but make them safe for a directory name.
+            // Keep unknown types, but reduce them to a stable, printable key:
+            // the value is stored as `profile_type` and is matched exactly by
+            // queries, so two spellings must not become two types.
             let slug: String = other
                 .chars()
                 .map(|c| {

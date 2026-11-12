@@ -1,20 +1,19 @@
-//! The query engine: merge segments into flamegraphs, top-N tables and time
-//! series.
+//! The query engine: turn stored samples into flamegraphs, top-N tables and
+//! time series.
 //!
-//! Everything here works on the mapped segment arrays directly. A query over
-//! N segments allocates one `Vec<Frame>` for the frame dictionary, one entry
-//! per node of the resulting tree, and nothing per sample.
+//! A query asks the store for the aggregated `(stack, value)` pairs of the
+//! window, once, and then walks them in memory. DuckDB does the filtering and
+//! grouping; the tree building, diffing and bucketing stay here because they
+//! are specific to profiling and would be slower as SQL.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use crate::error::{Error, Result};
 use crate::model::{Frame, ProfileType, Unit};
-use crate::segment::Segment;
 use crate::selector::Selector;
-use crate::store::Store;
+use crate::store::{ScanQuery, ScanResult, Store};
 
 /// Upper bound on the number of nodes built before pruning, protects the
 /// server from a query that would otherwise allocate unbounded memory.
@@ -147,7 +146,7 @@ impl QueryOptions {
     }
 }
 
-/// Interns frames across segments so identical functions collapse.
+/// Interns frames across batches so identical functions collapse.
 struct FrameDict {
     frames: Vec<Frame>,
     index: HashMap<(String, String, String, u32), u32>,
@@ -197,22 +196,24 @@ impl Frame {
     }
 }
 
-/// Resolve the frame ids of one segment into the global dictionary.
-fn build_remap(seg: &Segment, dict: &mut FrameDict) -> Vec<u32> {
-    let count = seg.frame_count();
-    let mut remap = Vec::with_capacity(count);
-    for id in 0..count as u32 {
-        match seg.frame_at(id) {
-            Some((m, s, f, line)) => {
-                let mut frame = Frame::new(seg.string_at(m), seg.string_at(s));
-                frame.file = seg.string_at(f).to_string();
-                frame.line = line;
-                remap.push(dict.intern(frame));
-            }
-            None => remap.push(u32::MAX),
-        }
+/// Intern every frame a scan references, returning `frame_id -> dict id`.
+///
+/// The scan only loads the frames that some stack actually points at, so one
+/// pass is enough and no per-sample lookup is needed afterwards.
+fn intern_scan(scan: &ScanResult, dict: &mut FrameDict) -> HashMap<u32, u32> {
+    let mut remap = HashMap::with_capacity(scan.frames.len());
+    for (&frame_id, frame) in &scan.frames {
+        remap.insert(frame_id, dict.intern(frame.clone()));
     }
     remap
+}
+
+/// Translate one stack's frame ids into dictionary ids.
+fn map_stack(stack: &[u32], remap: &HashMap<u32, u32>, out: &mut Vec<u32>) {
+    out.clear();
+    for &frame_id in stack {
+        out.push(remap.get(&frame_id).copied().unwrap_or(u32::MAX));
+    }
 }
 
 /// Incrementally built flamegraph tree.
@@ -397,52 +398,36 @@ impl TreeBuilder {
     }
 }
 
-/// Build a flamegraph from every segment matching `opts`.
+/// Build a flamegraph from every stored sample matching `opts`.
 pub fn flamegraph(store: &Store, opts: &QueryOptions) -> Result<Flamegraph> {
     opts.validate()?;
-    let metas = store.select(
-        &opts.profile_type,
-        opts.from_ns,
-        opts.until_ns,
-        &opts.selector,
-    );
-    let mut builder = TreeBuilder::new();
-    if metas.is_empty() {
+    let scan = store.scan(
+        &ScanQuery::new(
+            &opts.profile_type,
+            opts.from_ns,
+            opts.until_ns,
+            &opts.selector,
+        )
+        .with_group_by(opts.group_by.as_deref()),
+    )?;
+    if scan.rows.is_empty() {
         return Ok(Flamegraph::empty(opts.profile_type.unit()));
     }
 
+    let mut builder = TreeBuilder::new();
+    let remap = intern_scan(&scan, &mut builder.dict);
     let mut stack_buf: Vec<u32> = Vec::with_capacity(160);
-    for meta in &metas {
-        let seg = match Segment::open(&meta.path) {
-            Ok(seg) => seg,
-            Err(err) => {
-                warn!(path = %meta.path.display(), error = %err, "skipping unreadable segment");
-                continue;
-            }
+    for row in &scan.rows {
+        let Some(stack) = scan.stacks.get(&row.stack_id) else {
+            continue;
         };
-        // Name the synthetic frame `label=value`, not just the value: the tree
-        // can be grouped by any label, so a bare value would not say which one
-        // produced it.
-        let group = opts
-            .group_by
-            .as_deref()
-            .and_then(|label| meta.label(label).map(|value| format!("{label}={value}")));
-        let remap = build_remap(&seg, &mut builder.dict);
-        for i in 0..seg.sample_count() {
-            let Some((stack_id, value)) = seg.sample_at(i) else {
-                continue;
-            };
-            stack_buf.clear();
-            seg.for_each_frame_id(stack_id, |fid| {
-                let mapped = remap.get(fid as usize).copied().unwrap_or(u32::MAX);
-                stack_buf.push(mapped);
-            });
-            builder.add_stack(group.as_deref(), &stack_buf, value);
-        }
+        map_stack(stack, &remap, &mut stack_buf);
+        builder.add_stack(row.group.as_deref(), &stack_buf, row.value);
     }
 
     let mut fg = builder.finish(opts.max_nodes);
     fg.unit = opts.profile_type.unit().as_str().to_string();
+    fg.truncated |= scan.truncated;
     Ok(fg)
 }
 
@@ -473,51 +458,31 @@ pub struct TopResult {
 pub fn top(store: &Store, opts: &QueryOptions, limit: usize) -> Result<TopResult> {
     opts.validate()?;
     let limit = limit.clamp(1, 1000);
-    let metas = store.select(
+    let scan = store.scan(&ScanQuery::new(
         &opts.profile_type,
         opts.from_ns,
         opts.until_ns,
         &opts.selector,
-    );
+    ))?;
     let mut dict = FrameDict::new();
-    let mut self_values: Vec<u64> = Vec::new();
-    let mut total_values: Vec<u64> = Vec::new();
+    let remap = intern_scan(&scan, &mut dict);
+    let mut self_values: Vec<u64> = vec![0; dict.frames.len()];
+    let mut total_values: Vec<u64> = vec![0; dict.frames.len()];
     let mut stack_buf: Vec<u32> = Vec::with_capacity(160);
 
-    for meta in &metas {
-        let seg = match Segment::open(&meta.path) {
-            Ok(seg) => seg,
-            Err(err) => {
-                warn!(path = %meta.path.display(), error = %err, "skipping unreadable segment");
+    for row in &scan.rows {
+        let Some(stack) = scan.stacks.get(&row.stack_id) else {
+            continue;
+        };
+        map_stack(stack, &remap, &mut stack_buf);
+        for (pos, &frame) in stack_buf.iter().enumerate() {
+            if frame == u32::MAX {
                 continue;
             }
-        };
-        let remap = build_remap(&seg, &mut dict);
-        if self_values.len() < dict.frames.len() {
-            self_values.resize(dict.frames.len(), 0);
-            total_values.resize(dict.frames.len(), 0);
-        }
-        for i in 0..seg.sample_count() {
-            let Some((stack_id, value)) = seg.sample_at(i) else {
-                continue;
-            };
-            stack_buf.clear();
-            seg.for_each_frame_id(stack_id, |fid| {
-                stack_buf.push(remap.get(fid as usize).copied().unwrap_or(u32::MAX));
-            });
-            for (pos, &frame) in stack_buf.iter().enumerate() {
-                if frame == u32::MAX {
-                    continue;
-                }
-                let frame = frame as usize;
-                if frame >= total_values.len() {
-                    self_values.resize(frame + 1, 0);
-                    total_values.resize(frame + 1, 0);
-                }
-                total_values[frame] = total_values[frame].saturating_add(value);
-                if pos == 0 {
-                    self_values[frame] = self_values[frame].saturating_add(value);
-                }
+            let frame = frame as usize;
+            total_values[frame] = total_values[frame].saturating_add(row.value);
+            if pos == 0 {
+                self_values[frame] = self_values[frame].saturating_add(row.value);
             }
         }
     }
@@ -581,7 +546,7 @@ pub struct TimeSeries {
     pub series: Vec<SeriesPoints>,
 }
 
-/// Aggregate values into fixed-width buckets, splitting a segment's total
+/// Aggregate values into fixed-width buckets, splitting a batch's total
 /// proportionally over the buckets it overlaps.
 pub fn timeseries(store: &Store, opts: &TimeSeriesOptions) -> Result<TimeSeries> {
     if opts.until_ns <= opts.from_ns {
@@ -886,42 +851,34 @@ pub fn diff(store: &Store, opts: &DiffOptions) -> Result<DiffFlamegraph> {
             until: opts.baseline_until_ns,
         });
     }
-    let baseline = store.select(
+    let baseline = store.scan(&ScanQuery::new(
         &opts.profile_type,
         opts.baseline_from_ns,
         opts.baseline_until_ns,
         &opts.selector,
-    );
-    let comparison = store.select(
+    ))?;
+    let comparison = store.scan(&ScanQuery::new(
         &opts.profile_type,
         opts.from_ns,
         opts.until_ns,
         &opts.selector,
-    );
+    ))?;
 
     let mut tree = DiffTree::new();
     let mut stack_buf: Vec<u32> = Vec::with_capacity(160);
-    for (metas, is_baseline) in [(baseline, true), (comparison, false)] {
-        for meta in &metas {
-            let seg = match Segment::open(&meta.path) {
-                Ok(seg) => seg,
-                Err(err) => {
-                    warn!(path = %meta.path.display(), error = %err, "skipping unreadable segment");
-                    continue;
-                }
+    for (scan, is_baseline) in [(&baseline, true), (&comparison, false)] {
+        let remap = intern_scan(scan, &mut tree.dict);
+        for row in &scan.rows {
+            let Some(stack) = scan.stacks.get(&row.stack_id) else {
+                continue;
             };
-            let remap = build_remap(&seg, &mut tree.dict);
-            for i in 0..seg.sample_count() {
-                let Some((stack_id, value)) = seg.sample_at(i) else {
-                    continue;
-                };
-                stack_buf.clear();
-                seg.for_each_frame_id(stack_id, |fid| {
-                    stack_buf.push(remap.get(fid as usize).copied().unwrap_or(u32::MAX));
-                });
-                let (left, right) = if is_baseline { (value, 0) } else { (0, value) };
-                tree.add_stack(&stack_buf, left, right);
-            }
+            map_stack(stack, &remap, &mut stack_buf);
+            let (left, right) = if is_baseline {
+                (row.value, 0)
+            } else {
+                (0, row.value)
+            };
+            tree.add_stack(&stack_buf, left, right);
         }
     }
 
