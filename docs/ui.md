@@ -245,6 +245,22 @@ committed so `cargo build` still works without Node.
 | `lib/canvas/timebrush.ts` | histogram + draggable window |
 | `lib/canvas/chart.ts` | stacked time-series canvas |
 | `components/views/` | top table, label explorer, overview, empty states |
+
+### Working on the dashboard
+
+```bash
+lidlesseye serve --listen 127.0.0.1:4040   # any agent with data
+cd web && npm run dev                      # http://127.0.0.1:3000, hot reload
+```
+
+The dev server proxies `/api`, `/ingest` and `/metrics` to
+`LIDLESSEYE_DEV_SERVER` (default `http://127.0.0.1:4040`): `output: "export"`
+and `rewrites` cannot coexist, so development drops the export and `next build`
+restores it. Nothing has to be rebuilt to see a change — `make ui` (build +
+sync into `web/dist`) is only needed before `cargo build` or a release.
+
+`web/test/smoke.cjs` is the end-to-end check; `scripts/ui-smoke.sh` starts a
+server, seeds two tenants and drives the real dashboard in Chromium.
 | `format.js` | value/time/byte formatting, escaping |
 
 All state lives in one `state` object in `app.js`. Each view is a class with
