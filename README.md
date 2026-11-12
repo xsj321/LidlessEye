@@ -29,6 +29,12 @@ choices:
 
 ![Flamegraph](docs/images/flamegraph.png)
 
+The window is picked on a histogram of sample density: drag the bracket to
+select, drag its edges to resize, or click elsewhere to jump. Label filters are
+structured rows above it, and the comparison view gets two of these brackets.
+
+![Time range and label filters](docs/images/time-range.png)
+
 ![Top functions](docs/images/top.png)
 
 ## What it does
@@ -57,6 +63,10 @@ choices:
   separate time series.
 - Labels and PromQL-flavoured selectors: `service_name="api" {env="prod",
   pod=~"api-*"}`, a label explorer, and `label-names` / `label/{name}/values`.
+- The dashboard picks windows like Grafana does: a histogram of sample
+  density below the filter bar, bracketed by a draggable time window (and a
+  second, independent one in the comparison view). Label filters are
+  structured rows, not a selector string you have to type from memory.
 - Ingest speaks **pprof protobuf** and **folded/collapsed text** as well as its
   own JSON, so the Pyroscope SDKs and `go tool pprof` output push directly.
 - **Multi-tenancy**: `X-Scope-OrgID`, per-tenant tokens, per-tenant retention,

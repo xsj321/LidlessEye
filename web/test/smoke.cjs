@@ -1,8 +1,10 @@
 // Browser smoke test for the embedded dashboard.
 //
 // The Rust suites cover the API; this covers what a human actually clicks:
-// every tab renders, the flamegraph paints real pixels, the label explorer
-// writes back into the selector, and switching tenant really switches data.
+// every tab renders, the flamegraph paints real pixels, the histogram brush
+// drives an absolute time window, the compare view brushes two windows, the
+// label explorer and the structured filter rows write into the selector, and
+// switching tenant really switches data.
 //
 // Run it through `scripts/ui-smoke.sh`, which starts a server, seeds two
 // tenants and then runs this file inside the Playwright image. Requirements:
@@ -64,7 +66,7 @@ async function waitForServer(deadlineMs = 20000) {
  * A report in the columnar wire format: one string table, stacks of frame refs
  * `[module, symbol, file, line]`. Leaf first, like the kernel reports it.
  */
-function report({ service, pod, stacks, nowNs }) {
+function report({ service, pod, stacks, fromNs, toNs }) {
   const strings = [""];
   const intern = (value) => {
     const existing = strings.indexOf(value);
@@ -80,8 +82,8 @@ function report({ service, pod, stacks, nowNs }) {
     service_name: service,
     labels: pod ? { pod } : {},
     profile_type: "cpu",
-    start_ns: nowNs - 60_000_000_000,
-    end_ns: nowNs,
+    start_ns: fromNs,
+    end_ns: toNs,
     strings,
     stacks: encoded,
   };
@@ -114,11 +116,25 @@ async function expectData(tenant) {
 /** Two tenants, each with a function name no other tenant has. */
 async function seed() {
   const nowNs = Date.now() * 1e6;
+  const minute = 60_000_000_000;
   await ingest("acme", [
+    // A batch half an hour old: gives the histogram brush a second peak and
+    // a window the drag test can select without touching the recent one.
     report({
       service: "checkout",
       pod: "checkout-1",
-      nowNs,
+      fromNs: nowNs - 30 * minute,
+      toNs: nowNs - 29 * minute,
+      stacks: [
+        [["oldCheckout", "handleHTTP", "main"], 800_000_000],
+        [["oldCharge", "oldCheckout", "handleHTTP", "main"], 300_000_000],
+      ],
+    }),
+    report({
+      service: "checkout",
+      pod: "checkout-1",
+      fromNs: nowNs - minute,
+      toNs: nowNs,
       stacks: [
         [["checkoutCharge", "handleHTTP", "main"], 500_000_000],
         [["checkoutValidate", "handleHTTP", "main"], 200_000_000],
@@ -130,7 +146,8 @@ async function seed() {
     report({
       service: "search",
       pod: "search-1",
-      nowNs,
+      fromNs: nowNs - minute,
+      toNs: nowNs,
       stacks: [
         [["zetaSearch", "handleHTTP", "main"], 300_000_000],
         [["zetaRank", "zetaSearch", "handleHTTP", "main"], 90_000_000],
@@ -209,8 +226,8 @@ async function main() {
   await settle(page);
 
   // Clicking a child frame must fly to it rather than cut to it. Row 3 at a
-  // quarter of the width is `checkoutCharge` in this seed (61% wide), so the
-  // click is inside a frame no matter how the canvas is sized.
+  // quarter of the width is a wide frame in this seed no matter how the old
+  // batch reorders the siblings, so the click lands inside one.
   await page.mouse.click(box.x + box.width * 0.25, box.y + ROW * 3 + ROW / 2);
   const zoomMotion = await page.evaluate(
     () => document.querySelector("canvas.fg-canvas")?.dataset.motion ?? null,
@@ -250,11 +267,81 @@ async function main() {
   check((await page.locator("main canvas").count()) >= 1, "time series renders a chart");
   await shot(page, "3-timeseries");
 
+  // ---- histogram time brush --------------------------------------------
+  // Switch to a short preset first so the selection covers only the right
+  // part of the extent (the seed spans 30 minutes), then drag a new window
+  // across the older batch. Whatever lands in the bracket is what every view
+  // below queries — the top table proves the window really selects the old
+  // batch and not the recent one.
+  await page.waitForSelector("canvas.time-brush", { timeout: 20000 });
+  await page.selectOption("#range", "5m");
+  await page.waitForFunction(() => window.lidlesseye.state.range === "5m", null, { timeout: 10000 });
+  const brush = await page.locator("canvas.time-brush").boundingBox();
+  check(brush !== null && brush.width > 200, "the histogram brush has a size", JSON.stringify(brush));
+  await page.mouse.move(brush.x + brush.width * 0.01, brush.y + brush.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(brush.x + brush.width * 0.2, brush.y + brush.height / 2, { steps: 6 });
+  await page.mouse.up();
+  await page.waitForFunction(() => window.lidlesseye.state.range === "custom", null, { timeout: 10000 });
+  check(true, "dragging the brush makes the range custom");
+  const windowState = await page.evaluate(() => ({
+    from: window.lidlesseye.state.fromNs,
+    until: window.lidlesseye.state.untilNs,
+  }));
+  check(
+    windowState.until > windowState.from && windowState.from > 0,
+    "the dragged window is an absolute range",
+    JSON.stringify(windowState),
+  );
+  check((await page.url()).includes("from="), "the custom window is reflected in the URL", page.url());
+
+  await page.click('#tabs a[data-view="top"]');
+  await page.waitForSelector(".tbl-wrap table tbody tr", { timeout: 20000 });
+  topText = await page.locator(".tbl-wrap table tbody").innerText();
+  check(topText.includes("oldCheckout"), "the brushed window selects the older batch", topText.slice(0, 200));
+  check(!topText.includes("checkoutCharge"), "the brushed window excludes the recent batch", topText.slice(0, 200));
+  await shot(page, "3b-brush");
+
   // ---- compare ---------------------------------------------------------
   await page.click('#tabs a[data-view="compare"]');
   await page.waitForSelector("canvas.fg-canvas", { timeout: 20000 });
   await checkActiveTab(page, "compare");
-  check(!(await page.locator("#baseline-field").isHidden()), "compare reveals the baseline control");
+  const brushCount = await page.locator("canvas.time-brush").count();
+  check(brushCount === 2, "compare shows one brush per window", String(brushCount));
+  const brushLabels = (await page.locator(".brush-label").allInnerTexts()).map((text) =>
+    text.toLowerCase(),
+  );
+  check(
+    brushLabels.some((text) => text.includes("baseline")) &&
+      brushLabels.some((text) => text.includes("comparison")),
+    "the two brushes are labelled baseline and comparison",
+    JSON.stringify(brushLabels),
+  );
+  // Nudge the comparison window (the second brush) to the left: its selection
+  // sits in the left half of the extent (the dragged window plus its default
+  // baseline widened it), so 25% is inside the bracket and a small left move
+  // keeps the old batch covered.
+  const baselineBrushBox = await page.locator("canvas.time-brush").nth(0).boundingBox();
+  const comparisonBrushBox = await page.locator("canvas.time-brush").nth(1).boundingBox();
+  check(baselineBrushBox !== null && comparisonBrushBox !== null, "both brushes have a size");
+  const fromBefore = await page.evaluate(() => window.lidlesseye.state.fromNs);
+  await page.mouse.move(
+    comparisonBrushBox.x + comparisonBrushBox.width * 0.25,
+    comparisonBrushBox.y + comparisonBrushBox.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    comparisonBrushBox.x + comparisonBrushBox.width * 0.22,
+    comparisonBrushBox.y + comparisonBrushBox.height / 2,
+    { steps: 4 },
+  );
+  await page.mouse.up();
+  const fromAfter = await page.evaluate(() => window.lidlesseye.state.fromNs);
+  check(
+    fromAfter < fromBefore,
+    "dragging the comparison brush moves its window independently",
+    `from ${fromBefore} -> ${fromAfter}`,
+  );
   await settle(page);
   await shot(page, "4-compare");
 
@@ -280,19 +367,34 @@ async function main() {
   // Capture the explorer itself: the click below navigates away.
   await shot(page, "5-labels");
 
-  const firstValue = await page.locator(".label-values button[data-value]").first().innerText();
+  // The button's text is "Filter"; the label value lives in `data-value`.
+  const firstValue = await page
+    .locator(".label-values button[data-value]")
+    .first()
+    .getAttribute("data-value");
   await page.locator(".label-values button[data-value]").first().click();
-  const selector = await page.locator("#selector").inputValue();
+  const filterText = (await page.locator("#filters").getAttribute("data-selector")) ?? "";
   check(
-    selector.includes("pod="),
-    "clicking a label value writes it into the selector",
-    `selector=${selector} value=${firstValue}`,
+    filterText.includes("pod=") && filterText.includes(firstValue),
+    "clicking a label value adds a structured filter row",
+    `selector=${filterText} value=${firstValue}`,
+  );
+  check(
+    (await page.locator(".filter-row").count()) === 1,
+    "the filter bar shows exactly one row",
   );
   // Clicking a value navigates to the flamegraph, so the tab has to follow.
   await page.waitForSelector("canvas.fg-canvas", { timeout: 20000 });
   await checkActiveTab(page, "flamegraph");
   await settle(page);
   await shot(page, "5b-label-filtered");
+
+  // Rows are cheap to add and remove from the bar itself.
+  await page.click(".filter-add");
+  check((await page.locator(".filter-row").count()) === 2, "the add button appends a row");
+  await page.locator(".filter-row [data-role='remove']").nth(1).click();
+  check((await page.locator(".filter-row").count()) === 1, "the remove button drops the row");
+  await settle(page);
 
   // ---- overview --------------------------------------------------------
   await page.click('#tabs a[data-view="overview"]');
@@ -304,8 +406,13 @@ async function main() {
   // ---- tenant switching ------------------------------------------------
   // The label click above narrowed the selector to acme's pod; a switched
   // tenant inherits it, which is the intended behaviour but would make this
-  // check assert "no rows" instead of "the other tenant's rows".
-  await page.fill("#selector", "");
+  // check assert "no rows" instead of "the other tenant's rows". Drop the
+  // rows and go back to a whole-hour window first.
+  const rows = await page.locator(".filter-row").count();
+  for (let i = 0; i < rows; i += 1) {
+    await page.locator(".filter-row [data-role='remove']").first().click();
+  }
+  await page.selectOption("#range", "1h");
   await page.click("#apply");
   await page.click('#tabs a[data-view="top"]');
   await page.waitForSelector(".tbl-wrap table tbody tr", { timeout: 20000 });
@@ -321,6 +428,26 @@ async function main() {
   check(!topText.includes("checkoutCharge"), "switching tenant hides the previous one", topText.slice(0, 200));
   check((await page.url()).includes("tenant=zeta"), "the tenant is reflected in the URL", page.url());
   await shot(page, "7-zeta");
+
+  // A selector fragment the row editor cannot round-trip must be kept
+  // verbatim, not silently dropped: a deep link is someone's filter. The
+  // server accepts unquoted values, so `service_name=checkout` is a valid
+  // matcher that the editor has no dropdown representation for.
+  await page.goto(
+    `${BASE}/#/flamegraph?selector=pod%3D%22checkout-1%22%2Cservice_name%3Dcheckout`,
+    { waitUntil: "load" },
+  );
+  await page.waitForSelector(".filter-row", { timeout: 20000 });
+  const composed = await page.locator("#filters").getAttribute("data-selector");
+  check(
+    composed === 'pod="checkout-1",service_name=checkout',
+    "a selector fragment that is not a matcher survives the editor",
+    String(composed),
+  );
+  check(
+    (await page.locator(".filter-row .filter-raw").count()) === 1,
+    "the fragment is shown as a raw row",
+  );
 
   // Nothing above is worth much if the page is throwing while it renders.
   check(consoleErrors.length === 0, "no console errors", consoleErrors.join(" | "));

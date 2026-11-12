@@ -705,11 +705,160 @@ td .sub {
   background: hsl(148 60% 34%);
 }
 
-/* Tenant / group-by / baseline selects sit inside the filter bar. */
+/* ---- label filter rows ------------------------------------------------ */
+
+.filterrows {
+  flex: none;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 16px 8px;
+}
+
+.filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.filter-add {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.filter-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.filter-row select {
+  height: 26px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  max-width: 180px;
+}
+
+.filter-row select + select {
+  border-left: 1px solid var(--border);
+}
+
+.filter-row select[data-role="op"] {
+  max-width: 110px;
+  color: var(--text-faint);
+}
+
+.filter-row select[data-role="label"] {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.filter-row select[data-role="value"] {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.filter-row select:disabled {
+  opacity: 0.5;
+}
+
+.filter-remove {
+  height: 26px;
+  width: 26px;
+  padding: 0;
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* A matcher kept verbatim from a deep link: shown, applied, not editable. */
+.filter-raw {
+  padding: 0 10px;
+  line-height: 26px;
+  font-size: 12px;
+  color: var(--text-muted);
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filter-remove:hover {
+  color: var(--danger);
+  background: var(--bg-hover);
+}
+
+.filters-preview {
+  color: var(--text-faint);
+  font-size: 11px;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- histogram time bar ----------------------------------------------- */
+
+.timebar {
+  flex: none;
+  padding: 8px 16px 10px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.brushes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.brush {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 10px 2px;
+}
+
+.brush-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+
+.brush-label {
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--text-faint);
+}
+
+.brush-range {
+  color: var(--text-muted);
+}
+
+canvas.time-brush {
+  display: block;
+  width: 100%;
+  touch-action: none;
+}
+
+/* Tenant / group-by selects sit inside the filter bar. */
 .filterbar .field select,
 .filterbar #tenant,
-.filterbar #group-by,
-.filterbar #baseline {
+.filterbar #group-by {
   max-width: 190px;
 }
 

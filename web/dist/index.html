@@ -51,17 +51,9 @@
           <option value="">none</option>
         </select>
       </label>
-      <label class="field grow">
-        <span>Selector</span>
-        <input id="selector" type="text" spellcheck="false" placeholder='service_name="api" {env="prod", pod=~"api-*"}' />
-      </label>
       <label class="field">
         <span>Range</span>
         <select id="range"></select>
-      </label>
-      <label class="field" id="baseline-field" hidden>
-        <span>Baseline</span>
-        <select id="baseline"></select>
       </label>
       <label class="field checkbox" title="Reload every 30 seconds">
         <input id="auto-refresh" type="checkbox" />
@@ -69,6 +61,12 @@
       </label>
       <button class="primary" id="apply">Apply</button>
     </div>
+
+    <div class="filterrows">
+      <div id="filters" data-selector=""></div>
+    </div>
+
+    <div class="timebar" id="timebar"></div>
 
     <main id="main" class="main"></main>
 

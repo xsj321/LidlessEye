@@ -290,7 +290,9 @@ export class LabelExplorer {
 
   renderValues() {
     if (!this.active) {
-      this.valuesEl.innerHTML = `<div class="empty"><h3>No labels</h3><p>Ingest a profile first.</p></div>`;
+      // The range can now be an empty window (dragged on the histogram), so
+      // "ingest a profile" would be the wrong advice.
+      this.valuesEl.innerHTML = `<div class="empty"><h3>No labels in this window</h3><p>Widen the time range or clear the filters to see label values.</p></div>`;
       this.countEl.textContent = "";
       return;
     }

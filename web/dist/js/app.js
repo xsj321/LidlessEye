@@ -1,9 +1,17 @@
-// Application shell: filter bar, hash routing, data loading.
+// Application shell: filter bar, label filters, histogram time selection,
+// hash routing, data loading.
+//
+// The time window is always resolved to an absolute [from, until] before a
+// query goes out: presets are translated to `now-<range>` server-side, the
+// histogram brush below the filter bar sets absolute bounds. The compare view
+// carries a second, independent window for the baseline side of the diff.
 
 import { ApiError, api, getTenant, setTenant } from "./api.js";
 import { TimeSeriesChart } from "./chart.js";
 import { Flamegraph } from "./flamegraph.js";
 import { LabelExplorer, TopTable, emptyState, renderOverview } from "./views.js";
+import { TimeBrush } from "./timebrush.js";
+import { LabelFilters, composeSelector, parseSelector } from "./labelfilters.js";
 
 const RANGES = [
   ["5m", "Last 5 minutes"],
@@ -14,22 +22,20 @@ const RANGES = [
   ["7d", "Last 7 days"],
 ];
 
-const BASELINES = [
-  ["same", "Preceding window"],
-  ["15m", "15 minutes"],
-  ["1h", "1 hour"],
-  ["6h", "6 hours"],
-  ["24h", "24 hours"],
-];
-
 const VIEWS = ["flamegraph", "compare", "top", "timeseries", "labels", "overview"];
 
 const state = {
   view: "flamegraph",
   type: "cpu",
+  // Either a preset ("1h") or "custom": an absolute window set by dragging
+  // the histogram brush.
   range: "1h",
-  baseline: "same",
-  selector: "",
+  fromNs: 0,
+  untilNs: 0,
+  // Baseline window for the compare view; initialised to the preceding span.
+  baseFromNs: 0,
+  baseUntilNs: 0,
+  filters: [],
   groupBy: "",
   tenant: getTenant(),
   auto: false,
@@ -44,9 +50,8 @@ const el = {
   profileType: document.getElementById("profile-type"),
   groupBy: document.getElementById("group-by"),
   range: document.getElementById("range"),
-  baseline: document.getElementById("baseline"),
-  baselineField: document.getElementById("baseline-field"),
-  selector: document.getElementById("selector"),
+  filters: document.getElementById("filters"),
+  timebar: document.getElementById("timebar"),
   auto: document.getElementById("auto-refresh"),
   apply: document.getElementById("apply"),
   refresh: document.getElementById("refresh"),
@@ -58,47 +63,17 @@ let component = null;
 let autoTimer = null;
 let requestId = 0;
 
-// ---- routing -----------------------------------------------------------
+// The histogram brushes. One in every view, two in compare.
+const brushes = { main: null, baseline: null };
+let histData = null; // last /api/v1/timeseries payload over the extent
+let histToken = 0;
+let earliestNs = null; // per tenant, for the brush extent
+const valueCache = new Map();
 
-function parseHash() {
-  const raw = location.hash.replace(/^#\/?/, "");
-  const [view, query] = raw.split("?");
-  const params = new URLSearchParams(query ?? "");
-  if (VIEWS.includes(view)) state.view = view;
-  if (params.get("type")) state.type = params.get("type");
-  if (params.get("range")) state.range = params.get("range");
-  if (params.get("baseline")) state.baseline = params.get("baseline");
-  if (params.has("selector")) state.selector = params.get("selector");
-  if (params.has("group_by")) state.groupBy = params.get("group_by");
-  if (params.has("tenant")) {
-    state.tenant = params.get("tenant");
-    setTenant(state.tenant);
-  }
-}
+// ---- time windows ------------------------------------------------------
 
-function writeHash() {
-  const params = new URLSearchParams();
-  params.set("type", state.type);
-  params.set("range", state.range);
-  if (state.view === "compare") params.set("baseline", state.baseline);
-  if (state.selector) params.set("selector", state.selector);
-  if (state.groupBy) params.set("group_by", state.groupBy);
-  if (state.tenant) params.set("tenant", state.tenant);
-  const next = `#/${state.view}?${params.toString()}`;
-  if (location.hash !== next) history.replaceState(null, "", next);
-}
-
-// ---- data --------------------------------------------------------------
-
-function queryParams() {
-  const params = {
-    profile_type: state.type,
-    from: `now-${state.range}`,
-    until: "now",
-  };
-  if (state.selector.trim()) params.selector = state.selector.trim();
-  if (state.groupBy && state.view !== "compare") params.group_by = state.groupBy;
-  return params;
+function nowNs() {
+  return Date.now() * 1e6;
 }
 
 /** `1h` / `30m` / `7d` in nanoseconds. */
@@ -110,20 +85,121 @@ function durationNs(text) {
   return value * scale;
 }
 
-function diffParams() {
-  const params = queryParams();
-  const rangeNs = durationNs(state.range);
-  const baselineNs = state.baseline === "same" ? rangeNs : durationNs(state.baseline);
-  params.baseline_until = `now-${state.range}`;
-  params.baseline_from = `now-${nsToText(rangeNs + baselineNs)}`;
+/** Absolute window in ns, whatever the range preset says. */
+function resolveWindow() {
+  if (state.range === "custom" && state.fromNs && state.untilNs > state.fromNs) {
+    return { from: state.fromNs, until: state.untilNs };
+  }
+  const until = nowNs();
+  return { from: until - durationNs(state.range), until };
+}
+
+/** RFC3339, the format the server's time parser accepts. */
+function iso(ns) {
+  return new Date(Number(ns) / 1e6).toISOString();
+}
+
+/** The baseline window: defaults to the span immediately before the main one. */
+function resolveBaseline() {
+  if (state.baseFromNs && state.baseUntilNs > state.baseFromNs) {
+    return { from: state.baseFromNs, until: state.baseUntilNs };
+  }
+  const win = resolveWindow();
+  const span = win.until - win.from;
+  return { from: win.from - span, until: win.from };
+}
+
+function setWindow(from, until) {
+  state.range = "custom";
+  state.fromNs = from;
+  state.untilNs = until;
+  syncControls();
+  writeHash();
+  load();
+  loadHistogram();
+}
+
+function setBaselineWindow(from, until) {
+  state.baseFromNs = from;
+  state.baseUntilNs = until;
+  writeHash();
+  load();
+  loadHistogram();
+}
+
+// ---- routing -----------------------------------------------------------
+
+function parseHash() {
+  const raw = location.hash.replace(/^#\/?/, "");
+  const [view, query] = raw.split("?");
+  const params = new URLSearchParams(query ?? "");
+  if (VIEWS.includes(view)) state.view = view;
+  if (params.get("type")) state.type = params.get("type");
+  if (params.get("range")) state.range = params.get("range");
+  const from = Number(params.get("from"));
+  const until = Number(params.get("until"));
+  if (Number.isFinite(from) && Number.isFinite(until) && until > from) {
+    state.range = "custom";
+    state.fromNs = from;
+    state.untilNs = until;
+  }
+  const bfrom = Number(params.get("bfrom"));
+  const buntil = Number(params.get("buntil"));
+  if (Number.isFinite(bfrom) && Number.isFinite(buntil) && buntil > bfrom) {
+    state.baseFromNs = bfrom;
+    state.baseUntilNs = buntil;
+  }
+  if (params.has("selector")) state.filters = parseSelector(params.get("selector"));
+  if (params.has("group_by")) state.groupBy = params.get("group_by");
+  if (params.has("tenant")) {
+    state.tenant = params.get("tenant");
+    setTenant(state.tenant);
+  }
+}
+
+function writeHash() {
+  const params = new URLSearchParams();
+  params.set("type", state.type);
+  if (state.range === "custom") {
+    params.set("from", String(state.fromNs));
+    params.set("until", String(state.untilNs));
+  } else {
+    params.set("range", state.range);
+  }
+  if (state.view === "compare") {
+    const baseline = resolveBaseline();
+    params.set("bfrom", String(baseline.from));
+    params.set("buntil", String(baseline.until));
+  }
+  const selector = composeSelector(state.filters);
+  if (selector) params.set("selector", selector);
+  if (state.groupBy) params.set("group_by", state.groupBy);
+  if (state.tenant) params.set("tenant", state.tenant);
+  const next = `#/${state.view}?${params.toString()}`;
+  if (location.hash !== next) history.replaceState(null, "", next);
+}
+
+// ---- data --------------------------------------------------------------
+
+function queryParams() {
+  const win = resolveWindow();
+  const params = {
+    profile_type: state.type,
+    from: state.range === "custom" ? iso(win.from) : `now-${state.range}`,
+    until: state.range === "custom" ? iso(win.until) : "now",
+  };
+  const selector = composeSelector(state.filters);
+  if (selector) params.selector = selector;
+  if (state.groupBy && state.view !== "compare") params.group_by = state.groupBy;
   return params;
 }
 
-function nsToText(ns) {
-  if (ns % 8.64e13 === 0) return `${ns / 8.64e13}d`;
-  if (ns % 3.6e12 === 0) return `${ns / 3.6e12}h`;
-  if (ns % 6e10 === 0) return `${ns / 6e10}m`;
-  return `${Math.round(ns / 1e9)}s`;
+function diffParams() {
+  const params = queryParams();
+  const baseline = resolveBaseline();
+  params.baseline_from = iso(baseline.from);
+  params.baseline_until = iso(baseline.until);
+  return params;
 }
 
 function setBanner(message) {
@@ -214,6 +290,132 @@ async function load() {
   }
 }
 
+// ---- histogram time bar ------------------------------------------------
+
+/** The full span the brushes show: from the oldest data to now. */
+function computeExtent() {
+  const win = resolveWindow();
+  let from = win.from;
+  let until = Math.max(win.until, nowNs());
+  if (state.view === "compare") {
+    const baseline = resolveBaseline();
+    from = Math.min(from, baseline.from);
+    until = Math.max(until, baseline.until);
+  }
+  if (earliestNs) from = Math.min(from, earliestNs);
+  const span = until - from;
+  return { from: Math.floor(from - span * 0.02), until: Math.ceil(until) };
+}
+
+function renderTimebar() {
+  brushes.main?.destroy();
+  brushes.baseline?.destroy();
+  brushes.baseline = null;
+  el.timebar.innerHTML = "";
+
+  const extent = computeExtent();
+  const win = resolveWindow();
+
+  if (state.view === "compare") {
+    const baseline = resolveBaseline();
+    const wrap = document.createElement("div");
+    wrap.className = "brushes";
+    el.timebar.appendChild(wrap);
+
+    // One host per brush: a brush renders by replacing its host's innerHTML,
+    // so two brushes in one host would clobber each other.
+    const baselineHost = document.createElement("div");
+    const mainHost = document.createElement("div");
+    wrap.append(baselineHost, mainHost);
+
+    brushes.baseline = new TimeBrush(baselineHost, {
+      label: "A · Baseline",
+      onChange: setBaselineWindow,
+    });
+    brushes.main = new TimeBrush(mainHost, {
+      label: "B · Comparison",
+      onChange: (from, until) => setWindow(from, until),
+    });
+    brushes.baseline.setExtent(extent.from, extent.until);
+    brushes.main.setExtent(extent.from, extent.until);
+    brushes.baseline.setSelection(baseline.from, baseline.until);
+    brushes.main.setSelection(win.from, win.until);
+  } else {
+    brushes.main = new TimeBrush(el.timebar, {
+      label: "Time range",
+      onChange: (from, until) => setWindow(from, until),
+    });
+    brushes.main.setExtent(extent.from, extent.until);
+    brushes.main.setSelection(win.from, win.until);
+  }
+
+  if (histData) feedBrushes();
+}
+
+function feedBrushes() {
+  brushes.main?.setHistogram(histData);
+  brushes.baseline?.setHistogram(histData);
+}
+
+/** Refresh the histogram over the current extent; single-flighted. */
+async function loadHistogram() {
+  const token = ++histToken;
+  const extent = computeExtent();
+  const selector = composeSelector(state.filters);
+  const params = {
+    profile_type: state.type,
+    from: iso(extent.from),
+    until: iso(extent.until),
+    buckets: 120,
+  };
+  if (selector) params.selector = selector;
+  try {
+    const payload = await api.timeseries(params);
+    if (token !== histToken) return;
+    histData = payload;
+    feedBrushes();
+  } catch {
+    // The histogram is decoration on top of a working query path; a failure
+    // here (token expiry, transient 5xx) must not blank the views.
+  }
+}
+
+async function loadStats() {
+  try {
+    const stats = await api.stats();
+    earliestNs = stats?.store?.earliest_ns || null;
+  } catch {
+    earliestNs = null;
+  }
+}
+
+// ---- label filters -----------------------------------------------------
+
+async function loadValuesFor(label) {
+  const others = composeSelector(
+    state.filters.filter((filter) => !filter.raw && filter.label !== label),
+  );
+  const key = `${state.tenant}|${label}|${others}`;
+  if (valueCache.has(key)) return valueCache.get(key);
+  const win = resolveWindow();
+  const params = { from: iso(win.from), until: iso(win.until) };
+  if (others) params.selector = others;
+  const values = api
+    .labelValues(label, params)
+    .then((result) => (result.values ?? []).map((row) => row.value))
+    .catch(() => []);
+  valueCache.set(key, values);
+  return values;
+}
+
+function onFiltersChange(filters) {
+  state.filters = filters;
+  valueCache.clear();
+  writeHash();
+  load();
+  loadHistogram();
+}
+
 async function loadLabels(id, params) {
   const names = await api.labelNames(params);
   if (id !== requestId) return;
@@ -222,8 +424,8 @@ async function loadLabels(id, params) {
       (box) =>
         new LabelExplorer(box, {
           onFilter: (label, value) => {
-            state.selector = `${label}="${value}"`;
-            syncControls();
+            state.filters = [{ label, op: "=", value }];
+            filtersComponent.setFilters(state.filters);
             writeHash();
             setView("flamegraph");
           },
@@ -240,6 +442,14 @@ async function loadLabels(id, params) {
     component.setValues(active, values.values ?? []);
   }
 }
+
+// The structured filter rows in the bar under the filterbar.
+const filtersComponent = new LabelFilters(el.filters, {
+  loadValues: loadValuesFor,
+  onChange: onFiltersChange,
+});
+
+// ---- misc --------------------------------------------------------------
 
 async function unitFor(type, params) {
   try {
@@ -289,9 +499,6 @@ function hideTooltip() {
 /** Mirror the URL state into the filter controls. */
 function syncControls() {
   el.range.value = state.range;
-  el.baseline.value = state.baseline;
-  el.baselineField.hidden = state.view !== "compare";
-  el.selector.value = state.selector;
   el.groupBy.value = state.groupBy;
   if (![...el.profileType.options].some((option) => option.value === state.type)) {
     const option = document.createElement("option");
@@ -308,6 +515,9 @@ function syncControls() {
     el.tenant.appendChild(option);
   }
   el.tenant.value = state.tenant;
+  if (el.filters.dataset.selector !== composeSelector(state.filters)) {
+    filtersComponent.setFilters(state.filters);
+  }
 }
 
 function renderEmpty(title, hint) {
@@ -335,14 +545,9 @@ function renderEmptyFlamegraph() {
 // ---- UI wiring ---------------------------------------------------------
 
 function populateSelects() {
-  el.range.innerHTML = RANGES.map(
-    ([value, label]) => `<option value="${value}">${label}</option>`,
-  ).join("");
-  el.range.value = state.range;
-  el.baseline.innerHTML = BASELINES.map(
-    ([value, label]) => `<option value="${value}">${label}</option>`,
-  ).join("");
-  el.baseline.value = state.baseline;
+  el.range.innerHTML =
+    RANGES.map(([value, label]) => `<option value="${value}">${label}</option>`).join("") +
+    '<option value="custom">Custom (drag the histogram)</option>';
   el.profileType.innerHTML = '<option value="cpu">cpu</option>';
 }
 
@@ -378,7 +583,12 @@ async function loadTenants() {
 
 async function loadProfileTypes() {
   try {
-    const result = await api.profileTypes({ from: `now-${state.range}`, until: "now" });
+    const win = resolveWindow();
+    const params = {
+      from: state.range === "custom" ? iso(win.from) : `now-${state.range}`,
+      until: state.range === "custom" ? iso(win.until) : "now",
+    };
+    const result = await api.profileTypes(params);
     const types = (result.profile_types ?? []).map((row) => row.name);
     if (!types.includes("cpu")) types.unshift("cpu");
     el.profileType.innerHTML = types
@@ -393,7 +603,7 @@ async function loadProfileTypes() {
 
 async function loadLabelNames() {
   try {
-    const result = await api.labelNames({ from: `now-${state.range}`, until: "now" });
+    const result = await api.labelNames({ from: "now-7d", until: "now" });
     const names = (result.label_names ?? []).filter((name) => name !== "service_name");
     el.groupBy.innerHTML =
       '<option value="">none</option>' +
@@ -401,6 +611,7 @@ async function loadLabelNames() {
         .map((name) => `<option value="${name}">${name}</option>`)
         .join("");
     el.groupBy.value = state.groupBy;
+    filtersComponent.setNames(["service_name", ...names]);
   } catch {
     /* grouping is optional */
   }
@@ -408,23 +619,44 @@ async function loadLabelNames() {
 
 function applyFromControls() {
   state.type = el.profileType.value || "cpu";
-  state.range = el.range.value;
-  state.baseline = el.baseline.value;
-  state.selector = el.selector.value;
+  if (el.range.value !== state.range) {
+    state.range = el.range.value;
+    if (state.range === "custom" && !state.fromNs) {
+      // First switch to custom without a dragged window: pin the current one.
+      const win = resolveWindow();
+      state.fromNs = win.from;
+      state.untilNs = win.until;
+    }
+    if (state.range !== "custom") {
+      state.fromNs = 0;
+      state.untilNs = 0;
+    }
+    renderTimebar();
+  }
   state.groupBy = el.groupBy.value;
   writeHash();
   load();
+  loadHistogram();
 }
 
 function switchTenant(tenant) {
   state.tenant = tenant;
   setTenant(tenant);
   state.label = null;
+  valueCache.clear();
+  earliestNs = null;
+  histData = null;
   writeHash();
   // Profile types and label names are per tenant, so reload them too.
+  loadStats().then(() => {
+    renderTimebar();
+    loadHistogram();
+  });
   loadProfileTypes().then(() => {
     loadLabelNames();
+    renderTimebar();
     load();
+    loadHistogram();
   });
 }
 
@@ -438,21 +670,38 @@ function setView(view) {
   component = null;
   hideTooltip();
   el.main.innerHTML = "";
+  renderTimebar();
   syncControls();
   writeHash();
   load();
+  loadHistogram();
 }
 
 function setupAutoRefresh() {
   state.auto = el.auto.checked;
   clearInterval(autoTimer);
-  if (state.auto) autoTimer = setInterval(load, 30_000);
+  if (state.auto) {
+    autoTimer = setInterval(() => {
+      // A relative range tracks "now"; a custom window is pinned in place.
+      if (state.range !== "custom") {
+        const win = resolveWindow();
+        brushes.main?.setSelection(win.from, win.until);
+        if (state.view === "compare") {
+          const baseline = resolveBaseline();
+          brushes.baseline?.setSelection(baseline.from, baseline.until);
+        }
+      }
+      load();
+      loadHistogram();
+    }, 30_000);
+  }
 }
 
 function boot() {
   populateSelects();
   parseHash();
   syncControls();
+  renderTimebar();
   el.auto.checked = state.auto;
   for (const link of el.tabs.querySelectorAll("a")) {
     link.classList.toggle("active", link.dataset.view === state.view);
@@ -470,19 +719,26 @@ function boot() {
   });
 
   el.apply.addEventListener("click", applyFromControls);
-  el.refresh.addEventListener("click", load);
+  el.refresh.addEventListener("click", () => {
+    load();
+    loadHistogram();
+  });
   el.auto.addEventListener("change", setupAutoRefresh);
   el.range.addEventListener("change", applyFromControls);
-  el.baseline.addEventListener("change", applyFromControls);
-  el.profileType.addEventListener("change", applyFromControls);
+  el.profileType.addEventListener("change", () => {
+    state.type = el.profileType.value || "cpu";
+    writeHash();
+    load();
+    loadHistogram();
+  });
   el.groupBy.addEventListener("change", applyFromControls);
   el.tenant.addEventListener("change", () => switchTenant(el.tenant.value));
-  el.selector.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") applyFromControls();
-  });
   window.addEventListener("keydown", (event) => {
     if (event.target.matches("input, select, textarea")) return;
-    if (event.key === "r" || event.key === "R") load();
+    if (event.key === "r" || event.key === "R") {
+      load();
+      loadHistogram();
+    }
   });
 
   api
@@ -495,10 +751,16 @@ function boot() {
     });
 
   loadTenants().then(() => {
+    // The extent needs the oldest retained sample, so stats come first.
+    loadStats().then(() => {
+      renderTimebar();
+      loadHistogram();
+    });
     loadProfileTypes().then(() => {
       el.profileType.value = state.type;
       loadLabelNames();
       load();
+      loadHistogram();
     });
   });
 }
