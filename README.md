@@ -260,7 +260,7 @@ deploy/                   Dockerfile, docker-compose, Helm chart
 ## Testing
 
 ```bash
-cargo test --workspace        # 156 unit, integration and end-to-end tests
+cargo test --workspace        # unit, integration and end-to-end tests
 
 # eBPF against a real kernel (root; Docker is enough)
 DEV_PRIVILEGED=1 DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes" \
