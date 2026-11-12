@@ -1148,7 +1148,7 @@ impl Store {
             let stack_id: i64 = row.get(0).map_err(db_err)?;
             let blob: Vec<u8> = row.get(1).map_err(db_err)?;
             // Frame ids are 4 bytes each; a truncated blob cannot be trusted.
-            let mut bad = blob.len() % 4 != 0;
+            let mut bad = !blob.len().is_multiple_of(4);
             for id in unpack_frames(&blob) {
                 if !known.contains(&(id as i64)) {
                     orphans += 1;
@@ -1688,7 +1688,10 @@ mod tests {
             "fsck must report the dangling sample"
         );
         let removed = store.repair().unwrap();
-        assert!(removed >= 2, "expected at least two rows, removed {removed}");
+        assert!(
+            removed >= 2,
+            "expected at least two rows, removed {removed}"
+        );
         assert!(store.fsck().iter().all(|(_, r)| r.is_ok()));
         assert_eq!(store.stats().segment_count, before, "good batch survives");
         assert!(store.path().is_file(), "database file survives");
