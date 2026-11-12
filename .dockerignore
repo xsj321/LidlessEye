@@ -1,0 +1,31 @@
+# Keep the build context to what the Dockerfile actually copies.
+#
+# Without this the daemon tars up `.git`, `target/` and the local scratch
+# directories on every build: the transfer dominates the build time on a cold
+# machine, and anything sitting in the working tree rides along into the
+# builder — which is not where untracked files belong.
+
+target/
+**/target/
+
+.git/
+.gitignore
+.gitattributes
+
+# Local state and scratch space
+.tmp/
+.workbuddy/
+lidlesseye-data/
+*.leseg
+*.leseg.tmp
+
+# Not needed by the image
+docs/
+examples/
+deploy/
+scripts/
+.devcontainer/
+
+# Front-end dependencies (the dashboard is committed as plain ES modules)
+web/node_modules/
+web/src/

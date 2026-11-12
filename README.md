@@ -269,6 +269,9 @@ DEV_PRIVILEGED=1 DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes" \
 
 # the dashboard in Chromium (Docker only)
 ./scripts/ui-smoke.sh
+
+# the shipped image: build, run, ingest, query, tenant isolation
+./scripts/deploy-smoke.sh
 ```
 
 The browser test seeds two tenants, walks every tab and fails on a console

@@ -121,6 +121,24 @@ agent:
   tolerations: []
 ```
 
+## Verifying an image or a chart before shipping it
+
+Two scripts check the artefacts rather than the source tree. Both need only
+Docker, so they work on a laptop that has no Rust toolchain:
+
+```bash
+./scripts/deploy-smoke.sh     # build deploy/docker/Dockerfile, run it, exercise the API
+./scripts/ui-smoke.sh         # drive the dashboard in Chromium
+helm lint deploy/helm/lidlesseye
+helm template demo deploy/helm/lidlesseye -f my-values.yaml
+```
+
+`deploy-smoke.sh` is the one that catches packaging mistakes: a release build
+that dropped the embedded dashboard, an image whose data directory is not
+writable, an ingest path that only fails outside `cargo test`. It asserts the
+health endpoint, the embedded assets, a real ingest, the flamegraph total,
+tenant isolation, the diff endpoint, and that `/metrics` carries no tenant ids.
+
 ## Choosing parameters
 
 | Flag | Default | Notes |
