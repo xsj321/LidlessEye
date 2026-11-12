@@ -59,6 +59,12 @@ docker run --rm \
   "$IMAGE" \
   bash -c '
     set -u
+    # The server binary links the prebuilt libduckdb.so from the cargo build
+    # directory; this container only mounts the target volume read-only, so
+    # point the loader at that copy before starting it.
+    lib=$(dirname "$(find /build/debug/build -name libduckdb.so -type f -print -quit)")
+    [ -f "$lib/libduckdb.so" ] || { echo "libduckdb.so missing from the build tree" >&2; exit 1; }
+    export LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     /build/debug/lidlesseye serve --data-dir /tmp/le-ui --listen 127.0.0.1:4040 >/tmp/server.log 2>&1 &
     server=$!
     trap "kill $server 2>/dev/null || true" EXIT
