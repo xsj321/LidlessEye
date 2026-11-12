@@ -24,6 +24,11 @@
 mod collector;
 #[cfg(target_os = "linux")]
 mod gopclntab;
+/// Pod metadata, keyed by UID, that names the series of a pod.
+///
+/// Available on every platform: it is a plain snapshot with no eBPF in it, and
+/// the non-Linux build of this crate keeps the same `CollectorConfig` shape.
+pub mod k8s;
 #[cfg(target_os = "linux")]
 mod perf_map;
 #[cfg(target_os = "linux")]
@@ -100,6 +105,7 @@ pub struct CollectorConfig {
     pub collect_off_cpu: bool,
     pub exclude_pids: Vec<u32>,
     pub enrich_kubernetes_labels: bool,
+    pub pods: Option<std::sync::Arc<crate::k8s::PodIndex>>,
     pub node_label: bool,
 }
 
@@ -115,6 +121,7 @@ impl Default for CollectorConfig {
             collect_off_cpu: true,
             exclude_pids: Vec::new(),
             enrich_kubernetes_labels: true,
+            pods: None,
             node_label: true,
         }
     }

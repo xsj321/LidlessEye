@@ -152,7 +152,10 @@ helm install lidlesseye deploy/helm/lidlesseye \
 The chart renders a server `Deployment` (PVC, health probes, optional
 `ServiceMonitor`) and an agent `DaemonSet` with `hostPID: true`,
 `privileged: true` and `tolerations: [{operator: Exists}]` so it covers tainted
-nodes too. See [docs/deployment.md](docs/deployment.md).
+nodes too. The agent lists the pods on its node (the chart creates the
+`pod-reader` ClusterRole for that), so a series is named after the Deployment or
+StatefulSet that produced it rather than after the binary inside it. See
+[docs/deployment.md](docs/deployment.md).
 
 ## Embed it in your own binary
 
@@ -251,7 +254,9 @@ lidlesseye info     # build and platform information
 
 `collect` accepts `--frequency`, `--flush`, `--label k=v`, `--service-name`,
 `--no-cpu`, `--no-offcpu`, `--no-k8s-labels` (drop the `k8s_*` labels derived
-from each cgroup), plus `--server <url>`, `--tenant`, `--tenant-header`
+from each cgroup), `--no-k8s-pod-metadata` and `--k8s-pod-refresh` (name series
+after the pod's workload by listing pods on the node), plus `--server <url>`,
+`--tenant`, `--tenant-header`
 (default `X-Tenant-Id`, the alias the server always accepts), `--auth-token`
 and `--duration` (stop after this long; used by the tests).
 

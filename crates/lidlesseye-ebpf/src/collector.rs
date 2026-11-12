@@ -66,6 +66,14 @@ pub struct CollectorConfig {
     pub exclude_self: bool,
     /// Derive `k8s_*` labels from the cgroup path of each process.
     pub enrich_kubernetes_labels: bool,
+    /// Pod metadata, when something is able to fill it.
+    ///
+    /// The cgroup path only carries the pod *UID*; naming the series after the
+    /// pod's workload needs the API. Whoever can reach it hands the collector a
+    /// snapshot through [`crate::k8s::PodIndex`]; leaving this `None` (the
+    /// default) keeps the process-name behaviour and is what happens outside a
+    /// cluster.
+    pub pods: Option<Arc<crate::k8s::PodIndex>>,
     /// Add a `node` label with the host name.
     pub node_label: bool,
 }
@@ -82,6 +90,7 @@ impl Default for CollectorConfig {
             exclude_pids: Vec::new(),
             exclude_self: true,
             enrich_kubernetes_labels: true,
+            pods: None,
             node_label: true,
         }
     }
@@ -683,26 +692,61 @@ struct GroupKey {
 
 fn resolve_group(config: &CollectorConfig, tgid: u32) -> Option<GroupKey> {
     let comm = procfs::read_comm(tgid)?;
-    let service = config.service_name.clone().unwrap_or_else(|| comm.clone());
     let mut labels = config.labels.clone();
     if config.node_label {
         labels
             .entry("node".to_string())
             .or_insert_with(procfs::hostname);
     }
-    if config.service_name.is_some() {
-        // When everything is aggregated under one service name, keep the
-        // process name so that individual binaries remain distinguishable.
-        labels
-            .entry("process_name".to_string())
-            .or_insert(comm.clone());
-    }
+
+    // The cgroup path gives the pod UID, and the UID gives everything else.
+    // Both halves are optional: no cgroup path outside a container, and no pod
+    // metadata outside a cluster (or without the RBAC to read it).
+    let mut pod = None;
     if config.enrich_kubernetes_labels
         && let Some(cgroup) = procfs::read_cgroup(tgid)
     {
-        for (key, value) in procfs::kubernetes_labels(&cgroup) {
+        let from_cgroup = procfs::kubernetes_labels(&cgroup);
+        if let (Some(index), Some(uid)) = (config.pods.as_ref(), from_cgroup.get("k8s_pod_uid")) {
+            pod = index.lookup(uid);
+        }
+        for (key, value) in from_cgroup {
             labels.entry(key).or_insert(value);
         }
+    }
+    if let Some(meta) = &pod {
+        labels
+            .entry("k8s_namespace".to_string())
+            .or_insert_with(|| meta.namespace.clone());
+        labels
+            .entry("k8s_pod".to_string())
+            .or_insert_with(|| meta.name.clone());
+        if let Some(workload) = &meta.workload {
+            labels
+                .entry("k8s_workload".to_string())
+                .or_insert_with(|| workload.clone());
+        }
+        if let Some(kind) = &meta.workload_kind {
+            labels
+                .entry("k8s_workload_kind".to_string())
+                .or_insert_with(|| kind.clone());
+        }
+    }
+
+    // A pod knows what it is; a bare process only knows which binary it runs.
+    let service = config
+        .service_name
+        .clone()
+        .or_else(|| {
+            pod.as_ref()
+                .and_then(|meta| meta.service_name().map(str::to_string))
+        })
+        .unwrap_or_else(|| comm.clone());
+    if service != comm {
+        // The service name hides the binary, so keep the binary addressable.
+        labels
+            .entry("process_name".to_string())
+            .or_insert_with(|| comm.clone());
     }
     Some(GroupKey { service, labels })
 }

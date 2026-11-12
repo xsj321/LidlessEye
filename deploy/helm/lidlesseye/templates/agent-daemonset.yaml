@@ -19,7 +19,7 @@ spec:
         {{- include "lidlesseye.agent.selectorLabels" . | nindent 8 }}
       annotations:
         # Restart the agents when the server address or credentials change.
-        checksum/config: {{ printf "%s|%v|%v|%v" (include "lidlesseye.serverUrl" .) .Values.agent.frequency .Values.agent.serviceName .Values.agent.labels | sha256sum }}
+        checksum/config: {{ printf "%s|%v|%v|%v|%v" (include "lidlesseye.serverUrl" .) .Values.agent.frequency .Values.agent.serviceName .Values.agent.labels .Values.agent.podMetadata | sha256sum }}
         {{- with .Values.agent.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -55,6 +55,16 @@ spec:
             {{- end }}
             {{- if not .Values.agent.enrichKubernetesLabels }}
             - --no-k8s-labels
+            {{- end }}
+            {{- $pods := .Values.agent.podMetadata | default dict }}
+            {{- if not ($pods.enabled | default false) }}
+            # Pod metadata needs the pod UID from the cgroup labels, so it is
+            # only ever asked for when those are on (the binary enforces this
+            # too; the flag is here to make the intent visible in the pod spec).
+            - --no-k8s-pod-metadata
+            {{- end }}
+            {{- with $pods.refresh }}
+            - --k8s-pod-refresh={{ . }}
             {{- end }}
             {{- if .Values.agent.serviceName }}
             - --service-name={{ .Values.agent.serviceName }}

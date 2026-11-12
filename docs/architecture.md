@@ -115,6 +115,23 @@ Because every frame is resolved *before* storage, a stored batch is
 self-contained: no `vmlinux`, no build ids, no `.debug` files are needed to read
 it back, and a profile of a process that has already exited remains readable.
 
+### Labels, and what names a series
+
+Two enrichments run per process, and they fail independently:
+
+- **from the cgroup path** (always, no privileges): the pod UID, the QoS class
+  and a `k8s_container` marker. The path is not a name — it is a UID — so this
+  alone cannot say *what* was profiled.
+- **from the pod index** (only when the API is reachable): namespace, pod name,
+  owning workload and kind, plus the service name taken from
+  `app.kubernetes.io/name` or the workload. `lidlesseye-ebpf` only holds the
+  snapshot; the HTTP client lives in the `lidlesseye` crate, so the collector
+  keeps working with no API, no service account and no network.
+
+The series name stays the process name unless the pod index knows better, which
+is what makes a host install, a container and a cluster behave identically up to
+the point where the cluster has something more to say.
+
 ## Storage: DuckDB
 
 Samples live in DuckDB 2.0 LTS ("Cinnamon Teal"), one database file per tenant:

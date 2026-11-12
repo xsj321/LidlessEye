@@ -55,7 +55,8 @@ means it is genuinely absent.
 | User stacks + symbolization | yes | ELF symbols, DWARF inline frames, Go `.gopclntab` and JIT perf maps; **stack depth needs frame pointers**, see below |
 | Process discovery | yes | every process with a stack is reported, per-PID |
 | Every pod on the node | yes | needs `hostPID: true`; samples are named by the pid of the agent's PID namespace, see [PID namespaces](architecture.md#pid-namespaces) |
-| Kubernetes labels | yes | `enrich_kubernetes_labels`: `k8s_pod_uid`, `k8s_qos_class`, `k8s_container`, plus `node` — pod and namespace *names* are not in the cgroup path |
+| Kubernetes labels | yes | `enrich_kubernetes_labels`: `k8s_pod_uid`, `k8s_qos_class`, `k8s_container`, plus `node` — read from the cgroup path, no API access |
+| Pod names and workloads | yes | `list pods` on the node (`k8s_namespace`, `k8s_pod`, `k8s_workload`, `k8s_workload_kind`) and the service name taken from the workload; needs the `pod-reader` ClusterRole, and does nothing outside a cluster |
 | Node label | yes | `node_label` |
 | PID exclusion | yes | `exclude_pids` |
 | Container / label based filtering | no | exclusion is by PID only |

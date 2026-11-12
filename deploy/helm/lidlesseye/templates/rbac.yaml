@@ -1,0 +1,43 @@
+{{- /*
+Lets the agent name a series after the pod it came from.
+
+The cgroup path of a process carries the pod UID but nothing else; the pod's
+name, namespace and owning workload only exist in the API. Listing pods on one
+node (the agent filters with `spec.nodeName`) is the smallest permission that
+closes that gap — `watch` is not requested because the agent polls, and the
+Secret/ConfigMap the pods may mount is none of its business.
+*/ -}}
+{{- if .Values.agent.enabled }}
+{{- $pods := .Values.agent.podMetadata | default dict }}
+{{- /* `default` treats false as empty, so an explicit `createRBAC: false`
+       has to be read with hasKey rather than piped through it. */ -}}
+{{- $createRBAC := true }}
+{{- if hasKey $pods "createRBAC" }}{{ $createRBAC = $pods.createRBAC }}{{ end }}
+{{- if and $pods.enabled $createRBAC }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ printf "%s-pod-reader" (include "lidlesseye.fullname" .) }}
+  labels:
+    {{- include "lidlesseye.agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ printf "%s-pod-reader" (include "lidlesseye.fullname" .) }}
+  labels:
+    {{- include "lidlesseye.agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ printf "%s-pod-reader" (include "lidlesseye.fullname" .) }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "lidlesseye.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

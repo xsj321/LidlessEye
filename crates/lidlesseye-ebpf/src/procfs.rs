@@ -41,6 +41,14 @@ pub fn read_cgroup(tgid: u32) -> Option<String> {
 /// The systemd driver replaces the dashes inside the UID with underscores
 /// (`pod26fdedc9_3f6d_4bd1_a1c2_e5b7a1f2c3d4.slice`); both spellings map back
 /// to the UID the API server uses.
+///
+/// A pod UID is a UUID and this only returns one. Kubelet names the cgroup of a
+/// *static* pod — the control plane: `etcd`, `kube-apiserver`, … — with a
+/// 32-character hash instead
+/// (`kubelet-kubepods-burstable-pod8d5bd4003a31dbe5a62437d1e90c172b.slice`),
+/// and that hash exists nowhere in the API. Reporting it would put an
+/// unresolvable id in `k8s_pod_uid` and make every metadata lookup miss for a
+/// pod that looks perfectly well identified. Those processes keep their name.
 pub fn parse_pod_uid(cgroup: &str) -> Option<String> {
     // Search for the `-pod<uid>`/`/pod<uid>` marker, not the bare string:
     // `kubepods` contains "pod" too and would match much earlier.
@@ -54,10 +62,23 @@ pub fn parse_pod_uid(cgroup: &str) -> Option<String> {
         .find(|c: char| !(c.is_ascii_hexdigit() || c == '-' || c == '_'))
         .unwrap_or(rest.len());
     let uid = rest[..end].replace('_', "-");
-    if uid.len() < 8 {
+    if !is_uuid(&uid) {
         return None;
     }
     Some(uid)
+}
+
+/// `8-4-4-4-12` hexadecimal, the only shape a Kubernetes object UID has.
+fn is_uuid(value: &str) -> bool {
+    let mut groups = value.split('-');
+    for expected in [8, 4, 4, 4, 12] {
+        match groups.next() {
+            Some(group)
+                if group.len() == expected && group.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+            _ => return false,
+        }
+    }
+    groups.next().is_none()
 }
 
 /// Derive a few low-cardinality Kubernetes labels from a cgroup path.
@@ -231,6 +252,39 @@ mod tests {
     fn ignores_plain_cgroups() {
         assert_eq!(parse_pod_uid("/user.slice/user-1000.slice"), None);
         assert!(kubernetes_labels("/user.slice").is_empty());
+    }
+
+    #[test]
+    fn rejects_the_hashed_cgroup_of_a_static_pod() {
+        // Verbatim from a kind control-plane node (k8s 1.36): the pod's real
+        // UID is a normal UUID, but the cgroup carries a 32-character hash that
+        // the API never returns. Labeling the series with it would look
+        // correct and resolve to nothing, so the id is dropped and the pod is
+        // named after its process instead.
+        let cg = "/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/\
+                  kubelet-kubepods-burstable-pod8d5bd4003a31dbe5a62437d1e90c172b.slice/\
+                  cri-containerd-009d176d3433bad77f9ad74ffcc17d5f7b2bc15080e9dde28c5917d8270efcde.scope";
+        assert_eq!(parse_pod_uid(cg), None);
+        let labels = kubernetes_labels(cg);
+        assert!(!labels.contains_key("k8s_pod_uid"));
+        // It is still a container, which is what the other labels say.
+        assert_eq!(
+            labels.get("k8s_container").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            labels.get("k8s_qos_class").map(String::as_str),
+            Some("burstable")
+        );
+    }
+
+    #[test]
+    fn recognises_uuid_shapes() {
+        assert!(is_uuid("9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f60"));
+        assert!(!is_uuid("9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f6"));
+        assert!(!is_uuid("9d1b4a7c8c1e4f1d9a3e1b2c3d4e5f60"));
+        assert!(!is_uuid("9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f60-extra"));
+        assert!(!is_uuid("9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f6z"));
     }
 
     #[test]

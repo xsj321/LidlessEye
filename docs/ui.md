@@ -104,6 +104,12 @@ same sub-interval stays selected as time passes. An absolute range is pinned.
   narrowed by the *other* rows. Pick `node` first and the `pod` list shrinks to
   that node.
 
+In a Kubernetes deployment most of the names are `k8s_*`: `k8s_namespace`,
+`k8s_workload`, `k8s_workload_kind`, `k8s_pod` and `k8s_pod_uid` (see
+[deployment](deployment.md#naming-series-after-the-pod)). `k8s_workload` is the
+one to reach for first — it spans every pod of a Deployment across nodes, which
+`k8s_pod` by definition does not.
+
 Rows are ANDed. Together they compose the selector string shown to the right of
 the rows, which is exactly what goes on the wire:
 

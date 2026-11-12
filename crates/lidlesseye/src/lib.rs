@@ -54,6 +54,7 @@
 //! `lidlesseye serve --data-dir ./data --agent`, `lidlesseye collect --server
 //! http://host:4040`, `lidlesseye query --data-dir ./data --top`.
 
+pub mod k8s;
 pub mod publisher;
 
 pub use publisher::{PublisherConfig, PublisherHandle};
@@ -121,6 +122,8 @@ pub struct Builder {
     collect_cpu: bool,
     collect_off_cpu: bool,
     enrich_kubernetes_labels: bool,
+    k8s_pod_metadata: bool,
+    k8s_pod_refresh: Duration,
 }
 
 impl Default for Builder {
@@ -153,6 +156,8 @@ impl Default for Builder {
             collect_cpu: true,
             collect_off_cpu: true,
             enrich_kubernetes_labels: true,
+            k8s_pod_metadata: true,
+            k8s_pod_refresh: Duration::from_secs(30),
         }
     }
 }
@@ -301,6 +306,23 @@ impl Builder {
         self
     }
 
+    /// Read pod metadata from the Kubernetes API, so that a series is named
+    /// after the pod's service and labelled with its namespace and workload.
+    ///
+    /// Only meaningful together with [`Builder::enrich_kubernetes_labels`],
+    /// which supplies the pod UID the lookup is keyed by, and only inside a
+    /// cluster: without a service account nothing is attempted.
+    pub fn k8s_pod_metadata(mut self, enabled: bool) -> Self {
+        self.k8s_pod_metadata = enabled;
+        self
+    }
+
+    /// How often the pod metadata cache is refreshed.
+    pub fn k8s_pod_refresh(mut self, interval: Duration) -> Self {
+        self.k8s_pod_refresh = interval;
+        self
+    }
+
     fn server_config(&self) -> Result<ServerConfig> {
         let listen: SocketAddr = self.listen.parse().map_err(|err| {
             Error::Config(format!("invalid listen address `{}`: {err}", self.listen))
@@ -355,6 +377,13 @@ impl Builder {
                 collect_cpu: self.collect_cpu,
                 collect_off_cpu: self.collect_off_cpu,
                 enrich_kubernetes_labels: self.enrich_kubernetes_labels,
+                // The pod UID comes from the cgroup labels, so asking the API
+                // without them would be a request per interval and no names.
+                pods: if self.enrich_kubernetes_labels && self.k8s_pod_metadata {
+                    k8s::start_pod_index(self.k8s_pod_refresh)
+                } else {
+                    None
+                },
                 ..Default::default()
             };
             let state = http.state();

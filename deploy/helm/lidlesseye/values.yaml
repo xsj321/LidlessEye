@@ -139,6 +139,24 @@ agent:
   # series count matters more than telling containers apart.
   enrichKubernetesLabels: true
 
+  # A cgroup path carries the pod UID and nothing else, so on its own it cannot
+  # name a series: `sh` and `busybox` say nothing about what the pod does. With
+  # this on, the agent lists the pods on its node (see `createRBAC`) and adds
+  # `k8s_namespace`, `k8s_pod`, `k8s_workload` and `k8s_workload_kind`, and names
+  # the series after the pod's service (`app.kubernetes.io/name`, else the
+  # Deployment/StatefulSet/DaemonSet name) instead of the binary inside it.
+  # Outside a cluster nothing is attempted, so a host install is unaffected.
+  podMetadata:
+    enabled: true
+    # Create the ClusterRole/ClusterRoleBinding that allows `list pods`. Set to
+    # false when the service account already has it, e.g. through a shared
+    # namespace-scoped role — the agent then simply keeps whatever names it can
+    # resolve, and logs the reason once if it may not read pods.
+    createRBAC: true
+    # How often the cache is refreshed. New pods are named after at most one
+    # interval, and their samples are stored against the pod UID meanwhile.
+    refresh: 30s
+
   # The agent must see the host PID namespace to symbolize stacks, and needs
   # privileges to load BPF programs. These are the defaults that work; override
   # only if you know what you are doing.

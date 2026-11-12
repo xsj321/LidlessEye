@@ -75,9 +75,45 @@ Two consequences worth knowing:
 - Kubernetes labels come from each process's cgroup: `k8s_pod_uid`,
   `k8s_qos_class` and `k8s_container`. They identify *where* a stack was
   sampled without talking to the API server, which is why the set stops at the
-  UID — pod and namespace names are not in the cgroup path. With
-  `--service-name` unset the series name is the process name; set it to
-  aggregate a node under one service.
+  UID — pod and namespace names are not in the cgroup path.
+
+### Naming series after the pod
+
+A cgroup path says `pod 8f1c2e64-…`, which is precise and unreadable. When the
+agent can reach the API server it also fills in what that UID *is*:
+
+| Label | Example | Where it comes from |
+| --- | --- | --- |
+| `k8s_namespace` | `payments` | pod metadata |
+| `k8s_pod` | `checkout-7d9f8b6c4-mn2xk` | pod metadata |
+| `k8s_workload` | `checkout` | owner workload; the ReplicaSet's `pod-template-hash` is stripped so a rollout does not rename the service |
+| `k8s_workload_kind` | `Deployment` | `ReplicaSet` whose hash was stripped, otherwise the owner kind |
+
+The series name becomes the service instead of the binary: `app.kubernetes.io/name`
+if the pod has it, else `app` / `k8s-app`, else the workload name. A pod that
+runs `bash` in a Deployment called `cluster-spin` is therefore `cluster-spin`,
+with `process_name=bash` kept as a label so the binary stays addressable.
+`--service-name` still wins over all of it, and `--no-k8s-pod-metadata` turns the
+lookup off entirely (the `k8s_*` cgroup labels stay).
+
+Two kinds of pod stay under their process name, both deliberately. A *static*
+pod — the control plane: `etcd`, `kube-apiserver`, `kube-scheduler` — is named in
+its cgroup by a 32-character hash that the API never returns, so there is no UID
+to look up; its process name is the name you would have chosen anyway. A pod
+that has no owner (created directly, without a Deployment) has no workload
+either, though it still gets `k8s_namespace` and `k8s_pod`.
+
+The lookup is a `list pods` with a `spec.nodeName` field selector, refreshed
+every `--k8s-pod-refresh` (30s by default). Pods are stored against their UID
+from the moment they are sampled; only the *name* waits up to one interval, so a
+short-lived pod can stay unnamed without losing its samples. The Helm chart
+creates the `ClusterRole`/`ClusterRoleBinding` that allows exactly that
+(`agent.podMetadata.createRBAC`); grant `list` on `pods` yourself and set it to
+`false` if your cluster already provides it.
+
+Outside a cluster nothing is attempted: `KUBERNETES_SERVICE_HOST` **and** a
+mounted service account are both required, so a host install, a plain container
+and a CI runner keep naming series after the process.
 
 ### Authentication
 

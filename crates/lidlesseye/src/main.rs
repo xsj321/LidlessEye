@@ -114,6 +114,13 @@ struct ServeArgs {
     /// Do not attach the `k8s_*` labels derived from each process's cgroup.
     #[arg(long)]
     no_k8s_labels: bool,
+    /// Do not read pod metadata from the Kubernetes API. Leaves series named
+    /// after the process, as they are outside a cluster.
+    #[arg(long)]
+    no_k8s_pod_metadata: bool,
+    /// How often the pod metadata cache is refreshed.
+    #[arg(long, default_value = "30s")]
+    k8s_pod_refresh: String,
 }
 
 #[derive(Debug, Args)]
@@ -145,6 +152,13 @@ struct CollectArgs {
     /// Do not attach the `k8s_*` labels derived from each process's cgroup.
     #[arg(long)]
     no_k8s_labels: bool,
+    /// Do not read pod metadata from the Kubernetes API. Leaves series named
+    /// after the process, as they are outside a cluster.
+    #[arg(long)]
+    no_k8s_pod_metadata: bool,
+    /// How often the pod metadata cache is refreshed.
+    #[arg(long, default_value = "30s")]
+    k8s_pod_refresh: String,
     /// Stop after this long (used by tests); run forever by default.
     #[arg(long)]
     duration: Option<String>,
@@ -288,6 +302,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .collect_cpu(!args.no_cpu)
         .collect_off_cpu(!args.no_offcpu)
         .enrich_kubernetes_labels(!args.no_k8s_labels)
+        .k8s_pod_metadata(!args.no_k8s_pod_metadata)
+        .k8s_pod_refresh(parse_duration(&args.k8s_pod_refresh)?)
         .tenant(args.tenant)
         .tenant_header(args.tenant_header)
         .max_tenants(args.max_tenants);
@@ -356,6 +372,11 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
         collect_cpu: !args.no_cpu,
         collect_off_cpu: !args.no_offcpu,
         enrich_kubernetes_labels: !args.no_k8s_labels,
+        pods: if !args.no_k8s_labels && !args.no_k8s_pod_metadata {
+            lidlesseye::k8s::start_pod_index(parse_duration(&args.k8s_pod_refresh)?)
+        } else {
+            None
+        },
         ..Default::default()
     };
     let sink = publisher.clone();
