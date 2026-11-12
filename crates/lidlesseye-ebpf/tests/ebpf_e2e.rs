@@ -4,9 +4,16 @@
 //! `#[ignore]`d by default and need root:
 //!
 //! ```text
-//! DEV_PRIVILEGED=1 ./scripts/dev.sh \
-//!     cargo test -p lidlesseye-ebpf --test ebpf_e2e -- --ignored --nocapture
+//! DEV_PRIVILEGED=1 DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes" \
+//!     ./scripts/dev.sh cargo test -p lidlesseye-ebpf --test ebpf_e2e \
+//!     -- --ignored --nocapture
 //! ```
+//!
+//! The frame-pointer flag is not optional for the attribution test: without it
+//! a sample that lands inside a monomorphised `std` helper cannot be unwound
+//! past its leaf, and the CPU time is attributed to that helper instead of to
+//! the function that called it. Measured on this suite: 95 % of a spinning
+//! thread's time reaches `busy_loop` with frame pointers, 20 % without.
 
 #![cfg(target_os = "linux")]
 
@@ -71,14 +78,26 @@ fn all_programs_load() {
     }
 }
 
+/// Spin until `deadline`, with the sampled work in a tight arithmetic loop.
+///
+/// The clock is read once per 65k iterations, not every iteration, on purpose:
+/// `std` ships precompiled without frame pointers, so a sample that lands
+/// inside `Instant::now` cannot be unwound past its leaf. That is a real
+/// limitation of stack unwinding (see docs/compatibility.md), but it makes a
+/// poor oracle for "did the profiler attribute the time correctly", so the
+/// benchmark keeps its hot path in this function.
 #[inline(never)]
 fn busy_loop(deadline: Instant) -> u64 {
     let mut acc = 0u64;
-    while Instant::now() < deadline {
-        acc = acc.wrapping_add(1);
+    loop {
+        for step in 0..65_536u64 {
+            acc = acc.wrapping_add(step);
+        }
         std::hint::black_box(acc);
+        if Instant::now() >= deadline {
+            return acc;
+        }
     }
-    acc
 }
 
 /// Profiles this very process and asserts that the hot function shows up with
@@ -187,4 +206,141 @@ fn accounts_off_cpu_time() {
     );
     assert!(stats.offcpu_records > 0, "no off-CPU samples captured");
     assert!(total > 0, "off-CPU samples carried no time");
+}
+
+/// The CPU a thread actually burned, straight from the kernel.
+///
+/// Wall-clock time is the wrong oracle: on a busy host (or a VM with more
+/// vCPUs than cores) a spinning thread may only be scheduled for 80 % of the
+/// wall time, and the profiler would look like it lost 20 % of the samples.
+fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` only writes the `timespec` it is given.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Sampling must account for the *time*, not merely produce records.
+///
+/// A collector that drops half the samples, or multiplies by the wrong period,
+/// still produces a plausible-looking flamegraph — just a wrong one. The
+/// profile's value for `busy_loop` is compared against the thread's own CPU
+/// time, which is the number the profiler is trying to reproduce.
+///
+/// Requires a frame-pointer build (`RUSTFLAGS=-C force-frame-pointers=yes`);
+/// see the module docs for why, and for the numbers without it.
+#[test]
+#[ignore = "requires root and an eBPF capable kernel"]
+fn cpu_samples_add_up_to_the_time_the_thread_ran() {
+    let busy_for = Duration::from_secs(6);
+    let worker = std::thread::spawn(move || {
+        let started = thread_cpu_ns();
+        busy_loop(Instant::now() + busy_for);
+        thread_cpu_ns() - started
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let collector = start(
+        CollectorConfig {
+            service_name: Some("ebpf-e2e-accuracy".to_string()),
+            frequency_hz: 199,
+            flush_interval: Duration::from_secs(1),
+            collect_cpu: true,
+            collect_off_cpu: false,
+            exclude_self: false,
+            ..Default::default()
+        },
+        move |report| {
+            let _ = tx.send(report);
+        },
+    )
+    .expect("collector should start");
+
+    let mut busy_ns: u64 = 0;
+    let mut everything_ns: u64 = 0;
+    let mut missing_reports: Vec<lidlesseye_core::Report> = Vec::new();
+    let deadline = Instant::now() + busy_for + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let Ok(report) = rx.recv_timeout(Duration::from_secs(2)) else {
+            continue;
+        };
+        for stack in &report.stacks {
+            everything_ns += stack.value;
+            let touches_busy_loop = stack.frames.iter().any(|frame| {
+                report
+                    .strings
+                    .get(frame[1] as usize)
+                    .is_some_and(|symbol| symbol.contains("busy_loop"))
+            });
+            if touches_busy_loop {
+                busy_ns += stack.value;
+            }
+        }
+        missing_reports.push(report);
+    }
+
+    let stats = collector.stats();
+    collector.stop();
+    let measured_ns = worker.join().expect("the busy thread finished");
+
+    // Diagnostic: what are the samples that did *not* mention busy_loop?
+    // A sample lost in the kernel and a sample attributed to the wrong stack
+    // look identical in the total, so name the leaves before guessing.
+    let mut leaves: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut missing_ns: u64 = 0;
+    for report in &missing_reports {
+        for stack in &report.stacks {
+            let touches = stack.frames.iter().any(|f| {
+                report
+                    .strings
+                    .get(f[1] as usize)
+                    .is_some_and(|s| s.contains("busy_loop"))
+            });
+            if touches {
+                continue;
+            }
+            missing_ns += stack.value;
+            let leaf = stack
+                .frames
+                .first()
+                .and_then(|f| report.strings.get(f[1] as usize))
+                .map(|symbol| symbol.to_string())
+                .unwrap_or_else(|| "<no frames>".to_string());
+            *leaves.entry(leaf).or_default() += stack.value;
+        }
+    }
+    if !leaves.is_empty() {
+        println!("not busy_loop: {:.2}s", missing_ns as f64 / 1e9);
+        let mut ranked: Vec<_> = leaves.into_iter().collect();
+        ranked.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+        for (leaf, value) in ranked.iter().take(6) {
+            println!("  {:>8.2}s  {leaf}", *value as f64 / 1e9);
+        }
+    }
+
+    let profiled = busy_ns as f64 / 1e9;
+    let measured = measured_ns as f64 / 1e9;
+    let total = everything_ns as f64 / 1e9;
+    println!(
+        "busy_loop: profiled={profiled:.2}s measured={measured:.2}s \
+         total-cpu={total:.2}s records={} spans={}",
+        stats.cpu_records, stats.reports
+    );
+
+    // The tolerance is sampling noise (one period is 5 ms) plus the chance
+    // that a sample lands one frame outside `busy_loop`, e.g. inside the
+    // inlined `Instant::now` call.
+    let tolerance = (measured * 0.15).max(0.25);
+    assert!(
+        (profiled - measured).abs() <= tolerance,
+        "profiler says {profiled:.2}s, the thread burned {measured:.2}s \
+         (tolerance ±{tolerance:.2}s)"
+    );
+    assert!(
+        stats.cpu_records > 0,
+        "no samples, so the assertion above proves nothing"
+    );
 }

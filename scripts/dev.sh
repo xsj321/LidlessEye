@@ -3,6 +3,8 @@
 #
 #   ./scripts/dev.sh cargo test --workspace
 #   DEV_PRIVILEGED=1 ./scripts/dev.sh cargo run -- serve
+#   DEV_PRIVILEGED=1 DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes" \
+#       ./scripts/dev.sh cargo test -p lidlesseye-ebpf --test ebpf_e2e -- --ignored
 #   DEV_PORTS=4040:4040 ./scripts/dev.sh cargo run -- serve --listen 0.0.0.0:4040
 #
 # Notes:
@@ -32,8 +34,13 @@ if [[ "${DEV_PRIVILEGED:-0}" == "1" ]]; then
   ARGS+=(--privileged --pid=host -v /sys/kernel/debug:/sys/kernel/debug:ro)
 fi
 
+# Semicolon separated, so a value may contain spaces:
+#   DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes;RUST_LOG=debug"
 if [[ -n "${DEV_ENV:-}" ]]; then
-  for kv in $DEV_ENV; do ARGS+=(-e "$kv"); done
+  IFS=';' read -r -a env_pairs <<< "$DEV_ENV"
+  for kv in "${env_pairs[@]}"; do
+    [[ -n "$kv" ]] && ARGS+=(-e "$kv")
+  done
 fi
 
 # Publish ports, e.g. DEV_PORTS="4040:4040 4317:4317".

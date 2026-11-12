@@ -363,13 +363,35 @@ Administration endpoint. A tenant-scoped token only ever sees its own tenant.
 Reading this endpoint never creates a tenant; a tenant appears once something
 has been written to it.
 
+## `GET /api/v1/stats`
+
+```json
+{
+  "version": "0.1.0",
+  "tenant": "acme",
+  "uptime_seconds": 812,
+  "store": { "segment_count": 480, "total_bytes": 8416712, "total_value": 991233,
+             "earliest_ns": 1700000000000000000, "latest_ns": 1700003600000000000 },
+  "series": 12,
+  "tenants": 3,
+  "ingest_reports": 480,
+  "ingest_samples": 9120,
+  "queries": 57
+}
+```
+
+Every counter here belongs to the caller's tenant. Process-wide totals are on
+`/metrics` instead, which is what an operator scrapes; a tenant-scoped token
+must not be able to read another tenant's ingest volume. `tenants` and
+`uptime_seconds` are the only process-level numbers, and neither is sensitive.
+
 ## Operations
 
 | Endpoint | Response |
 | --- | --- |
 | `GET /api/v1/health` | `{"status":"ok","version":"0.1.0","uptime_seconds":42}`, always 200 |
 | `GET /api/v1/ready` | `204` when the store holds no segments yet, `200` otherwise — both mean "ready to serve" |
-| `GET /api/v1/stats` | store counters (segments, bytes, value, earliest/latest) for the caller's tenant, series count, tenant count, ingest and query counters |
+| `GET /api/v1/stats` | store counters (segments, bytes, value, earliest/latest), series count, tenant count, and ingest/query counters — all for the caller's tenant |
 | `GET /api/v1/version` | `{"name":"lidlesseye","version":"0.1.0","multi_tenant":true,"tenant_header":"X-Scope-OrgID"}` |
 | `GET /metrics` | Prometheus text format |
 

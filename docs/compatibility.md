@@ -53,7 +53,7 @@ means it is genuinely absent.
 | off-CPU (blocked) sampling | yes | `--no-offcpu` disables it |
 | Wall clock profile | yes | computed as `cpu + off_cpu`, not stored twice |
 | Kernel stacks | yes | kernel frames symbolized from the live kernel |
-| User stacks + ELF symbolization | yes | module/symbol/file/line resolved before the report is written |
+| User stacks + ELF symbolization | yes | module/symbol/file/line resolved before the report is written; **needs frame pointers**, see below |
 | Process discovery | yes | every process with a stack is reported, per-PID |
 | Kubernetes labels | yes | `enrich_kubernetes_labels`, namespace/pod/container/node |
 | Node label | yes | `node_label` |
@@ -92,6 +92,27 @@ means it is genuinely absent.
 - **Scaling.** Pyroscope scales horizontally into microservices. LidlessEye
   scales by running one instance per node (or per tenant group) — which is what
   an eBPF agent needs anyway, since the profiles are node-local.
+- **Frame pointers.** The kernel unwinder walks the user stack through frame
+  pointers, exactly like Pyroscope's eBPF collector. Code built without them
+  ends the walk at the leaf, so a sample that lands inside that code is
+  attributed to the leaf function instead of to its caller. The total CPU time
+  is unaffected — no samples are lost — but the flamegraph is shallower.
+
+  Measured on `crates/lidlesseye-ebpf/tests/ebpf_e2e.rs`, a 6-second spin in one
+  thread, 199 Hz, `libc`-measured thread CPU time as the oracle:
+
+  | Build | Time reaching the spinning function | Total accounted |
+  | --- | --- | --- |
+  | `RUSTFLAGS="-C force-frame-pointers=yes"` | 5.65 s of 6.00 s (94 %) | 6.21 s |
+  | default | 1.22 s of 6.00 s (20 %) | 6.16 s |
+
+  For Rust, that means `-C force-frame-pointers=yes` in `RUSTFLAGS` (or
+  `force-frame-pointers = true` in `.cargo/config.toml`) for the *whole* graph
+  including `std` — the precompiled `std` in the toolchain is built without
+  frame pointers, so samples landing in it still stop at the leaf. The same
+  applies to C/C++ (`-fno-omit-frame-pointer`) and to JITs, which is why
+  Pyroscope documents the flag too.
+
 - **SDKs.** Anything that speaks pprof or folded text can push to LidlessEye
   today, including the Pyroscope SDKs pointed at `LIDLESSEYE_SERVER`/`--server`.
   There is no LidlessEye SDK, and none is planned: the point is the agent.
@@ -106,4 +127,25 @@ cargo test -p lidlesseye-server --test round1   # boundaries and errors
 cargo test -p lidlesseye-server --test round2   # security, quotas, formats
 cargo test -p lidlesseye-server --test round3   # volume, concurrency, integrity
 cargo test -p lidlesseye --test cli             # the shipped binary
+cargo test -p lidlesseye --test embedded        # the crate API, in-process
 ```
+
+The eBPF programs are tested against a real kernel, not a mock, which needs a
+Linux host and root. Docker is enough:
+
+```bash
+# load every program, sample and symbolise this process, check the numbers
+DEV_PRIVILEGED=1 DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes" \
+    ./scripts/dev.sh cargo test -p lidlesseye-ebpf --test ebpf_e2e \
+    -- --ignored --nocapture
+```
+
+The dashboard has its own browser test, which also needs nothing but Docker:
+
+```bash
+./scripts/ui-smoke.sh    # Chromium: every tab, the tenant switch, the label explorer
+```
+
+It seeds two tenants, drives the UI and fails on any console error or on a
+request that returns non-2xx, so "the page renders" is checked against real
+API responses rather than a fixture.

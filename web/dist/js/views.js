@@ -117,13 +117,26 @@ export class TopTable {
 }
 
 /** Overview: storage stats, available profile types and known series. */
+/** `1 report ingested` / `2 reports ingested`, without an "s" on the first. */
+function plural(count, one, many) {
+  return `${formatCount(count)} ${count === 1 ? one : many}`;
+}
+
 export function renderOverview(host, { stats, types, series }) {
   const store = stats?.store ?? {};
   const cards = [
     ["Uptime", formatUptime(stats?.uptime_seconds ?? 0), `version ${stats?.version ?? "?"}`],
     ["Segments", formatCount(store.segment_count ?? 0), formatBytes(store.total_bytes ?? 0)],
-    ["Series", formatCount(stats?.series ?? 0), `${formatCount(stats?.ingest_reports ?? 0)} reports ingested`],
-    ["Samples ingested", formatCount(stats?.ingest_samples ?? 0), `${formatCount(stats?.queries ?? 0)} queries served`],
+    [
+      "Series",
+      formatCount(stats?.series ?? 0),
+      plural(stats?.ingest_reports ?? 0, "report ingested", "reports ingested"),
+    ],
+    [
+      "Samples ingested",
+      formatCount(stats?.ingest_samples ?? 0),
+      plural(stats?.queries ?? 0, "query served", "queries served"),
+    ],
     [
       "Oldest data",
       store.earliest_ns ? formatRelative(store.earliest_ns) : "–",
@@ -288,7 +301,7 @@ export class LabelExplorer {
     this.countEl.textContent = `${filtered.length} value${filtered.length === 1 ? "" : "s"} for ${this.active}`;
     this.valuesEl.innerHTML = `
       <table class="label-table">
-        <thead><tr><th>Value</th><th class="bar-cell"></th><th class="num">Value</th><th></th></tr></thead>
+        <thead><tr><th>Value</th><th class="bar-cell"></th><th class="num">Total</th><th></th></tr></thead>
         <tbody>
           ${
             filtered

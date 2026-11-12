@@ -246,12 +246,16 @@ export class Flamegraph {
     let parts;
     if (this.diff) {
       const delta = (data.total_right ?? 0) - (data.total_left ?? 0);
-      const ratio = data.total_left ? (delta / data.total_left) * 100 : 0;
+      // A zero baseline has no percentage: dividing by it would print "+0.0%"
+      // for a window that did not exist, which reads as "no change at all".
+      const ratio = data.total_left ? (delta / data.total_left) * 100 : null;
       const sign = delta > 0 ? "+" : delta < 0 ? "−" : "";
+      const percent =
+        ratio !== null ? ` (${sign}${Math.abs(ratio).toFixed(1)}%)` : " (new)";
       parts = [
         `<span class="legend-swatch diff-up"></span>baseline ${formatValue(data.total_left, data.unit)}`,
         `<span class="legend-swatch diff-down"></span>comparison ${formatValue(data.total_right, data.unit)}`,
-        `delta ${sign}${formatValue(Math.abs(delta), data.unit)} (${sign}${Math.abs(ratio).toFixed(1)}%)`,
+        `delta ${sign}${formatValue(Math.abs(delta), data.unit)}${percent}`,
         `${data.names.length} frames`,
       ];
     } else {

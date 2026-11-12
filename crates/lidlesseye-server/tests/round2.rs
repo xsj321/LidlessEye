@@ -937,3 +937,70 @@ async fn gzip_responses_are_negotiated() {
         "responses are not compressed for gzip-capable clients"
     );
 }
+
+/// `/api/v1/stats` must describe the caller's tenant, not the process.
+///
+/// The numbers used to come straight from the process-wide atomics, so a
+/// tenant-scoped token could read how much every other tenant ingests, and the
+/// dashboard showed a total that did not match the series listed below it.
+#[tokio::test]
+async fn stats_are_scoped_to_the_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(dir.path()).await;
+
+    // Two reports with two stacks each for acme, one report with one for zeta.
+    let batch = serde_json::to_vec(&json!({
+        "reports": [report("acme-api", "cpu", 10), report("acme-web", "cpu", 20)],
+    }))
+    .unwrap();
+    let accepted = request(
+        &app,
+        "POST",
+        "/ingest",
+        Some(batch),
+        &[("x-scope-orgid", "acme")],
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.text());
+    let (status, _) = call_as(
+        &app,
+        "POST",
+        "/ingest",
+        Some(report("zeta-api", "cpu", 30)),
+        "zeta",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A query made by acme only counts against acme.
+    let (status, _) = call_as(&app, "GET", "/api/v1/flamegraph?from=now-1h", None, "acme").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, acme) = call_as(&app, "GET", "/api/v1/stats", None, "acme").await;
+    assert_eq!(status, StatusCode::OK, "{acme}");
+    assert_eq!(acme["tenant"], "acme");
+    assert_eq!(acme["ingest_reports"], 2, "{acme}");
+    assert_eq!(acme["ingest_samples"], 4, "{acme}");
+    assert_eq!(acme["queries"], 1, "{acme}");
+    assert_eq!(acme["series"], 2, "{acme}");
+
+    let (status, zeta) = call_as(&app, "GET", "/api/v1/stats", None, "zeta").await;
+    assert_eq!(status, StatusCode::OK, "{zeta}");
+    assert_eq!(
+        zeta["ingest_reports"], 1,
+        "zeta sees another tenant's ingest count: {zeta}"
+    );
+    assert_eq!(zeta["ingest_samples"], 2, "{zeta}");
+    assert_eq!(
+        zeta["queries"], 0,
+        "zeta sees another tenant's query count: {zeta}"
+    );
+
+    // The process-wide totals are still on /metrics, where the operator looks.
+    let metrics = get_raw(&app, "/metrics").await;
+    let text = metrics.text();
+    assert!(
+        text.contains("lidlesseye_ingest_reports_total 3"),
+        "the operator lost the global counter: {text}"
+    );
+}

@@ -257,6 +257,23 @@ web/dist                  the dashboard (plain ES modules, no build step)
 deploy/                   Dockerfile, docker-compose, Helm chart
 ```
 
+## Testing
+
+```bash
+cargo test --workspace        # 156 unit, integration and end-to-end tests
+
+# eBPF against a real kernel (root; Docker is enough)
+DEV_PRIVILEGED=1 DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes" \
+    ./scripts/dev.sh cargo test -p lidlesseye-ebpf --test ebpf_e2e \
+    -- --ignored --nocapture
+
+# the dashboard in Chromium (Docker only)
+./scripts/ui-smoke.sh
+```
+
+The browser test seeds two tenants, walks every tab and fails on a console
+error, so a rendering regression cannot pass as "the API is fine".
+
 ## Limits
 
 - **Linux only** for collection. The storage server and the query API are
@@ -268,6 +285,14 @@ deploy/                   Dockerfile, docker-compose, Helm chart
   Run one server per storage volume; there is no clustering or replication.
 - **No dynamic tracing yet**: only the built-in CPU/off-CPU profilers. Uprobes,
   allocations and lock contention are the obvious next steps.
+- **User stacks need frame pointers.** The kernel unwinder walks the stack
+  through them, so a target built without frame pointers shows the leaf
+  function but not its callers. The profiled time is still correct. Build Rust
+  targets with `-C force-frame-pointers=yes` and C/C++ with
+  `-fno-omit-frame-pointer`; precompiled `std` in the toolchain is the one part
+  that cannot be fixed that way. Measured effect: 94 % of a spinning thread's
+  time is attributed to the spinning function with frame pointers, 20 %
+  without.
 
 ## License
 

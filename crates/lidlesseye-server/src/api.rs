@@ -228,7 +228,7 @@ pub async fn flamegraph(
         .await
         .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
-    state.record_query(started);
+    state.record_query(&caller.tenant, started);
 
     if params.get("format") == Some("tree") {
         return Ok(Json(json!({
@@ -291,7 +291,7 @@ pub async fn diff(
         .await
         .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
-    state.record_query(started);
+    state.record_query(&caller.tenant, started);
     Ok(Json(result).into_response())
 }
 
@@ -324,7 +324,7 @@ pub async fn top(
         .await
         .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
-    state.record_query(started);
+    state.record_query(&caller.tenant, started);
     let TopResult { items, total_value } = result;
 
     Ok(Json(json!({
@@ -376,7 +376,7 @@ pub async fn timeseries(
         .await
         .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
-    state.record_query(started);
+    state.record_query(&caller.tenant, started);
     Ok(Json(series).into_response())
 }
 
@@ -546,7 +546,7 @@ pub async fn stats(
         Some(store) => (store.stats(), store.series_count()),
         None => (Default::default(), 0),
     };
-    let metrics = state.metrics();
+    let activity = state.activity(&caller.tenant);
     Ok(Json(StatsResponse {
         version: VERSION,
         tenant: caller.tenant.to_string(),
@@ -554,9 +554,12 @@ pub async fn stats(
         store: store.0,
         series: store.1,
         tenants: state.registry().tenant_ids().len(),
-        ingest_reports: metrics.ingest_reports.load(Ordering::Relaxed),
-        ingest_samples: metrics.ingest_samples.load(Ordering::Relaxed),
-        queries: metrics.queries.load(Ordering::Relaxed),
+        // Per tenant, not per process: a token scoped to one tenant must not
+        // learn how much another tenant ingests. The process-wide totals stay
+        // on `/metrics` for the operator.
+        ingest_reports: activity.ingest_reports,
+        ingest_samples: activity.ingest_samples,
+        queries: activity.queries,
     })
     .into_response())
 }
@@ -589,7 +592,12 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
 }
 
 impl AppState {
-    pub(crate) fn record_query(&self, started: Instant) {
+    /// Count a query against the tenant that asked for it.
+    pub(crate) fn record_query(&self, tenant: &lidlesseye_core::TenantId, started: Instant) {
+        if let Ok(mut map) = self.inner.activity.lock() {
+            let entry = map.entry(tenant.to_string()).or_default();
+            entry.queries += 1;
+        }
         self.metrics().queries.fetch_add(1, Ordering::Relaxed);
         self.metrics()
             .query_nanos

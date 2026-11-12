@@ -1,0 +1,20 @@
+# Browser test image for the dashboard.
+#
+# The Playwright image already ships the browsers under /ms-playwright; it just
+# does not expose the `playwright` module, so pin the matching version here. The
+# application itself is not baked in: the mounted build output is used, which
+# guarantees the UI under test is the one in the working tree.
+#
+#   docker build -t lidlesseye-ui-test -f .devcontainer/Dockerfile.ui .devcontainer
+#   ./scripts/ui-smoke.sh
+FROM mcr.microsoft.com/playwright:v1.49.0-noble
+
+# The browsers are already installed; do not download them again.
+# `npm root -g` is /usr/lib/node_modules in this image (NodeSource layout), and
+# NODE_PATH must match it for the CommonJS `require("playwright")` to resolve.
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    NODE_PATH=/usr/lib/node_modules
+
+RUN npm install -g --no-audit --no-fund playwright@1.49.0
+
+WORKDIR /work

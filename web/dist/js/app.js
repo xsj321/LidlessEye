@@ -356,6 +356,12 @@ async function loadTenants() {
       .map((id) => `<option value="${id}">${id}</option>`)
       .join("");
     if (!state.tenant) state.tenant = list[0] ?? "default";
+    // The request layer reads the tenant from storage, so choosing one here has
+    // to be persisted too. Without this the first query went to the server's
+    // default tenant while the selector already displayed another — the empty
+    // state then blamed the wrong tenant, and worse, a populated default
+    // tenant would have been shown under someone else's name.
+    setTenant(state.tenant);
     el.tenant.value = state.tenant;
     el.tenant.hidden = list.length <= 1;
   } catch (err) {

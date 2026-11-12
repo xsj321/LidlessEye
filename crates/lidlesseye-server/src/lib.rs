@@ -20,8 +20,8 @@ mod ui;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -57,6 +57,21 @@ struct Inner {
     metrics: Arc<Metrics>,
     started: Instant,
     allowed_tenants: Option<Vec<TenantId>>,
+    /// Per-tenant counters for `/api/v1/stats`.
+    ///
+    /// [`Metrics`] stays process-global because `/metrics` is scraped by the
+    /// operator, not by a tenant. A tenant-scoped caller asking for its own
+    /// stats, however, must not be handed another tenant's ingest volume, so
+    /// the numbers it sees are kept per tenant.
+    activity: Mutex<BTreeMap<String, TenantActivity>>,
+}
+
+/// Ingestion and query counters for a single tenant.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct TenantActivity {
+    pub ingest_reports: u64,
+    pub ingest_samples: u64,
+    pub queries: u64,
 }
 
 /// Who is calling, and on which tenant.
@@ -72,6 +87,24 @@ pub struct Caller {
 impl AppState {
     pub fn registry(&self) -> &Arc<TenantStore> {
         &self.inner.registry
+    }
+
+    /// Counters for one tenant; unknown tenants read as zero.
+    pub fn activity(&self, tenant: &TenantId) -> TenantActivity {
+        self.inner
+            .activity
+            .lock()
+            .ok()
+            .and_then(|map| map.get(tenant.as_str()).copied())
+            .unwrap_or_default()
+    }
+
+    fn record_ingest(&self, tenant: &TenantId, reports: u64, samples: u64) {
+        if let Ok(mut map) = self.inner.activity.lock() {
+            let entry = map.entry(tenant.to_string()).or_default();
+            entry.ingest_reports += reports;
+            entry.ingest_samples += samples;
+        }
     }
 
     pub fn config(&self) -> &ServerConfig {
@@ -253,6 +286,9 @@ impl AppState {
         .map_err(|err| ApiError::internal(format!("ingest task failed: {err}")))?;
 
         let (metas, errors) = result;
+        if !metas.is_empty() {
+            self.record_ingest(tenant, metas.len() as u64, samples);
+        }
         self.inner
             .metrics
             .ingest_samples
@@ -383,6 +419,7 @@ impl LidlessEye {
                     metrics: Arc::new(Metrics::default()),
                     started: Instant::now(),
                     allowed_tenants,
+                    activity: Mutex::new(BTreeMap::new()),
                 }),
             },
             listener,
