@@ -42,6 +42,18 @@ use crate::perf_map::PerfMapFallback;
 /// (a process restart or a container recycle makes old entries useless anyway).
 const MAX_CACHE_ENTRIES: usize = 200_000;
 
+/// How many distinct processes may be symbolized before the resolver starts
+/// over with empty caches.
+///
+/// blazesym's per-process cache is *insert-only*: it has no eviction, and a
+/// symbolizer keeps every module it parsed for every process it has seen. That
+/// is fine for a single-service agent, but an agent that profiles a whole node
+/// — with pods coming and going, and Go services whose symbol tables run to
+/// tens of megabytes — would grow until the kernel OOM killer takes it down.
+/// Rebasing the caches every few hundred processes bounds it; the cost is one
+/// flush of slower symbolization afterwards, because everything is re-read.
+const MAX_PROCESSES: usize = 1024;
+
 impl UnknownReasons {
     fn record(&mut self, reason: &Reason) {
         match reason {
@@ -96,6 +108,10 @@ pub(crate) struct FrameResolver {
     symbolizer: Symbolizer,
     user_cache: HashMap<(u32, u64), Vec<Frame>>,
     kernel_cache: HashMap<u64, Vec<Frame>>,
+    /// Processes symbolized since the caches were last rebased. Kept separate
+    /// from `user_cache` because it is a bound on *churn*: the entries blazesym
+    /// cannot evict are exactly the processes that are already gone.
+    processes: std::collections::HashSet<u32>,
     /// Last resort for binaries without any ELF symbols. See [`crate::gopclntab`].
     go: GoFallback,
     /// Last resort for code that exists in no file at all. See
@@ -119,6 +135,7 @@ impl FrameResolver {
             symbolizer: Symbolizer::new(),
             user_cache: HashMap::new(),
             kernel_cache: HashMap::new(),
+            processes: std::collections::HashSet::new(),
             go: GoFallback::new(),
             perf_map: PerfMapFallback::new(),
             tally: Tally::default(),
@@ -146,6 +163,31 @@ impl FrameResolver {
     pub(crate) fn retain_processes(&mut self, alive: &[u32]) {
         let alive: std::collections::HashSet<u32> = alive.iter().copied().collect();
         self.user_cache.retain(|(tgid, _), _| alive.contains(tgid));
+    }
+
+    /// Record that `tgid` is being symbolized, and rebase the caches when too
+    /// many processes have passed through since the last time.
+    fn note_process(&mut self, tgid: u32) {
+        if !self.processes.insert(tgid) {
+            return;
+        }
+        if self.processes.len() > MAX_PROCESSES {
+            self.reset();
+        }
+    }
+
+    /// Drop every cache, including the ones inside blazesym and the fallbacks.
+    fn reset(&mut self) {
+        tracing::debug!(
+            processes = self.processes.len(),
+            "rebasing symbol caches after too many processes"
+        );
+        self.symbolizer = Symbolizer::new();
+        self.go = GoFallback::new();
+        self.perf_map = PerfMapFallback::new();
+        self.user_cache.clear();
+        self.kernel_cache.clear();
+        self.processes.clear();
     }
 
     fn maybe_prune(&mut self) {
@@ -187,6 +229,7 @@ impl FrameResolver {
     /// Symbolize `addrs` for `tgid`, never failing: unresolved addresses become
     /// `[unknown]` frames so that a stack keeps its shape.
     fn symbolize_user(&mut self, tgid: u32, addrs: &[u64]) -> Vec<Vec<Frame>> {
+        self.note_process(tgid);
         loop {
             let mut process = Process::new(Pid::from(tgid));
             process.map_files = self.map_files;
@@ -521,5 +564,23 @@ mod tests {
         // PID 0 is not a process we can read; resolution must not panic.
         let frames = r.resolve_user(0, &[0x1000, 0x2000]);
         assert_eq!(frames.len(), 2);
+    }
+
+    #[test]
+    fn rebases_the_caches_after_too_many_processes() {
+        let mut r = FrameResolver::new();
+        r.user_cache.insert((1, 0x1000), Vec::new());
+        for tgid in 1..=MAX_PROCESSES as u32 {
+            r.note_process(tgid);
+        }
+        assert!(!r.user_cache.is_empty(), "cap reached exactly: keep going");
+
+        // One process past the cap. blazesym cannot evict the symbol tables of
+        // the processes that are already gone, so the resolver throws its own
+        // caches away rather than growing until the OOM killer notices.
+        r.note_process(MAX_PROCESSES as u32 + 1);
+        assert!(r.user_cache.is_empty());
+        assert!(r.kernel_cache.is_empty());
+        assert!(r.processes.is_empty());
     }
 }

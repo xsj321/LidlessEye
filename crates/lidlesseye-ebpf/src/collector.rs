@@ -130,8 +130,10 @@ pub struct CollectorStats {
     pub symbol_unknown: Mutex<UnknownReasons>,
     /// Records dropped because the process no longer exists, cumulatively.
     pub skipped: AtomicU64,
-    /// Records whose pid could not be translated into the agent's PID
-    /// namespace. Non-zero means the samples of other containers are invisible.
+    /// Records whose pid is not visible in the agent's PID namespace. Always
+    /// zero when the agent shares the host's PID namespace; non-zero means the
+    /// agent is confined to its own and the samples of other containers are
+    /// lost.
     pub unattributed: AtomicU64,
     /// Records that were sampled but carried no usable stack at all.
     pub empty_stacks: AtomicU64,
@@ -283,17 +285,6 @@ struct StackKey {
 // contains no pointers, so it is plain old data.
 unsafe impl aya::Pod for StackKey {}
 
-/// Must match `struct ns_config` in `profile.bpf.c`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct NsConfig {
-    dev: u64,
-    ino: u64,
-}
-
-// SAFETY: two `u64` fields, no padding, no pointers.
-unsafe impl aya::Pod for NsConfig {}
-
 #[derive(Debug, Clone)]
 struct RawRecord {
     tgid: u32,
@@ -315,23 +306,26 @@ where
         debug!("could not raise RLIMIT_MEMLOCK, relying on the kernel's default");
     }
 
-    // Translate the kernel-global pids reported by the helpers into the agent's
-    // PID namespace, so that they line up with `/proc`. The value has to outlive
-    // the loader because `override_global` keeps a borrow of it until `load`.
-    let ns_cfg = procfs::pid_namespace().map(|(dev, ino)| NsConfig { dev, ino });
-    if let Some(cfg) = &ns_cfg {
-        debug!(
-            dev = cfg.dev,
-            ino = cfg.ino,
-            "using PID namespace translation"
+    // Tell the programs which PID namespace `/proc` shows, so that the pid
+    // they report is one this process can read. A pod with `hostPID: true`
+    // shares the node's namespace, which is an ancestor of every other pod's:
+    // that is what makes one agent able to profile the whole node.
+    let ns_inum = procfs::pid_namespace_inum().unwrap_or(0);
+    if ns_inum == 0 {
+        warn!(
+            "could not read /proc/self/ns/pid; reporting pids from the initial PID namespace, \
+             which /proc may not list"
+        );
+    } else {
+        info!(
+            pid_namespace = ns_inum,
+            "identifying samples by the pid in this PID namespace"
         );
     }
     let mut loader = aya::EbpfLoader::new();
-    if let Some(cfg) = ns_cfg.as_ref() {
-        // `must_exist = false` so that an object built without `ns_cfg` still
-        // loads (the pids then stay in the initial namespace).
-        loader.override_global("ns_cfg", cfg, false);
-    }
+    // `must_exist = false` so that an object built without `agent_ns_inum`
+    // still loads (the programs then report initial-namespace pids).
+    loader.override_global("agent_ns_inum", &ns_inum, false);
     let mut ebpf = loader
         .load(BPF_OBJECT)
         .map_err(|err| format!("failed to load eBPF: {err}"))?;

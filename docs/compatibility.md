@@ -54,7 +54,8 @@ means it is genuinely absent.
 | Kernel stacks | yes | kernel frames symbolized from the live kernel |
 | User stacks + symbolization | yes | ELF symbols, DWARF inline frames, Go `.gopclntab` and JIT perf maps; **stack depth needs frame pointers**, see below |
 | Process discovery | yes | every process with a stack is reported, per-PID |
-| Kubernetes labels | yes | `enrich_kubernetes_labels`, namespace/pod/container/node |
+| Every pod on the node | yes | needs `hostPID: true`; samples are named by the pid of the agent's PID namespace, see [PID namespaces](architecture.md#pid-namespaces) |
+| Kubernetes labels | yes | `enrich_kubernetes_labels`: `k8s_pod_uid`, `k8s_qos_class`, `k8s_container`, plus `node` — pod and namespace *names* are not in the cgroup path |
 | Node label | yes | `node_label` |
 | PID exclusion | yes | `exclude_pids` |
 | Container / label based filtering | no | exclusion is by PID only |

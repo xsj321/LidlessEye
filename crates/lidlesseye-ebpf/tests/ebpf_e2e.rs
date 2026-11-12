@@ -344,3 +344,107 @@ fn cpu_samples_add_up_to_the_time_the_thread_ran() {
         "no samples, so the assertion above proves nothing"
     );
 }
+
+/// A process in *another* PID namespace must be profiled under its own name.
+///
+/// This is the whole-cluster case: the agent runs with `hostPID: true`, every
+/// other pod lives in its own PID namespace, and the only pid `/proc` can
+/// resolve for those tasks is the one the kernel keeps for the *initial*
+/// namespace (`task_struct->tgid`). Translating through the agent's own
+/// namespace instead, which is what the object used to do unconditionally,
+/// answers "not visible" for every one of them: the samples then land in
+/// `unattributed` and the cluster looks idle.
+///
+/// Runs anywhere: the burner is put in a child of *this* PID namespace, which
+/// is the same relation a pod has to a `hostPID` agent, so the test does not
+/// need to be on a particular node.
+#[test]
+#[ignore = "requires root, an eBPF capable kernel, and --pid=host"]
+fn profiles_a_process_in_another_pid_namespace() {
+    use lidlesseye_ebpf::procfs;
+
+    if procfs::pid_namespace_inum().is_none() {
+        eprintln!("skipping: no /proc/self/ns/pid to identify this namespace");
+        return;
+    }
+
+    // A copy of `yes` under a unique name: the report can then only be about
+    // this test, and the process saturates a CPU for as long as it runs.
+    let source = ["/usr/bin/yes", "/bin/yes"]
+        .iter()
+        .map(std::path::Path::new)
+        .find(|path| path.exists())
+        .expect("no `yes` binary to burn CPU with");
+    let burner = std::env::temp_dir().join("lidlesseye-ns-burner");
+    std::fs::copy(source, &burner).expect("copy the burner");
+    // 15 characters, the most the kernel keeps in `comm`.
+    let expected = "lidlesseye-ns-b";
+
+    // `timeout` outlives the test run, so an assertion failure cannot leave a
+    // process spinning on someone's machine.
+    let mut child = std::process::Command::new("unshare")
+        .args(["--pid", "--fork", "--mount-proc", "timeout", "30"])
+        .arg(&burner)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn unshare");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let collector = start(
+        CollectorConfig {
+            service_name: None,
+            frequency_hz: 199,
+            flush_interval: Duration::from_secs(1),
+            collect_cpu: true,
+            collect_off_cpu: false,
+            ..Default::default()
+        },
+        move |report| {
+            let _ = tx.send(report);
+        },
+    )
+    .expect("collector should start");
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut found = false;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline && !found {
+        let Ok(report) = rx.recv_timeout(Duration::from_secs(2)) else {
+            continue;
+        };
+        if report.service_name == expected {
+            found = true;
+        } else if seen.len() < 8 && !seen.contains(&report.service_name) {
+            seen.push(report.service_name.clone());
+        }
+    }
+
+    let stats = collector.stats();
+    collector.stop();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&burner);
+
+    println!(
+        "cpu records={} unattributed={} skipped={} namespaced test: {}",
+        stats.cpu_records,
+        stats.unattributed,
+        stats.symbol_skipped,
+        if found { "attributed" } else { "missing" }
+    );
+    assert!(stats.cpu_records > 0, "no samples captured at all");
+    // A handful of samples always lands in kernel threads, and those exist only
+    // in the *initial* namespace: when the agent itself is one level down (as
+    // here) they have no name it could use. Everything else must be named.
+    assert!(
+        stats.unattributed * 10 < stats.cpu_records,
+        "{} of {} samples were dropped as unattributable",
+        stats.unattributed,
+        stats.cpu_records
+    );
+    assert!(
+        found,
+        "`{expected}` never appeared in a report; saw {:?}",
+        seen
+    );
+}

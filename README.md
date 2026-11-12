@@ -95,7 +95,8 @@ sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 # dashboard on http://localhost:4040
 ```
 
-Prerequisites: Linux ≥ 4.17 with BTF, `clang`, and root (or `CAP_BPF` +
+Prerequisites: Linux ≥ 5.5 with BTF (`/sys/kernel/btf/vmlinux`, used to
+resolve the collector's CO-RE relocations), `clang`, and root (or `CAP_BPF` +
 `CAP_PERFMON` + `CAP_SYS_ADMIN`). The first build downloads the prebuilt
 `libduckdb.so` matching `duckdb = "1.20000.1"`, so it needs network access once;
 set `DUCKDB_LIB_DIR` to a directory holding a vendored copy for offline builds.

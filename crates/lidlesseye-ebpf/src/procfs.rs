@@ -134,27 +134,23 @@ pub fn online_cpus() -> Vec<u32> {
     (0..num_cpus::get() as u32).collect()
 }
 
-/// `(st_dev, st_ino)` of the agent's PID namespace.
+/// `ns_common.inum` of the agent's PID namespace.
 ///
-/// The loader feeds these into the eBPF programs, which turn them into a pid
-/// that `/proc` *in this namespace* can resolve.
+/// A pid only names a task together with the namespace it was read in, and
+/// `/proc` shows exactly one namespace — the one this process is in. The eBPF
+/// programs use this value to pick, for every task, the pid belonging to *this*
+/// namespace out of the `task_struct->thread_pid->numbers[]` array, which is
+/// the only number `/proc` here can resolve.
 ///
-/// It must be set even when the agent already runs in the initial namespace.
-/// `bpf_get_current_pid_tgid()` numbers a task in that task's own namespace,
-/// so for a process inside another container it returns a small, unrelated
-/// number — reading `/proc/<that number>` then yields an entirely different
-/// process, and the profile is silently misattributed. Translating through the
-/// helper gives the correct (global) pid for every task the agent can see.
-///
-/// The flip side is a hard limit of `bpf_get_ns_current_pid_tgid`: it only
-/// succeeds for tasks sharing the agent's namespace. Samples from other
-/// containers come back as tgid 0, are counted in `unattributed`, and are
-/// dropped. Making those visible needs a per-namespace pid, which in turn needs
-/// the task's `nsproxy` — i.e. BTF/CO-RE, which this object deliberately avoids.
-pub fn pid_namespace() -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata("/proc/self/ns/pid").ok()?;
-    Some((metadata.dev(), metadata.ino()))
+/// It has to be read from the link target (`pid:[4026532294]`), not from
+/// `st_ino`: nsfs hands out anonymous inodes, so since kernel 6.13 the inode
+/// number and the namespace id are unrelated numbers.
+pub fn pid_namespace_inum() -> Option<u32> {
+    let target = std::fs::read_link("/proc/self/ns/pid").ok()?;
+    let text = target.to_str()?;
+    let inum = text.strip_prefix("pid:[")?.strip_suffix(']')?;
+    let inum: u32 = inum.parse().ok()?;
+    (inum != 0).then_some(inum)
 }
 
 /// Is the process inside a Kubernetes pod?
@@ -240,5 +236,21 @@ mod tests {
     #[test]
     fn online_cpu_list_is_not_empty() {
         assert!(!online_cpus().is_empty());
+    }
+
+    #[test]
+    fn reads_the_pid_namespace_id() {
+        let inum = pid_namespace_inum().expect("/proc/self/ns/pid should be readable");
+        // Namespace ids are allocated from a high range and never zero; a small
+        // number would mean the link target was parsed wrongly.
+        assert!(inum > 1_000_000, "unexpected namespace id {inum}");
+        // Everything in this process's `/proc` that shares its namespace must
+        // report the same id, which is what the eBPF walk matches on.
+        let own = std::fs::read_link("/proc/1/ns/pid").ok();
+        if let Some(own) = own.and_then(|link| link.to_str().map(str::to_string))
+            && own == format!("pid:[{inum}]")
+        {
+            assert_eq!(pid_namespace_inum(), Some(inum));
+        }
     }
 }

@@ -22,7 +22,7 @@ Requirements:
 
 | Requirement | Why | Check |
 | --- | --- | --- |
-| Linux ≥ 4.17 with BTF | BPF maps are declared with BTF; the object has no CO-RE relocations | `ls /sys/kernel/btf/vmlinux` |
+| Linux ≥ 5.5 with BTF | the object reads `task_struct` through CO-RE relocations, which the loader resolves from the kernel's own BTF, and needs `bpf_probe_read_kernel` | `ls /sys/kernel/btf/vmlinux` |
 | root, or `CAP_BPF`+`CAP_PERFMON`+`CAP_SYS_ADMIN` | loading programs, `BPF_MAP_TYPE_STACK_TRACE` | `id -u` |
 | `perf_event_paranoid ≤ 2` | the on-CPU sampler opens a perf event per CPU | `cat /proc/sys/kernel/perf_event_paranoid` |
 | `clang` (build time only) | compiles `profile.bpf.c`; a prebuilt object is committed as a fallback | `clang --version` |
@@ -55,10 +55,29 @@ defaults to the machine's hostname; inside a pod that is the pod name, which
 changes on every rollout, so the Helm chart passes `spec.nodeName` as
 `LIDLESSEYE_NODE_NAME` and the agent prefers it.
 
-Kubernetes labels come from each process's cgroup when the agent runs with
-`hostPID`: `k8s_pod_uid`, `k8s_qos_class` and `k8s_container`. They identify
-*where* a stack was sampled without talking to the API server, which is why the
-set stops at the UID — pod and namespace names are not in the cgroup path.
+### What the agent profiles
+
+The DaemonSet runs with `hostPID: true`, which is what makes it a *node*
+profiler rather than a profiler of its own pod. Every task on the node is
+sampled, and each sample is named with the pid that the agent's `/proc` can
+resolve — the number the kernel keeps for the agent's own PID namespace, not the
+one from the initial namespace (see
+[PID namespaces](architecture.md#pid-namespaces)). A pod in another namespace
+therefore shows up under its own process, cgroup and labels, and nothing is
+silently attributed to lookalike pids.
+
+Two consequences worth knowing:
+
+- `unattributed` in the collector log counts samples of tasks that are *outside*
+  the agent's namespace tree. On a node it is ~0; anything larger means the
+  agent lost `hostPID` (or runs in a nested namespace of its own, as a
+  kind-in-Docker node does — there a few kernel-thread samples are expected).
+- Kubernetes labels come from each process's cgroup: `k8s_pod_uid`,
+  `k8s_qos_class` and `k8s_container`. They identify *where* a stack was
+  sampled without talking to the API server, which is why the set stops at the
+  UID — pod and namespace names are not in the cgroup path. With
+  `--service-name` unset the series name is the process name; set it to
+  aggregate a node under one service.
 
 ### Authentication
 
@@ -217,9 +236,15 @@ stopped working.
 
 ## Troubleshooting
 
+**`failed to load eBPF: … missing target BTF info for type …`**
+The kernel has no BTF for the loader to resolve the CO-RE relocations against,
+so it cannot find where `task_struct.thread_pid` lives on this kernel. Check
+`ls /sys/kernel/btf/vmlinux` (kernel ≥ 5.5, `CONFIG_DEBUG_INFO_BTF=y`); a
+distribution kernel may ship it as a separate `kernel-debuginfo` package.
+
 **`failed to load eBPF: the verifier rejected the program`**
-The kernel is too old or the object was built for a newer one. Check
-`ls /sys/kernel/btf/vmlinux`; rebuild with `LIDLESSEYE_BUILD_BPF=1`.
+The kernel is too old or the object was built for a newer one. Rebuild with
+`LIDLESSEYE_BUILD_BPF=1`.
 
 **`could not attach the CPU sampler to any CPU`**
 `perf_event_paranoid` is 3, or the container lacks `CAP_PERFMON`:

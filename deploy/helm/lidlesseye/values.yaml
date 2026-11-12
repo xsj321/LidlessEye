@@ -151,12 +151,17 @@ agent:
     - operator: Exists
       effect: NoSchedule
   nodeSelector: {}
+  # A node agent symbolizes every process on the node, and a symbolizer keeps
+  # the parsed symbol tables of the modules it has seen. 512Mi was enough while
+  # every other container's samples were dropped as unattributable; a node
+  # running a few Go services (Prometheus, kube-state-metrics, an operator)
+  # needs more, and the kernel OOM killer takes the agent down when it runs out.
   resources:
     requests:
       cpu: 50m
-      memory: 128Mi
+      memory: 256Mi
     limits:
-      memory: 512Mi
+      memory: 1Gi
 
   extraArgs: []
 

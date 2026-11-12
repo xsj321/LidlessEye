@@ -70,13 +70,35 @@ attaches the program to whichever exists.
 
 ### PID namespaces
 
-`bpf_get_current_pid_tgid` returns PIDs in the **initial** namespace, but an
-agent inside a container can only read `/proc/<pid>` for processes in *its*
-namespace. The BPF program therefore uses
-`bpf_get_ns_current_pid_tgid(dev, ino, …)` when the loader injects a
-`const volatile struct ns_config { dev, ino }` (read from
-`/proc/self/ns/pid` via `stat`). On a host, or with `hostPID: true`, the
-translation is the identity.
+A pid does not identify a task on its own. The kernel keeps one number per PID
+namespace in `task_struct->thread_pid->numbers[]`, indexed by the namespace's
+level (`0` = the initial namespace), and `/proc` lists the tasks of exactly one
+namespace: the reader's. Getting this wrong is silent — the profile looks
+plausible and is attributed to an unrelated process — so the programs resolve
+it explicitly instead of relying on a helper's convention:
+
+- the loader reads this process's namespace id from `/proc/self/ns/pid` and
+  injects it as `const volatile __u32 agent_ns_inum`. The id is the
+  `ns_common.inum` from the link target (`pid:[4026532502]`), *not* the file's
+  inode: nsfs hands out anonymous inodes, so the two numbers are unrelated;
+- per sample, `current_tgid()` walks `group_leader->thread_pid->numbers[level]`
+  from the deepest level down and returns the `nr` whose `numbers[].ns` *is* the
+  agent's namespace. The group leader, not the calling thread: `thread_pid`
+  belongs to the individual thread, and keying on it would turn every worker
+  thread into a series of its own.
+
+A host agent, or a pod with `hostPID: true`, is an ancestor of every container's
+namespace, so every container has a matching entry and a single agent can
+profile the whole node. A task outside that tree — a kernel thread, when the
+agent itself runs in a nested namespace — has no entry at all; it is counted in
+`unattributed` rather than given a number that would name some other process.
+
+These are the only kernel struct reads in the object, and they are CO-RE
+relocations: no `vmlinux.h`, no kernel headers, no fixed offsets. `clang -g`
+records the field accesses in `.BTF.ext` and aya rewrites them from
+`/sys/kernel/btf/vmlinux` when the object is loaded, so the same object works on
+kernels whose `task_struct` or `struct pid` has a different layout — this file
+only names the fields it needs, and they are matched by name.
 
 ### Symbolization
 
