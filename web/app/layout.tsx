@@ -1,0 +1,18 @@
+import type { Metadata } from "next";
+
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "LidlessEye",
+  description: "Continuous profiling for Linux, powered by eBPF.",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{ children: React.ReactNode }>) {
+  return (
+    <html lang="en" className="dark" suppressHydrationWarning>
+      <body>{children}</body>
+    </html>
+  );
+}

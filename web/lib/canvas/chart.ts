@@ -2,12 +2,13 @@
 //
 // One canvas, one draw pass, no chart library: the data is a fixed number of
 // buckets per series, so a plain 2D context is both the smallest and the
-// fastest option.
+// fastest option. The legend is React's, because it is a list of buttons that
+// toggle series visibility — the canvas only reports which series it drew.
 
-import { formatClock, formatValue } from "./format.js";
+import { formatClock, formatValue } from "@/lib/format";
+import type { TimeseriesPayload } from "@/lib/types";
 
-const PAD = { top: 14, right: 16, bottom: 26, left: 62 };
-const PALETTE = [
+export const SERIES_PALETTE = [
   "#f2a65a",
   "#6ba7f7",
   "#4fbf8b",
@@ -20,69 +21,89 @@ const PALETTE = [
   "#8d93a8",
 ];
 
+const PAD = { top: 14, right: 16, bottom: 26, left: 62 };
+
+export interface SeriesLegendEntry {
+  name: string;
+  label: string;
+  color: string;
+  hidden: boolean;
+}
+
+export interface SeriesHover {
+  clock: string;
+  total: string;
+  rows: Array<{ label: string; value: string }>;
+}
+
+export interface ChartCallbacks {
+  onLegend?: (entries: SeriesLegendEntry[]) => void;
+  onHover?: (hover: SeriesHover | null, clientX: number, clientY: number) => void;
+}
+
 export class TimeSeriesChart {
-  constructor(host) {
-    this.host = host;
-    host.classList.add("panel");
-    this.canvas = document.createElement("canvas");
-    this.canvas.className = "chart-canvas";
-    this.ctx = this.canvas.getContext("2d");
-    this.wrap = document.createElement("div");
-    this.wrap.className = "chart-wrap";
-    this.wrap.appendChild(this.canvas);
-    this.legend = document.createElement("div");
-    this.legend.className = "legend";
-    host.append(this.wrap, this.legend);
+  private readonly canvas: HTMLCanvasElement;
+  private readonly wrap: HTMLElement;
+  private readonly ctx: CanvasRenderingContext2D;
+  private readonly callbacks: ChartCallbacks;
 
-    this.hidden = new Set();
-    this.hoverIndex = -1;
-    this.data = null;
-    this.unit = "nanoseconds";
+  private hidden = new Set<string>();
+  private hoverIndex = -1;
+  private data: TimeseriesPayload | null = null;
+  private unit = "nanoseconds";
+  private resizeObserver: ResizeObserver | null;
 
-    this.canvas.addEventListener("mousemove", (event) => {
-      const rect = this.canvas.getBoundingClientRect();
+  constructor(canvas: HTMLCanvasElement, wrap: HTMLElement, callbacks: ChartCallbacks = {}) {
+    this.canvas = canvas;
+    this.wrap = wrap;
+    this.callbacks = callbacks;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("2D canvas context unavailable");
+    this.ctx = ctx;
+
+    canvas.addEventListener("mousemove", (event) => {
+      const rect = canvas.getBoundingClientRect();
       this.hoverIndex = this.indexAt(event.clientX - rect.left, rect.width);
       this.draw();
-      this.showTooltip(event);
+      this.emitHover(event);
     });
-    this.canvas.addEventListener("mouseleave", () => {
+    canvas.addEventListener("mouseleave", () => {
       this.hoverIndex = -1;
-      this.tooltipEl()?.remove();
-      this.draw();
-    });
-    this.legend.addEventListener("click", (event) => {
-      const item = event.target.closest("[data-name]");
-      if (!item) return;
-      const name = item.dataset.name;
-      if (this.hidden.has(name)) this.hidden.delete(name);
-      else this.hidden.add(name);
-      this.renderLegend();
+      this.callbacks.onHover?.(null, 0, 0);
       this.draw();
     });
 
     this.resizeObserver = new ResizeObserver(() => this.draw());
-    this.resizeObserver.observe(this.wrap);
+    this.resizeObserver.observe(wrap);
   }
 
   destroy() {
     this.resizeObserver?.disconnect();
-    this.tooltipEl()?.remove();
-    this.host.innerHTML = "";
+    this.resizeObserver = null;
+    this.callbacks.onHover?.(null, 0, 0);
   }
 
-  setData(payload, unit) {
+  setData(payload: TimeseriesPayload | null, unit: string) {
     this.data = payload;
     this.unit = unit ?? "nanoseconds";
     this.hoverIndex = -1;
-    this.renderLegend();
+    this.emitLegend();
     this.draw();
   }
 
-  visible() {
+  /** Show/hide one series; the legend calls this. */
+  toggleSeries(name: string) {
+    if (this.hidden.has(name)) this.hidden.delete(name);
+    else this.hidden.add(name);
+    this.emitLegend();
+    this.draw();
+  }
+
+  private visible() {
     return (this.data?.series ?? []).filter((s) => !this.hidden.has(s.service_name));
   }
 
-  seriesLabel(series) {
+  private seriesLabel(series: { service_name: string; labels?: Record<string, string> }) {
     const labels = Object.entries(series.labels ?? {})
       .filter(([k]) => k !== "node" && k !== "service_name" && k !== "process_name")
       .map(([k, v]) => `${k}=${v}`)
@@ -90,30 +111,19 @@ export class TimeSeriesChart {
     return labels ? `${series.service_name} ${labels}` : series.service_name;
   }
 
-  renderLegend() {
+  private emitLegend() {
     const rows = this.data?.series ?? [];
-    if (!rows.length) {
-      this.legend.innerHTML = "";
-      return;
-    }
-    this.legend.innerHTML = rows
-      .map((series, i) => {
-        const off = this.hidden.has(series.service_name) ? " off" : "";
-        const color = PALETTE[this.colorIndex(series, i)];
-        return `<span class="legend-item${off}" data-name="${escape(series.service_name)}">
-          <span class="legend-swatch" style="background:${color}"></span>${escape(this.seriesLabel(series))}
-        </span>`;
-      })
-      .join("");
+    this.callbacks.onLegend?.(
+      rows.map((series, i) => ({
+        name: series.service_name,
+        label: this.seriesLabel(series),
+        color: SERIES_PALETTE[i % SERIES_PALETTE.length],
+        hidden: this.hidden.has(series.service_name),
+      })),
+    );
   }
 
-  colorIndex(series, fallback) {
-    const rows = this.data?.series ?? [];
-    const i = rows.indexOf(series);
-    return (i >= 0 ? i : fallback) % PALETTE.length;
-  }
-
-  indexAt(px, width) {
+  private indexAt(px: number, width: number) {
     const data = this.data;
     if (!data) return -1;
     const plotWidth = width - PAD.left - PAD.right;
@@ -124,59 +134,38 @@ export class TimeSeriesChart {
     return Math.min(buckets - 1, Math.max(0, Math.floor(ratio * buckets)));
   }
 
-  bucketCount() {
+  private bucketCount() {
     return this.data?.series?.[0]?.points?.length ?? 0;
   }
 
-  totals() {
-    const buckets = this.bucketCount();
-    const out = new Array(buckets).fill(0);
-    for (const series of this.visible()) {
-      for (let i = 0; i < buckets; i += 1) out[i] += series.points[i] ?? 0;
-    }
-    return out;
-  }
-
-  tooltipEl() {
-    return this.wrap.querySelector(".chart-tooltip");
-  }
-
-  showTooltip(event) {
-    if (this.hoverIndex < 0) {
-      this.tooltipEl()?.remove();
+  private emitHover(event: MouseEvent) {
+    const data = this.data;
+    if (!data || this.hoverIndex < 0) {
+      this.callbacks.onHover?.(null, event.clientX, event.clientY);
       return;
     }
-    let el = this.tooltipEl();
-    if (!el) {
-      el = document.createElement("div");
-      el.className = "tooltip chart-tooltip";
-      this.wrap.appendChild(el);
-    }
-    const data = this.data;
     const bucketNs = data.from_ns + this.hoverIndex * data.step_ns;
     const rows = this.visible()
-      .map((series) => ({ label: this.seriesLabel(series), value: series.points[this.hoverIndex] ?? 0 }))
+      .map((series) => ({
+        label: this.seriesLabel(series),
+        value: series.points[this.hoverIndex] ?? 0,
+      }))
       .filter((row) => row.value > 0)
       .sort((a, b) => b.value - a.value)
       .slice(0, 8);
     const total = rows.reduce((acc, row) => acc + row.value, 0);
-    el.innerHTML = `
-      <div class="tt-title">${formatClock(bucketNs)}</div>
-      <div class="tt-row"><span class="tt-key">total</span>${formatValue(total, this.unit)}</div>
-      ${rows
-        .map(
-          (row) =>
-            `<div class="tt-row"><span class="tt-key">${formatValue(row.value, this.unit)}</span>${escape(row.label)}</div>`,
-        )
-        .join("")}
-    `;
-    const rect = this.wrap.getBoundingClientRect();
-    const tooltipRect = el.getBoundingClientRect();
-    let left = event.clientX - rect.left + 16;
-    if (left + tooltipRect.width > rect.width - 8) left = event.clientX - rect.left - tooltipRect.width - 16;
-    el.style.left = `${Math.max(8, left)}px`;
-    el.style.top = `${Math.max(8, event.clientY - rect.top + 12)}px`;
-    el.hidden = false;
+    this.callbacks.onHover?.(
+      {
+        clock: formatClock(bucketNs),
+        total: formatValue(total, this.unit),
+        rows: rows.map((row) => ({
+          label: row.label,
+          value: formatValue(row.value, this.unit),
+        })),
+      },
+      event.clientX,
+      event.clientY,
+    );
   }
 
   draw() {
@@ -184,7 +173,10 @@ export class TimeSeriesChart {
     const width = Math.max(320, this.wrap.clientWidth);
     const height = 260;
     const dpr = window.devicePixelRatio || 1;
-    if (this.canvas.width !== Math.round(width * dpr) || this.canvas.height !== Math.round(height * dpr)) {
+    if (
+      this.canvas.width !== Math.round(width * dpr) ||
+      this.canvas.height !== Math.round(height * dpr)
+    ) {
       this.canvas.width = Math.round(width * dpr);
       this.canvas.height = Math.round(height * dpr);
       this.canvas.style.width = `${width}px`;
@@ -193,7 +185,7 @@ export class TimeSeriesChart {
     const ctx = this.ctx;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
-    ctx.font = '11px system-ui, sans-serif';
+    ctx.font = "11px system-ui, sans-serif";
 
     if (!data || !this.bucketCount()) {
       ctx.fillStyle = "#96a0b2";
@@ -206,7 +198,6 @@ export class TimeSeriesChart {
     const plotWidth = width - PAD.left - PAD.right;
     const plotHeight = height - PAD.top - PAD.bottom;
     const buckets = this.bucketCount();
-    const totals = this.totals();
     let max = 0;
     for (let i = 0; i < buckets; i += 1) {
       let stacked = 0;
@@ -216,7 +207,7 @@ export class TimeSeriesChart {
     if (max <= 0) max = 1;
     max *= 1.08;
 
-    const xFor = (i) => PAD.left + (i / buckets) * plotWidth;
+    const xFor = (i: number) => PAD.left + (i / buckets) * plotWidth;
     const barWidth = Math.max(1, plotWidth / buckets - 0.5);
 
     // Grid + y axis
@@ -235,11 +226,11 @@ export class TimeSeriesChart {
     }
 
     // Stacked bars
-    const columnTotals = new Array(buckets).fill(0);
+    const columnTotals = new Array<number>(buckets).fill(0);
     const seriesList = this.visible();
-    seriesList.forEach((series, order) => {
-      const original = this.data.series.indexOf(series);
-      ctx.fillStyle = PALETTE[original % PALETTE.length];
+    seriesList.forEach((series) => {
+      const original = this.data!.series.indexOf(series);
+      ctx.fillStyle = SERIES_PALETTE[original % SERIES_PALETTE.length];
       ctx.globalAlpha = 0.85;
       for (let i = 0; i < buckets; i += 1) {
         const value = series.points[i] ?? 0;
@@ -252,7 +243,6 @@ export class TimeSeriesChart {
         columnTotals[i] += value;
       }
       ctx.globalAlpha = 1;
-      void order;
     });
 
     // X axis ticks
@@ -274,13 +264,6 @@ export class TimeSeriesChart {
       ctx.moveTo(px, PAD.top);
       ctx.lineTo(px, PAD.top + plotHeight);
       ctx.stroke();
-      void totals;
     }
   }
-}
-
-function escape(text) {
-  return String(text).replace(/[&<>"]/g, (c) =>
-    c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;",
-  );
 }

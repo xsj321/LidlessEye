@@ -308,7 +308,7 @@ crates/lidlesseye-core    data model, DuckDB store, query engine, selectors
 crates/lidlesseye-ebpf    aya programs (BPF C), collector, blazesym symbolization
 crates/lidlesseye-server  axum HTTP API, embedded UI, metrics
 crates/lidlesseye         the `LidlessEye` builder, the CLI, the publisher
-web/dist                  the dashboard (plain ES modules, no build step)
+web/                      the dashboard (Next.js + shadcn, static export into dist)
 deploy/                   Dockerfile, docker-compose, Helm chart
 ```
 

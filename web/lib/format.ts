@@ -1,4 +1,7 @@
 // Formatting helpers shared by every view.
+//
+// These are pure functions over the units the API reports, ported unchanged
+// from the pre-React dashboard so the numbers read exactly the same.
 
 const TIME_UNITS = [
   { ns: 1e9, suffix: "s" },
@@ -8,17 +11,17 @@ const TIME_UNITS = [
 ];
 
 /** Format a raw value given the profile unit reported by the API. */
-export function formatValue(value, unit = "nanoseconds") {
+export function formatValue(value: number | null | undefined, unit = "nanoseconds"): string {
   if (value == null || Number.isNaN(value)) return "–";
   if (unit === "nanoseconds") return formatDuration(value);
   if (unit === "bytes") return formatBytes(value);
   return formatCount(value);
 }
 
-export function formatDuration(ns) {
+export function formatDuration(ns: number): string {
   if (!Number.isFinite(ns)) return "–";
   const sign = ns < 0 ? "-" : "";
-  let v = Math.abs(ns);
+  const v = Math.abs(ns);
   if (v === 0) return "0s";
   if (v >= 60e9) {
     const minutes = Math.floor(v / 60e9);
@@ -35,7 +38,7 @@ export function formatDuration(ns) {
   return `${sign}${v}ns`;
 }
 
-export function formatBytes(bytes) {
+export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes)) return "–";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let i = 0;
@@ -47,10 +50,10 @@ export function formatBytes(bytes) {
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-export function formatCount(n) {
+export function formatCount(n: number): string {
   if (!Number.isFinite(n)) return "–";
   if (Math.abs(n) < 1000) return String(n);
-  const units = [
+  const units: Array<[number, string]> = [
     [1e12, "T"],
     [1e9, "G"],
     [1e6, "M"],
@@ -65,12 +68,12 @@ export function formatCount(n) {
 }
 
 /** `0.1234` -> `12.3%` */
-export function formatPercent(fraction, digits = 1) {
+export function formatPercent(fraction: number, digits = 1): string {
   if (!Number.isFinite(fraction)) return "–";
   return `${(fraction * 100).toFixed(digits)}%`;
 }
 
-export function formatTimestamp(ns) {
+export function formatTimestamp(ns: number): string {
   const date = new Date(Number(ns) / 1e6);
   return date.toLocaleString(undefined, {
     month: "short",
@@ -81,13 +84,13 @@ export function formatTimestamp(ns) {
   });
 }
 
-export function formatClock(ns) {
+export function formatClock(ns: number): string {
   const date = new Date(Number(ns) / 1e6);
-  const pad = (n) => String(n).padStart(2, "0");
+  const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-export function formatRelative(ns) {
+export function formatRelative(ns: number): string {
   const seconds = Math.round((Date.now() - Number(ns) / 1e6) / 1000);
   if (!Number.isFinite(seconds)) return "–";
   if (seconds < 60) return `${seconds}s ago`;
@@ -96,36 +99,21 @@ export function formatRelative(ns) {
   return `${Math.round(seconds / 86400)}d ago`;
 }
 
-/** Escape a string for safe interpolation into HTML. */
-export function escapeHtml(text) {
-  return String(text ?? "").replace(/[&<>"']/g, (c) => {
-    switch (c) {
-      case "&":
-        return "&amp;";
-      case "<":
-        return "&lt;";
-      case ">":
-        return "&gt;";
-      case '"':
-        return "&quot;";
-      default:
-        return "&#39;";
-    }
-  });
-}
-
 /** `{app="api", env="prod"}` from a label map, omitting internal labels. */
-export function formatLabels(labels, skip = ["node", "service_name", "process_name"]) {
+export function formatLabels(
+  labels: Record<string, string> | undefined,
+  skip: string[] = ["node", "service_name", "process_name"],
+): string {
   const parts = Object.entries(labels ?? {})
     .filter(([k]) => !skip.includes(k))
     .map(([k, v]) => `${k}="${v}"`);
   return parts.length ? `{${parts.join(", ")}}` : "";
 }
 
-export function debounce(fn, ms) {
-  let handle = null;
-  return (...args) => {
-    clearTimeout(handle);
+export function debounce<A extends unknown[]>(fn: (...args: A) => void, ms: number) {
+  let handle: ReturnType<typeof setTimeout> | null = null;
+  return (...args: A) => {
+    if (handle) clearTimeout(handle);
     handle = setTimeout(() => fn(...args), ms);
   };
 }

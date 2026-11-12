@@ -30,8 +30,10 @@ fn mime_for(path: &str) -> &'static str {
 
 fn serve(path: &str) -> Option<Response> {
     let asset = Assets::get(path)?;
-    let cache = if path.starts_with("assets/") {
-        // Vite emits content-hashed filenames under assets/.
+    let cache = if path.starts_with("_next/static/") || path.starts_with("assets/") {
+        // Next.js emits content-hashed filenames under `_next/static/`, so a
+        // given URL never changes meaning; `index.html` must be revalidated or
+        // a new agent would serve an old asset graph.
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"

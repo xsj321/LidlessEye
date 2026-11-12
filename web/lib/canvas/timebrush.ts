@@ -7,11 +7,14 @@
 // window still covers the whole domain there is nothing to move, so a drag
 // inside starts a new selection instead (zoom, then pan).
 //
-// The component never fetches: app.js feeds it the histogram (from
+// The component never fetches: the dashboard feeds it the histogram (from
 // /api/v1/timeseries over the domain) and the selection, and reacts to
 // `onChange` — fired once per gesture, on pointer-up, not during the drag.
+// `onPreview` fires during the gesture so the readout above the canvas can
+// follow the handle without a server round-trip.
 
-import { formatClock, formatDuration } from "./format.js";
+import { formatClock, formatDuration } from "@/lib/format";
+import type { TimeseriesPayload } from "@/lib/types";
 
 const HEIGHT = 68; // css px: bars + axis labels + head room
 const BAR_TOP = 8;
@@ -19,67 +22,84 @@ const BAR_BOTTOM = 48;
 const HANDLE_PX = 8; // grabable width of each edge, in css px
 const MIN_SPAN_FRACTION = 1 / 300; // of the domain; below this resizing stops
 
+interface Span {
+  from: number;
+  until: number;
+}
+
+interface Histogram {
+  from_ns: number;
+  until_ns: number;
+  step_ns: number;
+  totals: number[];
+}
+
+export interface TimeBrushOptions {
+  onChange?: (from: number, until: number) => void;
+  onPreview?: (from: number | null, until: number | null) => void;
+}
+
+type DragMode = "move" | "resizeL" | "resizeR" | "create";
+
+interface Drag {
+  mode: DragMode;
+  anchorNs: number;
+  grabNs: number;
+  startSel: Span;
+  moved: boolean;
+}
+
 export class TimeBrush {
-  /**
-   * @param {HTMLElement} host container, rendered into
-   * @param {{ label: string, onChange: (from: number, until: number) => void }} options
-   */
-  constructor(host, { label, onChange } = {}) {
-    this.host = host;
-    this.label = label ?? "Time range";
-    this.onChange = onChange ?? (() => {});
-    this.domain = null; // {from, until} in ns
-    this.histogram = null; // {from_ns, until_ns, step_ns, totals: number[]}
-    this.sel = null; // {from, until} in ns
-    this.drag = null; // active gesture: {mode, anchorNs, grabNs, startSel}
+  private readonly canvas: HTMLCanvasElement;
+  private readonly ctx: CanvasRenderingContext2D;
+  private readonly onChange: (from: number, until: number) => void;
+  private readonly onPreview: (from: number | null, until: number | null) => void;
 
-    host.innerHTML = `
-      <div class="brush">
-        <div class="brush-head">
-          <span class="brush-label">${escape(this.label)}</span>
-          <span class="brush-range mono" data-role="range">–</span>
-          <span class="brush-domain faint mono" data-role="domain"></span>
-        </div>
-        <canvas class="time-brush" height="${HEIGHT}"></canvas>
-      </div>
-    `;
-    this.headEl = host.querySelector(".brush-head");
-    this.canvas = host.querySelector("canvas.time-brush");
-    this.rangeEl = host.querySelector('[data-role="range"]');
-    this.domainEl = host.querySelector('[data-role="domain"]');
-    this.ctx = this.canvas.getContext("2d");
+  private domain: Span | null = null;
+  private histogram: Histogram | null = null;
+  private sel: Span | null = null;
+  private drag: Drag | null = null;
+  private resizeObserver: ResizeObserver | null;
 
-    this.canvas.addEventListener("pointerdown", (event) => this.onPointerDown(event));
-    this.canvas.addEventListener("pointermove", (event) => this.onPointerMove(event));
-    this.canvas.addEventListener("pointerup", (event) => this.onPointerUp(event));
-    this.canvas.addEventListener("pointerleave", () => {
-      if (!this.drag) this.canvas.style.cursor = "";
+  constructor(canvas: HTMLCanvasElement, options: TimeBrushOptions = {}) {
+    this.canvas = canvas;
+    this.onChange = options.onChange ?? (() => {});
+    this.onPreview = options.onPreview ?? (() => {});
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("2D canvas context unavailable");
+    this.ctx = ctx;
+
+    canvas.addEventListener("pointerdown", (event) => this.onPointerDown(event));
+    canvas.addEventListener("pointermove", (event) => this.onPointerMove(event));
+    canvas.addEventListener("pointerup", (event) => this.onPointerUp(event));
+    canvas.addEventListener("pointerleave", () => {
+      if (!this.drag) canvas.style.cursor = "";
     });
 
     this.resizeObserver = new ResizeObserver(() => this.draw());
-    this.resizeObserver.observe(this.canvas);
+    this.resizeObserver.observe(canvas);
   }
 
   destroy() {
     this.resizeObserver?.disconnect();
-    this.host.innerHTML = "";
+    this.resizeObserver = null;
   }
 
   /** The range the bracket may slide in; also what the histogram spans. */
-  setDomain(from, until) {
+  setDomain(from: number, until: number) {
     this.domain = { from, until };
     this.draw();
   }
 
   /** Bucket totals from /api/v1/timeseries, summed over its series. */
-  setHistogram(payload) {
+  setHistogram(payload: TimeseriesPayload | null | undefined) {
     if (!payload) {
       this.histogram = null;
       this.draw();
       return;
     }
     const buckets = payload.series?.[0]?.points?.length ?? 0;
-    const totals = new Array(buckets).fill(0);
+    const totals = new Array<number>(buckets).fill(0);
     for (const series of payload.series ?? []) {
       for (let i = 0; i < buckets; i += 1) totals[i] += series.points?.[i] ?? 0;
     }
@@ -93,58 +113,60 @@ export class TimeBrush {
   }
 
   /** External selection update (picker, hash, auto-refresh). */
-  setSelection(from, until) {
+  setSelection(from: number, until: number) {
     this.sel = { from, until };
     this.draw();
   }
 
-  selection() {
+  selection(): Span | null {
     return this.sel ? { ...this.sel } : null;
   }
 
   // ---- geometry ---------------------------------------------------------
 
-  plotWidth() {
+  private plotWidth() {
     return Math.max(10, this.canvas.clientWidth);
   }
 
-  xFor(ns) {
-    const { from, until } = this.domain;
+  private xFor(ns: number) {
+    const { from, until } = this.domain!;
     return ((ns - from) / (until - from)) * this.plotWidth();
   }
 
-  nsFor(px) {
-    const { from, until } = this.domain;
+  private nsFor(px: number) {
+    const { from, until } = this.domain!;
     return from + (px / this.plotWidth()) * (until - from);
   }
 
-  minSpan() {
+  private minSpan() {
     if (!this.domain) return 1e9;
     return Math.max(1e9, (this.domain.until - this.domain.from) * MIN_SPAN_FRACTION);
   }
 
-  edgePx() {
+  private edgePx() {
     return {
-      left: this.xFor(this.sel.from),
-      right: this.xFor(this.sel.until),
+      left: this.xFor(this.sel!.from),
+      right: this.xFor(this.sel!.until),
     };
   }
 
   /** Is the window still the whole domain? Then a drag must select, not move. */
-  coversDomain() {
+  private coversDomain() {
     if (!this.domain || !this.sel) return true;
-    return this.sel.until - this.sel.from >= (this.domain.until - this.domain.from) * 0.999;
+    return (
+      this.sel.until - this.sel.from >= (this.domain.until - this.domain.from) * 0.999
+    );
   }
 
   // ---- interaction ------------------------------------------------------
 
-  onPointerDown(event) {
+  private onPointerDown(event: PointerEvent) {
     if (!this.domain || !this.sel) return;
     const rect = this.canvas.getBoundingClientRect();
     const px = event.clientX - rect.left;
     const { left, right } = this.edgePx();
     this.canvas.setPointerCapture(event.pointerId);
-    let mode;
+    let mode: DragMode;
     if (Math.abs(px - left) <= HANDLE_PX) mode = "resizeL";
     else if (Math.abs(px - right) <= HANDLE_PX) mode = "resizeR";
     else if (px > left && px < right && !this.coversDomain()) mode = "move";
@@ -160,7 +182,7 @@ export class TimeBrush {
     this.canvas.style.cursor = mode === "create" ? "crosshair" : "ew-resize";
   }
 
-  onPointerMove(event) {
+  private onPointerMove(event: PointerEvent) {
     const rect = this.canvas.getBoundingClientRect();
     const px = event.clientX - rect.left;
     if (!this.drag) {
@@ -172,7 +194,7 @@ export class TimeBrush {
       return;
     }
     if (Math.abs(px - this.xFor(this.drag.anchorNs)) > 3) this.drag.moved = true;
-    const ns = clamp(this.nsFor(px), this.domain.from, this.domain.until);
+    const ns = clamp(this.nsFor(px), this.domain!.from, this.domain!.until);
     const start = this.drag.startSel;
     const min = this.minSpan();
 
@@ -180,17 +202,17 @@ export class TimeBrush {
       const span = start.until - start.from;
       const shift = ns - this.drag.grabNs;
       let from = start.from + shift;
-      from = clamp(from, this.domain.from, this.domain.until - span);
+      from = clamp(from, this.domain!.from, this.domain!.until - span);
       this.sel = { from, until: from + span };
     } else if (this.drag.mode === "resizeL") {
       this.sel = {
-        from: clamp(Math.min(ns, start.until - min), this.domain.from, start.until - min),
+        from: clamp(Math.min(ns, start.until - min), this.domain!.from, start.until - min),
         until: start.until,
       };
     } else if (this.drag.mode === "resizeR") {
       this.sel = {
         from: start.from,
-        until: clamp(Math.max(ns, start.from + min), start.from + min, this.domain.until),
+        until: clamp(Math.max(ns, start.from + min), start.from + min, this.domain!.until),
       };
     } else {
       // create: bracket between the anchor and the pointer
@@ -202,14 +224,15 @@ export class TimeBrush {
         until = mid + min / 2;
       }
       this.sel = {
-        from: clamp(from, this.domain.from, this.domain.until - min),
-        until: clamp(until, this.domain.from + min, this.domain.until),
+        from: clamp(from, this.domain!.from, this.domain!.until - min),
+        until: clamp(until, this.domain!.from + min, this.domain!.until),
       };
     }
     this.draw();
+    this.onPreview(Math.round(this.sel.from), Math.round(this.sel.until));
   }
 
-  onPointerUp(event) {
+  private onPointerUp(event: PointerEvent) {
     if (!this.drag) return;
     const drag = this.drag;
     this.drag = null;
@@ -220,10 +243,10 @@ export class TimeBrush {
     if (drag.mode === "create" && !drag.moved && !this.coversDomain()) {
       const rect = this.canvas.getBoundingClientRect();
       const px = event.clientX - rect.left;
-      const ns = clamp(this.nsFor(px), this.domain.from, this.domain.until);
+      const ns = clamp(this.nsFor(px), this.domain!.from, this.domain!.until);
       const span = drag.startSel.until - drag.startSel.from;
       let from = ns - span / 2;
-      from = clamp(from, this.domain.from, this.domain.until - span);
+      from = clamp(from, this.domain!.from, this.domain!.until - span);
       this.sel = { from, until: from + span };
     }
     this.draw();
@@ -245,19 +268,11 @@ export class TimeBrush {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, HEIGHT);
 
-    if (this.domain) {
-      this.domainEl.textContent = `of ${formatClock(this.domain.from)}–${formatClock(
-        this.domain.until,
-      )}`;
-    }
+    // The readout above the canvas is React's; these attributes are what the
+    // smoke test asserts on, so they stay here next to the geometry.
     if (this.sel) {
       this.canvas.dataset.from = String(this.sel.from);
       this.canvas.dataset.until = String(this.sel.until);
-      this.rangeEl.textContent = `${formatClock(this.sel.from)} → ${formatClock(
-        this.sel.until,
-      )} · ${formatDuration(this.sel.until - this.sel.from)}`;
-    } else {
-      this.rangeEl.textContent = "–";
     }
     if (!this.domain) return;
 
@@ -327,11 +342,30 @@ export class TimeBrush {
   }
 }
 
-function clamp(v, lo, hi) {
+/** `12:04:11 → 12:19:30 · 15m20s`, or an em dash before the first selection. */
+export function selectionText(sel: Span | null): string {
+  if (!sel) return "–";
+  return `${formatClock(sel.from)} → ${formatClock(sel.until)} · ${formatDuration(
+    sel.until - sel.from,
+  )}`;
+}
+
+export function domainText(domain: Span): string {
+  return `of ${formatClock(domain.from)}–${formatClock(domain.until)}`;
+}
+
+function clamp(v: number, lo: number, hi: number) {
   return Math.min(hi, Math.max(lo, v));
 }
 
-function roundRect(ctx, x, y, w, h, r) {
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
   ctx.beginPath();
   ctx.moveTo(x + r, y);
   ctx.arcTo(x + w, y, x + w, y + h, r);
@@ -339,10 +373,4 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y + h, x, y, r);
   ctx.arcTo(x, y, x + w, y, r);
   ctx.closePath();
-}
-
-function escape(text) {
-  return String(text).replace(/[&<>"]/g, (c) =>
-    c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;",
-  );
 }

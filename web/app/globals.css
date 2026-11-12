@@ -1,0 +1,155 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * The palette is the one the hand-written dashboard used, expressed as the
+ * semantic tokens shadcn components read. Keeping the same hex values means the
+ * canvas drawings (which hard-code colours in a few places) still sit on the
+ * same background they were tuned for.
+ */
+:root,
+.dark {
+  --radius: 0.5rem;
+
+  --background: #0e1014;
+  --foreground: #e7eaf0;
+
+  --card: #151a21;
+  --card-foreground: #e7eaf0;
+
+  --popover: #171d25;
+  --popover-foreground: #e7eaf0;
+
+  --primary: #f2a65a;
+  --primary-foreground: #14100a;
+
+  --secondary: #1c232c;
+  --secondary-foreground: #e7eaf0;
+
+  --muted: #1c232c;
+  --muted-foreground: #96a0b2;
+
+  /* shadcn's `accent` is the hover surface, not the brand colour. */
+  --accent: #1f2732;
+  --accent-foreground: #e7eaf0;
+
+  --destructive: #e05c5c;
+  --destructive-foreground: #ffffff;
+
+  --success: #4fbf8b;
+  --link: #6ba7f7;
+  --faint: #6b7585;
+
+  --border: #232b36;
+  --input: #303a48;
+  --ring: #f2a65a;
+
+  --chart-1: #f2a65a;
+  --chart-2: #6ba7f7;
+  --chart-3: #4fbf8b;
+  --chart-4: #e05c5c;
+  --chart-5: #b48ef2;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-link: var(--link);
+  --color-faint: var(--faint);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas,
+    monospace;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font: 13px/1.5 var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  /* The shell is a fixed-height column: only the main pane scrolls. */
+  #app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+
+  [data-loading="1"] {
+    opacity: 0.55;
+    transition: opacity 120ms ease-out;
+  }
+}
+
+/*
+ * Canvas surfaces. The three drawing components size themselves from their
+ * host element, so these rules only establish the box and the scroll
+ * behaviour — everything inside is painted by the 2D context.
+ */
+@layer components {
+  .fg-scroll {
+    overflow-x: hidden;
+    overflow-y: auto;
+    max-height: min(62vh, 640px);
+  }
+
+  .fg-canvas {
+    display: block;
+    cursor: default;
+  }
+
+  .time-brush {
+    display: block;
+    width: 100%;
+    touch-action: none;
+  }
+}
+
+/* Respect the OS preference for reduced motion in the canvas animations. */
+@media (prefers-reduced-motion: reduce) {
+  [data-loading="1"] {
+    transition: none;
+  }
+}

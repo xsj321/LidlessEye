@@ -13,8 +13,13 @@
 // `prefers-reduced-motion: reduce` each effect renders its final state in one
 // frame — and `canvas[data-motion]` is set while an animation is running so a
 // test can wait for the graph to settle instead of racing it.
+//
+// The class owns painting and interaction only. Toolbars, breadcrumbs and the
+// legend are React's, fed through the callbacks below; that is also what keeps
+// `destroy()` honest — every listener it binds to `window` is removed here.
 
-import { formatPercent, formatValue } from "./format.js";
+import { formatPercent, formatValue } from "@/lib/format";
+import type { DiffPayload, FlamegraphPayload } from "@/lib/types";
 
 const ROW_HEIGHT = 22;
 const FONT = '11px ui-monospace, "SF Mono", Menlo, Consolas, monospace';
@@ -28,11 +33,12 @@ const ZOOM_MS = 260;
 
 const HUES = [22, 38, 8, 46, 190, 210, 265, 320, 160, 350];
 
-const easeOutCubic = (t) => 1 - (1 - t) ** 3;
-const easeInOutCubic = (t) => (t < 0.5 ? 4 * t ** 3 : 1 - (-2 * t + 2) ** 3 / 2);
-const lerp = (a, b, t) => a + (b - a) * t;
+const easeOutCubic = (t: number) => 1 - (1 - t) ** 3;
+const easeInOutCubic = (t: number) =>
+  t < 0.5 ? 4 * t ** 3 : 1 - (-2 * t + 2) ** 3 / 2;
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
-function hashString(text) {
+function hashString(text: string): number {
   let h = 0x811c9dc5;
   for (let i = 0; i < text.length; i += 1) {
     h ^= text.charCodeAt(i);
@@ -41,85 +47,152 @@ function hashString(text) {
   return h >>> 0;
 }
 
-function frameColor(name, depth) {
+function frameColor(name: string, depth: number): string {
   const hue = HUES[hashString(name) % HUES.length] + (depth % 3) * 1.5;
   const light = 34 + ((hashString(name) >> 8) % 14);
   return `hsl(${hue} 58% ${light}%)`;
 }
 
+export interface Crumb {
+  index: number;
+  label: string;
+}
+
+export interface FlameHover {
+  index: number;
+  title: string;
+  rows: Array<{ key: string; value: string }>;
+}
+
+export interface LegendEntry {
+  text: string;
+  swatch?: "diff-up" | "diff-down";
+}
+
+export interface FlamegraphCallbacks {
+  onSelect?: (name: string) => void;
+  onCrumbs?: (crumbs: Crumb[]) => void;
+  onMatch?: (text: string) => void;
+  /** Zoom fraction of the whole graph currently visible, 0..1. */
+  onZoom?: (fraction: number) => void;
+  onHover?: (hover: FlameHover | null, clientX: number, clientY: number) => void;
+  onLegend?: (entries: LegendEntry[]) => void;
+}
+
+type Payload = FlamegraphPayload | DiffPayload;
+
+interface DiffData {
+  left: number[];
+  right: number[];
+  diff: number[];
+}
+
 export class Flamegraph {
-  constructor(host, { onSelect } = {}) {
-    this.host = host;
-    this.onSelect = onSelect ?? null;
-    this.data = null;
-    this.view = { x0: 0, x1: 1 };
-    this.crumbs = [];
-    this.search = "";
-    this.tooltip = document.getElementById("tooltip");
+  private readonly canvas: HTMLCanvasElement;
+  private readonly scroll: HTMLElement;
+  private readonly ctx: CanvasRenderingContext2D;
+  private readonly callbacks: FlamegraphCallbacks;
 
-    // Motion state. `intro` grows the bars in, `zoomAnim` interpolates the
-    // viewport, `frame` is the single pending paint, and `hovered` is the frame
-    // under the cursor plus the ancestry highlighted behind it.
-    this.intro = null;
-    this.zoomAnim = null;
-    this.frame = null;
-    this.hovered = -1;
+  private data: Payload | null = null;
+  private diff: DiffData | null = null;
+  private view = { x0: 0, x1: 1 };
+  private crumbs: number[] = [];
+  private search = "";
 
-    const motionQuery = window.matchMedia?.("(prefers-reduced-motion: reduce)");
-    this.reducedMotion = motionQuery?.matches ?? false;
-    motionQuery?.addEventListener?.("change", (event) => {
+  // Motion state. `intro` grows the bars in, `zoomAnim` interpolates the
+  // viewport, `frame` is the single pending paint, and `hovered` is the frame
+  // under the cursor plus the ancestry highlighted behind it.
+  private intro: { start: number; stagger: number } | null = null;
+  private zoomAnim: {
+    from: { x0: number; x1: number };
+    to: { x0: number; x1: number };
+    start: number;
+    duration: number;
+  } | null = null;
+  private frame: number | null = null;
+  private hovered = -1;
+  private reducedMotion = false;
+
+  private n = 0;
+  private total = 1;
+  private maxAbsDiff = 0;
+  private parent = new Int32Array(0);
+  private value = new Float64Array(0);
+  private selfValue = new Float64Array(0);
+  private childStart = new Int32Array(0);
+  private childList = new Int32Array(0);
+  private x = new Float64Array(0);
+  private w = new Float64Array(0);
+  private depth = new Int32Array(0);
+  private byDepth: number[][] = [];
+  private colors: string[] = [];
+  private matches: Uint8Array | null = null;
+
+  private readonly motionQuery: MediaQueryList | null;
+  private readonly onMotionChange: (event: MediaQueryListEvent) => void;
+  private readonly onWindowMouseUp: () => void;
+  private readonly keyHandler: (event: KeyboardEvent) => void;
+
+  constructor(
+    canvas: HTMLCanvasElement,
+    scroll: HTMLElement,
+    callbacks: FlamegraphCallbacks = {},
+  ) {
+    this.canvas = canvas;
+    this.scroll = scroll;
+    this.callbacks = callbacks;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("2D canvas context unavailable");
+    this.ctx = ctx;
+
+    this.motionQuery = window.matchMedia?.("(prefers-reduced-motion: reduce)") ?? null;
+    this.reducedMotion = this.motionQuery?.matches ?? false;
+    this.onMotionChange = (event: MediaQueryListEvent) => {
       this.reducedMotion = event.matches;
       if (this.reducedMotion) this.finishMotion();
-    });
+    };
+    this.motionQuery?.addEventListener?.("change", this.onMotionChange);
 
-    host.classList.add("panel");
-    host.innerHTML = `
-      <div class="fg-toolbar">
-        <input type="search" placeholder="Search frames…" aria-label="Search frames" />
-        <button class="ghost" data-action="reset">Reset zoom</button>
-        <span class="spacer"></span>
-        <span class="muted" data-role="match"></span>
-      </div>
-      <div class="fg-crumbs" data-role="crumbs"></div>
-      <div class="fg-scroll"><canvas class="fg-canvas"></canvas></div>
-      <div class="fg-legend" data-role="legend"></div>
-    `;
+    // `mouseup` on the canvas misses the release outside it, so drag state has
+    // to be observed at the window. Kept as a field so `destroy()` can unbind
+    // it: this listener used to leak one closure (and one whole decoded graph)
+    // per mount.
+    this.onWindowMouseUp = () => {
+      if (!this.dragging) return;
+      this.dragging = false;
+      this.canvas.style.cursor = "pointer";
+    };
 
-    this.canvas = host.querySelector("canvas");
-    this.ctx = this.canvas.getContext("2d");
-    this.scroll = host.querySelector(".fg-scroll");
-    this.crumbsEl = host.querySelector('[data-role="crumbs"]');
-    this.matchEl = host.querySelector('[data-role="match"]');
-    this.legendEl = host.querySelector('[data-role="legend"]');
-    this.searchEl = host.querySelector('input[type="search"]');
-
-    this.searchEl.addEventListener("input", () => {
-      this.search = this.searchEl.value.trim().toLowerCase();
-      this.computeMatches();
-      this.draw();
-    });
-    host.querySelector('[data-action="reset"]').addEventListener("click", () => this.reset());
-    this.crumbsEl.addEventListener("click", (event) => {
-      const button = event.target.closest("button[data-index]");
-      if (!button) return;
-      this.focusCrumb(Number(button.dataset.index));
-    });
+    this.keyHandler = (event: KeyboardEvent) => {
+      if ((event.target as HTMLElement | null)?.matches?.("input, select, textarea")) return;
+      if (event.key === "Escape") this.zoomOut();
+      else if (event.key === "+" || event.key === "=") this.zoomAt(0.5, 1.5);
+      else if (event.key === "-") this.zoomAt(0.5, 1 / 1.5);
+      else if (event.key === "0") this.reset();
+    };
 
     this.bindPointer();
     this.resizeObserver = new ResizeObserver(() => this.draw());
     this.resizeObserver.observe(this.scroll);
   }
 
+  private resizeObserver: ResizeObserver | null;
+  private dragging = false;
+
   destroy() {
     this.cancelFrame();
     this.resizeObserver?.disconnect();
-    this.host.innerHTML = "";
+    this.resizeObserver = null;
+    window.removeEventListener("mouseup", this.onWindowMouseUp);
+    window.removeEventListener("keydown", this.keyHandler);
+    this.motionQuery?.removeEventListener?.("change", this.onMotionChange);
+    this.callbacks.onHover?.(null, 0, 0);
   }
 
   // ---- motion ----------------------------------------------------------
 
   /** One pending paint at a time, however many callers ask for it. */
-  scheduleFrame() {
+  private scheduleFrame() {
     if (this.frame !== null) return;
     this.frame = requestAnimationFrame(() => {
       this.frame = null;
@@ -127,20 +200,20 @@ export class Flamegraph {
     });
   }
 
-  cancelFrame() {
+  private cancelFrame() {
     if (this.frame !== null) cancelAnimationFrame(this.frame);
     this.frame = null;
   }
 
   /** `canvas[data-motion]` tells a test when the graph is still moving. */
-  syncMotion() {
+  private syncMotion() {
     const kind = this.zoomAnim ? "zoom" : this.intro ? "intro" : null;
     if (kind) this.canvas.dataset.motion = kind;
     else delete this.canvas.dataset.motion;
   }
 
   /** Jump every in-flight animation to its final state. */
-  finishMotion() {
+  private finishMotion() {
     this.intro = null;
     this.zoomAnim = null;
     this.cancelFrame();
@@ -148,7 +221,7 @@ export class Flamegraph {
     this.draw();
   }
 
-  startIntro() {
+  private startIntro() {
     this.hovered = -1;
     const rows = this.byDepth.length;
     if (this.reducedMotion || !rows) {
@@ -165,7 +238,7 @@ export class Flamegraph {
   }
 
   /** 0..1 for row `depth`, eased and staggered behind the row above it. */
-  introProgress(depth, now) {
+  private introProgress(depth: number, now: number): number {
     const intro = this.intro;
     if (!intro) return 1;
     const elapsed = now - intro.start - depth * intro.stagger;
@@ -174,7 +247,7 @@ export class Flamegraph {
   }
 
   /** Interpolate the viewport instead of snapping to it. */
-  animateView(target, duration = ZOOM_MS) {
+  private animateView(target: { x0: number; x1: number }, duration = ZOOM_MS) {
     if (this.reducedMotion) {
       this.zoomAnim = null;
       this.view = { ...target };
@@ -193,7 +266,7 @@ export class Flamegraph {
   }
 
   /** A pan or a wheel zoom has to win over a running transition. */
-  cancelViewAnimation() {
+  private cancelViewAnimation() {
     if (!this.zoomAnim) return;
     this.zoomAnim = null;
     this.syncMotion();
@@ -202,7 +275,7 @@ export class Flamegraph {
   // ---- data ------------------------------------------------------------
 
   /** Lay the flat arrays out into x / width / depth order. */
-  setData(data) {
+  setData(data: Payload) {
     this.data = data;
     this.view = { x0: 0, x1: 1 };
     this.crumbs = [];
@@ -211,23 +284,29 @@ export class Flamegraph {
     // A diff payload carries two windows per node. The layout is driven by the
     // larger of the two so that both a hot spot that disappeared and one that
     // appeared keep a visible width; colour carries the delta.
-    const isDiff = Array.isArray(data.diff) && Array.isArray(data.left);
-    this.diff = isDiff ? { left: data.left, right: data.right, diff: data.diff } : null;
+    const isDiff = Array.isArray((data as DiffPayload).diff) && Array.isArray((data as DiffPayload).left);
+    this.diff = isDiff
+      ? {
+          left: (data as DiffPayload).left,
+          right: (data as DiffPayload).right,
+          diff: (data as DiffPayload).diff,
+        }
+      : null;
     const n = data.names.length;
     const rawValues = isDiff
-      ? data.names.map((_, i) => Math.max(data.left[i] ?? 0, data.right[i] ?? 0))
-      : data.values;
+      ? data.names.map((_, i) => Math.max((data as DiffPayload).left[i] ?? 0, (data as DiffPayload).right[i] ?? 0))
+      : ((data as FlamegraphPayload).values ?? []);
     const total = isDiff
       ? rawValues[0] || 1
-      : data.total > 0
-        ? data.total
+      : ((data as FlamegraphPayload).total ?? 0) > 0
+        ? ((data as FlamegraphPayload).total as number)
         : 1;
     this.total = total;
 
     if (isDiff) {
       let maxAbs = 0;
       for (let i = 0; i < n; i += 1) {
-        const d = Math.abs(data.diff[i] ?? 0);
+        const d = Math.abs((data as DiffPayload).diff[i] ?? 0);
         if (d > maxAbs) maxAbs = d;
       }
       this.maxAbsDiff = maxAbs || 1;
@@ -279,12 +358,12 @@ export class Flamegraph {
     w[0] = 1;
     depth[0] = 0;
 
-    const byDepth = n > 0 ? [[0]] : [];
+    const byDepth: number[][] = n > 0 ? [[0]] : [];
     const cursor = new Float64Array(n);
     let frontier = n > 0 ? [0] : [];
     let level = 0;
     while (frontier.length) {
-      const next = [];
+      const next: number[] = [];
       for (const p of frontier) {
         for (let k = childStart[p]; k < childStart[p + 1]; k += 1) {
           const c = childList[k];
@@ -316,17 +395,23 @@ export class Flamegraph {
     this.colors = new Array(n);
 
     this.computeMatches();
-    this.renderCrumbs();
-    this.renderLegend();
+    this.emitCrumbs();
+    this.emitLegend();
     this.startIntro();
     this.draw();
   }
 
-  computeMatches() {
+  setSearch(text: string) {
+    this.search = text.trim().toLowerCase();
+    this.computeMatches();
+    this.draw();
+  }
+
+  private computeMatches() {
     const { n } = this;
     this.matches = null;
-    if (!this.search || !n) {
-      this.matchEl.textContent = "";
+    if (!this.search || !n || !this.data) {
+      this.callbacks.onMatch?.("");
       return;
     }
     const set = new Uint8Array(n);
@@ -338,72 +423,73 @@ export class Flamegraph {
       }
     }
     this.matches = set;
-    this.matchEl.textContent = count
-      ? `${count} matching frame${count === 1 ? "" : "s"}`
-      : "no match";
+    this.callbacks.onMatch?.(
+      count ? `${count} matching frame${count === 1 ? "" : "s"}` : "no match",
+    );
   }
 
   // ---- geometry --------------------------------------------------------
 
-  width() {
+  private width() {
     return Math.max(320, this.scroll.clientWidth);
   }
 
-  span() {
+  private span() {
     return this.view.x1 - this.view.x0;
   }
 
-  renderLegend() {
+  private emitCrumbs() {
+    if (!this.data) {
+      this.callbacks.onCrumbs?.([]);
+      return;
+    }
+    this.callbacks.onCrumbs?.(
+      this.crumbs.map((index) => ({
+        index,
+        label: this.data!.names[index],
+      })),
+    );
+  }
+
+  private emitLegend() {
     const { data } = this;
     if (!data) {
-      this.legendEl.textContent = "";
+      this.callbacks.onLegend?.([]);
       return;
     }
-    let parts;
+    const parts: LegendEntry[] = [];
     if (this.diff) {
-      const delta = (data.total_right ?? 0) - (data.total_left ?? 0);
+      const left = (data as DiffPayload).total_left ?? 0;
+      const right = (data as DiffPayload).total_right ?? 0;
+      const delta = right - left;
       // A zero baseline has no percentage: dividing by it would print "+0.0%"
       // for a window that did not exist, which reads as "no change at all".
-      const ratio = data.total_left ? (delta / data.total_left) * 100 : null;
+      const ratio = left ? (delta / left) * 100 : null;
       const sign = delta > 0 ? "+" : delta < 0 ? "−" : "";
-      const percent =
-        ratio !== null ? ` (${sign}${Math.abs(ratio).toFixed(1)}%)` : " (new)";
-      parts = [
-        `<span class="legend-swatch diff-up"></span>baseline ${formatValue(data.total_left, data.unit)}`,
-        `<span class="legend-swatch diff-down"></span>comparison ${formatValue(data.total_right, data.unit)}`,
-        `delta ${sign}${formatValue(Math.abs(delta), data.unit)}${percent}`,
-        `${data.names.length} frames`,
-      ];
+      const percent = ratio !== null ? ` (${sign}${Math.abs(ratio).toFixed(1)}%)` : " (new)";
+      parts.push({
+        text: `baseline ${formatValue(left, data.unit)}`,
+        swatch: "diff-up",
+      });
+      parts.push({
+        text: `comparison ${formatValue(right, data.unit)}`,
+        swatch: "diff-down",
+      });
+      parts.push({
+        text: `delta ${sign}${formatValue(Math.abs(delta), data.unit)}${percent}`,
+      });
+      parts.push({ text: `${data.names.length} frames` });
     } else {
-      parts = [
-        `total ${formatValue(data.total, data.unit)}`,
-        `${data.samples ?? 0} samples`,
-        `${data.names.length} frames`,
-      ];
-      if (data.truncated) parts.push("truncated — lower max_nodes? see docs");
+      const flame = data as FlamegraphPayload;
+      parts.push({ text: `total ${formatValue(flame.total, data.unit)}` });
+      parts.push({ text: `${flame.samples ?? 0} samples` });
+      parts.push({ text: `${data.names.length} frames` });
+      if (flame.truncated) parts.push({ text: "truncated — lower max_nodes? see docs" });
     }
-    this.legendEl.innerHTML = parts
-      .map((text) => `<span>${text}</span>`)
-      .join("");
+    this.callbacks.onLegend?.(parts);
   }
 
-  renderCrumbs() {
-    if (!this.crumbs.length) {
-      this.crumbsEl.innerHTML = `<span class="faint">Click a frame to zoom, Esc to go back.</span>`;
-      return;
-    }
-    const buttons = this.crumbs
-      .map((index, i) => {
-        const label = this.data.names[index];
-        const short = label.length > 40 ? `${label.slice(0, 39)}…` : label;
-        const arrow = i === 0 ? "" : `<span class="faint">›</span>`;
-        return `<button data-index="${i}" title="${label.replace(/"/g, "&quot;")}">${arrow}${short}</button>`;
-      })
-      .join("");
-    this.crumbsEl.innerHTML = buttons;
-  }
-
-  color(index) {
+  private color(index: number): string {
     let color = this.colors[index];
     if (!color) {
       if (this.diff) {
@@ -419,7 +505,7 @@ export class Flamegraph {
           color = `hsl(${hue} 60% ${light}%)`;
         }
       } else {
-        color = frameColor(this.data.names[index], this.depth[index]);
+        color = frameColor(this.data!.names[index], this.depth[index]);
       }
       this.colors[index] = color;
     }
@@ -451,7 +537,10 @@ export class Flamegraph {
       }
     }
 
-    if (this.canvas.width !== Math.round(width * dpr) || this.canvas.height !== Math.round(height * dpr)) {
+    if (
+      this.canvas.width !== Math.round(width * dpr) ||
+      this.canvas.height !== Math.round(height * dpr)
+    ) {
       this.canvas.width = Math.round(width * dpr);
       this.canvas.height = Math.round(height * dpr);
       this.canvas.style.width = `${width}px`;
@@ -462,14 +551,14 @@ export class Flamegraph {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
-    if (!this.n) {
+    if (!this.n || !this.data) {
       // Nothing to animate towards: an empty graph must not stay "moving".
       this.intro = null;
       this.zoomAnim = null;
       this.syncMotion();
       ctx.globalAlpha = 1;
       ctx.fillStyle = "#96a0b2";
-      ctx.font = '13px system-ui, sans-serif';
+      ctx.font = "13px system-ui, sans-serif";
       ctx.textAlign = "center";
       ctx.fillText("No samples in this range.", width / 2, 64);
       ctx.textAlign = "left";
@@ -480,6 +569,7 @@ export class Flamegraph {
     const { x0, x1 } = this.view;
     const scale = width / (x1 - x0);
     const base = this.total > 0 ? this.total : 1;
+    const names = this.data.names;
 
     ctx.textBaseline = "middle";
     ctx.font = FONT;
@@ -487,7 +577,7 @@ export class Flamegraph {
     // The hovered frame and its ancestors: the chain is what the cursor is
     // actually inside, so highlighting all of it explains where the number
     // comes from without reading the tooltip.
-    let chain = null;
+    let chain: Set<number> | null = null;
     if (this.hovered >= 0 && this.hovered < this.n) {
       chain = new Set();
       for (let i = this.hovered; i >= 0 && chain.size <= rows; i = this.parent[i]) {
@@ -530,7 +620,8 @@ export class Flamegraph {
         if (chain && chain.has(i)) {
           // The ancestry is the explanation for the number in the tooltip, so
           // it is lit as one continuous column rather than one bar at a time.
-          ctx.fillStyle = i === this.hovered ? "rgba(255, 255, 255, 0.16)" : "rgba(255, 255, 255, 0.08)";
+          ctx.fillStyle =
+            i === this.hovered ? "rgba(255, 255, 255, 0.16)" : "rgba(255, 255, 255, 0.08)";
           ctx.fillRect(px, y + 1, Math.max(pw - 0.6, 0.6), ROW_HEIGHT - 2);
         }
 
@@ -547,7 +638,7 @@ export class Flamegraph {
         }
 
         if (grow >= 1 && pw >= MIN_LABEL_PX) {
-          const name = this.data.names[i];
+          const name = names[i];
           const pct = w[i];
           ctx.save();
           ctx.beginPath();
@@ -566,7 +657,7 @@ export class Flamegraph {
     ctx.fillStyle = "rgba(10, 12, 16, 0.55)";
     for (let d = 1; d < rows; d += 1) ctx.fillRect(0, d * ROW_HEIGHT - 1, width, 1);
 
-    this.renderAxisNote(base);
+    this.emitZoom(base);
 
     // Keep painting while something is still moving, then let the canvas rest.
     if (this.zoomAnim) {
@@ -580,32 +671,15 @@ export class Flamegraph {
     }
   }
 
-  renderAxisNote() {
-    this.legendEl.dataset.zoom =
-      this.view.x0 === 0 && this.view.x1 === 1
-        ? ""
-        : `${formatPercent(this.span(), 1)} of total shown`;
-    const extra = this.legendEl.dataset.zoom;
-    const existing = this.legendEl.querySelector("[data-role=zoom]");
-    if (!extra) {
-      existing?.remove();
-      return;
-    }
-    if (existing) existing.textContent = extra;
-    else {
-      const span = document.createElement("span");
-      span.dataset.role = "zoom";
-      span.className = "faint";
-      span.textContent = extra;
-      this.legendEl.appendChild(span);
-    }
+  private emitZoom(_base: number) {
+    const fraction = this.view.x0 === 0 && this.view.x1 === 1 ? 1 : this.span();
+    this.callbacks.onZoom?.(fraction);
   }
 
   // ---- interaction -----------------------------------------------------
 
-  bindPointer() {
+  private bindPointer() {
     const canvas = this.canvas;
-    let dragging = false;
     let moved = 0;
     let lastX = 0;
 
@@ -613,7 +687,7 @@ export class Flamegraph {
       const rect = canvas.getBoundingClientRect();
       const cx = event.clientX - rect.left;
       const cy = event.clientY - rect.top;
-      if (dragging) {
+      if (this.dragging) {
         const dx = event.clientX - lastX;
         lastX = event.clientX;
         moved += Math.abs(dx);
@@ -625,7 +699,7 @@ export class Flamegraph {
 
     canvas.addEventListener("mousedown", (event) => {
       if (event.button !== 0) return;
-      dragging = true;
+      this.dragging = true;
       moved = 0;
       lastX = event.clientX;
       canvas.style.cursor = "grabbing";
@@ -635,11 +709,7 @@ export class Flamegraph {
       }
     });
 
-    window.addEventListener("mouseup", () => {
-      if (!dragging) return;
-      dragging = false;
-      canvas.style.cursor = "pointer";
-    });
+    window.addEventListener("mouseup", this.onWindowMouseUp);
 
     canvas.addEventListener("click", (event) => {
       if (moved > 4) return;
@@ -651,7 +721,7 @@ export class Flamegraph {
     canvas.addEventListener("dblclick", () => this.reset());
 
     canvas.addEventListener("mouseleave", () => {
-      this.tooltip.hidden = true;
+      this.callbacks.onHover?.(null, 0, 0);
       if (this.hovered !== -1) {
         this.hovered = -1;
         this.draw();
@@ -672,17 +742,10 @@ export class Flamegraph {
       { passive: false },
     );
 
-    this.keyHandler = (event) => {
-      if (event.target.matches("input, select, textarea")) return;
-      if (event.key === "Escape") this.zoomOut();
-      else if (event.key === "+" || event.key === "=") this.zoomAt(0.5, 1.5);
-      else if (event.key === "-") this.zoomAt(0.5, 1 / 1.5);
-      else if (event.key === "0") this.reset();
-    };
     window.addEventListener("keydown", this.keyHandler);
   }
 
-  hitTest(cx, cy) {
+  private hitTest(cx: number, cy: number): number {
     if (!this.n) return -1;
     const depth = Math.floor(cy / ROW_HEIGHT);
     if (depth < 0 || depth >= this.byDepth.length) return -1;
@@ -700,76 +763,78 @@ export class Flamegraph {
     return -1;
   }
 
-  hover(cx, cy, event) {
+  private hover(cx: number, cy: number, event: MouseEvent) {
     const index = this.hitTest(cx, cy);
-    const tooltip = this.tooltip;
     if (index !== this.hovered) {
       this.hovered = index;
       this.draw();
     }
-    if (index < 0) {
-      tooltip.hidden = true;
+    if (index < 0 || !this.data) {
       this.canvas.style.cursor = "default";
+      this.callbacks.onHover?.(null, event.clientX, event.clientY);
       return;
     }
     this.canvas.style.cursor = "pointer";
+    this.callbacks.onHover?.(this.describe(index), event.clientX, event.clientY);
+  }
+
+  private describe(index: number): FlameHover {
+    const data = this.data!;
     const total = this.total || 1;
     const value = this.value[index];
-    const self = this.selfValue[index];
-    let detail;
+    const rows: Array<{ key: string; value: string }> = [];
     if (this.diff) {
       const left = this.diff.left[index] ?? 0;
       const right = this.diff.right[index] ?? 0;
       const delta = right - left;
       const ratio = left ? (delta / left) * 100 : null;
       const sign = delta > 0 ? "+" : delta < 0 ? "−" : "";
-      detail = `
-        <div class="tt-row"><span class="tt-key">baseline</span>${formatValue(left, this.data.unit)}</div>
-        <div class="tt-row"><span class="tt-key">comparison</span>${formatValue(right, this.data.unit)}</div>
-        <div class="tt-row"><span class="tt-key">delta</span>${sign}${formatValue(Math.abs(delta), this.data.unit)}${
+      rows.push({ key: "baseline", value: formatValue(left, data.unit) });
+      rows.push({ key: "comparison", value: formatValue(right, data.unit) });
+      rows.push({
+        key: "delta",
+        value: `${sign}${formatValue(Math.abs(delta), data.unit)}${
           ratio === null ? "" : ` · ${sign}${Math.abs(ratio).toFixed(1)}%`
-        }</div>
-        <div class="tt-row"><span class="tt-key">share</span>${formatPercent(value / total)} of max window</div>
-      `;
+        }`,
+      });
+      rows.push({
+        key: "share",
+        value: `${formatPercent(value / total)} of max window`,
+      });
     } else {
-      detail = `
-        <div class="tt-row"><span class="tt-key">total</span>${formatValue(value, this.data.unit)} · ${formatPercent(value / total)}</div>
-        <div class="tt-row"><span class="tt-key">self</span>${formatValue(self, this.data.unit)} · ${formatPercent(self / total)}</div>
-        <div class="tt-row"><span class="tt-key">depth</span>${this.depth[index]}</div>
-      `;
+      rows.push({
+        key: "total",
+        value: `${formatValue(value, data.unit)} · ${formatPercent(value / total)}`,
+      });
+      rows.push({
+        key: "self",
+        value: `${formatValue(this.selfValue[index], data.unit)} · ${formatPercent(
+          this.selfValue[index] / total,
+        )}`,
+      });
+      rows.push({ key: "depth", value: String(this.depth[index]) });
     }
-    tooltip.innerHTML = `
-      <div class="tt-title">${escape(this.data.names[index])}</div>
-      ${detail}
-    `;
-    tooltip.hidden = false;
-    const pad = 14;
-    const rect = tooltip.getBoundingClientRect();
-    let left = event.clientX + pad;
-    let top = event.clientY + pad;
-    if (left + rect.width > window.innerWidth - 8) left = event.clientX - rect.width - pad;
-    if (top + rect.height > window.innerHeight - 8) top = event.clientY - rect.height - pad;
-    tooltip.style.left = `${Math.max(8, left)}px`;
-    tooltip.style.top = `${Math.max(8, top)}px`;
+    return { index, title: data.names[index], rows };
   }
 
-  zoomTo(index) {
+  zoomTo(index: number) {
+    if (!this.data) return;
     this.crumbs.push(index);
     this.revealFrame(index);
-    this.renderCrumbs();
-    this.onSelect?.(this.data.names[index]);
+    this.emitCrumbs();
+    this.callbacks.onSelect?.(this.data.names[index]);
   }
 
   /** Fly to a frame's extent instead of cutting to it. */
-  revealFrame(index) {
+  private revealFrame(index: number) {
     this.hovered = -1;
     this.animateView({ x0: this.x[index], x1: this.x[index] + this.w[index] });
   }
 
-  focusCrumb(position) {
+  focusCrumb(position: number) {
     this.crumbs = this.crumbs.slice(0, position + 1);
     this.revealFrame(this.crumbs[position]);
-    this.renderCrumbs();
+    this.emitCrumbs();
   }
 
   zoomOut() {
@@ -782,14 +847,14 @@ export class Flamegraph {
 
   reset() {
     this.crumbs = [];
-    this.renderCrumbs();
+    this.emitCrumbs();
     // Slightly slower than a zoom: pulling back to the whole graph reads as a
     // change of context, not a jump within one.
     this.hovered = -1;
     this.animateView({ x0: 0, x1: 1 }, 320);
   }
 
-  zoomAt(fraction, factor) {
+  private zoomAt(fraction: number, factor: number) {
     this.cancelViewAnimation();
     const span = this.span();
     const nextSpan = Math.min(1, Math.max(1e-6, span / factor));
@@ -800,7 +865,7 @@ export class Flamegraph {
     this.draw();
   }
 
-  pan(deltaPx) {
+  private pan(deltaPx: number) {
     this.cancelViewAnimation();
     const shift = (-deltaPx / this.width()) * this.span();
     let x0 = this.view.x0 + shift;
@@ -808,10 +873,4 @@ export class Flamegraph {
     this.view = { x0, x1: x0 + this.span() };
     this.draw();
   }
-}
-
-function escape(text) {
-  return String(text).replace(/[&<>"]/g, (c) =>
-    c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;",
-  );
 }

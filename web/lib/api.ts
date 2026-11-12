@@ -4,18 +4,34 @@
 // localStorage) and turns non-2xx responses into `ApiError`s that carry the
 // server's own error message.
 
+import type {
+  DiffPayload,
+  FlamegraphPayload,
+  LabelNamesPayload,
+  LabelValuesPayload,
+  ProfileTypesPayload,
+  SeriesPayload,
+  StatsPayload,
+  TenantsPayload,
+  TimeseriesPayload,
+  TopPayload,
+  VersionPayload,
+} from "./types";
+
 const TOKEN_KEY = "lidlesseye.token";
 const TENANT_KEY = "lidlesseye.tenant";
 
 export class ApiError extends Error {
-  constructor(message, status) {
+  status: number;
+
+  constructor(message: string, status: number) {
     super(message);
     this.name = "ApiError";
     this.status = status;
   }
 }
 
-export function getToken() {
+export function getToken(): string {
   try {
     return localStorage.getItem(TOKEN_KEY) ?? "";
   } catch {
@@ -23,7 +39,7 @@ export function getToken() {
   }
 }
 
-export function setToken(token) {
+export function setToken(token: string): void {
   try {
     if (token) localStorage.setItem(TOKEN_KEY, token);
     else localStorage.removeItem(TOKEN_KEY);
@@ -33,7 +49,7 @@ export function setToken(token) {
 }
 
 /** Tenant the dashboard reads and writes. Empty means "server default". */
-export function getTenant() {
+export function getTenant(): string {
   try {
     return localStorage.getItem(TENANT_KEY) ?? "";
   } catch {
@@ -41,7 +57,7 @@ export function getTenant() {
   }
 }
 
-export function setTenant(tenant) {
+export function setTenant(tenant: string): void {
   try {
     if (tenant) localStorage.setItem(TENANT_KEY, tenant);
     else localStorage.removeItem(TENANT_KEY);
@@ -50,7 +66,9 @@ export function setTenant(tenant) {
   }
 }
 
-function buildQuery(params) {
+export type QueryParams = Record<string, string | number | undefined | null>;
+
+function buildQuery(params: QueryParams | undefined): string {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params ?? {})) {
     if (value === undefined || value === null || value === "") continue;
@@ -60,7 +78,11 @@ function buildQuery(params) {
   return query ? `?${query}` : "";
 }
 
-async function request(path, params, init) {
+async function request<T>(
+  path: string,
+  params?: QueryParams,
+  init?: RequestInit,
+): Promise<T> {
   const headers = new Headers(init?.headers);
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
@@ -69,16 +91,16 @@ async function request(path, params, init) {
   // is set to, so the dashboard keeps working when the header is renamed.
   if (tenant) headers.set("X-Tenant-Id", tenant);
 
-  let response;
+  let response: Response;
   try {
     response = await fetch(path + buildQuery(params), { ...init, headers });
   } catch (err) {
-    throw new ApiError(`network error: ${err.message}`, 0);
+    throw new ApiError(`network error: ${(err as Error).message}`, 0);
   }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {
-      const body = await response.json();
+      const body = (await response.json()) as { error?: string };
       if (body?.error) message = body.error;
     } catch {
       /* not JSON: keep the status line */
@@ -89,27 +111,33 @@ async function request(path, params, init) {
     throw new ApiError(message, response.status);
   }
   const type = response.headers.get("content-type") ?? "";
-  if (!type.includes("application/json")) return response.text();
-  return response.json();
+  if (!type.includes("application/json")) {
+    return (await response.text()) as unknown as T;
+  }
+  return (await response.json()) as T;
 }
 
 export const api = {
-  health: () => request("/api/v1/health"),
-  version: () => request("/api/v1/version"),
-  stats: () => request("/api/v1/stats"),
-  tenants: () => request("/api/v1/tenants"),
+  health: () => request<unknown>("/api/v1/health"),
+  version: () => request<VersionPayload>("/api/v1/version"),
+  stats: () => request<StatsPayload>("/api/v1/stats"),
+  tenants: () => request<TenantsPayload>("/api/v1/tenants"),
 
-  profileTypes: (params) => request("/api/v1/profile_types", params),
-  series: (params) => request("/api/v1/series", params),
-  labelNames: (params) => request("/api/v1/label-names", params),
-  labelValues: (name, params) =>
-    request(`/api/v1/label/${encodeURIComponent(name)}/values`, params),
+  profileTypes: (params?: QueryParams) =>
+    request<ProfileTypesPayload>("/api/v1/profile_types", params),
+  series: (params?: QueryParams) => request<SeriesPayload>("/api/v1/series", params),
+  labelNames: (params?: QueryParams) =>
+    request<LabelNamesPayload>("/api/v1/label-names", params),
+  labelValues: (name: string, params?: QueryParams) =>
+    request<LabelValuesPayload>(`/api/v1/label/${encodeURIComponent(name)}/values`, params),
 
   // 50k nodes is the server-side ceiling (`QueryOptions::with_max_nodes`); the
   // canvas is happy with that, and it keeps the response in the low megabytes.
-  flamegraph: (params) =>
-    request("/api/v1/flamegraph", { max_nodes: 50000, ...params }),
-  diff: (params) => request("/api/v1/diff", { max_nodes: 50000, ...params }),
-  top: (params) => request("/api/v1/top", { limit: 100, ...params }),
-  timeseries: (params) => request("/api/v1/timeseries", { buckets: 90, ...params }),
+  flamegraph: (params: QueryParams) =>
+    request<FlamegraphPayload>("/api/v1/flamegraph", { max_nodes: 50000, ...params }),
+  diff: (params: QueryParams) =>
+    request<DiffPayload>("/api/v1/diff", { max_nodes: 50000, ...params }),
+  top: (params: QueryParams) => request<TopPayload>("/api/v1/top", { limit: 100, ...params }),
+  timeseries: (params: QueryParams) =>
+    request<TimeseriesPayload>("/api/v1/timeseries", { buckets: 90, ...params }),
 };

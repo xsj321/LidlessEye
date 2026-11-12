@@ -67,7 +67,7 @@ means it is genuinely absent.
 
 | Capability | Status | Notes |
 | --- | --- | --- |
-| Single binary + embedded UI | yes | `rust-embed`, no separate frontend process |
+| Single binary + embedded UI | yes | `rust-embed`; the UI is a committed static export, so `cargo build` needs no Node |
 | Helm chart | yes | `deploy/helm/lidlesseye` |
 | Docker image | yes | `deploy/docker` |
 | Retention per tenant | yes | `--retention`, per-tenant override |

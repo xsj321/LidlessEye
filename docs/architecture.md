@@ -302,17 +302,39 @@ a production SLO — the host was a Windows Docker Desktop VM.
 
 ## Dashboard
 
-The UI is part of the server, not a separate app: `lidlesseye-server` embeds
-`web/dist` with `rust-embed`, so `cargo build` produces a binary that serves the
-HTML, the ES modules and the API from one port. There is no bundler, no
-`node_modules` in the build path, and no second container to deploy.
+The UI is part of the server, not a separate app: `web/dist` is a Next.js static
+export, committed, and embedded by `lidlesseye-server` with `rust-embed`. A
+release is still one executable serving the HTML, the JS chunks and the API from
+one port — no second container and no Node runtime in production.
 
-The design follows from that constraint. Files are plain ES modules, the
-flamegraph and charts are drawn on a single canvas per view (the data is a
-fixed-size array; a chart library would add weight and a second animation
-model), and all state lives in one object in `app.js` from which query
-parameters are derived as a pure function. That is what makes a URL reproduce a
-view exactly, and what lets the shell swap views without a router.
+The build is two steps, and only the first needs Node:
+
+```
+cd web && npm run build   # next build -> web/out
+cd web && npm run sync    # web/out -> web/dist (what rust-embed reads)
+```
+
+`make ui` runs both. `web/dist` stays in git on purpose: `cargo build` must not
+depend on npm, so a checkout with only a Rust toolchain still produces a binary
+with a working dashboard, and a UI change shows up as a reviewable diff of the
+generated files.
+
+Components are React 19 with shadcn/ui (Radix primitives, Tailwind v4) under
+`app/`. Navigation, tables, selects, the filter rows and the error banner are
+shadcn components; `components.json` records the style so `npx shadcn add` keeps
+working. The three drawings — flamegraph, stacked time series, histogram brush —
+stay on a single canvas per view and are *wrapped*, not reimplemented: the data
+is a fixed-size typed array, DOM/SVG flamegraphs fall over around 20k nodes, and
+zoom/pan/hover is a binary search plus one draw pass that a chart library would
+replace with a slower and different interaction model. Their classes live in
+`lib/canvas/` and own painting only; toolbars, breadcrumbs, legends and tooltips
+are React, fed by callbacks.
+
+State lives in one store (`lib/store.ts`) read through `useSyncExternalStore`,
+and the query window is derived from the chosen domain as a pure function. That
+is what makes a URL reproduce a view exactly. Routing stays hash-based
+(`#/flamegraph?…`), so the single exported `index.html` serves every view and
+pre-existing deep links keep working.
 
 The histogram behind the time-range selector is `GET /api/v1/timeseries` over
 the tenant's extent — the same endpoint the time-series view uses, at 120

@@ -166,7 +166,7 @@ async function seed() {
 
 /** The highlighted tab must name the view that is actually rendered. */
 async function checkActiveTab(page, expected) {
-  const active = await page.locator("#tabs a.active").evaluateAll((links) =>
+  const active = await page.locator('#tabs [data-view][data-state="active"]').evaluateAll((links) =>
     links.map((link) => link.dataset.view),
   );
   check(
@@ -174,6 +174,19 @@ async function checkActiveTab(page, expected) {
     `the ${expected} tab is the only one highlighted`,
     JSON.stringify(active),
   );
+}
+
+/**
+ * Pick an option from a Radix Select.
+ *
+ * The toolbar uses shadcn's Select, whose trigger is a button rather than a
+ * native <select>, so `selectOption` does not apply: open the trigger, then
+ * click the option by its visible text.
+ */
+async function choose(page, trigger, optionText) {
+  await page.click(trigger);
+  await page.getByRole("option", { name: optionText, exact: true }).first().click();
+  await page.waitForTimeout(50);
 }
 
 async function shot(page, name) {
@@ -219,7 +232,7 @@ async function main() {
   await page.waitForSelector("canvas.fg-canvas", { timeout: 20000 });
 
   check((await page.title()) === "LidlessEye", "page title");
-  check((await page.locator("#tabs a").count()) === 6, "six tabs are rendered");
+  check((await page.locator("#tabs [data-view]").count()) === 6, "six tabs are rendered");
 
   const box = await page.locator("canvas.fg-canvas").boundingBox();
   check(box !== null && box.width > 100 && box.height > 100, "flamegraph canvas has a size", JSON.stringify(box));
@@ -255,12 +268,12 @@ async function main() {
   await shot(page, "1-flamegraph");
 
   // The tenant selector is only shown when more than one tenant exists.
-  const initialTenant = await page.locator("#tenant").inputValue();
+  const initialTenant = (await page.locator("#tenant").innerText()).trim();
   check(initialTenant === "acme", "the tenant selector defaults to the first tenant", initialTenant);
   check(!(await page.locator("#tenant").isHidden()), "tenant selector is visible with two tenants");
 
   // ---- top functions ---------------------------------------------------
-  await page.click('#tabs a[data-view="top"]');
+  await page.click('#tabs [data-view="top"]');
   await page.waitForSelector(".tbl-wrap table tbody tr", { timeout: 20000 });
   await checkActiveTab(page, "top");
   let topText = await page.locator(".tbl-wrap table tbody").innerText();
@@ -269,7 +282,7 @@ async function main() {
   await shot(page, "2-top");
 
   // ---- time series -----------------------------------------------------
-  await page.click('#tabs a[data-view="timeseries"]');
+  await page.click('#tabs [data-view="timeseries"]');
   await page.waitForSelector("main canvas", { timeout: 20000 });
   await checkActiveTab(page, "timeseries");
   check((await page.locator("main canvas").count()) >= 1, "time series renders a chart");
@@ -282,16 +295,16 @@ async function main() {
   // below queries.
   await page.waitForSelector("canvas.time-brush", { timeout: 20000 });
   check(
-    await page.locator('#range-mode [data-mode="relative"]').evaluate((el) =>
-      el.classList.contains("active"),
-    ),
+    (await page
+      .locator('#range-mode [data-mode="relative"]')
+      .getAttribute("data-state")) === "on",
     "relative is the initial range mode",
   );
   const pickNow = Date.now();
   const pickFrom = new Date(pickNow - 40 * 60_000);
   const pickUntil = new Date(pickNow - 5_000);
   await page.click('#range-mode [data-mode="absolute"]');
-  await page.waitForFunction(() => !document.getElementById("abs-range").hidden, null, {
+  await page.waitForFunction(() => document.getElementById("abs-range") !== null, null, {
     timeout: 5000,
   });
   await page.fill("#abs-from", localInput(pickFrom));
@@ -342,7 +355,7 @@ async function main() {
   );
   check((await page.url()).includes("wfrom="), "the window is in the URL alongside the domain", page.url());
 
-  await page.click('#tabs a[data-view="top"]');
+  await page.click('#tabs [data-view="top"]');
   await page.waitForSelector(".tbl-wrap table tbody tr", { timeout: 20000 });
   topText = await page.locator(".tbl-wrap table tbody").innerText();
   check(topText.includes("oldCheckout"), "the brushed window selects the older batch", topText.slice(0, 200));
@@ -350,7 +363,7 @@ async function main() {
   await shot(page, "3b-brush");
 
   // ---- compare ---------------------------------------------------------
-  await page.click('#tabs a[data-view="compare"]');
+  await page.click('#tabs [data-view="compare"]');
   await page.waitForSelector("canvas.fg-canvas", { timeout: 20000 });
   await checkActiveTab(page, "compare");
   const brushCount = await page.locator("canvas.time-brush").count();
@@ -392,7 +405,7 @@ async function main() {
   await shot(page, "4-compare");
 
   // ---- labels ----------------------------------------------------------
-  await page.click('#tabs a[data-view="labels"]');
+  await page.click('#tabs [data-view="labels"]');
   await page.waitForSelector('.label-names button[data-name]', { timeout: 20000 });
   await checkActiveTab(page, "labels");
   const headers = await page.locator(".label-table thead th").allInnerTexts();
@@ -443,10 +456,10 @@ async function main() {
   await settle(page);
 
   // ---- overview --------------------------------------------------------
-  await page.click('#tabs a[data-view="overview"]');
-  await page.waitForSelector(".cards .card", { timeout: 20000 });
+  await page.click('#tabs [data-view="overview"]');
+  await page.waitForSelector('[data-testid="overview-card"]', { timeout: 20000 });
   await checkActiveTab(page, "overview");
-  check((await page.locator(".cards .card").count()) >= 3, "overview renders its cards");
+  check((await page.locator('[data-testid="overview-card"]').count()) >= 3, "overview renders its cards");
   await shot(page, "6-overview");
 
   // ---- tenant switching ------------------------------------------------
@@ -458,12 +471,12 @@ async function main() {
   for (let i = 0; i < rows; i += 1) {
     await page.locator(".filter-row [data-role='remove']").first().click();
   }
-  await page.selectOption("#range", "1h");
+  await choose(page, "#range", "Last hour");
   await page.click("#apply");
-  await page.click('#tabs a[data-view="top"]');
+  await page.click('#tabs [data-view="top"]');
   await page.waitForSelector(".tbl-wrap table tbody tr", { timeout: 20000 });
 
-  await page.selectOption("#tenant", "zeta");
+  await choose(page, "#tenant", "zeta");
   await page.waitForFunction(
     () => document.querySelector(".tbl-wrap table tbody")?.innerText.includes("zetaSearch"),
     null,
@@ -481,9 +494,9 @@ async function main() {
   await zetaPage.goto(`${BASE}/?tenant=zeta#/top`, { waitUntil: "load" });
   await zetaPage.waitForSelector(".tbl-wrap table tbody tr", { timeout: 20000 });
   check(
-    (await zetaPage.locator("#tenant").inputValue()) === "zeta",
+    (await zetaPage.locator("#tenant").innerText()).trim() === "zeta",
     "?tenant= in the query string selects that tenant",
-    await zetaPage.locator("#tenant").inputValue(),
+    (await zetaPage.locator("#tenant").innerText()).trim(),
   );
   await zetaPage.close();
 
@@ -528,18 +541,15 @@ async function main() {
     "an empty range offers the range that has data",
   );
   await page.click(".filter-add");
-  await page.selectOption('.filter-row [data-role="label"]', "pod");
+  await choose(page, '.filter-row [data-role="label"]', "pod");
   let valueCount = 0;
   try {
-    await page.waitForFunction(
-      () => {
-        const select = document.querySelector('.filter-row [data-role="value"]');
-        return select && !select.disabled && select.options.length > 0;
-      },
-      null,
-      { timeout: 15000 },
-    );
-    valueCount = await page.locator('.filter-row [data-role="value"] option').count();
+    // The value picker is a searchable combobox now: the options only exist
+    // while it is open.
+    await page.click('.filter-row [data-role="value"]');
+    await page.waitForSelector('[role="option"]', { timeout: 15000 });
+    valueCount = await page.locator('[role="option"]').count();
+    await page.keyboard.press("Escape");
   } catch {
     valueCount = 0;
   }

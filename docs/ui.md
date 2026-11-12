@@ -230,19 +230,21 @@ without animation.
 
 ## How it is built
 
-Plain ES modules, no framework and no build step — `rust-embed` inlines
-`web/dist` into the binary at compile time, so `cargo build` is the build:
+React 19 with shadcn/ui over a Next.js static export, and no second process:
+`next build` emits `web/out`, `npm run sync` copies it to `web/dist`, and
+`rust-embed` inlines that into the binary at compile time. `web/dist` is
+committed so `cargo build` still works without Node.
 
-| File | Responsibility |
+| Path | Responsibility |
 | --- | --- |
-| `index.html`, `styles.css` | shell and theme (CSS custom properties on `:root`) |
-| `app.js` | state, hash routing, query construction, view switching |
-| `api.js` | fetch wrapper, tenant/token headers, error mapping |
-| `flamegraph.js` | canvas flamegraph: layout, zoom, hover, animation |
-| `timebrush.js` | histogram + draggable window |
-| `labelfilters.js` | filter rows and selector composition/parsing |
-| `chart.js` | stacked time-series canvas |
-| `views.js` | top table, label explorer, overview, empty states |
+| `app/`, `components/` | shell, navigation, tables and filter UI (shadcn components) |
+| `lib/store.ts` | state, query construction, view switching, URL sync |
+| `lib/hash.ts`, `lib/time.ts` | hash <-> state, domain/window arithmetic |
+| `lib/selector.ts` | filter rows and selector composition/parsing |
+| `lib/canvas/flamegraph.ts` | canvas flamegraph: layout, zoom, hover, animation |
+| `lib/canvas/timebrush.ts` | histogram + draggable window |
+| `lib/canvas/chart.ts` | stacked time-series canvas |
+| `components/views/` | top table, label explorer, overview, empty states |
 | `format.js` | value/time/byte formatting, escaping |
 
 All state lives in one `state` object in `app.js`. Each view is a class with

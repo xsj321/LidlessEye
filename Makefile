@@ -4,7 +4,7 @@
 CARGO ?= cargo
 HELM  ?= helm
 
-.PHONY: help build release test test-ebpf lint fmt bpf ui helm-lint docker
+.PHONY: help build release test test-ebpf lint fmt bpf ui ui-test helm-lint docker
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -30,6 +30,12 @@ fmt: ## Format the workspace
 
 bpf: ## Rebuild the eBPF object from profile.bpf.c (needs clang)
 	LIDLESSEYE_BUILD_BPF=1 $(CARGO) build -p lidlesseye-ebpf
+
+ui: ## Build the dashboard and copy it into web/dist for rust-embed
+	cd web && npm run build && npm run sync
+
+ui-test: ## Drive the embedded dashboard in a real browser (needs Docker)
+	./scripts/ui-smoke.sh
 
 helm-lint: ## Lint the chart
 	$(HELM) lint deploy/helm/lidlesseye
