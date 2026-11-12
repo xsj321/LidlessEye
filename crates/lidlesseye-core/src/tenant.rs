@@ -593,6 +593,22 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The server's process-wide thread budget must survive the tenant
+    /// registry: `open_tenant` used to hardcode `None` and silently drop it.
+    #[test]
+    fn thread_budget_reaches_every_tenant() {
+        let dir = temp_dir("threads");
+        let base = StoreConfig {
+            threads: Some(2),
+            ..StoreConfig::new(&dir)
+        };
+        let registry = TenantStore::open(&dir, base).unwrap();
+        let acme = TenantId::parse("acme").unwrap();
+        let store = registry.open_tenant(&acme).unwrap();
+        assert_eq!(store.config().threads, Some(2));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn tenant_count_is_capped() {
         let dir = temp_dir("cap");
