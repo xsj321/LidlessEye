@@ -53,7 +53,7 @@ means it is genuinely absent.
 | off-CPU (blocked) sampling | yes | `--no-offcpu` disables it |
 | Wall clock profile | yes | computed as `cpu + off_cpu`, not stored twice |
 | Kernel stacks | yes | kernel frames symbolized from the live kernel |
-| User stacks + ELF symbolization | yes | module/symbol/file/line resolved before the report is written; **needs frame pointers**, see below |
+| User stacks + symbolization | yes | ELF symbols, DWARF inline frames, Go `.gopclntab` and JIT perf maps; **stack depth needs frame pointers**, see below |
 | Process discovery | yes | every process with a stack is reported, per-PID |
 | Kubernetes labels | yes | `enrich_kubernetes_labels`, namespace/pod/container/node |
 | Node label | yes | `node_label` |
@@ -82,6 +82,55 @@ means it is genuinely absent.
 | Horizontal query fan-out | no | complicates the tenancy story more than it is worth for a single-node design |
 | gRPC API | no | HTTP/JSON |
 
+## How frames get their names
+
+A flamegraph leaf that reads `0x7f3c1a0042a0` is not a rendering problem: the
+agent sampled an address and could not name it. Five sources are consulted, in
+this order, and each one closes a hole the previous one cannot:
+
+| Source | Covers | Notes |
+| --- | --- | --- |
+| ELF symbol tables | native code | `.symtab`, `.dynsym`, split debug info under `/usr/lib/debug/.build-id` |
+| DWARF `.debug_info` | inlined frames | a release build inlines aggressively, so the leaf often exists only as an inlined copy; those frames are expanded and emitted leaf first |
+| Go `.gopclntab` | stripped Go binaries | survives `-ldflags="-s -w"`, because the Go runtime needs it to unwind and to print panics |
+| JIT perf maps | JVM, V8, Node | `/tmp/perf-<pid>.map`, found through `/proc/<pid>/root` and `NSpid` so it works across mount and PID namespaces |
+| `kallsyms` / `vmlinux` | kernel | read live; `vmlinux` is preferred when it is installed |
+
+Two details decide whether a stack looks complete or full of holes:
+
+- **Return addresses are off by one.** Only the innermost frame is an
+  instruction that really executed; every frame below it is the address of the
+  instruction *after* a `call`. Resolving it verbatim lands on whatever symbol
+  starts at that boundary — often the wrong function, which is worse than an
+  unknown frame because it looks plausible. Every frame but the leaf is resolved
+  as `ip - 1`, the same convention `perf` uses.
+- **`unknown` has reasons.** Unresolved addresses are counted by cause
+  (`missing_syms`, `missing_component`, `unmapped`, `unknown_addr`,
+  `unsupported`) and printed by `lidlesseye collect`, because "install debug
+  info" and "this is a JIT region" are different problems.
+
+Measured on a 20-vCPU node with containerd, dockerd and a stripped Go init
+running, 12 s of whole-machine sampling at 199 Hz
+(`crates/lidlesseye-ebpf/tests/symbol_coverage.rs`):
+
+| Build | Frames without a symbol | Unresolved addresses |
+| --- | --- | --- |
+| ELF symbolization only | 16.1 % | 464 |
+| + inline expansion, return-address fix, Go pclntab | 3.9 % | 4 |
+
+What remains is `libc.so.6`: distributions strip it, so its internal helpers
+(`__memmove_avx_unaligned_erms` and friends) have no symbol outside the debug
+package. Installing `libc6-dbg` (or the matching `debuginfo` package) resolves
+them; nothing on the agent side can.
+
+One limitation is worth stating plainly: samples from a process in **another
+PID namespace** (another container, when the agent runs with `hostPID: true`)
+are counted and dropped. `bpf_get_ns_current_pid_tgid` only answers for tasks
+that share the agent's namespace, and a plain `bpf_get_current_pid_tgid` numbers
+a task in *its own* namespace — resolving that to a `/proc` entry would silently
+attribute the samples to an unrelated process. `lidlesseye collect` reports the
+number as `in another PID namespace`.
+
 ## What the differences mean in practice
 
 - **Storage.** Pyroscope ships blocks to object storage and compacts them;
@@ -103,7 +152,7 @@ means it is genuinely absent.
 
   | Build | Time reaching the spinning function | Total accounted |
   | --- | --- | --- |
-  | `RUSTFLAGS="-C force-frame-pointers=yes"` | 5.65 s of 6.00 s (94 %) | 6.21 s |
+  | `RUSTFLAGS="-C force-frame-pointers=yes"` | 5.71 s of 6.00 s (95 %) | 6.33 s |
   | default | 1.22 s of 6.00 s (20 %) | 6.16 s |
 
   For Rust, that means `-C force-frame-pointers=yes` in `RUSTFLAGS` (or
@@ -138,6 +187,14 @@ Linux host and root. Docker is enough:
 DEV_PRIVILEGED=1 DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes" \
     ./scripts/dev.sh cargo test -p lidlesseye-ebpf --test ebpf_e2e \
     -- --ignored --nocapture
+```
+
+Symbolization has a coverage test of its own. It samples the whole machine and
+fails if more than a quarter of the frames come back as bare addresses:
+
+```bash
+DEV_PRIVILEGED=1 ./scripts/dev.sh cargo test -p lidlesseye-ebpf \
+    --test symbol_coverage -- --ignored --nocapture
 ```
 
 The dashboard has its own browser test, which also needs nothing but Docker:

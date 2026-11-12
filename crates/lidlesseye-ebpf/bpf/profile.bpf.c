@@ -184,6 +184,13 @@ SEC("perf_event")
 int lidlesseye_cpu(struct pt_regs_opaque *ctx) {
     __u32 tgid = current_tgid();
     if (tgid == 0) {
+        /* The task lives in a PID namespace the agent cannot see (another
+         * container). Account the sample under the reserved tgid 0 so user
+         * space can report the loss instead of dropping it silently. */
+        struct stack_key lost = {};
+        lost.user_stack = (__u32)INVALID_STACK_ID;
+        lost.kernel_stack = (__u32)INVALID_STACK_ID;
+        add_value((void *)&cpu_counts, &lost, 1);
         return 0;
     }
 

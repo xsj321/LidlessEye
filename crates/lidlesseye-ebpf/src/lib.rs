@@ -23,12 +23,63 @@
 #[cfg(target_os = "linux")]
 mod collector;
 #[cfg(target_os = "linux")]
+mod gopclntab;
+#[cfg(target_os = "linux")]
+mod perf_map;
+#[cfg(target_os = "linux")]
 pub mod procfs;
 #[cfg(target_os = "linux")]
 mod symbolizer;
 
 #[cfg(target_os = "linux")]
 pub use collector::{CollectorConfig, CollectorHandle, StatsSnapshot, start};
+
+/// Why addresses could not be symbolized, split by cause.
+///
+/// The split is what makes a coverage report actionable: `missing_syms` means
+/// "install debug info or stop stripping the binary", `missing_component`
+/// means "this is a JIT or anonymous mapping with no file behind it", and
+/// `unmapped` means the address is not in the process at all (a corrupt stack,
+/// or a pid that was recycled between sampling and flushing).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownReasons {
+    /// The address is not inside any mapping of the process.
+    pub unmapped: u64,
+    /// The mapping exists but carries no symbols (stripped binary).
+    pub missing_syms: u64,
+    /// The mapping has no file behind it: anonymous memory, `[heap]`, or JIT
+    /// code that did not publish a perf map.
+    pub missing_component: u64,
+    /// The file has symbols, but none covers this address.
+    pub unknown_addr: u64,
+    /// The mapping is of a kind the symbolizer cannot read (e.g. a device).
+    pub unsupported: u64,
+    /// Any other reason.
+    pub other: u64,
+}
+
+impl UnknownReasons {
+    pub fn total(&self) -> u64 {
+        self.unmapped
+            + self.missing_syms
+            + self.missing_component
+            + self.unknown_addr
+            + self.unsupported
+            + self.other
+    }
+
+    /// `(name, count)` pairs, in a stable order suitable for logs and metrics.
+    pub fn entries(&self) -> [(&'static str, u64); 6] {
+        [
+            ("unmapped", self.unmapped),
+            ("missing_syms", self.missing_syms),
+            ("missing_component", self.missing_component),
+            ("unknown_addr", self.unknown_addr),
+            ("unsupported", self.unsupported),
+            ("other", self.other),
+        ]
+    }
+}
 
 /// The compiled eBPF object, exposed for debugging and for `bpftool` based
 /// inspection (`lidlesseye` embeds the same bytes).
@@ -87,7 +138,24 @@ pub struct StatsSnapshot {
     pub cpu_records: u64,
     pub offcpu_records: u64,
     pub reports: u64,
+    /// Addresses that produced no symbol name, of every reason.
     pub symbol_failures: u64,
+    /// Frames that carry a real symbol name.
+    pub symbol_frames: u64,
+    /// Frames recovered from DWARF inline information alone.
+    pub symbol_inlined: u64,
+    /// Frames named through a Go `.gopclntab`.
+    pub symbol_go: u64,
+    /// Frames named through a JIT runtime's perf map.
+    pub symbol_jit: u64,
+    /// Unresolved addresses, split by cause. Always zero off Linux.
+    pub symbol_unknown: UnknownReasons,
+    /// Samples discarded because the process was gone. Always zero off Linux.
+    pub symbol_skipped: u64,
+    /// Samples whose pid is not visible in the agent's PID namespace.
+    pub unattributed: u64,
+    /// Samples that carried no usable stack.
+    pub empty_stacks: u64,
     pub drains: u64,
     pub errors: u64,
 }

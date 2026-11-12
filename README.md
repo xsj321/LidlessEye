@@ -267,6 +267,10 @@ DEV_PRIVILEGED=1 DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes" \
     ./scripts/dev.sh cargo test -p lidlesseye-ebpf --test ebpf_e2e \
     -- --ignored --nocapture
 
+# how many frames get a name (root; samples the whole machine)
+DEV_PRIVILEGED=1 ./scripts/dev.sh cargo test -p lidlesseye-ebpf \
+    --test symbol_coverage -- --ignored --nocapture
+
 # the dashboard in Chromium (Docker only)
 ./scripts/ui-smoke.sh
 
@@ -275,7 +279,10 @@ DEV_PRIVILEGED=1 DEV_ENV="RUSTFLAGS=-C force-frame-pointers=yes" \
 ```
 
 The browser test seeds two tenants, walks every tab and fails on a console
-error, so a rendering regression cannot pass as "the API is fine".
+error, so a rendering regression cannot pass as "the API is fine". The coverage
+test fails if more than a quarter of the sampled frames come back as bare
+addresses, so losing the inline expansion or the Go symbol table is a build
+failure rather than a slightly worse-looking flamegraph.
 
 ## Limits
 
@@ -283,7 +290,14 @@ error, so a rendering regression cannot pass as "the API is fine".
   portable Rust and run anywhere (the tests run on every platform).
 - **Symbolized at ingest**: a profile whose modules cannot be opened becomes a
   tree of `[unknown]`/`0x…` frames. Agents therefore need `hostPID` (or
-  `--pid=host`) plus read access to the binaries that are running.
+  `--pid=host`) plus read access to the binaries that are running. Addresses
+  that stay unnamed are counted by cause, and `lidlesseye collect` prints the
+  breakdown (`missing_syms` means "install debug info", `missing_component`
+  means "JIT without a perf map").
+- **One PID namespace per agent**: `bpf_get_ns_current_pid_tgid` only answers
+  for tasks that share the agent's namespace, so processes in *other*
+  containers cannot be attributed. Those samples are counted as
+  `in another PID namespace` rather than silently misattributed.
 - **Per-host storage**: the server is a single writer over a local directory.
   Run one server per storage volume; there is no clustering or replication.
 - **No dynamic tracing yet**: only the built-in CPU/off-CPU profilers. Uprobes,

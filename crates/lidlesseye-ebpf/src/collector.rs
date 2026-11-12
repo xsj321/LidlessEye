@@ -18,8 +18,8 @@
 //! matter how fast samples arrive.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,7 @@ use lidlesseye_core::model::{Frame, ProfileType, Report, ReportBuilder};
 use lidlesseye_core::now_ns;
 use tracing::{debug, info, warn};
 
+use crate::UnknownReasons;
 use crate::procfs;
 use crate::symbolizer::FrameResolver;
 
@@ -122,6 +123,18 @@ pub struct CollectorStats {
     pub offcpu_records: AtomicU64,
     pub reports: AtomicU64,
     pub symbol_failures: AtomicU64,
+    pub symbol_frames: AtomicU64,
+    pub symbol_inlined: AtomicU64,
+    pub symbol_go: AtomicU64,
+    pub symbol_jit: AtomicU64,
+    pub symbol_unknown: Mutex<UnknownReasons>,
+    /// Records dropped because the process no longer exists, cumulatively.
+    pub skipped: AtomicU64,
+    /// Records whose pid could not be translated into the agent's PID
+    /// namespace. Non-zero means the samples of other containers are invisible.
+    pub unattributed: AtomicU64,
+    /// Records that were sampled but carried no usable stack at all.
+    pub empty_stacks: AtomicU64,
     pub drains: AtomicU64,
     pub errors: AtomicU64,
 }
@@ -131,7 +144,29 @@ pub struct StatsSnapshot {
     pub cpu_records: u64,
     pub offcpu_records: u64,
     pub reports: u64,
+    /// Addresses that produced no symbol name, of every reason. This used to
+    /// count only hard failures, which read as "0" on a machine where half the
+    /// frames were `[unknown]`; it now counts what a user would call a failure.
     pub symbol_failures: u64,
+    /// Frames that carry a real symbol name.
+    pub symbol_frames: u64,
+    /// Frames recovered from DWARF inline information alone. A leaf that only
+    /// exists as an inlined copy shows up here.
+    pub symbol_inlined: u64,
+    /// Frames named through a Go `.gopclntab`, i.e. stripped Go binaries that
+    /// no ELF symbolizer could have resolved.
+    pub symbol_go: u64,
+    /// Frames named through a JIT runtime's perf map.
+    pub symbol_jit: u64,
+    /// Unresolved addresses, split by cause.
+    pub symbol_unknown: UnknownReasons,
+    /// Samples discarded because the process was gone before it could be
+    /// symbolized. Not a symbol failure — a data loss that cannot be undone.
+    pub symbol_skipped: u64,
+    /// Samples whose pid is not visible in the agent's PID namespace.
+    pub unattributed: u64,
+    /// Samples that carried no usable stack.
+    pub empty_stacks: u64,
     pub drains: u64,
     pub errors: u64,
 }
@@ -155,6 +190,18 @@ impl CollectorHandle {
             offcpu_records: self.stats.offcpu_records.load(Ordering::Relaxed),
             reports: self.stats.reports.load(Ordering::Relaxed),
             symbol_failures: self.stats.symbol_failures.load(Ordering::Relaxed),
+            symbol_frames: self.stats.symbol_frames.load(Ordering::Relaxed),
+            symbol_inlined: self.stats.symbol_inlined.load(Ordering::Relaxed),
+            symbol_go: self.stats.symbol_go.load(Ordering::Relaxed),
+            symbol_jit: self.stats.symbol_jit.load(Ordering::Relaxed),
+            symbol_unknown: *self
+                .stats
+                .symbol_unknown
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            symbol_skipped: self.stats.skipped.load(Ordering::Relaxed),
+            unattributed: self.stats.unattributed.load(Ordering::Relaxed),
+            empty_stacks: self.stats.empty_stacks.load(Ordering::Relaxed),
             drains: self.stats.drains.load(Ordering::Relaxed),
             errors: self.stats.errors.load(Ordering::Relaxed),
         }
@@ -456,6 +503,14 @@ where
     if config.exclude_self {
         excluded.insert(std::process::id());
     }
+    let unattributed = cpu_records
+        .iter()
+        .chain(offcpu_records.iter())
+        .filter(|record| record.tgid == 0)
+        .count() as u64;
+    stats
+        .unattributed
+        .fetch_add(unattributed, Ordering::Relaxed);
     cpu_records.retain(|r| !excluded.contains(&r.tgid) && r.tgid != 0);
     offcpu_records.retain(|r| !excluded.contains(&r.tgid) && r.tgid != 0);
 
@@ -508,11 +563,11 @@ where
     let period_ns = 1_000_000_000u64 / config.frequency_hz.max(1);
     let mut cpu_builders: HashMap<GroupKey, ReportBuilder> = HashMap::new();
     let mut offcpu_builders: HashMap<GroupKey, ReportBuilder> = HashMap::new();
-    // A profile of a process that no longer exists in `/proc` cannot be
-    // symbolized, so those records are skipped instead of being stored as a
-    // wall of `[unknown]` frames.
+    // A process that is gone cannot be symbolized at all, so its records are
+    // skipped instead of being stored as a wall of `[unknown]` frames.
     let mut groups: HashMap<u32, Option<GroupKey>> = HashMap::new();
     let mut skipped = 0u64;
+    let mut empty = 0u64;
 
     for (records, builders, factor) in [
         (&cpu_records, &mut cpu_builders, period_ns),
@@ -540,6 +595,7 @@ where
                 frames.extend(resolver.resolve_user(record.tgid, ips));
             }
             if frames.is_empty() {
+                empty += 1;
                 continue;
             }
 
@@ -570,9 +626,28 @@ where
         emit(on_report, report, stats, &mut emitted);
     }
 
+    // A sampled pid that is gone by now has no usable symbols left, so its
+    // cache entry would only serve a future process that recycles the pid.
+    let alive: Vec<u32> = cpu_records
+        .iter()
+        .chain(offcpu_records.iter())
+        .map(|record| record.tgid)
+        .collect();
+    resolver.retain_processes(&alive);
+
+    let tally = resolver.tally();
+    stats.symbol_frames.store(tally.resolved, Ordering::Relaxed);
+    stats.symbol_inlined.store(tally.inlined, Ordering::Relaxed);
+    stats.symbol_go.store(tally.go, Ordering::Relaxed);
+    stats.symbol_jit.store(tally.jit, Ordering::Relaxed);
+    stats.skipped.fetch_add(skipped, Ordering::Relaxed);
+    stats.empty_stacks.fetch_add(empty, Ordering::Relaxed);
     stats
         .symbol_failures
         .store(resolver.failed_lookups(), Ordering::Relaxed);
+    if let Ok(mut unknown) = stats.symbol_unknown.lock() {
+        *unknown = tally.unknown;
+    }
     if tracing::enabled!(tracing::Level::DEBUG) {
         let sample: Vec<String> = groups
             .iter()

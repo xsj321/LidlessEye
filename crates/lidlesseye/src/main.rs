@@ -343,6 +343,27 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
         "collected {} cpu / {} off-cpu records in {} flushes",
         stats.cpu_records, stats.offcpu_records, stats.drains
     );
+    println!(
+        "symbols: {} named frames ({} from DWARF inline info, {} from Go pclntab, {} from JIT maps)",
+        stats.symbol_frames, stats.symbol_inlined, stats.symbol_go, stats.symbol_jit
+    );
+    let unresolved = stats.symbol_unknown.total();
+    if unresolved > 0 {
+        // Naming the reason is what makes this actionable rather than alarming.
+        println!("symbols: {unresolved} addresses could not be named");
+        for (reason, count) in stats.symbol_unknown.entries() {
+            if count > 0 {
+                println!("  {reason:<18} {count}");
+            }
+        }
+    }
+    let lost = stats.symbol_skipped + stats.unattributed + stats.empty_stacks;
+    if lost > 0 {
+        println!(
+            "samples dropped: {} process gone, {} in another PID namespace, {} without a stack",
+            stats.symbol_skipped, stats.unattributed, stats.empty_stacks
+        );
+    }
     // Give the uploader a moment to drain its queue.
     tokio::time::sleep(Duration::from_millis(500)).await;
     drop(publisher);

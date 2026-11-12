@@ -121,8 +121,21 @@ pub fn online_cpus() -> Vec<u32> {
 
 /// `(st_dev, st_ino)` of the agent's PID namespace.
 ///
-/// The loader feeds these into the eBPF programs so that the pids stored in the
-/// maps are relative to the namespace the agent can actually read from `/proc`.
+/// The loader feeds these into the eBPF programs, which turn them into a pid
+/// that `/proc` *in this namespace* can resolve.
+///
+/// It must be set even when the agent already runs in the initial namespace.
+/// `bpf_get_current_pid_tgid()` numbers a task in that task's own namespace,
+/// so for a process inside another container it returns a small, unrelated
+/// number — reading `/proc/<that number>` then yields an entirely different
+/// process, and the profile is silently misattributed. Translating through the
+/// helper gives the correct (global) pid for every task the agent can see.
+///
+/// The flip side is a hard limit of `bpf_get_ns_current_pid_tgid`: it only
+/// succeeds for tasks sharing the agent's namespace. Samples from other
+/// containers come back as tgid 0, are counted in `unattributed`, and are
+/// dropped. Making those visible needs a per-namespace pid, which in turn needs
+/// the task's `nsproxy` — i.e. BTF/CO-RE, which this object deliberately avoids.
 pub fn pid_namespace() -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata("/proc/self/ns/pid").ok()?;
