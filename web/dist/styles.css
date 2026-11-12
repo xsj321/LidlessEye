@@ -818,6 +818,96 @@ td .sub {
   border-bottom: 1px solid var(--border);
 }
 
+/* First choice: relative or absolute, then the range itself. */
+.time-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.time-head .spacer {
+  flex: 1;
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.seg button {
+  height: 24px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.seg button + button {
+  border-left: 1px solid var(--border);
+}
+
+.seg button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.abs-range {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.abs-range[hidden] {
+  display: none;
+}
+
+.abs-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-faint);
+}
+
+.abs-field input {
+  height: 26px;
+  padding: 0 6px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: 0;
+  /* The native calendar popup follows the rest of the page. */
+  color-scheme: dark;
+}
+
+.abs-field input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.time-head > button {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.time-context,
+.time-hint {
+  font-size: 11.5px;
+}
+
 .brushes {
   display: flex;
   flex-direction: column;
@@ -847,6 +937,17 @@ td .sub {
 
 .brush-range {
   color: var(--text-muted);
+}
+
+.brush-domain {
+  font-size: 10.5px;
+}
+
+.brush-action {
+  margin-left: auto;
+  height: 20px !important;
+  padding: 0 8px !important;
+  font-size: 11px !important;
 }
 
 canvas.time-brush {

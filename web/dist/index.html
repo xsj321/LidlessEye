@@ -66,7 +66,32 @@
       <div id="filters" data-selector=""></div>
     </div>
 
-    <div class="timebar" id="timebar"></div>
+    <div class="timebar">
+      <div class="time-head">
+        <div class="seg" id="range-mode" role="group" aria-label="How the time range is chosen">
+          <button type="button" data-mode="relative">Relative</button>
+          <button type="button" data-mode="absolute">Absolute</button>
+        </div>
+        <span class="time-context faint" id="range-context"></span>
+        <div class="abs-range" id="abs-range" hidden>
+          <label class="abs-field">
+            <span>From</span>
+            <input type="datetime-local" id="abs-from" step="1" />
+          </label>
+          <span class="faint">→</span>
+          <label class="abs-field">
+            <span>To</span>
+            <input type="datetime-local" id="abs-until" step="1" />
+          </label>
+          <button class="ghost" id="abs-apply">Apply</button>
+          <button class="ghost" id="abs-now" title="Move the end of the range to now">Now</button>
+        </div>
+        <span class="spacer"></span>
+        <span class="time-hint faint" id="range-hint"></span>
+        <button class="ghost" id="range-hint-use" hidden>Use data range</button>
+      </div>
+      <div id="brushes"></div>
+    </div>
 
     <main id="main" class="main"></main>
 

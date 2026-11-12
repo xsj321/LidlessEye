@@ -34,6 +34,14 @@ function check(ok, message, detail) {
 // Mirrors ROW_HEIGHT in web/dist/js/flamegraph.js: hit tests are row-based.
 const ROW = 22;
 
+/** `2026-11-12T20:15:00` in local time, the value <input type=datetime-local> takes. */
+function localInput(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
 /** Wait until the flamegraph stops moving (load-in or zoom transition). */
 async function settle(page, timeout = 4000) {
   await page
@@ -267,33 +275,72 @@ async function main() {
   check((await page.locator("main canvas").count()) >= 1, "time series renders a chart");
   await shot(page, "3-timeseries");
 
-  // ---- histogram time brush --------------------------------------------
-  // Switch to a short preset first so the selection covers only the right
-  // part of the extent (the seed spans 30 minutes), then drag a new window
-  // across the older batch. Whatever lands in the bracket is what every view
-  // below queries — the top table proves the window really selects the old
-  // batch and not the recent one.
+  // ---- absolute time range + histogram brush ---------------------------
+  // The picker decides the domain first; the bracket then slides inside it.
+  // Pick 40 minutes (the seed spans the last 30 plus a batch at now-30m), then
+  // bracket the older batch: whatever the window covers is what every view
+  // below queries.
   await page.waitForSelector("canvas.time-brush", { timeout: 20000 });
-  await page.selectOption("#range", "5m");
-  await page.waitForFunction(() => window.lidlesseye.state.range === "5m", null, { timeout: 10000 });
+  check(
+    await page.locator('#range-mode [data-mode="relative"]').evaluate((el) =>
+      el.classList.contains("active"),
+    ),
+    "relative is the initial range mode",
+  );
+  const pickNow = Date.now();
+  const pickFrom = new Date(pickNow - 40 * 60_000);
+  const pickUntil = new Date(pickNow - 5_000);
+  await page.click('#range-mode [data-mode="absolute"]');
+  await page.waitForFunction(() => !document.getElementById("abs-range").hidden, null, {
+    timeout: 5000,
+  });
+  await page.fill("#abs-from", localInput(pickFrom));
+  await page.fill("#abs-until", localInput(pickUntil));
+  await page.click("#abs-apply");
+  await page.waitForFunction(() => window.lidlesseye.state.mode === "absolute", null, {
+    timeout: 10000,
+  });
+  const domain = await page.evaluate(() => ({
+    from: window.lidlesseye.state.domainFrom,
+    until: window.lidlesseye.state.domainUntil,
+  }));
+  check(
+    Math.abs(domain.from / 1e6 - pickFrom.getTime()) < 2000 &&
+      Math.abs(domain.until / 1e6 - pickUntil.getTime()) < 2000,
+    "the date-time inputs define the domain",
+    `${JSON.stringify(domain)} vs ${pickFrom.toISOString()}`,
+  );
+  check((await page.url()).includes("from="), "the absolute domain is in the URL", page.url());
+  const domainText = (await page.locator('.brush [data-role="domain"]').innerText()).trim();
+  check(/^of \d\d:\d\d:\d\d–\d\d:\d\d:\d\d$/.test(domainText), "the brush says which range it spans", domainText);
+
   const brush = await page.locator("canvas.time-brush").boundingBox();
   check(brush !== null && brush.width > 200, "the histogram brush has a size", JSON.stringify(brush));
-  await page.mouse.move(brush.x + brush.width * 0.01, brush.y + brush.height / 2);
+  // The window covers the whole domain, so dragging inside brackets a new one.
+  await page.mouse.move(brush.x + brush.width * 0.02, brush.y + brush.height / 2);
   await page.mouse.down();
-  await page.mouse.move(brush.x + brush.width * 0.2, brush.y + brush.height / 2, { steps: 6 });
+  await page.mouse.move(brush.x + brush.width * 0.35, brush.y + brush.height / 2, { steps: 6 });
   await page.mouse.up();
-  await page.waitForFunction(() => window.lidlesseye.state.range === "custom", null, { timeout: 10000 });
-  check(true, "dragging the brush makes the range custom");
+  await page.waitForFunction(
+    () => window.lidlesseye.state.untilNs - window.lidlesseye.state.fromNs > 0,
+    null,
+    { timeout: 10000 },
+  );
   const windowState = await page.evaluate(() => ({
     from: window.lidlesseye.state.fromNs,
     until: window.lidlesseye.state.untilNs,
+    domainFrom: window.lidlesseye.state.domainFrom,
+    domainUntil: window.lidlesseye.state.domainUntil,
   }));
   check(
-    windowState.until > windowState.from && windowState.from > 0,
-    "the dragged window is an absolute range",
+    windowState.until > windowState.from &&
+      windowState.from >= windowState.domainFrom &&
+      windowState.until <= windowState.domainUntil &&
+      windowState.until - windowState.from < windowState.domainUntil - windowState.domainFrom,
+    "the dragged window is narrower than the domain and stays inside it",
     JSON.stringify(windowState),
   );
-  check((await page.url()).includes("from="), "the custom window is reflected in the URL", page.url());
+  check((await page.url()).includes("wfrom="), "the window is in the URL alongside the domain", page.url());
 
   await page.click('#tabs a[data-view="top"]');
   await page.waitForSelector(".tbl-wrap table tbody tr", { timeout: 20000 });
@@ -317,21 +364,20 @@ async function main() {
     "the two brushes are labelled baseline and comparison",
     JSON.stringify(brushLabels),
   );
-  // Nudge the comparison window (the second brush) to the left: its selection
-  // sits in the left half of the extent (the dragged window plus its default
-  // baseline widened it), so 25% is inside the bracket and a small left move
-  // keeps the old batch covered.
+  // Nudge the comparison window (the second brush) to the left. Both brushes
+  // share the domain, and the comparison bracket sits at 2–35% of it, so 20%
+  // is inside and a small move stays within the domain.
   const baselineBrushBox = await page.locator("canvas.time-brush").nth(0).boundingBox();
   const comparisonBrushBox = await page.locator("canvas.time-brush").nth(1).boundingBox();
   check(baselineBrushBox !== null && comparisonBrushBox !== null, "both brushes have a size");
   const fromBefore = await page.evaluate(() => window.lidlesseye.state.fromNs);
   await page.mouse.move(
-    comparisonBrushBox.x + comparisonBrushBox.width * 0.25,
+    comparisonBrushBox.x + comparisonBrushBox.width * 0.2,
     comparisonBrushBox.y + comparisonBrushBox.height / 2,
   );
   await page.mouse.down();
   await page.mouse.move(
-    comparisonBrushBox.x + comparisonBrushBox.width * 0.22,
+    comparisonBrushBox.x + comparisonBrushBox.width * 0.17,
     comparisonBrushBox.y + comparisonBrushBox.height / 2,
     { steps: 4 },
   );
@@ -459,6 +505,48 @@ async function main() {
   check(
     (await page.locator(".filter-row .filter-raw").count()) === 1,
     "the fragment is shown as a raw row",
+  );
+
+  // ---- an empty range must not dead-end the picker ----------------------
+  // Reported symptom: choosing `pod` showed no values. Value lists were
+  // scoped to the analysis window, so a window with no samples emptied them.
+  // They now fall back to the last seven days, and the picker offers the
+  // range that actually has data.
+  const emptyNow = Date.now();
+  await page.goto(`${BASE}/?tenant=zeta#/flamegraph`, { waitUntil: "load" });
+  await page.waitForSelector("canvas.time-brush", { timeout: 20000 });
+  await page.click('#range-mode [data-mode="absolute"]');
+  await page.fill("#abs-from", localInput(new Date(emptyNow - 10 * 3_600_000)));
+  await page.fill("#abs-until", localInput(new Date(emptyNow - 9 * 3_600_000)));
+  await page.click("#abs-apply");
+  await page.waitForFunction(() => window.lidlesseye.state.mode === "absolute", null, {
+    timeout: 10000,
+  });
+  await page.waitForTimeout(900);
+  check(
+    await page.locator("#range-hint-use").isVisible(),
+    "an empty range offers the range that has data",
+  );
+  await page.click(".filter-add");
+  await page.selectOption('.filter-row [data-role="label"]', "pod");
+  let valueCount = 0;
+  try {
+    await page.waitForFunction(
+      () => {
+        const select = document.querySelector('.filter-row [data-role="value"]');
+        return select && !select.disabled && select.options.length > 0;
+      },
+      null,
+      { timeout: 15000 },
+    );
+    valueCount = await page.locator('.filter-row [data-role="value"] option').count();
+  } catch {
+    valueCount = 0;
+  }
+  check(
+    valueCount > 0,
+    "label values still load when the chosen range has no samples",
+    String(valueCount),
   );
 
   // Nothing above is worth much if the page is throwing while it renders.

@@ -39,7 +39,6 @@ export class LabelFilters {
       const name = this.names.find((n) => !used.has(n)) ?? this.names[0] ?? "service_name";
       this.filters.push({ label: name, op: "=", value: "" });
       this.render();
-      this.loadRowValues(this.filters.length - 1);
       this.emit();
     });
   }
@@ -58,7 +57,6 @@ export class LabelFilters {
   setFilters(filters) {
     this.filters = (filters ?? []).map((f) => ({ ...f }));
     this.render();
-    this.filters.forEach((_, index) => this.loadRowValues(index));
   }
 
   emit() {
@@ -79,17 +77,20 @@ export class LabelFilters {
     if (!row || !filter?.label) return;
     const valueSelect = row.querySelector('[data-role="value"]');
     valueSelect.disabled = true;
-    let values = [];
+    let result;
     try {
-      values = await this.loadValues(filter.label);
+      result = await this.loadValues(filter.label);
     } catch {
-      values = []; // a failed lookup must not wedge the row
+      result = { values: [] }; // a failed lookup must not wedge the row
     }
+    const values = Array.isArray(result) ? result : (result?.values ?? []);
+    const note = Array.isArray(result) ? "" : (result?.note ?? "");
     // The row may have been re-rendered while the request was in flight.
     const still = this.host.querySelector(`.filter-row[data-index="${index}"]`);
     if (still !== row) return;
     refreshSelect(valueSelect, values, filter.value);
     valueSelect.disabled = false;
+    valueSelect.title = note || "Label value";
   }
 
   render() {
@@ -132,7 +133,6 @@ export class LabelFilters {
         filter.label = event.target.value;
         filter.value = "";
         this.render();
-        this.loadRowValues(index);
         this.emit();
       });
       row.querySelector('[data-role="op"]').addEventListener("change", (event) => {
@@ -146,7 +146,6 @@ export class LabelFilters {
       row.querySelector('[data-role="remove"]').addEventListener("click", () => {
         this.filters.splice(index, 1);
         this.render();
-        this.filters.forEach((_, i) => this.loadRowValues(i));
         this.emit();
       });
     });
@@ -158,6 +157,9 @@ export class LabelFilters {
     } else {
       this.previewEl.hidden = true;
     }
+    // Every row reloads its list: a re-render replaces all the selects, and a
+    // row left with only its current value looks like "no values found".
+    this.filters.forEach((_, index) => this.loadRowValues(index));
   }
 }
 

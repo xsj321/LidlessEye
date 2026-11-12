@@ -29,10 +29,12 @@ choices:
 
 ![Flamegraph](docs/images/flamegraph.png)
 
-The window is picked on a histogram of sample density: drag the bracket to
-select, drag its edges to resize, or click elsewhere to jump. Label filters are
-structured rows above it, and the comparison view gets two of these brackets.
-Every control is described in [docs/ui.md](docs/ui.md).
+The window is picked in two steps: choose a range first — a relative preset or
+an absolute `From → To` with date-time pickers — and the histogram spans exactly
+that range. The bracket then slides inside it: drag to select, drag its edges to
+resize, or click to jump. Label filters are structured rows above it, and the
+comparison view gets two of these brackets. Every control is described in
+[docs/ui.md](docs/ui.md).
 
 ![Time range and label filters](docs/images/time-range.png)
 
@@ -64,10 +66,11 @@ Every control is described in [docs/ui.md](docs/ui.md).
   separate time series.
 - Labels and PromQL-flavoured selectors: `service_name="api" {env="prod",
   pod=~"api-*"}`, a label explorer, and `label-names` / `label/{name}/values`.
-- The dashboard picks windows like Grafana does: a histogram of sample
-  density below the filter bar, bracketed by a draggable time window (and a
-  second, independent one in the comparison view). Label filters are
-  structured rows, not a selector string you have to type from memory.
+- The dashboard picks windows like Grafana does: choose a relative or absolute
+  range (with date-time pickers), then bracket the window you want to analyse
+  inside it — plus a second, independent bracket in the comparison view. Label
+  filters are structured rows, not a selector string you have to type from
+  memory.
 - Ingest speaks **pprof protobuf** and **folded/collapsed text** as well as its
   own JSON, so the Pyroscope SDKs and `go tool pprof` output push directly.
 - **Multi-tenancy**: `X-Scope-OrgID`, per-tenant tokens, per-tenant retention,

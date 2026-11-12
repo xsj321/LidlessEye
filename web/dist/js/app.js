@@ -1,14 +1,21 @@
-// Application shell: filter bar, label filters, histogram time selection,
+// Application shell: filter bar, label filters, time range picker + histogram,
 // hash routing, data loading.
 //
-// The time window is always resolved to an absolute [from, until] before a
-// query goes out: presets are translated to `now-<range>` server-side, the
-// histogram brush below the filter bar sets absolute bounds. The compare view
-// carries a second, independent window for the baseline side of the diff.
+// The time state has two levels on purpose:
+//
+//   domain — the range you *chose* first (a relative preset, or an absolute
+//            from/to). The histogram spans exactly this, so the bracket can
+//            only slide inside it.
+//   window — the bracket inside the domain; this is what queries use.
+//
+// Changing the domain resets the window to the whole domain. Dragging the
+// bracket narrows or moves the window without touching the domain. The compare
+// view keeps two windows (baseline and comparison) in the same domain.
 
 import { ApiError, api, getTenant, setTenant } from "./api.js";
 import { TimeSeriesChart } from "./chart.js";
 import { Flamegraph } from "./flamegraph.js";
+import { formatClock } from "./format.js";
 import { LabelExplorer, TopTable, emptyState, renderOverview } from "./views.js";
 import { TimeBrush } from "./timebrush.js";
 import { LabelFilters, composeSelector, parseSelector } from "./labelfilters.js";
@@ -27,12 +34,15 @@ const VIEWS = ["flamegraph", "compare", "top", "timeseries", "labels", "overview
 const state = {
   view: "flamegraph",
   type: "cpu",
-  // Either a preset ("1h") or "custom": an absolute window set by dragging
-  // the histogram brush.
+  // "relative" (preset ending now) or "absolute" (domainFrom/domainUntil).
+  mode: "relative",
   range: "1h",
+  domainFrom: 0,
+  domainUntil: 0,
+  // The bracket inside the domain; 0 means "the whole domain".
   fromNs: 0,
   untilNs: 0,
-  // Baseline window for the compare view; initialised to the preceding span.
+  // Baseline window for the compare view.
   baseFromNs: 0,
   baseUntilNs: 0,
   filters: [],
@@ -51,7 +61,16 @@ const el = {
   groupBy: document.getElementById("group-by"),
   range: document.getElementById("range"),
   filters: document.getElementById("filters"),
-  timebar: document.getElementById("timebar"),
+  brushes: document.getElementById("brushes"),
+  rangeMode: document.getElementById("range-mode"),
+  rangeContext: document.getElementById("range-context"),
+  absRange: document.getElementById("abs-range"),
+  absFrom: document.getElementById("abs-from"),
+  absUntil: document.getElementById("abs-until"),
+  absApply: document.getElementById("abs-apply"),
+  absNow: document.getElementById("abs-now"),
+  hint: document.getElementById("range-hint"),
+  hintUse: document.getElementById("range-hint-use"),
   auto: document.getElementById("auto-refresh"),
   apply: document.getElementById("apply"),
   refresh: document.getElementById("refresh"),
@@ -63,14 +82,16 @@ let component = null;
 let autoTimer = null;
 let requestId = 0;
 
-// The histogram brushes. One in every view, two in compare.
 const brushes = { main: null, baseline: null };
-let histData = null; // last /api/v1/timeseries payload over the extent
+let histData = null;
 let histToken = 0;
-let earliestNs = null; // per tenant, for the brush extent
+let histEmpty = false;
+let lastDomain = null;
+// Oldest/newest retained sample, used only for the "no samples here" escape.
+let dataRange = null;
 const valueCache = new Map();
 
-// ---- time windows ------------------------------------------------------
+// ---- time --------------------------------------------------------------
 
 function nowNs() {
   return Date.now() * 1e6;
@@ -85,13 +106,24 @@ function durationNs(text) {
   return value * scale;
 }
 
-/** Absolute window in ns, whatever the range preset says. */
-function resolveWindow() {
-  if (state.range === "custom" && state.fromNs && state.untilNs > state.fromNs) {
-    return { from: state.fromNs, until: state.untilNs };
+/** The range chosen first: a relative preset, or the absolute inputs. */
+function resolveDomain() {
+  if (state.mode === "absolute" && state.domainUntil > state.domainFrom) {
+    return { from: state.domainFrom, until: state.domainUntil };
   }
   const until = nowNs();
   return { from: until - durationNs(state.range), until };
+}
+
+/** The bracket, clamped into the domain; falls back to the whole domain. */
+function resolveWindow() {
+  const domain = resolveDomain();
+  if (!state.fromNs || !state.untilNs || state.untilNs <= state.fromNs) return domain;
+  const span = Math.min(state.untilNs - state.fromNs, domain.until - domain.from);
+  let from = state.fromNs;
+  if (from < domain.from) from = domain.from;
+  if (from + span > domain.until) from = domain.until - span;
+  return { from, until: from + span };
 }
 
 /** RFC3339, the format the server's time parser accepts. */
@@ -99,32 +131,127 @@ function iso(ns) {
   return new Date(Number(ns) / 1e6).toISOString();
 }
 
-/** The baseline window: defaults to the span immediately before the main one. */
-function resolveBaseline() {
-  if (state.baseFromNs && state.baseUntilNs > state.baseFromNs) {
-    return { from: state.baseFromNs, until: state.baseUntilNs };
-  }
-  const win = resolveWindow();
-  const span = win.until - win.from;
-  return { from: win.from - span, until: win.from };
+/** `2026-11-12T20:15:00` in the browser's zone, for <input type=datetime-local>. */
+function toLocalInput(ns) {
+  const date = new Date(Number(ns) / 1e6);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function setWindow(from, until) {
-  state.range = "custom";
+function fromLocalInput(value) {
+  if (!value) return null;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms * 1e6 : null;
+}
+
+function setRelativeRange(preset) {
+  state.mode = "relative";
+  state.range = preset;
+  state.domainFrom = 0;
+  state.domainUntil = 0;
+  state.fromNs = 0;
+  state.untilNs = 0;
+  state.baseFromNs = 0;
+  state.baseUntilNs = 0;
+  afterTimeChange();
+}
+
+function setAbsoluteDomain(from, until) {
+  if (!(until > from)) {
+    setBanner("`From` must be earlier than `To`.");
+    return;
+  }
+  setBanner("");
+  state.mode = "absolute";
+  state.domainFrom = Math.round(from);
+  state.domainUntil = Math.round(until);
+  state.fromNs = state.domainFrom;
+  state.untilNs = state.domainUntil;
+  state.baseFromNs = 0;
+  state.baseUntilNs = 0;
+  afterTimeChange();
+}
+
+/** One entry point for "the chosen range changed": rebuild, persist, reload. */
+function afterTimeChange() {
+  lastDomain = resolveDomain();
+  syncControls();
+  writeHash();
+  renderTimebar();
+  load();
+  loadHistogram();
+}
+
+function onWindowChange(from, until) {
   state.fromNs = from;
   state.untilNs = until;
   syncControls();
   writeHash();
   load();
-  loadHistogram();
 }
 
-function setBaselineWindow(from, until) {
+function onBaselineChange(from, until) {
   state.baseFromNs = from;
   state.baseUntilNs = until;
   writeHash();
   load();
-  loadHistogram();
+}
+
+/** The window the baseline brush starts with, always inside the domain. */
+function defaultBaseline() {
+  const domain = resolveDomain();
+  const win = resolveWindow();
+  const span = win.until - win.from;
+  const full = span >= (domain.until - domain.from) * 0.999;
+  if (full) {
+    // Nothing precedes a full-domain window: compare the two halves.
+    const mid = Math.floor((domain.from + domain.until) / 2);
+    return { from: domain.from, until: mid, split: mid };
+  }
+  let from = win.from - span;
+  let until = win.from;
+  if (from < domain.from) from = domain.from;
+  if (until - from < span * 0.25) {
+    from = domain.from;
+    until = Math.min(domain.from + span, win.from);
+  }
+  return { from, until, split: null };
+}
+
+function resolveBaseline() {
+  const domain = resolveDomain();
+  if (state.baseFromNs && state.baseUntilNs > state.baseFromNs) {
+    const span = Math.min(state.baseUntilNs - state.baseFromNs, domain.until - domain.from);
+    let from = Math.max(domain.from, state.baseFromNs);
+    if (from + span > domain.until) from = domain.until - span;
+    return { from, until: Math.round(from + span) };
+  }
+  return defaultBaseline();
+}
+
+/**
+ * Entering compare with a full-domain window has no baseline to show, so the
+ * domain is split in half and the second half becomes the window.
+ */
+function prepareCompare() {
+  const domain = resolveDomain();
+  const win = resolveWindow();
+  const full = win.until - win.from >= (domain.until - domain.from) * 0.999;
+  if (!state.baseFromNs && full) {
+    const split = defaultBaseline();
+    if (split.split) {
+      state.fromNs = split.split;
+      state.untilNs = domain.until;
+      state.baseFromNs = domain.from;
+      state.baseUntilNs = split.split;
+    }
+  } else if (!state.baseFromNs) {
+    const baseline = defaultBaseline();
+    state.baseFromNs = baseline.from;
+    state.baseUntilNs = baseline.until;
+  }
 }
 
 // ---- routing -----------------------------------------------------------
@@ -135,20 +262,35 @@ function parseHash() {
   const params = new URLSearchParams(query ?? "");
   if (VIEWS.includes(view)) state.view = view;
   if (params.get("type")) state.type = params.get("type");
-  if (params.get("range")) state.range = params.get("range");
+
   const from = Number(params.get("from"));
   const until = Number(params.get("until"));
   if (Number.isFinite(from) && Number.isFinite(until) && until > from) {
-    state.range = "custom";
-    state.fromNs = from;
-    state.untilNs = until;
+    state.mode = "absolute";
+    state.domainFrom = from;
+    state.domainUntil = until;
+  } else if (params.get("range")) {
+    state.mode = "relative";
+    state.range = params.get("range");
   }
-  const bfrom = Number(params.get("bfrom"));
-  const buntil = Number(params.get("buntil"));
+
+  const wfrom = Number(params.get("wfrom"));
+  const wuntil = Number(params.get("wuntil"));
+  if (Number.isFinite(wfrom) && Number.isFinite(wuntil) && wuntil > wfrom) {
+    state.fromNs = wfrom;
+    state.untilNs = wuntil;
+  } else {
+    state.fromNs = 0;
+    state.untilNs = 0;
+  }
+
+  const bfrom = Number(params.get("bwfrom"));
+  const buntil = Number(params.get("bwuntil"));
   if (Number.isFinite(bfrom) && Number.isFinite(buntil) && buntil > bfrom) {
     state.baseFromNs = bfrom;
     state.baseUntilNs = buntil;
   }
+
   if (params.has("selector")) state.filters = parseSelector(params.get("selector"));
   if (params.has("group_by")) state.groupBy = params.get("group_by");
   if (params.has("tenant")) {
@@ -160,16 +302,24 @@ function parseHash() {
 function writeHash() {
   const params = new URLSearchParams();
   params.set("type", state.type);
-  if (state.range === "custom") {
-    params.set("from", String(state.fromNs));
-    params.set("until", String(state.untilNs));
+  const domain = resolveDomain();
+  if (state.mode === "absolute") {
+    params.set("from", String(state.domainFrom));
+    params.set("until", String(state.domainUntil));
   } else {
     params.set("range", state.range);
   }
+  const win = resolveWindow();
+  const whole =
+    Math.abs(win.from - domain.from) < 1e6 && Math.abs(win.until - domain.until) < 1e6;
+  if (!whole) {
+    params.set("wfrom", String(win.from));
+    params.set("wuntil", String(win.until));
+  }
   if (state.view === "compare") {
     const baseline = resolveBaseline();
-    params.set("bfrom", String(baseline.from));
-    params.set("buntil", String(baseline.until));
+    params.set("bwfrom", String(baseline.from));
+    params.set("bwuntil", String(baseline.until));
   }
   const selector = composeSelector(state.filters);
   if (selector) params.set("selector", selector);
@@ -185,8 +335,8 @@ function queryParams() {
   const win = resolveWindow();
   const params = {
     profile_type: state.type,
-    from: state.range === "custom" ? iso(win.from) : `now-${state.range}`,
-    until: state.range === "custom" ? iso(win.until) : "now",
+    from: iso(win.from),
+    until: iso(win.until),
   };
   const selector = composeSelector(state.filters);
   if (selector) params.selector = selector;
@@ -212,6 +362,7 @@ function setBanner(message) {
 }
 
 async function load() {
+  if (state.view === "compare") prepareCompare();
   const id = ++requestId;
   const params = queryParams();
   setBanner("");
@@ -290,66 +441,68 @@ async function load() {
   }
 }
 
-// ---- histogram time bar ------------------------------------------------
-
-/** The full span the brushes show: from the oldest data to now. */
-function computeExtent() {
-  const win = resolveWindow();
-  let from = win.from;
-  let until = Math.max(win.until, nowNs());
-  if (state.view === "compare") {
-    const baseline = resolveBaseline();
-    from = Math.min(from, baseline.from);
-    until = Math.max(until, baseline.until);
-  }
-  if (earliestNs) from = Math.min(from, earliestNs);
-  const span = until - from;
-  return { from: Math.floor(from - span * 0.02), until: Math.ceil(until) };
-}
+// ---- time bar ----------------------------------------------------------
 
 function renderTimebar() {
   brushes.main?.destroy();
   brushes.baseline?.destroy();
   brushes.baseline = null;
-  el.timebar.innerHTML = "";
+  el.brushes.innerHTML = "";
 
-  const extent = computeExtent();
+  const domain = resolveDomain();
   const win = resolveWindow();
 
   if (state.view === "compare") {
-    const baseline = resolveBaseline();
     const wrap = document.createElement("div");
     wrap.className = "brushes";
-    el.timebar.appendChild(wrap);
-
+    el.brushes.appendChild(wrap);
     // One host per brush: a brush renders by replacing its host's innerHTML,
     // so two brushes in one host would clobber each other.
     const baselineHost = document.createElement("div");
     const mainHost = document.createElement("div");
     wrap.append(baselineHost, mainHost);
 
+    const baseline = resolveBaseline();
     brushes.baseline = new TimeBrush(baselineHost, {
       label: "A · Baseline",
-      onChange: setBaselineWindow,
+      onChange: onBaselineChange,
     });
     brushes.main = new TimeBrush(mainHost, {
       label: "B · Comparison",
-      onChange: (from, until) => setWindow(from, until),
+      onChange: onWindowChange,
     });
-    brushes.baseline.setExtent(extent.from, extent.until);
-    brushes.main.setExtent(extent.from, extent.until);
+    for (const brush of [brushes.baseline, brushes.main]) {
+      brush.setDomain(domain.from, domain.until);
+    }
     brushes.baseline.setSelection(baseline.from, baseline.until);
     brushes.main.setSelection(win.from, win.until);
+    addFullButton(brushes.baseline);
+    addFullButton(brushes.main);
   } else {
-    brushes.main = new TimeBrush(el.timebar, {
+    brushes.main = new TimeBrush(el.brushes, {
       label: "Time range",
-      onChange: (from, until) => setWindow(from, until),
+      onChange: onWindowChange,
     });
-    brushes.main.setExtent(extent.from, extent.until);
+    brushes.main.setDomain(domain.from, domain.until);
     brushes.main.setSelection(win.from, win.until);
+    addFullButton(brushes.main);
   }
 
   if (histData) feedBrushes();
+}
+
+/** Small "Full" action: put the bracket back to the whole domain. */
+function addFullButton(brush) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "ghost brush-action";
+  button.textContent = "Full";
+  button.title = "Reset this window to the whole range";
+  button.addEventListener("click", () => {
+    const domain = resolveDomain();
+    brush.onChange(domain.from, domain.until);
+  });
+  brush.headEl.appendChild(button);
 }
 
 function feedBrushes() {
@@ -357,15 +510,15 @@ function feedBrushes() {
   brushes.baseline?.setHistogram(histData);
 }
 
-/** Refresh the histogram over the current extent; single-flighted. */
+/** Refresh the histogram over the domain; single-flighted. */
 async function loadHistogram() {
   const token = ++histToken;
-  const extent = computeExtent();
+  const domain = resolveDomain();
   const selector = composeSelector(state.filters);
   const params = {
     profile_type: state.type,
-    from: iso(extent.from),
-    until: iso(extent.until),
+    from: iso(domain.from),
+    until: iso(domain.until),
     buckets: 120,
   };
   if (selector) params.selector = selector;
@@ -373,20 +526,42 @@ async function loadHistogram() {
     const payload = await api.timeseries(params);
     if (token !== histToken) return;
     histData = payload;
+    histEmpty = (payload.series ?? []).every((series) =>
+      (series.points ?? []).every((point) => !point),
+    );
     feedBrushes();
+    updateHint();
   } catch {
     // The histogram is decoration on top of a working query path; a failure
     // here (token expiry, transient 5xx) must not blank the views.
   }
 }
 
+/** When the chosen range has no data, point at the range that does. */
+function updateHint() {
+  if (histEmpty && dataRange?.earliest && dataRange?.latest) {
+    el.hint.textContent = `No samples here; data spans ${formatClock(
+      dataRange.earliest,
+    )} → ${formatClock(dataRange.latest)}`;
+    el.hintUse.hidden = false;
+  } else {
+    el.hint.textContent = "";
+    el.hintUse.hidden = true;
+  }
+}
+
 async function loadStats() {
   try {
     const stats = await api.stats();
-    earliestNs = stats?.store?.earliest_ns || null;
+    const store = stats?.store ?? {};
+    dataRange =
+      store.earliest_ns && store.latest_ns
+        ? { earliest: store.earliest_ns, latest: store.latest_ns }
+        : null;
   } catch {
-    earliestNs = null;
+    dataRange = null;
   }
+  updateHint();
 }
 
 // ---- label filters -----------------------------------------------------
@@ -395,17 +570,44 @@ async function loadValuesFor(label) {
   const others = composeSelector(
     state.filters.filter((filter) => !filter.raw && filter.label !== label),
   );
-  const key = `${state.tenant}|${label}|${others}`;
+  const domain = resolveDomain();
+  const key = `${state.tenant}|${label}|${others}|${domain.from}|${domain.until}`;
   if (valueCache.has(key)) return valueCache.get(key);
-  const win = resolveWindow();
-  const params = { from: iso(win.from), until: iso(win.until) };
-  if (others) params.selector = others;
-  const values = api
-    .labelValues(label, params)
-    .then((result) => (result.values ?? []).map((row) => row.value))
-    .catch(() => []);
-  valueCache.set(key, values);
-  return values;
+
+  const fetchValues = async (from, until) => {
+    const params = { from: iso(from), until: iso(until) };
+    if (others) params.selector = others;
+    const result = await api.labelValues(label, params);
+    return (result.values ?? []).map((row) => row.value);
+  };
+
+  const promise = (async () => {
+    let values = [];
+    try {
+      values = await fetchValues(domain.from, domain.until);
+    } catch {
+      values = [];
+    }
+    if (values.length) return { values, note: "" };
+    // An empty chosen range must not dead-end the picker: offer what exists
+    // elsewhere, with a note saying so.
+    try {
+      const until = nowNs();
+      const wide = await fetchValues(until - 7 * 86_400e9, until);
+      if (wide.length) {
+        return {
+          values: wide,
+          note: "No values in the selected range — showing the last 7 days",
+        };
+      }
+    } catch {
+      /* fall through with the empty list */
+    }
+    return { values, note: "No values found in the selected range" };
+  })();
+
+  valueCache.set(key, promise);
+  return promise;
 }
 
 function onFiltersChange(filters) {
@@ -443,7 +645,6 @@ async function loadLabels(id, params) {
   }
 }
 
-// The structured filter rows in the bar under the filterbar.
 const filtersComponent = new LabelFilters(el.filters, {
   loadValues: loadValuesFor,
   onChange: onFiltersChange,
@@ -496,9 +697,9 @@ function hideTooltip() {
   if (tooltip) tooltip.hidden = true;
 }
 
-/** Mirror the URL state into the filter controls. */
+/** Mirror the state into the toolbar and the time picker. */
 function syncControls() {
-  el.range.value = state.range;
+  el.range.value = state.mode === "absolute" ? "custom" : state.range;
   el.groupBy.value = state.groupBy;
   if (![...el.profileType.options].some((option) => option.value === state.type)) {
     const option = document.createElement("option");
@@ -515,9 +716,34 @@ function syncControls() {
     el.tenant.appendChild(option);
   }
   el.tenant.value = state.tenant;
+
+  // Time picker: mode, context, absolute inputs.
+  for (const button of el.rangeMode.querySelectorAll("button[data-mode]")) {
+    button.classList.toggle("active", button.dataset.mode === state.mode);
+  }
+  el.absRange.hidden = state.mode !== "absolute";
+  const domain = resolveDomain();
+  el.absFrom.value = toLocalInput(domain.from);
+  el.absUntil.value = toLocalInput(domain.until);
+  if (state.mode === "absolute") {
+    el.rangeContext.textContent = `absolute · ${domainSpanText(domain)}`;
+  } else {
+    const label = RANGES.find(([value]) => value === state.range)?.[1] ?? state.range;
+    el.rangeContext.textContent = `${label.toLowerCase()} · ends now`;
+  }
+
   if (el.filters.dataset.selector !== composeSelector(state.filters)) {
     filtersComponent.setFilters(state.filters);
   }
+}
+
+function domainSpanText(domain) {
+  const span = domain.until - domain.from;
+  const days = span / 86_400e9;
+  if (days >= 1) return `${days.toFixed(days >= 10 ? 0 : 1)} days`;
+  const hours = span / 3.6e12;
+  if (hours >= 1) return `${hours.toFixed(hours >= 10 ? 0 : 1)} h`;
+  return `${Math.round(span / 6e10)} min`;
 }
 
 function renderEmpty(title, hint) {
@@ -535,7 +761,7 @@ function renderEmptyFlamegraph() {
   emptyState(el.main, {
     title: "No samples yet",
     hint: state.tenant
-      ? `Tenant "${state.tenant}" has no data in this range. Start an agent pointed at it, or switch tenant.`
+      ? `Tenant "${state.tenant}" has no data in this range. Widen the range, or switch tenant.`
       : "Start an agent on a machine with eBPF enabled, or point an existing one here.",
     command,
   });
@@ -547,7 +773,7 @@ function renderEmptyFlamegraph() {
 function populateSelects() {
   el.range.innerHTML =
     RANGES.map(([value, label]) => `<option value="${value}">${label}</option>`).join("") +
-    '<option value="custom">Custom (drag the histogram)</option>';
+    '<option value="custom">Custom (absolute range below)</option>';
   el.profileType.innerHTML = '<option value="cpu">cpu</option>';
 }
 
@@ -584,11 +810,7 @@ async function loadTenants() {
 async function loadProfileTypes() {
   try {
     const win = resolveWindow();
-    const params = {
-      from: state.range === "custom" ? iso(win.from) : `now-${state.range}`,
-      until: state.range === "custom" ? iso(win.until) : "now",
-    };
-    const result = await api.profileTypes(params);
+    const result = await api.profileTypes({ from: iso(win.from), until: iso(win.until) });
     const types = (result.profile_types ?? []).map((row) => row.name);
     if (!types.includes("cpu")) types.unshift("cpu");
     el.profileType.innerHTML = types
@@ -619,19 +841,16 @@ async function loadLabelNames() {
 
 function applyFromControls() {
   state.type = el.profileType.value || "cpu";
-  if (el.range.value !== state.range) {
-    state.range = el.range.value;
-    if (state.range === "custom" && !state.fromNs) {
-      // First switch to custom without a dragged window: pin the current one.
+  const picked = el.range.value;
+  if (picked === "custom") {
+    if (state.mode !== "absolute") {
       const win = resolveWindow();
-      state.fromNs = win.from;
-      state.untilNs = win.until;
+      setAbsoluteDomain(win.from, win.until);
+      return;
     }
-    if (state.range !== "custom") {
-      state.fromNs = 0;
-      state.untilNs = 0;
-    }
-    renderTimebar();
+  } else if (picked !== state.range || state.mode !== "relative") {
+    setRelativeRange(picked);
+    return;
   }
   state.groupBy = el.groupBy.value;
   writeHash();
@@ -644,14 +863,10 @@ function switchTenant(tenant) {
   setTenant(tenant);
   state.label = null;
   valueCache.clear();
-  earliestNs = null;
   histData = null;
+  dataRange = null;
   writeHash();
-  // Profile types and label names are per tenant, so reload them too.
-  loadStats().then(() => {
-    renderTimebar();
-    loadHistogram();
-  });
+  loadStats();
   loadProfileTypes().then(() => {
     loadLabelNames();
     renderTimebar();
@@ -670,6 +885,7 @@ function setView(view) {
   component = null;
   hideTooltip();
   el.main.innerHTML = "";
+  if (view === "compare") prepareCompare();
   renderTimebar();
   syncControls();
   writeHash();
@@ -682,15 +898,25 @@ function setupAutoRefresh() {
   clearInterval(autoTimer);
   if (state.auto) {
     autoTimer = setInterval(() => {
-      // A relative range tracks "now"; a custom window is pinned in place.
-      if (state.range !== "custom") {
-        const win = resolveWindow();
-        brushes.main?.setSelection(win.from, win.until);
-        if (state.view === "compare") {
-          const baseline = resolveBaseline();
-          brushes.baseline?.setSelection(baseline.from, baseline.until);
+      // A relative domain follows the clock; the bracket moves with it so the
+      // same sub-interval stays selected. An absolute domain is pinned.
+      if (state.mode === "relative") {
+        const domain = resolveDomain();
+        const shift = lastDomain ? domain.until - lastDomain.until : 0;
+        if (shift > 0) {
+          if (state.fromNs) {
+            state.fromNs += shift;
+            state.untilNs += shift;
+          }
+          if (state.baseFromNs) {
+            state.baseFromNs += shift;
+            state.baseUntilNs += shift;
+          }
         }
+        lastDomain = domain;
       }
+      renderTimebar();
+      syncControls();
       load();
       loadHistogram();
     }, 30_000);
@@ -708,6 +934,7 @@ function boot() {
   }
   populateSelects();
   parseHash();
+  lastDomain = resolveDomain();
   syncControls();
   renderTimebar();
   el.auto.checked = state.auto;
@@ -723,6 +950,7 @@ function boot() {
   });
   window.addEventListener("hashchange", () => {
     parseHash();
+    lastDomain = resolveDomain();
     setView(state.view);
   });
 
@@ -741,6 +969,42 @@ function boot() {
   });
   el.groupBy.addEventListener("change", applyFromControls);
   el.tenant.addEventListener("change", () => switchTenant(el.tenant.value));
+
+  el.rangeMode.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-mode]");
+    if (!button || button.dataset.mode === state.mode) return;
+    if (button.dataset.mode === "relative") {
+      setRelativeRange(state.range === "custom" ? "1h" : state.range);
+    } else {
+      // Switching to absolute keeps the range you are looking at, so the
+      // picker opens with something meaningful in it.
+      const win = resolveWindow();
+      setAbsoluteDomain(win.from, win.until);
+    }
+  });
+  el.absApply.addEventListener("click", () => {
+    const from = fromLocalInput(el.absFrom.value);
+    const until = fromLocalInput(el.absUntil.value);
+    if (from === null || until === null) {
+      setBanner("Pick both ends of the range.");
+      return;
+    }
+    setAbsoluteDomain(from, until);
+  });
+  el.absNow.addEventListener("click", () => {
+    const from = fromLocalInput(el.absFrom.value) ?? resolveDomain().from;
+    setAbsoluteDomain(from, nowNs());
+  });
+  for (const input of [el.absFrom, el.absUntil]) {
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") el.absApply.click();
+    });
+  }
+  el.hintUse.addEventListener("click", () => {
+    if (!dataRange) return;
+    setAbsoluteDomain(dataRange.earliest, dataRange.latest);
+  });
+
   window.addEventListener("keydown", (event) => {
     if (event.target.matches("input, select, textarea")) return;
     if (event.key === "r" || event.key === "R") {
@@ -759,11 +1023,7 @@ function boot() {
     });
 
   loadTenants().then(() => {
-    // The extent needs the oldest retained sample, so stats come first.
-    loadStats().then(() => {
-      renderTimebar();
-      loadHistogram();
-    });
+    loadStats();
     loadProfileTypes().then(() => {
       el.profileType.value = state.type;
       loadLabelNames();
@@ -780,6 +1040,8 @@ window.lidlesseye = {
   reload: load,
   setView,
   switchTenant,
+  setAbsoluteDomain,
+  setRelativeRange,
 };
 
 boot();

@@ -19,12 +19,14 @@ in a URL, and what to expect from the rendering. The endpoint shapes are in
 | `/?tenant=acme` | open as tenant `acme` (also written to `localStorage`) |
 | `/#/compare` | open the compare tab |
 | `/#/flamegraph?type=off_cpu&range=6h` | last six hours of off-CPU |
+| `/#/flamegraph?range=6h&wfrom=…&wuntil=…` | twenty minutes inside the last six hours |
 | `/#/flamegraph?selector=pod%3D%22cart-1%22` | one pod, selector URL-encoded |
-| `/#/compare?from=…&until=…&bfrom=…&buntil=…` | two absolute windows (ns) |
+| `/#/compare?from=…&until=…&bwfrom=…&bwuntil=…` | two absolute windows (ns) |
 
-`range` is a relative preset (`5m`, `15m`, `1h`, `6h`, `24h`, `7d`); `from` /
-`until` are absolute nanoseconds and take precedence. The full table is under
-[URL reference](#url-reference).
+`range` is a relative range (`5m`, `15m`, `1h`, `6h`, `24h`, `7d`); `from` /
+`until` are an absolute range in nanoseconds and take precedence. `wfrom` /
+`wuntil` narrow the window inside that range and may be omitted when the window
+is the whole range. The full table is under [URL reference](#url-reference).
 
 If the server was started with `--auth-token`, the dashboard asks for a bearer
 token once:
@@ -42,7 +44,7 @@ there is nothing to choose.
 ┌ top bar ─ tabs · tenant · version · refresh ──────────────────────────┐
 ├ filter bar ─ profile · group by · range preset · auto · apply ────────┤
 ├ filter rows ─ [+ Filter]  label = value  … ───────────────────────────┤
-├ time bar ───── histogram of sample density, draggable window ────────┤
+├ time bar ─ mode · date pickers · histogram of the chosen range ───────┤
 └ main ─────── the selected view ───────────────────────────────────────┘
 ```
 
@@ -51,28 +53,43 @@ or the profile type re-queries whatever view is open.
 
 ## Time range
 
-The **Range** preset is relative: `Last hour` means *the hour before now*, so
-with **Auto** ticked (a 30-second reload) the view keeps tracking the present.
+The time selector works in two steps, because the two questions are different:
+*which stretch of time am I looking at*, and *which part of it do I want to
+analyse*.
 
-The **histogram** below the filter bar shows sample density over the tenant's
-whole retained extent — oldest sample to now. Its window is the query range.
-Once you drag it, the range becomes absolute: the *Custom* entry appears in the
-preset list, the exact bounds go into the URL, and auto-refresh reloads that
-same window instead of following the clock.
+1. **Choose the range first** — the segmented control **Relative | Absolute**.
+   - *Relative* keeps the preset from the toolbar's **Range** dropdown: `Last
+     hour` means the hour before now, and **Auto** (a 30-second reload) makes it
+     follow the clock.
+   - *Absolute* opens a `From → To` pair of date-time pickers (`Apply`, or
+     `Enter` in either field). `Now` moves the end to the present.
+2. **Then slide inside it** — the histogram spans exactly the range you chose,
+   and the bracket picks the query window inside that range.
 
 | Gesture | Result |
 | --- | --- |
-| drag the middle of the window | move it, keeping the span |
+| drag inside a narrowed bracket | move it, keeping the span |
 | drag the left or right edge | resize that edge |
-| drag across empty histogram | draw a new window |
-| click outside the window | jump there, keeping the span |
+| drag across the histogram | draw a new window |
+| click inside a narrowed bracket | jump there, keeping the span |
+| **Full** (top right of a bracket) | back to the whole chosen range |
 
-The minimum span is 1/300 of the extent (at least one second). The label above
-the canvas reads `14:03:10 → 14:43:10 · 40m0.0s` so the window is legible
-without hovering.
+While the bracket covers the whole range there is nothing to move, so dragging
+inside starts a new selection — zoom in, then pan. The minimum span is 1/300 of
+the range (at least one second).
 
+Two labels keep this legible: the bracket reads `14:03:10 → 14:43:10 · 40m0.0s`
+(what you are looking at) and next to it `of 12:25:00–14:43:10` (the range it
+may slide in). The window is what every view queries; the range is what the
+picker says.
+
+If the chosen range has no samples, the header says so and offers **Use data
+range**, which jumps the picker to the oldest and newest sample the tenant has.
 The histogram is decoration on top of the query path: if it cannot load
 (expired token, a 5xx), the views keep working.
+
+With **Auto** on and a relative range, the bracket moves with the range, so the
+same sub-interval stays selected as time passes. An absolute range is pinned.
 
 ## Filtering by label
 
@@ -166,12 +183,18 @@ The hash carries the view and everything that shapes the query:
 | --- | --- | --- |
 | view | `#/flamegraph` | `flamegraph`, `compare`, `top`, `timeseries`, `labels`, `overview` |
 | `type` | `off_cpu` | profile type, including the virtual `wall` |
-| `range` | `1h` | relative preset (mutually exclusive with `from`/`until`) |
-| `from`, `until` | `1794486354991000000` | absolute window, nanoseconds |
-| `bfrom`, `buntil` | `1794482754991000000` | compare view's baseline window |
+| `range` | `1h` | relative range: the preset the bracket may slide in |
+| `from`, `until` | `1794486354991000000` | absolute range, nanoseconds (replaces `range`) |
+| `wfrom`, `wuntil` | `1794482754991000000` | the window inside the range; omitted when it is the whole range |
+| `bwfrom`, `bwuntil` | `1794482754991000000` | compare view's baseline window |
 | `selector` | `pod="cart-1"` | label selector (URL-encoded) |
 | `group_by` | `pod` | split frames / series by this label |
 | `tenant` | `acme` | tenant to read |
+
+So `#/flamegraph?range=6h&wfrom=…&wuntil=…` reads "inside the last six hours,
+this twenty minutes", and `#/flamegraph?from=…&until=…` reads "this exact
+range, all of it". A link with only `from`/`until` therefore still means what it
+used to: the range *is* the window.
 
 `?tenant=` in the query string also works, which is the form a shared link
 usually takes.
@@ -247,12 +270,19 @@ wait for a still frame instead of sleeping.
 
 ## Limits and known behaviour
 
-- The histogram spans the tenant's retained data, so a five-minute selection
-  inside a seven-day retention is a thin sliver — the handles still work, but
-  the default presets are the easier way to get there.
+- The histogram spans only the range you chose. A range with no samples shows
+  an empty histogram and the **Use data range** hint rather than silently
+  widening itself.
 - Compare ignores **Group by**; the diff tree is the same shape as a flamegraph
   without synthetic frames.
-- Auto-refresh is 30 seconds and only reloads; it never moves a custom window.
-- Queries are not cached: every change (filters, window, profile type, view)
-  hits the API. That is intentional — the data is live and the query path is
-  the thing being inspected.
+- Entering compare with the whole range selected splits it in half (first half
+  baseline, second half comparison) — a diff of a range against itself is not
+  useful. Narrow the bracket first if you want a different split.
+- Label filter values are looked up in the chosen range; if it holds no
+  samples, the picker falls back to the last seven days and says so in the
+  tooltip instead of showing an empty list.
+- Auto-refresh is 30 seconds and only reloads. With a relative range it also
+  moves the window along, so the same sub-interval stays selected.
+- Queries are not cached: every change (filters, window, range, profile type,
+  view) hits the API. That is intentional — the data is live and the query path
+  is the thing being inspected.

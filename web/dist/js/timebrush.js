@@ -1,13 +1,14 @@
 // Histogram time-range selector.
 //
-// A small canvas showing sample density over the tenant's whole data extent,
-// with a draggable window on top: drag the middle to move, the edges to
-// resize, or drag across empty space to draw a new window. The selection is
-// absolute time, so what the flamegraph below shows is exactly what is
-// bracketed here.
+// A small canvas showing sample density over the **domain** — the range chosen
+// with the time picker (a relative preset or an absolute from/until). Inside
+// that domain a draggable window picks the analysis range: drag the middle to
+// move, the edges to resize, or empty space to draw a new window. When the
+// window still covers the whole domain there is nothing to move, so a drag
+// inside starts a new selection instead (zoom, then pan).
 //
 // The component never fetches: app.js feeds it the histogram (from
-// /api/v1/timeseries over the extent) and the selection, and reacts to
+// /api/v1/timeseries over the domain) and the selection, and reacts to
 // `onChange` — fired once per gesture, on pointer-up, not during the drag.
 
 import { formatClock, formatDuration } from "./format.js";
@@ -16,7 +17,7 @@ const HEIGHT = 68; // css px: bars + axis labels + head room
 const BAR_TOP = 8;
 const BAR_BOTTOM = 48;
 const HANDLE_PX = 8; // grabable width of each edge, in css px
-const MIN_SPAN_FRACTION = 1 / 300; // of the extent; below this resizing stops
+const MIN_SPAN_FRACTION = 1 / 300; // of the domain; below this resizing stops
 
 export class TimeBrush {
   /**
@@ -27,7 +28,7 @@ export class TimeBrush {
     this.host = host;
     this.label = label ?? "Time range";
     this.onChange = onChange ?? (() => {});
-    this.extent = null; // {from, until} in ns
+    this.domain = null; // {from, until} in ns
     this.histogram = null; // {from_ns, until_ns, step_ns, totals: number[]}
     this.sel = null; // {from, until} in ns
     this.drag = null; // active gesture: {mode, anchorNs, grabNs, startSel}
@@ -37,20 +38,22 @@ export class TimeBrush {
         <div class="brush-head">
           <span class="brush-label">${escape(this.label)}</span>
           <span class="brush-range mono" data-role="range">–</span>
+          <span class="brush-domain faint mono" data-role="domain"></span>
         </div>
         <canvas class="time-brush" height="${HEIGHT}"></canvas>
       </div>
     `;
+    this.headEl = host.querySelector(".brush-head");
     this.canvas = host.querySelector("canvas.time-brush");
     this.rangeEl = host.querySelector('[data-role="range"]');
+    this.domainEl = host.querySelector('[data-role="domain"]');
     this.ctx = this.canvas.getContext("2d");
 
     this.canvas.addEventListener("pointerdown", (event) => this.onPointerDown(event));
     this.canvas.addEventListener("pointermove", (event) => this.onPointerMove(event));
     this.canvas.addEventListener("pointerup", (event) => this.onPointerUp(event));
-    this.canvas.addEventListener("pointerleave", (event) => {
+    this.canvas.addEventListener("pointerleave", () => {
       if (!this.drag) this.canvas.style.cursor = "";
-      void event;
     });
 
     this.resizeObserver = new ResizeObserver(() => this.draw());
@@ -62,9 +65,9 @@ export class TimeBrush {
     this.host.innerHTML = "";
   }
 
-  /** Whole timeline shown; the selection is clamped into it. */
-  setExtent(from, until) {
-    this.extent = { from, until };
+  /** The range the bracket may slide in; also what the histogram spans. */
+  setDomain(from, until) {
+    this.domain = { from, until };
     this.draw();
   }
 
@@ -75,10 +78,11 @@ export class TimeBrush {
       this.draw();
       return;
     }
-    const totals = (payload.series ?? []).reduce((acc, series) => {
-      for (let i = 0; i < acc.length; i += 1) acc[i] += series.points?.[i] ?? 0;
-      return acc;
-    }, new Array(payload.series?.[0]?.points?.length ?? 0).fill(0));
+    const buckets = payload.series?.[0]?.points?.length ?? 0;
+    const totals = new Array(buckets).fill(0);
+    for (const series of payload.series ?? []) {
+      for (let i = 0; i < buckets; i += 1) totals[i] += series.points?.[i] ?? 0;
+    }
     this.histogram = {
       from_ns: payload.from_ns,
       until_ns: payload.until_ns,
@@ -88,7 +92,7 @@ export class TimeBrush {
     this.draw();
   }
 
-  /** External selection update (preset picked, hash parsed, auto-refresh). */
+  /** External selection update (picker, hash, auto-refresh). */
   setSelection(from, until) {
     this.sel = { from, until };
     this.draw();
@@ -105,18 +109,18 @@ export class TimeBrush {
   }
 
   xFor(ns) {
-    const { from, until } = this.extent;
+    const { from, until } = this.domain;
     return ((ns - from) / (until - from)) * this.plotWidth();
   }
 
   nsFor(px) {
-    const { from, until } = this.extent;
+    const { from, until } = this.domain;
     return from + (px / this.plotWidth()) * (until - from);
   }
 
   minSpan() {
-    if (!this.extent) return 1e9;
-    return Math.max(1e9, (this.extent.until - this.extent.from) * MIN_SPAN_FRACTION);
+    if (!this.domain) return 1e9;
+    return Math.max(1e9, (this.domain.until - this.domain.from) * MIN_SPAN_FRACTION);
   }
 
   edgePx() {
@@ -126,10 +130,16 @@ export class TimeBrush {
     };
   }
 
+  /** Is the window still the whole domain? Then a drag must select, not move. */
+  coversDomain() {
+    if (!this.domain || !this.sel) return true;
+    return this.sel.until - this.sel.from >= (this.domain.until - this.domain.from) * 0.999;
+  }
+
   // ---- interaction ------------------------------------------------------
 
   onPointerDown(event) {
-    if (!this.extent || !this.sel) return;
+    if (!this.domain || !this.sel) return;
     const rect = this.canvas.getBoundingClientRect();
     const px = event.clientX - rect.left;
     const { left, right } = this.edgePx();
@@ -137,7 +147,7 @@ export class TimeBrush {
     let mode;
     if (Math.abs(px - left) <= HANDLE_PX) mode = "resizeL";
     else if (Math.abs(px - right) <= HANDLE_PX) mode = "resizeR";
-    else if (px > left && px < right) mode = "move";
+    else if (px > left && px < right && !this.coversDomain()) mode = "move";
     else mode = "create";
     this.drag = {
       mode,
@@ -154,16 +164,15 @@ export class TimeBrush {
     const rect = this.canvas.getBoundingClientRect();
     const px = event.clientX - rect.left;
     if (!this.drag) {
-      if (!this.extent || !this.sel) return;
+      if (!this.domain || !this.sel) return;
       const { left, right } = this.edgePx();
-      const near =
-        Math.abs(px - left) <= HANDLE_PX || Math.abs(px - right) <= HANDLE_PX;
-      const inside = px > left && px < right;
+      const near = Math.abs(px - left) <= HANDLE_PX || Math.abs(px - right) <= HANDLE_PX;
+      const inside = px > left && px < right && !this.coversDomain();
       this.canvas.style.cursor = near ? "ew-resize" : inside ? "grab" : "crosshair";
       return;
     }
     if (Math.abs(px - this.xFor(this.drag.anchorNs)) > 3) this.drag.moved = true;
-    const ns = clamp(this.nsFor(px), this.extent.from, this.extent.until);
+    const ns = clamp(this.nsFor(px), this.domain.from, this.domain.until);
     const start = this.drag.startSel;
     const min = this.minSpan();
 
@@ -171,17 +180,17 @@ export class TimeBrush {
       const span = start.until - start.from;
       const shift = ns - this.drag.grabNs;
       let from = start.from + shift;
-      from = clamp(from, this.extent.from, this.extent.until - span);
+      from = clamp(from, this.domain.from, this.domain.until - span);
       this.sel = { from, until: from + span };
     } else if (this.drag.mode === "resizeL") {
       this.sel = {
-        from: clamp(Math.min(ns, start.until - min), this.extent.from, start.until - min),
+        from: clamp(Math.min(ns, start.until - min), this.domain.from, start.until - min),
         until: start.until,
       };
     } else if (this.drag.mode === "resizeR") {
       this.sel = {
         from: start.from,
-        until: clamp(Math.max(ns, start.from + min), start.from + min, this.extent.until),
+        until: clamp(Math.max(ns, start.from + min), start.from + min, this.domain.until),
       };
     } else {
       // create: bracket between the anchor and the pointer
@@ -193,8 +202,8 @@ export class TimeBrush {
         until = mid + min / 2;
       }
       this.sel = {
-        from: clamp(from, this.extent.from, this.extent.until - min),
-        until: clamp(until, this.extent.from + min, this.extent.until),
+        from: clamp(from, this.domain.from, this.domain.until - min),
+        until: clamp(until, this.domain.from + min, this.domain.until),
       };
     }
     this.draw();
@@ -206,15 +215,15 @@ export class TimeBrush {
     this.drag = null;
     delete this.canvas.dataset.drag;
     this.canvas.style.cursor = "";
-    // A plain click outside the window is a jump, not a hairline selection:
-    // keep the current span, center it on the click.
-    if (drag.mode === "create" && !drag.moved && this.sel) {
+    // A plain click inside a narrowed window jumps, keeping the span; a click
+    // while the window covers everything has nowhere to go, so it is ignored.
+    if (drag.mode === "create" && !drag.moved && !this.coversDomain()) {
       const rect = this.canvas.getBoundingClientRect();
       const px = event.clientX - rect.left;
-      const ns = clamp(this.nsFor(px), this.extent.from, this.extent.until);
+      const ns = clamp(this.nsFor(px), this.domain.from, this.domain.until);
       const span = drag.startSel.until - drag.startSel.from;
       let from = ns - span / 2;
-      from = clamp(from, this.extent.from, this.extent.until - span);
+      from = clamp(from, this.domain.from, this.domain.until - span);
       this.sel = { from, until: from + span };
     }
     this.draw();
@@ -236,6 +245,11 @@ export class TimeBrush {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, HEIGHT);
 
+    if (this.domain) {
+      this.domainEl.textContent = `of ${formatClock(this.domain.from)}–${formatClock(
+        this.domain.until,
+      )}`;
+    }
     if (this.sel) {
       this.canvas.dataset.from = String(this.sel.from);
       this.canvas.dataset.until = String(this.sel.until);
@@ -245,7 +259,7 @@ export class TimeBrush {
     } else {
       this.rangeEl.textContent = "–";
     }
-    if (!this.extent) return;
+    if (!this.domain) return;
 
     const { left, right } = this.sel ? this.edgePx() : { left: -1, right: -1 };
     const barBottom = BAR_BOTTOM;
@@ -300,19 +314,15 @@ export class TimeBrush {
       ctx.fillRect(x - 0.5, barBottom - 5, 1, 10);
     }
 
-    // Axis: extent ends plus a mid tick, so the window has landmarks.
+    // Axis: domain ends plus a mid tick, so the window has landmarks.
     ctx.fillStyle = "#6b7585";
     ctx.font = "10px system-ui, sans-serif";
     ctx.textAlign = "left";
-    ctx.fillText(formatClock(this.extent.from), 2, HEIGHT - 6);
+    ctx.fillText(formatClock(this.domain.from), 2, HEIGHT - 6);
     ctx.textAlign = "right";
-    ctx.fillText(formatClock(this.extent.until), width - 2, HEIGHT - 6);
+    ctx.fillText(formatClock(this.domain.until), width - 2, HEIGHT - 6);
     ctx.textAlign = "center";
-    ctx.fillText(
-      formatClock((this.extent.from + this.extent.until) / 2),
-      width / 2,
-      HEIGHT - 6,
-    );
+    ctx.fillText(formatClock((this.domain.from + this.domain.until) / 2), width / 2, HEIGHT - 6);
     ctx.textAlign = "left";
   }
 }
