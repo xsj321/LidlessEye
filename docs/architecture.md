@@ -143,8 +143,9 @@ The trade-offs are real:
 - **One process per database file.** DuckDB takes a file lock, so two
   `lidlesseye serve` processes cannot share a data directory. The old format
   allowed that, at the price of two writers racing on the same index.
-- **The binary is larger.** DuckDB is statically linked
-  (`features = ["bundled"]`), which needs `cmake` at build time. The
+- **The binary is larger, and the first build is slow.** DuckDB is statically
+  linked (`features = ["bundled"]`), so the `cc` crate compiles its C++ sources
+  into the binary once; that needs nothing more than a C++ compiler. The
   alternative — linking the prebuilt `libduckdb.so` — produces a binary that
   fails to start unless the loader path is arranged for it, which is not
   something a `cargo install` user should have to discover.

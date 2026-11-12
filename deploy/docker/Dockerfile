@@ -1,9 +1,10 @@
 # Build stage.
 #
 # The eBPF object is compiled here, so the builder needs clang/llvm even though
-# the final image only runs a static Rust binary. `cmake` is for the bundled
-# DuckDB 2.0 build (`libduckdb-sys` compiles its C++ sources into the binary),
-# which is why the runtime image needs no `libduckdb.so`.
+# the final image only runs a static Rust binary. The Rust image already ships
+# g++, which is what the statically linked DuckDB 2.0 build needs; no cmake is
+# involved (that is only for the optional `bundled-cmake` feature). The runtime
+# image needs no `libduckdb.so`.
 FROM rust:1.98-bookworm AS builder
 
 RUN apt-get update \
@@ -13,7 +14,6 @@ RUN apt-get update \
         libelf-dev \
         libzstd-dev \
         pkg-config \
-        cmake \
         ca-certificates \
         git \
     && rm -rf /var/lib/apt/lists/*

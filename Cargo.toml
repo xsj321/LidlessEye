@@ -37,7 +37,8 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 # shared object: a binary produced with the default features starts with
 # "error while loading shared libraries: libduckdb.so" unless the loader path
 # is arranged for it, which is not something a `cargo install` user should
-# have to know. The cost is a one-off C++ compile (needs cmake).
+# have to know. The cost is a one-off C++ compile (needs a C++ compiler such
+# as g++; only the optional `bundled-cmake` path needs cmake).
 duckdb = { version = "1.20000.1", default-features = false, features = ["bundled"] }
 flate2 = "1.1.11"
 futures = "0.3.34"
