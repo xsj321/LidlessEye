@@ -260,3 +260,24 @@ These numbers were measured with the shipped configuration — DuckDB 2.0.0
 linked against its prebuilt shared library. Treat the figures as an
 order-of-magnitude guide for a single tenant on a laptop-class machine, not as
 a production SLO — the host was a Windows Docker Desktop VM.
+
+## Dashboard
+
+The UI is part of the server, not a separate app: `lidlesseye-server` embeds
+`web/dist` with `rust-embed`, so `cargo build` produces a binary that serves the
+HTML, the ES modules and the API from one port. There is no bundler, no
+`node_modules` in the build path, and no second container to deploy.
+
+The design follows from that constraint. Files are plain ES modules, the
+flamegraph and charts are drawn on a single canvas per view (the data is a
+fixed-size array; a chart library would add weight and a second animation
+model), and all state lives in one object in `app.js` from which query
+parameters are derived as a pure function. That is what makes a URL reproduce a
+view exactly, and what lets the shell swap views without a router.
+
+The histogram behind the time-range selector is `GET /api/v1/timeseries` over
+the tenant's extent — the same endpoint the time-series view uses, at 120
+buckets instead of 90 — summed across series. It is fetched separately from the
+view's query so a slow or failed histogram never blocks the flamegraph.
+
+See [ui.md](ui.md) for the controls and the URL model.

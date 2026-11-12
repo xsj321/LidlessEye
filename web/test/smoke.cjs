@@ -429,6 +429,18 @@ async function main() {
   check((await page.url()).includes("tenant=zeta"), "the tenant is reflected in the URL", page.url());
   await shot(page, "7-zeta");
 
+  // A tenant in the query string is the form people paste into chat; it has
+  // to select that tenant even when it is not the first one.
+  const zetaPage = await context.newPage();
+  await zetaPage.goto(`${BASE}/?tenant=zeta#/top`, { waitUntil: "load" });
+  await zetaPage.waitForSelector(".tbl-wrap table tbody tr", { timeout: 20000 });
+  check(
+    (await zetaPage.locator("#tenant").inputValue()) === "zeta",
+    "?tenant= in the query string selects that tenant",
+    await zetaPage.locator("#tenant").inputValue(),
+  );
+  await zetaPage.close();
+
   // A selector fragment the row editor cannot round-trip must be kept
   // verbatim, not silently dropped: a deep link is someone's filter. The
   // server accepts unquoted values, so `service_name=checkout` is a valid

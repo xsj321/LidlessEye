@@ -698,6 +698,14 @@ function setupAutoRefresh() {
 }
 
 function boot() {
+  // `?tenant=acme` is the link form people paste around; the hash carries it
+  // too, but the query string is what a bookmark or a chat message tends to
+  // have. Read it before the hash so an explicit hash param still wins.
+  const queryTenant = new URLSearchParams(location.search).get("tenant");
+  if (queryTenant) {
+    state.tenant = queryTenant;
+    setTenant(queryTenant);
+  }
   populateSelects();
   parseHash();
   syncControls();

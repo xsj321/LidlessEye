@@ -207,6 +207,9 @@ curl -s 'http://localhost:4040/api/v1/flamegraph?profile_type=wall&from=now-15m'
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
+| `profile_type` / `type` | `cpu` | profile type, or `wall` |
+| `from`, `until` | last hour | time range |
+| `selector` | — | label selector |
 | `limit` | `50` | rows, clamped to 1…1 000 |
 | `group_by` | — | split the table per label value |
 
@@ -235,6 +238,9 @@ every stack containing it. `total_value` at the top level is the denominator for
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
+| `profile_type` / `type` | `cpu` | profile type, or `wall` |
+| `from`, `until` | last hour | time range |
+| `selector` | — | label selector |
 | `buckets` | `60` | number of buckets (clamped to 1…1 000) |
 | `step` | — | explicit bucket width (`10s`, `1m`); overrides `buckets` |
 | `group_by` | — | return one series per value of this label |
@@ -283,6 +289,11 @@ Known `(service, profile_type, labels)` combinations in the range:
 ```
 
 ## `GET /api/v1/label/{name}/values`
+
+Values of one label in the range, with the total value each carries. Accepts
+`from`, `until` and `selector` like the query endpoints, so a value list can be
+narrowed by the other filters (`selector=node="worker-3"` → only pods that ran
+there).
 
 ```json
 { "label": "env", "values": [ { "value": "prod", "total": 123456 } ] }
@@ -344,7 +355,8 @@ curl -s 'http://localhost:4040/api/v1/diff?from=now-1h&baseline_from=now-2h&base
 
 ## `GET /api/v1/label-names`
 
-`/api/v1/labels` is an alias. Keys seen in the range:
+`/api/v1/labels` is an alias. Keys seen in the range (`from` / `until` /
+`selector` apply here too, which is how the dashboard fills its label picker):
 
 ```json
 { "label_names": ["service_name", "env", "pod"], "labels": ["service_name", "env", "pod"] }

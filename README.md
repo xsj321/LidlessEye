@@ -32,6 +32,7 @@ choices:
 The window is picked on a histogram of sample density: drag the bracket to
 select, drag its edges to resize, or click elsewhere to jump. Label filters are
 structured rows above it, and the comparison view gets two of these brackets.
+Every control is described in [docs/ui.md](docs/ui.md).
 
 ![Time range and label filters](docs/images/time-range.png)
 
@@ -240,10 +241,22 @@ lidlesseye fsck     # verify database integrity and cross-table references
 lidlesseye info     # build and platform information
 ```
 
-`serve` and `collect` accept `--frequency`, `--flush`, `--label k=v`,
-`--service-name`, `--no-cpu`, `--no-offcpu`. `ingest` accepts `--format
-json|pprof|folded` and `--tenant`; `query` accepts `--tenant`, `--group-by`,
-`--top` / `--tree`.
+`serve` takes the storage flags (`--retention`, `--max-disk`,
+`--duckdb-threads`) and `--agent` to start the collector in-process; with
+`--agent` it also accepts the collector flags below.
+
+`collect` accepts `--frequency`, `--flush`, `--label k=v`, `--service-name`,
+`--no-cpu`, `--no-offcpu`, `--no-k8s-labels` (drop the `k8s_*` labels derived
+from each cgroup), plus `--server <url>`, `--tenant`, `--tenant-header`
+(default `X-Tenant-Id`, the alias the server always accepts), `--auth-token`
+and `--duration` (stop after this long; used by the tests).
+
+`ingest` accepts `--format json|pprof|folded` and `--tenant`; `query` accepts
+`--tenant`, `--group-by`, `--top` / `--tree`.
+
+Collector placement: the `node` label defaults to the machine hostname, but in a
+pod that is the pod name and changes on every rollout. Set `LIDLESSEYE_NODE_NAME`
+(the Helm chart passes `spec.nodeName`) so the label stays stable.
 
 Multi-tenancy flags on `serve`:
 
@@ -263,6 +276,8 @@ out of the pod spec.
 
 ## How it works
 
+- [Dashboard](docs/ui.md) — every control, the histogram brush gestures, deep
+  links and the URL model, and how the front end is built.
 - [Architecture and storage](docs/architecture.md) — the DuckDB schema, why it
   replaced a hand-written format, sampling model, query pipeline, concurrency.
 - [HTTP API](docs/api.md) — every endpoint, parameter and payload.
