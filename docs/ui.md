@@ -255,6 +255,11 @@ lidlesseye serve --listen 127.0.0.1:4040   # any agent with data
 cd web && npm run dev                      # http://127.0.0.1:3000, hot reload
 ```
 
+Node 20.19+ is required: the PostCSS pipeline loads ESM-only packages and older
+Node cannot `require()` them. `make build`/`release`/`test` run `make ui` first,
+which is why a dashboard change is picked up by the next Rust build without an
+extra step; `make ui` on its own only rebuilds the export.
+
 The dev server proxies `/api`, `/ingest` and `/metrics` to
 `LIDLESSEYE_DEV_SERVER` (default `http://127.0.0.1:4040`): `output: "export"`
 and `rewrites` cannot coexist, so development drops the export and `next build`
@@ -263,12 +268,10 @@ sync into `web/dist`) is only needed before `cargo build` or a release.
 
 `web/test/smoke.cjs` is the end-to-end check; `scripts/ui-smoke.sh` starts a
 server, seeds two tenants and drives the real dashboard in Chromium.
-| `format.js` | value/time/byte formatting, escaping |
-
-All state lives in one `state` object in `app.js`. Each view is a class with
-`setData(payload)` and `destroy()`; the shell mounts at most one at a time. A
-query is a pure function of `state` (`queryParams()` / `diffParams()`), which is
-why a URL reproduces a view exactly.
+State lives in one store (`lib/store.ts`) read through `useSyncExternalStore`.
+`queryParams()` / `diffParams()` derive the request from it as pure functions,
+which is why a URL reproduces a view exactly; the shell swaps views by changing
+one field, and each view is a component that draws from the store's payload.
 
 The histograms are filled from `/api/v1/timeseries` over the extent, bucketed
 120 ways, and summed across series; the window itself is client state until it
@@ -277,8 +280,9 @@ lands in the URL.
 ### Testing it
 
 ```bash
-./scripts/ui-smoke.sh        # builds the debug binary, seeds two tenants,
-                             # drives Chromium: 46 checks, screenshots in .tmp/ui
+./scripts/ui-smoke.sh        # builds the dashboard if needed, then the debug
+                             # binary, seeds two tenants and drives Chromium:
+                             # 51 checks, screenshots in .tmp/ui
 ./scripts/demo.sh            # throwaway instance on :4040 with 45 minutes of
                              # data in two tenants — the quickest way to see the
                              # histogram do something

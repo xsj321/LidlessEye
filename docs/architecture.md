@@ -307,15 +307,15 @@ export built by `make ui` and embedded by `lidlesseye-server` with `rust-embed`.
 A release is still one executable serving the HTML, the JS chunks and the API
 from one port — no second container and no Node runtime in production.
 
-The build is two steps, and only the first needs Node:
+The ordering is the Makefile's job, not the developer's: `make build`,
+`make release` and `make test` all depend on the phony `ui` target, which runs
+`next build` and `sync` before `cargo` starts. The dependency is deliberately not
+`web/dist/index.html`: an export left behind by an interrupted build, a branch
+switch or a restored directory still has a fresh mtime, and trusting it would
+ship an old dashboard. Only `npm install` is gated on the lockfile (through the
+marker npm writes into `node_modules`), so a no-op rebuild costs one `next build`.
 
-```
-cd web && npm run build   # next build -> web/out
-cd web && npm run sync    # web/out -> web/dist (what rust-embed reads)
-```
-
-`make ui` runs both, and `make build`/`make test` depend on the export so they
-build it first. `web/dist` is not committed: it is a build artefact, and keeping
+`web/dist` is not committed: it is a build artefact, and keeping
 it out of git removes a megabyte of generated chunks from every UI diff. A
 `build.rs` in `lidlesseye-server` creates the directory when it is missing, so a
 checkout without Node still compiles — the binary then answers 503

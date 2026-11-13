@@ -90,17 +90,17 @@ comparison view gets two of these brackets. Every control is described in
 ### One binary, one host
 
 ```bash
-make ui                          # dashboard export, embedded at compile time (Node 20+)
-cargo build --release            # needs clang for eBPF; DuckDB's library is fetched once
+make release                     # dashboard export first, then the workspace (Node 20.19+)
 sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 # dashboard on http://localhost:4040
 ```
 
 Prerequisites: Linux ≥ 5.5 with BTF (`/sys/kernel/btf/vmlinux`, used to
 resolve the collector's CO-RE relocations), `clang`, and root (or `CAP_BPF` +
-`CAP_PERFMON` + `CAP_SYS_ADMIN`). Node 20+ is needed once for `make ui`: the
-dashboard export is embedded into the binary and is not committed, so a plain
-`cargo build` without it produces a working agent whose `/` answers
+`CAP_PERFMON` + `CAP_SYS_ADMIN`). Node 20.19+ is needed too: `make build`,
+`make release` and `make test` always run the dashboard export before `cargo`,
+because the export is embedded at compile time and is not committed. A bare
+`cargo build` skips it and produces a working agent whose `/` answers
 `UI is not embedded in this build`. The first build downloads the prebuilt
 `libduckdb.so` matching `duckdb = "1.20000.1"`, so it needs network access once;
 set `DUCKDB_LIB_DIR` to a directory holding a vendored copy for offline builds.
