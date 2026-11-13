@@ -1,3 +1,18 @@
+# Dashboard stage.
+#
+# The UI is embedded into the binary at compile time and is not committed, so it
+# has to exist before `cargo build` runs. Building it in its own stage keeps
+# Node out of the Rust image and lets the npm layer cache independently of the
+# Rust sources; `sync` writes the static export into `web/dist`, which is what
+# rust-embed reads.
+FROM node:22-bookworm-slim AS ui
+
+WORKDIR /ui
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web ./
+RUN npm run build && npm run sync
+
 # Build stage.
 #
 # The eBPF object is compiled here, so the builder needs clang/llvm even though
@@ -21,6 +36,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY web ./web
+# The dashboard comes from the Node stage; the copy above carries the sources
+# only, because `.dockerignore` drops any local `web/dist`.
+COPY --from=ui /ui/dist ./web/dist
 # A dummy `main` keeps the dependency layer cacheable when only sources change.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \

@@ -19,6 +19,14 @@ lidlesseye-data/
 *.leseg
 *.leseg.tmp
 
+# The dashboard is built in the Dockerfile's Node stage. Shipping the local
+# copy would make the Rust layer depend on whatever was last built on this
+# machine — including node_modules with the wrong platform binaries.
+web/node_modules
+web/.next
+web/out
+web/dist
+
 # Not needed by the image
 docs/
 examples/

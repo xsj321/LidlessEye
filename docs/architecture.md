@@ -303,9 +303,9 @@ a production SLO — the host was a Windows Docker Desktop VM.
 ## Dashboard
 
 The UI is part of the server, not a separate app: `web/dist` is a Next.js static
-export, committed, and embedded by `lidlesseye-server` with `rust-embed`. A
-release is still one executable serving the HTML, the JS chunks and the API from
-one port — no second container and no Node runtime in production.
+export built by `make ui` and embedded by `lidlesseye-server` with `rust-embed`.
+A release is still one executable serving the HTML, the JS chunks and the API
+from one port — no second container and no Node runtime in production.
 
 The build is two steps, and only the first needs Node:
 
@@ -314,10 +314,14 @@ cd web && npm run build   # next build -> web/out
 cd web && npm run sync    # web/out -> web/dist (what rust-embed reads)
 ```
 
-`make ui` runs both. `web/dist` stays in git on purpose: `cargo build` must not
-depend on npm, so a checkout with only a Rust toolchain still produces a binary
-with a working dashboard, and a UI change shows up as a reviewable diff of the
-generated files.
+`make ui` runs both, and `make build`/`make test` depend on the export so they
+build it first. `web/dist` is not committed: it is a build artefact, and keeping
+it out of git removes a megabyte of generated chunks from every UI diff. A
+`build.rs` in `lidlesseye-server` creates the directory when it is missing, so a
+checkout without Node still compiles — the binary then answers 503
+`UI is not embedded in this build` at `/`, while the API keeps working. The
+Dockerfile builds the export in its own Node stage and copies it into the Rust
+builder, so the image never depends on local state.
 
 Components are React 19 with shadcn/ui (Radix primitives, Tailwind v4) under
 `app/`. Navigation, tables, selects, the filter rows and the error banner are

@@ -5,11 +5,12 @@
 #   SHOT_DIR= ./scripts/ui-smoke.sh       # no screenshots
 #
 # What it does:
-#   1. builds the debug server binary (the UI is embedded at compile time, so
+#   1. builds the dashboard if web/dist is missing (it is not committed),
+#   2. builds the debug server binary (the UI is embedded at compile time, so
 #      this is also what makes the test cover the current web/dist),
-#   2. starts it on 127.0.0.1:4040 inside the container,
-#   3. seeds two tenants over HTTP,
-#   4. drives the dashboard with Chromium and fails on any console error.
+#   3. starts it on 127.0.0.1:4040 inside the container,
+#   4. seeds two tenants over HTTP,
+#   5. drives the dashboard with Chromium and fails on any console error.
 #
 # Requires Docker only: no local Rust, node or browser.
 set -euo pipefail
@@ -31,6 +32,19 @@ fi
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "building $IMAGE (one time)…"
   docker build -q -t "$IMAGE" -f "$REPO_ROOT/.devcontainer/Dockerfile.ui" "$REPO_ROOT/.devcontainer" >/dev/null
+fi
+
+# The dashboard is not committed, and the Rust build embeds it. Build it inside
+# the test image when it is missing, using a named volume for node_modules: the
+# host copy (if any) carries Windows/macOS binaries that do not run in here.
+if [ ! -f "$REPO_ROOT/web/dist/index.html" ]; then
+  echo "building the dashboard (web/dist is missing)…"
+  docker run --rm \
+    -v "${HOST_PATH}:/work" \
+    -v lidlesseye-web-modules:/work/web/node_modules \
+    -w /work/web \
+    "$IMAGE" \
+    bash -c 'npm ci --no-audit --no-fund && npm run build && npm run sync'
 fi
 
 echo "building the server binary…"

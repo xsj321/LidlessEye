@@ -3,6 +3,11 @@
 //! `web/dist` is compiled into the binary, so a LidlessEye release is a single
 //! static executable: no Node runtime, no asset directory to ship, and the UI
 //! is always the same version as the API it talks to.
+//!
+//! The directory itself is generated — `make ui` runs `next build` and copies
+//! the static export in — and is not committed. `build.rs` creates an empty
+//! placeholder so a checkout without Node still compiles; until a real build is
+//! present `index()` answers 503 rather than serving a blank page.
 
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};

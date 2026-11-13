@@ -232,8 +232,10 @@ without animation.
 
 React 19 with shadcn/ui over a Next.js static export, and no second process:
 `next build` emits `web/out`, `npm run sync` copies it to `web/dist`, and
-`rust-embed` inlines that into the binary at compile time. `web/dist` is
-committed so `cargo build` still works without Node.
+`rust-embed` inlines that into the binary at compile time. The export is not
+committed — `make ui` produces it, and `lidlesseye-server`'s `build.rs` keeps an
+empty placeholder so a checkout without Node still compiles (the server then
+answers 503 at `/` until the real build is in place).
 
 | Path | Responsibility |
 | --- | --- |

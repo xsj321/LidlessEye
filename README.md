@@ -90,6 +90,7 @@ comparison view gets two of these brackets. Every control is described in
 ### One binary, one host
 
 ```bash
+make ui                          # dashboard export, embedded at compile time (Node 20+)
 cargo build --release            # needs clang for eBPF; DuckDB's library is fetched once
 sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 # dashboard on http://localhost:4040
@@ -97,7 +98,10 @@ sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 
 Prerequisites: Linux ≥ 5.5 with BTF (`/sys/kernel/btf/vmlinux`, used to
 resolve the collector's CO-RE relocations), `clang`, and root (or `CAP_BPF` +
-`CAP_PERFMON` + `CAP_SYS_ADMIN`). The first build downloads the prebuilt
+`CAP_PERFMON` + `CAP_SYS_ADMIN`). Node 20+ is needed once for `make ui`: the
+dashboard export is embedded into the binary and is not committed, so a plain
+`cargo build` without it produces a working agent whose `/` answers
+`UI is not embedded in this build`. The first build downloads the prebuilt
 `libduckdb.so` matching `duckdb = "1.20000.1"`, so it needs network access once;
 set `DUCKDB_LIB_DIR` to a directory holding a vendored copy for offline builds.
 The binary loads that shared library at runtime: set `LD_LIBRARY_PATH` to the
@@ -308,7 +312,7 @@ crates/lidlesseye-core    data model, DuckDB store, query engine, selectors
 crates/lidlesseye-ebpf    aya programs (BPF C), collector, blazesym symbolization
 crates/lidlesseye-server  axum HTTP API, embedded UI, metrics
 crates/lidlesseye         the `LidlessEye` builder, the CLI, the publisher
-web/                      the dashboard (Next.js + shadcn, static export into dist)
+web/                      the dashboard (Next.js + shadcn; export built by `make ui`)
 deploy/                   Dockerfile, docker-compose, Helm chart
 ```
 
