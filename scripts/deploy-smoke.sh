@@ -62,8 +62,12 @@ pass "health: ${health}"
 # `web/dist` serves a 503 placeholder instead.
 index=$(curl -sf "${BASE}/" 2>&1) || fail "GET / failed: ${index}"
 [[ "$index" == *'id="main"'* ]] || fail "GET / did not return the dashboard"
-script=$(curl -sf "${BASE}/js/app.js" 2>&1) || fail "GET /js/app.js failed: ${script}"
-[[ "$script" == *"Application shell"* ]] || fail "the dashboard script is not embedded"
+# The export emits content-hashed chunks, so follow what the HTML references
+# instead of naming a file: a hard-coded path breaks on every rebuild.
+script=$(printf '%s' "$index" | grep -o 'src="/_next/static/[^"]*\.js"' | head -1 | sed 's/^src="//; s/"$//')
+[[ -n "$script" ]] || fail "GET / returned no script tag"
+script_body=$(curl -sf "${BASE}${script}" 2>&1) || fail "GET ${script} failed: ${script_body}"
+[[ -n "$script_body" ]] || fail "the dashboard chunk ${script} is empty"
 pass "dashboard HTML and JS are embedded"
 
 # Ingest a batch as one tenant.

@@ -7,7 +7,8 @@ web/node_modules
 web/.next
 web/out
 web/*.tsbuildinfo
-web/.vite
+# `web/dist` is the committed build output that rust-embed reads; everything
+# above is what the Next.js build leaves behind.
 web/dist/*.map
 
 # Local data and binaries

@@ -31,7 +31,7 @@ function check(ok, message, detail) {
   console.log(`${ok ? "ok  " : "FAIL"} ${message}`);
 }
 
-// Mirrors ROW_HEIGHT in web/dist/js/flamegraph.js: hit tests are row-based.
+// Mirrors ROW_HEIGHT in lib/canvas/flamegraph.ts: hit tests are row-based.
 const ROW = 22;
 
 /** `2026-11-12T20:15:00` in local time, the value <input type=datetime-local> takes. */
