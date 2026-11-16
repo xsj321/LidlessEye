@@ -42,6 +42,8 @@ spec:
             - collect
             - --frequency={{ .Values.agent.frequency }}
             - --flush={{ .Values.agent.flush }}
+            - --report-queue={{ .Values.agent.reportQueue }}
+            - --map-queue={{ .Values.agent.mapQueue }}
             # The tenant header is left at its default, `X-Tenant-Id`: the
             # server always accepts that alias, so renaming
             # `server.tenants.header` for a gateway does not silently divert

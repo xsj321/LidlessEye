@@ -13,7 +13,9 @@
 // path, and every tab re-queries for the node now in focus.
 
 import { useEffect, useRef, useState } from "react";
-import { X } from "lucide-react";
+import type { PointerEvent as ReactPointerEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
+import { createPortal } from "react-dom";
+import { GripVertical, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -53,6 +55,24 @@ const TONE_TEXT = {
   muted: "text-muted-foreground",
 };
 
+// The drawer is resized by dragging its left edge. Width is a view preference
+// like the histogram fold, so it lives in localStorage rather than the URL and
+// survives a reload without changing what a shared link shows.
+const WIDTH_KEY = "lidlesseye.map.panel.width";
+const DEFAULT_WIDTH = 560;
+const MIN_WIDTH = 360;
+const EDGE_KEEP_FREE = 200;
+
+function storedWidth(): number {
+  if (typeof window === "undefined") return DEFAULT_WIDTH;
+  try {
+    const value = Number(window.localStorage.getItem(WIDTH_KEY));
+    return Number.isFinite(value) && value > 0 ? value : DEFAULT_WIDTH;
+  } catch {
+    return DEFAULT_WIDTH;
+  }
+}
+
 export interface NodePanelProps {
   node: ServiceMapNode | null;
   nodes: Map<string, ServiceMapNode>;
@@ -76,6 +96,81 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
   const data = useNodeData(current, range);
   const panel = useRef<HTMLElement | null>(null);
   const returnTo = useRef<HTMLElement | null>(null);
+
+  // Portal the drawer to the body so it spans the whole viewport rather than
+  // the map card's box; the toolbar and time bar stay visible behind it.
+  const [portalRoot, setPortalRoot] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    setPortalRoot(document.body);
+  }, []);
+
+  const [width, setWidth] = useState(DEFAULT_WIDTH);
+  const widthRef = useRef(DEFAULT_WIDTH);
+  const dragging = useRef(false);
+  const dragStart = useRef<{ x: number; width: number } | null>(null);
+  const [resizing, setResizing] = useState(false);
+
+  useEffect(() => {
+    const next = storedWidth();
+    widthRef.current = next;
+    setWidth(next);
+  }, []);
+
+  const clampWidth = (value: number) => {
+    if (typeof window === "undefined") return DEFAULT_WIDTH;
+    const min = Math.min(MIN_WIDTH, Math.max(240, window.innerWidth - EDGE_KEEP_FREE));
+    const max = Math.max(min, window.innerWidth - EDGE_KEEP_FREE);
+    return Math.round(Math.min(max, Math.max(min, value)));
+  };
+
+  const applyWidth = (value: number) => {
+    const next = clampWidth(value);
+    widthRef.current = next;
+    setWidth(next);
+  };
+
+  const persistWidth = () => {
+    try {
+      window.localStorage.setItem(WIDTH_KEY, String(widthRef.current));
+    } catch {
+      // Storage is optional; the in-memory width still applies this session.
+    }
+  };
+
+  const onResizeDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragging.current = true;
+    dragStart.current = { x: event.clientX, width: widthRef.current };
+    setResizing(true);
+  };
+
+  const onResizeMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragging.current || !dragStart.current) return;
+    // Dragging left widens the panel: the edge being dragged is on its left.
+    applyWidth(dragStart.current.width + (dragStart.current.x - event.clientX));
+  };
+
+  const onResizeEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragging.current) return;
+    dragging.current = false;
+    dragStart.current = null;
+    setResizing(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    persistWidth();
+  };
+
+  const onResizeKey = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 64 : 24;
+    if (event.key === "ArrowLeft") applyWidth(widthRef.current + step);
+    else if (event.key === "ArrowRight") applyWidth(widthRef.current - step);
+    else if (event.key === "Home") applyWidth(DEFAULT_WIDTH);
+    else return;
+    event.preventDefault();
+    persistWidth();
+  };
 
   // Focus follows the panel, both ways. Opening moves focus into the drawer so
   // the next Tab presses land in the content the click just revealed; closing
@@ -119,7 +214,7 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
   const ready = Math.min(current?.ready ?? 0, pods);
   const tone = current ? healthTone(current) : "muted";
 
-  return (
+  const panelNode = (
     <aside
       ref={panel}
       id="map-panel"
@@ -132,18 +227,57 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
       tabIndex={-1}
       data-testid="map-panel"
       data-state={open ? "open" : "closed"}
+      data-width={width}
+      style={{ width }}
       // `inert` rather than only `aria-hidden`: the drawer is translated fully
       // off-screen, and without it every button inside it stays in the tab
       // order at a position nobody can see.
       inert={!open}
       className={cn(
-        "absolute inset-y-0 right-0 z-20 flex w-[560px] max-w-[calc(100%-16px)] flex-col",
+        // `fixed` and the body portal give the drawer the full window height,
+        // independent of how far down the page the map card happens to sit.
+        "fixed inset-y-0 right-0 z-40 flex flex-col",
         "border-l bg-card/95 shadow-[-24px_0_48px_-32px_rgba(0,0,0,0.95)] backdrop-blur-sm",
-        "outline-none motion-safe:transition-transform motion-safe:duration-300",
-        "motion-safe:ease-[cubic-bezier(0.32,0.72,0,1)]",
+        "outline-none",
+        // Suppress the slide transition while dragging, or the edge lags the
+        // pointer by one animation frame.
+        !resizing &&
+          "motion-safe:transition-transform motion-safe:duration-300 motion-safe:ease-[cubic-bezier(0.32,0.72,0,1)]",
         open ? "translate-x-0" : "pointer-events-none translate-x-full",
       )}
     >
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize node panel"
+        aria-valuemin={MIN_WIDTH}
+        aria-valuemax={typeof window === "undefined" ? 1280 : Math.max(MIN_WIDTH, window.innerWidth - EDGE_KEEP_FREE)}
+        aria-valuenow={width}
+        tabIndex={open ? 0 : -1}
+        data-testid="map-panel-resize"
+        data-dragging={resizing ? "true" : "false"}
+        title="Drag to resize · arrow keys to nudge"
+        onPointerDown={onResizeDown}
+        onPointerMove={onResizeMove}
+        onPointerUp={onResizeEnd}
+        onPointerCancel={onResizeEnd}
+        onKeyDown={onResizeKey}
+        className={cn(
+          "group absolute inset-y-0 -left-1 z-10 flex w-2 cursor-col-resize touch-none items-center justify-center",
+          "outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        )}
+      >
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border opacity-60 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+        />
+        <span
+          aria-hidden="true"
+          className="pointer-events-none flex h-10 w-4 items-center justify-center rounded-full border bg-card text-muted-foreground opacity-0 shadow-sm transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+        >
+          <GripVertical className="h-4 w-3" />
+        </span>
+      </div>
       {current ? (
         <>
           <header className="flex items-start gap-2 border-b px-3 py-2.5">
@@ -253,4 +387,8 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
       ) : null}
     </aside>
   );
+
+  // Nothing is rendered during the static export; the drawer is hidden until
+  // a node is selected, so rendering it on the server would add nothing.
+  return portalRoot ? createPortal(panelNode, portalRoot) : null;
 }

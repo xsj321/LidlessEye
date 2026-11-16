@@ -122,6 +122,10 @@ agent:
   # detail at a roughly linear cost in overhead.
   frequency: 99
   flush: 10s
+  # Upload queues are bounded on purpose: when the server is slow the agent
+  # drops the newest data instead of growing until the kernel OOM-kills it.
+  reportQueue: 256
+  mapQueue: 64
   collectCpu: true
   collectOffCpu: true
 
@@ -174,12 +178,14 @@ agent:
   # every other container's samples were dropped as unattributable; a node
   # running a few Go services (Prometheus, kube-state-metrics, an operator)
   # needs more, and the kernel OOM killer takes the agent down when it runs out.
+  # The symbol caches and upload queues are now bounded, but a full node still
+  # holds roughly 850Mi of live symbol tables, so leave headroom above that.
   resources:
     requests:
       cpu: 50m
       memory: 256Mi
     limits:
-      memory: 1Gi
+      memory: 1536Mi
 
   extraArgs: []
 

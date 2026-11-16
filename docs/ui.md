@@ -243,6 +243,13 @@ the node in the middle, callees on the right, every edge labelled like the map's
 and every card clickable, so walking the graph is one hop per click. A column
 with nothing in it is dropped and its space given to the others.
 
+The panel is portalled to `document.body` and positioned `fixed`, so it spans
+the **full window height** rather than stopping at the map card. Drag its left
+edge (the `map-panel-resize` separator) to change its width; arrow keys nudge it
+by 24 px, Shift+arrow by 64 px, and Home restores the 560 px default. The width
+is kept in `localStorage["lidlesseye.map.panel.width"]`, so a reload reopens the
+drawer at the size you left it.
+
 Below the neighbourhood are seven tabs:
 
 | tab | what it answers | where the numbers come from |

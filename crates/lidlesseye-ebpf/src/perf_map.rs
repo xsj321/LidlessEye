@@ -21,7 +21,7 @@
 //! Addresses here are absolute: JIT regions are not relocated, so no load bias
 //! applies.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,12 @@ pub(crate) struct PerfMapFallback {
 impl PerfMapFallback {
     pub(crate) fn new() -> Self {
         PerfMapFallback::default()
+    }
+
+    /// Forget processes that are no longer sampled; see the resolver's
+    /// `retain_processes` for why stale per-pid caches must not survive.
+    pub(crate) fn retain_processes(&mut self, alive: &HashSet<u32>) {
+        self.maps.retain(|tgid, _| alive.contains(tgid));
     }
 
     /// Name of the JIT region containing `addr`, if the process publishes one.

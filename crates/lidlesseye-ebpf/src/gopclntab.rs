@@ -31,7 +31,7 @@
 //! and reads as 0 — hence the section address of `.text` is used instead, which
 //! is always in the same coordinate space as `entryOff`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,11 @@ const MAPS_TTL: Duration = Duration::from_secs(60);
 /// Number of distinct binaries whose function tables are kept in memory.
 /// containerd's is ~10 MB, so this caps the fallback at a few tens of MB.
 const MAX_TABLES: usize = 8;
+
+/// Number of pids whose `/proc/<pid>/maps` snapshots are kept. The resolver
+/// already caps the number of processes between cache rebases, but the map
+/// list of a process can be large, so keep this independently bounded.
+const MAX_MAPS: usize = 256;
 
 /// One `PT_LOAD` segment, needed to undo relocation for an address.
 #[derive(Clone, Copy)]
@@ -239,6 +244,13 @@ impl GoFallback {
         GoFallback::default()
     }
 
+    /// Forget processes that are no longer sampled. Their maps are useless
+    /// once the pid is gone, and a recycled pid would otherwise inherit the
+    /// address ranges of its predecessor.
+    pub(crate) fn retain_processes(&mut self, alive: &HashSet<u32>) {
+        self.maps.retain(|tgid, _| alive.contains(tgid));
+    }
+
     /// Resolve `addr` of process `tgid` through its Go function table.
     ///
     /// Returns `(module path, function name)`.
@@ -275,6 +287,9 @@ impl GoFallback {
             .is_none_or(|cache| cache.at.elapsed() > MAPS_TTL);
         if stale {
             let entries = read_maps(tgid).unwrap_or_default();
+            if self.maps.len() >= MAX_MAPS {
+                self.maps.clear();
+            }
             self.maps.insert(
                 tgid,
                 MapsCache {

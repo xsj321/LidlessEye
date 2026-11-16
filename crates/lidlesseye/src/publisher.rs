@@ -4,7 +4,9 @@
 //! DaemonSet: profiles are produced on the node and pushed to a central
 //! server, which owns storage and the UI.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lidlesseye_core::Report;
 use lidlesseye_core::servicemap::ServiceMapBatch;
@@ -31,6 +33,11 @@ pub struct PublisherConfig {
     pub max_delay: Duration,
     /// Per-request timeout.
     pub timeout: Duration,
+    /// How many profile reports may wait for upload before new ones are
+    /// dropped. This is the memory bound on an agent whose server slows down.
+    pub report_queue: usize,
+    /// Same bound for service-map windows.
+    pub map_queue: usize,
 }
 
 impl PublisherConfig {
@@ -43,38 +50,90 @@ impl PublisherConfig {
             max_batch: 64,
             max_delay: Duration::from_millis(250),
             timeout: Duration::from_secs(30),
+            report_queue: 256,
+            map_queue: 64,
         }
+    }
+}
+
+/// Emit one warning a minute at most when a queue is full, so an operator can
+/// see that data is being dropped without the logs becoming a second outage.
+fn note_drop(dropped: &AtomicU64, last_warn: &AtomicU64, what: &str) {
+    let count = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let previous = last_warn.swap(now, Ordering::Relaxed);
+    if now.saturating_sub(previous) >= 60 {
+        tracing::warn!(
+            count,
+            "{} queue full, dropping new data until the uploader catches up",
+            what
+        );
     }
 }
 
 /// Handle used to enqueue reports. Cheap to clone.
 #[derive(Clone)]
 pub struct PublisherHandle {
-    tx: mpsc::UnboundedSender<Report>,
-    map_tx: mpsc::UnboundedSender<ServiceMapBatch>,
+    tx: mpsc::Sender<Report>,
+    map_tx: mpsc::Sender<ServiceMapBatch>,
     client: reqwest::Client,
     url: String,
+    dropped_reports: Arc<AtomicU64>,
+    dropped_maps: Arc<AtomicU64>,
+    report_warned: Arc<AtomicU64>,
+    map_warned: Arc<AtomicU64>,
 }
 
 impl PublisherHandle {
     /// Queue a report for delivery. Never blocks the collector thread.
+    ///
+    /// The queue is bounded on purpose. An unbounded queue turns a slow or
+    /// unreachable server into an agent OOM: the collectors keep producing on
+    /// every flush while the uploader is stuck in retries, so the queue grows
+    /// until the container's memory limit kills it. When full, the newest
+    /// report is dropped and counted; telemetry may lose a window, but the
+    /// agent stays alive and resumes as soon as the uploader drains.
     pub fn send(&self, report: Report) {
-        if self.tx.send(report).is_err() {
-            tracing::debug!("publisher stopped, dropping report");
+        match self.tx.try_send(report) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                note_drop(&self.dropped_reports, &self.report_warned, "report")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("publisher stopped, dropping report");
+            }
         }
     }
 
     /// Queue one service-map window. Independent of the profile queue: a slow
     /// profile upload must not delay the map, and vice versa.
     pub fn send_servicemap(&self, batch: ServiceMapBatch) {
-        if self.map_tx.send(batch).is_err() {
-            tracing::debug!("publisher stopped, dropping service map window");
+        match self.map_tx.try_send(batch) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                note_drop(&self.dropped_maps, &self.map_warned, "service map")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("publisher stopped, dropping service map window");
+            }
         }
+    }
+
+    /// `(dropped_reports, dropped_service_maps)` since this handle was created.
+    /// Clones share the counters, so the agent can log them at shutdown.
+    pub fn drop_stats(&self) -> (u64, u64) {
+        (
+            self.dropped_reports.load(Ordering::Relaxed),
+            self.dropped_maps.load(Ordering::Relaxed),
+        )
     }
 
     /// Send one report synchronously, used by `lidlesseye ingest --server`.
     pub async fn send_now(&self, report: Report) -> Result<()> {
-        post_batch(&self.client, &self.url, None, vec![report]).await
+        post_batch(&self.client, &self.url, None, &[report]).await
     }
 
     /// Poll `/api/v1/health` until the server answers, or `budget` runs out.
@@ -152,13 +211,21 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
         .build()
         .map_err(|err| Error::Http(err.to_string()))?;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Report>();
-    let (map_tx, mut map_rx) = mpsc::unbounded_channel::<ServiceMapBatch>();
+    let report_queue = cfg.report_queue.max(1);
+    let map_queue = cfg.map_queue.max(1);
+    let (tx, mut rx) = mpsc::channel::<Report>(report_queue);
+    let (map_tx, mut map_rx) = mpsc::channel::<ServiceMapBatch>(map_queue);
+    let dropped_reports = Arc::new(AtomicU64::new(0));
+    let dropped_maps = Arc::new(AtomicU64::new(0));
     let handle = PublisherHandle {
         tx,
         map_tx,
         client: client.clone(),
         url: url.clone(),
+        dropped_reports: Arc::clone(&dropped_reports),
+        dropped_maps: Arc::clone(&dropped_maps),
+        report_warned: Arc::new(AtomicU64::new(0)),
+        map_warned: Arc::new(AtomicU64::new(0)),
     };
 
     // The map runs on its own task: its windows are independent of profile
@@ -249,7 +316,7 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
             const MAX_ATTEMPTS: u32 = 6;
             let mut attempt = 0u32;
             loop {
-                match post_batch(&client, &url, None, batch.clone()).await {
+                match post_batch(&client, &url, None, &batch).await {
                     Ok(()) => {
                         tracing::debug!(reports = count, "uploaded reports");
                         break;
@@ -288,7 +355,7 @@ async fn post_batch(
     client: &reqwest::Client,
     url: &str,
     _token: Option<&str>,
-    reports: Vec<Report>,
+    reports: &[Report],
 ) -> Result<()> {
     let body = serde_json::json!({ "reports": reports });
     let response = client
@@ -323,4 +390,64 @@ async fn post_service_map(
         return Err(Error::Http(format!("server returned {status}: {text}")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use lidlesseye_core::ProfileType;
+
+    use super::*;
+
+    fn report() -> Report {
+        Report {
+            service_name: "svc".to_string(),
+            labels: Default::default(),
+            profile_type: ProfileType::cpu(),
+            start_ns: 0,
+            end_ns: 1,
+            sample_rate_hz: 0,
+            strings: Vec::new(),
+            stacks: Vec::new(),
+        }
+    }
+
+    /// The receivers are returned so they stay alive: a closed channel reports
+    /// `Closed`, not `Full`, which would hide the behaviour under test.
+    fn handle(
+        capacity: usize,
+    ) -> (
+        PublisherHandle,
+        mpsc::Receiver<Report>,
+        mpsc::Receiver<ServiceMapBatch>,
+    ) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let (map_tx, map_rx) = mpsc::channel(capacity);
+        let h = PublisherHandle {
+            tx,
+            map_tx,
+            client: reqwest::Client::new(),
+            url: "http://127.0.0.1:1/ingest".to_string(),
+            dropped_reports: Arc::new(AtomicU64::new(0)),
+            dropped_maps: Arc::new(AtomicU64::new(0)),
+            report_warned: Arc::new(AtomicU64::new(0)),
+            map_warned: Arc::new(AtomicU64::new(0)),
+        };
+        (h, rx, map_rx)
+    }
+
+    #[test]
+    fn a_full_report_queue_drops_instead_of_growing() {
+        let (h, _rx, _map_rx) = handle(1);
+        h.send(report()); // fills the only slot
+        h.send(report()); // must be dropped, never queued
+        assert_eq!(h.drop_stats().0, 1);
+    }
+
+    #[test]
+    fn a_full_service_map_queue_drops_instead_of_growing() {
+        let (h, _rx, _map_rx) = handle(1);
+        h.send_servicemap(ServiceMapBatch::default());
+        h.send_servicemap(ServiceMapBatch::default());
+        assert_eq!(h.drop_stats().1, 1);
+    }
 }

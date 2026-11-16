@@ -716,6 +716,40 @@ async function main() {
     { timeout: 20000 },
   );
   check(true, "the profiling tab embeds this node's flamegraph");
+
+  // The drawer is portalled to the body, so it covers the whole window rather
+  // than just the map card, and its left edge can be dragged to change width.
+  const panelBox = await mapPage.locator('[data-testid="map-panel"]').boundingBox();
+  check(
+    panelBox !== null && Math.abs(panelBox.height - 900) <= 1,
+    "the node panel spans the full window height",
+    JSON.stringify(panelBox),
+  );
+  const panelWidth = () =>
+    mapPage
+      .locator('[data-testid="map-panel"]')
+      .getAttribute("data-width")
+      .then((value) => Number(value));
+  const widthBefore = await panelWidth();
+  const handle = mapPage.locator('[data-testid="map-panel-resize"]');
+  const handleBox = await handle.boundingBox();
+  await mapPage.mouse.move(
+    handleBox.x + handleBox.width / 2,
+    handleBox.y + handleBox.height / 2,
+  );
+  await mapPage.mouse.down();
+  await mapPage.mouse.move(
+    handleBox.x + handleBox.width / 2 - 120,
+    handleBox.y + handleBox.height / 2,
+    { steps: 6 },
+  );
+  await mapPage.mouse.up();
+  const widthAfter = await panelWidth();
+  check(
+    widthAfter > widthBefore + 60,
+    "dragging the drawer edge widens it",
+    `${widthBefore} -> ${widthAfter}`,
+  );
   await mapPage.close();
 
   // Nothing above is worth much if the page is throwing while it renders.

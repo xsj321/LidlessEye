@@ -97,6 +97,7 @@ Use the `+` / `−` buttons to zoom, the fit button to frame the whole graph, an
 Click a card. A panel slides in from the right **over** the map — the map stays clickable, so you can walk the graph one hop at a time.
 
 - **Neighbours** shows callers and callees as small cards. Click one to make it the inspected node.
+- The panel fills the full window height. To make room for wide charts, drag its **left edge** to the left; the new width is remembered across reloads. Keyboard: focus the edge, then use `←` / `→` (or `Shift` for bigger steps) and `Home` to reset.
 - Close the panel with `×` or `Escape`. Focus returns to the card that opened it.
 
 The seven tabs answer different questions:

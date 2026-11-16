@@ -165,6 +165,12 @@ struct CollectArgs {
     /// Do not build the service map (network topology) from `/proc`.
     #[arg(long)]
     no_netmap: bool,
+    /// Reports waiting for upload before new ones are dropped (memory bound).
+    #[arg(long, default_value_t = 256)]
+    report_queue: usize,
+    /// Service-map windows waiting for upload before new ones are dropped.
+    #[arg(long, default_value_t = 64)]
+    map_queue: usize,
     /// Stop after this long (used by tests); run forever by default.
     #[arg(long)]
     duration: Option<String>,
@@ -370,6 +376,8 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
     cfg.auth_token = args.auth_token;
     cfg.tenant = Some(args.tenant.clone());
     cfg.tenant_header = args.tenant_header.clone();
+    cfg.report_queue = args.report_queue;
+    cfg.map_queue = args.map_queue;
     let (publisher, uploader) = lidlesseye::publisher::start(cfg)?;
     println!(
         "pushing profiles to {} as tenant `{}`",
@@ -445,6 +453,12 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
         "symbols: {} named frames ({} from DWARF inline info, {} from Go pclntab, {} from JIT maps)",
         stats.symbol_frames, stats.symbol_inlined, stats.symbol_go, stats.symbol_jit
     );
+    let (dropped_reports, dropped_maps) = publisher.drop_stats();
+    if dropped_reports > 0 || dropped_maps > 0 {
+        println!(
+            "upload queue overflow: {dropped_reports} reports, {dropped_maps} service-map windows dropped"
+        );
+    }
     let unresolved = stats.symbol_unknown.total();
     if unresolved > 0 {
         // Naming the reason is what makes this actionable rather than alarming.

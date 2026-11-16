@@ -38,9 +38,18 @@ use crate::UnknownReasons;
 use crate::gopclntab::GoFallback;
 use crate::perf_map::PerfMapFallback;
 
-/// Hard cap on the symbol cache; when exceeded the cache is dropped wholesale
-/// (a process restart or a container recycle makes old entries useless anyway).
-const MAX_CACHE_ENTRIES: usize = 200_000;
+/// Hard cap on the symbol cache by entry count.
+const MAX_CACHE_ENTRIES: usize = 40_000;
+
+/// Hard cap on the symbol cache by estimated heap size.
+///
+/// Counting entries alone is not enough: one address expands to one `Frame`
+/// per inlined function, and every frame owns three `String`s (module, symbol,
+/// source file). A 200k-entry cache with a handful of inlined frames each is
+/// several hundred MiB — enough on its own to OOM a 1 GiB agent. Budget the
+/// caches in bytes instead and drop them wholesale when the budget is spent:
+/// a process restart or a container recycle makes old entries useless anyway.
+const MAX_CACHE_BYTES: usize = 48 * 1024 * 1024;
 
 /// How many distinct processes may be symbolized before the resolver starts
 /// over with empty caches.
@@ -52,7 +61,25 @@ const MAX_CACHE_ENTRIES: usize = 200_000;
 /// tens of megabytes — would grow until the kernel OOM killer takes it down.
 /// Rebasing the caches every few hundred processes bounds it; the cost is one
 /// flush of slower symbolization afterwards, because everything is re-read.
-const MAX_PROCESSES: usize = 1024;
+///
+/// 128 is deliberate: with a 1 GiB container limit the symbol tables of a few
+/// hundred processes already dominate RSS, so waiting for 1024 processes made
+/// the rebase happen too late to prevent an OOM kill.
+const MAX_PROCESSES: usize = 128;
+
+/// Approximate heap cost of a resolved stack. Exact allocation sizes are not
+/// observable, but the three owned strings dominate and their lengths are.
+fn frames_bytes(frames: &[Frame]) -> usize {
+    frames
+        .iter()
+        .map(|frame| {
+            std::mem::size_of::<Frame>()
+                + frame.module.len()
+                + frame.symbol.len()
+                + frame.file.len()
+        })
+        .sum()
+}
 
 impl UnknownReasons {
     fn record(&mut self, reason: &Reason) {
@@ -108,6 +135,11 @@ pub(crate) struct FrameResolver {
     symbolizer: Symbolizer,
     user_cache: HashMap<(u32, u64), Vec<Frame>>,
     kernel_cache: HashMap<u64, Vec<Frame>>,
+    /// Estimated heap held by the two caches. Kept in step with every insert,
+    /// eviction and clear so pruning can be driven by memory rather than by a
+    /// count of addresses that says nothing about the size of a frame.
+    user_bytes: usize,
+    kernel_bytes: usize,
     /// Processes symbolized since the caches were last rebased. Kept separate
     /// from `user_cache` because it is a bound on *churn*: the entries blazesym
     /// cannot evict are exactly the processes that are already gone.
@@ -135,6 +167,8 @@ impl FrameResolver {
             symbolizer: Symbolizer::new(),
             user_cache: HashMap::new(),
             kernel_cache: HashMap::new(),
+            user_bytes: 0,
+            kernel_bytes: 0,
             processes: std::collections::HashSet::new(),
             go: GoFallback::new(),
             perf_map: PerfMapFallback::new(),
@@ -162,7 +196,21 @@ impl FrameResolver {
     /// is gone, anything still alive keeps its cache and stays cheap.
     pub(crate) fn retain_processes(&mut self, alive: &[u32]) {
         let alive: std::collections::HashSet<u32> = alive.iter().copied().collect();
-        self.user_cache.retain(|(tgid, _), _| alive.contains(tgid));
+        let mut freed = 0usize;
+        self.user_cache.retain(|(tgid, _), frames| {
+            if alive.contains(tgid) {
+                true
+            } else {
+                freed += frames_bytes(frames);
+                false
+            }
+        });
+        self.user_bytes = self.user_bytes.saturating_sub(freed);
+        // The fallbacks keep one map per pid too. Without this they hold the
+        // `/proc/<pid>/maps` of every process that ever appeared, long after
+        // the process is gone and its pid has been reused.
+        self.go.retain_processes(&alive);
+        self.perf_map.retain_processes(&alive);
     }
 
     /// Record that `tgid` is being symbolized, and rebase the caches when too
@@ -185,15 +233,29 @@ impl FrameResolver {
         self.symbolizer = Symbolizer::new();
         self.go = GoFallback::new();
         self.perf_map = PerfMapFallback::new();
+        self.clear_caches();
+        self.processes.clear();
+        // glibc keeps freed arena pages in RSS. Without a trim the memory
+        // saved by the rebase is invisible to the cgroup limit, and the agent
+        // creeps back to OOM even though the caches are empty.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+
+    fn clear_caches(&mut self) {
         self.user_cache.clear();
         self.kernel_cache.clear();
-        self.processes.clear();
+        self.user_bytes = 0;
+        self.kernel_bytes = 0;
     }
 
     fn maybe_prune(&mut self) {
-        if self.user_cache.len() + self.kernel_cache.len() > MAX_CACHE_ENTRIES {
-            self.user_cache.clear();
-            self.kernel_cache.clear();
+        if self.user_cache.len() + self.kernel_cache.len() > MAX_CACHE_ENTRIES
+            || self.user_bytes + self.kernel_bytes > MAX_CACHE_BYTES
+        {
+            self.clear_caches();
         }
     }
 
@@ -212,6 +274,7 @@ impl FrameResolver {
         if !missing.is_empty() {
             let resolved = self.symbolize_user(tgid, &missing);
             for (probe, frames) in missing.into_iter().zip(resolved) {
+                self.user_bytes += frames_bytes(&frames);
                 self.user_cache.insert((tgid, probe), frames);
             }
         }
@@ -363,6 +426,7 @@ impl FrameResolver {
                 }
             };
             for (probe, frames) in missing.into_iter().zip(resolved) {
+                self.kernel_bytes += frames_bytes(&frames);
                 self.kernel_cache.insert(probe, frames);
             }
         }
@@ -582,5 +646,35 @@ mod tests {
         assert!(r.user_cache.is_empty());
         assert!(r.kernel_cache.is_empty());
         assert!(r.processes.is_empty());
+    }
+
+    #[test]
+    fn prunes_the_cache_when_its_byte_budget_is_spent() {
+        let mut r = FrameResolver::new();
+        r.user_cache.insert(
+            (1, 0x1000),
+            vec![Frame::new("x".repeat(64), "y".repeat(64))],
+        );
+        r.user_bytes = MAX_CACHE_BYTES + 1;
+        r.maybe_prune();
+        assert!(r.user_cache.is_empty());
+        assert_eq!(r.user_bytes, 0);
+        assert_eq!(
+            frames_bytes(&[Frame::new("abcd", "efgh")]),
+            std::mem::size_of::<Frame>() + 8
+        );
+    }
+
+    #[test]
+    fn evicting_dead_processes_credits_the_byte_budget() {
+        let mut r = FrameResolver::new();
+        let frames = vec![Frame::new("mod", "sym")];
+        let bytes = frames_bytes(&frames);
+        r.user_cache.insert((1, 0x1000), frames.clone());
+        r.user_cache.insert((2, 0x2000), frames);
+        r.user_bytes = 2 * bytes;
+        r.retain_processes(&[1]);
+        assert_eq!(r.user_cache.len(), 1);
+        assert_eq!(r.user_bytes, bytes);
     }
 }
