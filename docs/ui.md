@@ -184,25 +184,35 @@ range. This is the view that answers "is anything arriving at all?".
 ### Service map
 
 The network graph of the selected window: nodes are workloads, ClusterIP
-Services and the outside world; edges are TCP connections between them. Node
-size grows with new connections, node colour is the on-CPU time of that
-workload's profiles (blue = idle, orange = hot), and an orange edge carries
-retransmits.
+Services and the outside world; edges are TCP connections between them. A node
+is a rounded card with two lines inside it — the service name, then its
+namespace and, for a workload, how many of its replicas are ready (`3/3` in
+green, `2/3` in orange when a replica is failing). The card's fill warms with
+the on-CPU time of that workload's profiles, so a busy service is visibly
+warmer than an idle one without the text becoming unreadable; an orange edge
+carries retransmits, and a dashed edge calls back upstream — against the
+column flow — which is the case worth spotting.
+
+Two lines of text set the card's size, and the card's size sets the column and
+row gaps, so the map is drawn at 1:1: the layout works in pixels and the chart
+is inset by the content's margin instead of being scaled to fit the canvas.
+Text longer than the card is clipped with an ellipsis; the tooltip and the
+panel carry the full name.
 
 The graph is laid out in columns, one per dependency depth: an entry point sits
-in the leftmost column and everything it calls sits to its right, with the
-arrow on each edge pointing at the caller. Cycles are condensed first, so a pair
-of services that call each other share a column instead of stacking up. Within a
-column, nodes are ordered to reduce crossings against the column before them,
-and the busiest node is highest. Scroll to zoom, drag the background to pan.
+in the leftmost column and everything it calls sits to its right. Cycles are
+condensed first, so a pair of services that call each other share a column
+instead of stacking up. Within a column, cards are ordered to reduce crossings
+against the column before them, and the busiest node is highest. Scroll to
+zoom, drag the background to pan.
 
 Selecting a node dims everything that is not its neighbour and fills the panel
-on the right: CPU, connections, bytes in/out, retransmits and the mean latency
-over the edges that closed a connection in this window. Below that are the two
-lists that make the node navigable — *Inbound*, everything that calls it, and
-*Outbound*, everything it calls — each row showing the peer, protocol,
-connections and round-trip time. Clicking a row selects that peer, so following
-a dependency is two clicks rather than a drag.
+on the right: CPU, connections, replicas, bytes in/out, retransmits and the
+mean latency over the edges that closed a connection in this window. Below that
+are the two lists that make the node navigable — *Inbound*, everything that
+calls it, and *Outbound*, everything it calls — each row showing the peer,
+protocol, connections and round-trip time. Clicking a row selects that peer, so
+following a dependency is two clicks rather than a drag.
 
 *Profile this service* replaces the filter bar with `k8s_namespace` +
 `k8s_workload` (or `service_name` for a ClusterIP) and switches to the

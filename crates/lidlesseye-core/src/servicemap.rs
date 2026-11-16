@@ -99,6 +99,14 @@ pub struct ServiceNode {
     /// Retransmitted segments during the window.
     #[serde(default)]
     pub retransmits: u64,
+    /// Replicas of this workload the cluster has, and how many of them are
+    /// ready. Gauges, not counters: a window reports the newest sample and a
+    /// merge keeps the larger one, because every agent reads the same
+    /// cluster-wide pod list and would otherwise multiply the count.
+    #[serde(default)]
+    pub pods: u32,
+    #[serde(default)]
+    pub ready: u32,
 }
 
 impl ServiceNode {
@@ -184,6 +192,11 @@ impl ServiceMapBatch {
                     slot.tx_bytes += node.tx_bytes;
                     slot.connections += node.connections;
                     slot.retransmits += node.retransmits;
+                    // Replicas are a gauge sampled from the same cluster-wide
+                    // pod list by every agent: summing them would count each
+                    // replica once per node that noticed the workload.
+                    slot.pods = slot.pods.max(node.pods);
+                    slot.ready = slot.ready.max(node.ready);
                     if slot.namespace.is_empty() {
                         slot.namespace = node.namespace;
                     }
@@ -253,6 +266,13 @@ pub struct MapNode {
     /// On-CPU nanoseconds from the profile store, when the service is profiled.
     #[serde(default)]
     pub cpu_ns: u64,
+    /// Replicas behind this node at the end of the window, and how many of
+    /// them reported `Ready`. Zero for a ClusterIP service (its endpoints are
+    /// pods, and those are their own nodes) and for the outside world.
+    #[serde(default)]
+    pub pods: u32,
+    #[serde(default)]
+    pub ready: u32,
 }
 
 /// An aggregated edge in a query response.
@@ -359,7 +379,11 @@ mod tests {
     #[test]
     fn merging_batches_adds_counters_instead_of_duplicating_rows() {
         let mut a = ServiceMapBatch {
-            nodes: vec![ServiceNode::new("shop/a", NodeKind::Workload)],
+            nodes: vec![ServiceNode {
+                pods: 3,
+                ready: 2,
+                ..ServiceNode::new("shop/a", NodeKind::Workload)
+            }],
             edges: vec![ServiceEdge {
                 client: "shop/a".into(),
                 server: "shop/b".into(),
@@ -374,7 +398,12 @@ mod tests {
             ..Default::default()
         };
         let b = ServiceMapBatch {
-            nodes: vec![ServiceNode::new("shop/a", NodeKind::Workload)],
+            nodes: vec![ServiceNode {
+                // The same rollout a moment later, every replica now ready.
+                pods: 3,
+                ready: 3,
+                ..ServiceNode::new("shop/a", NodeKind::Workload)
+            }],
             edges: vec![ServiceEdge {
                 client: "shop/a".into(),
                 server: "shop/b".into(),
@@ -399,6 +428,11 @@ mod tests {
         assert_eq!(a.edges[0].rx_bytes, 1000);
         assert_eq!(a.edges[0].rtt_us_sum, 3000);
         assert_eq!(a.edges[0].rtt_samples, 3);
+        // Replicas are a gauge: every agent reads the same cluster-wide pod
+        // list, so summing them would multiply the count by the node count.
+        // The larger sample wins, because the newer pod list is the one that
+        // noticed the last replica becoming ready.
+        assert_eq!((a.nodes[0].pods, a.nodes[0].ready), (3, 3));
     }
 
     #[test]

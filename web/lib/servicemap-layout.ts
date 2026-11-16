@@ -19,12 +19,16 @@
 //      this size,
 //   4. spread each column vertically, centred against the tallest one.
 //
-// The gaps come from the canvas rather than from constants. ECharts fits the
-// node bounding box into the canvas with one scale for both axes, so the axis
-// that is not filled decides the scale for both: with a constant row gap, a
-// wide dashboard scales a 9-row graph up until the rows fill the height and the
-// columns land wherever the scale puts them. Filling the height with the row
-// gap pins that scale at 1, so the column gap below is the gap that is drawn.
+// The gaps come from the canvas rather than from constants, because the graph
+// series fits the node bounding box into the drawing rect with one scale for
+// both axes: a 9-row graph on a wide dashboard gets scaled up until the rows
+// fill the height, and the columns land wherever that scale puts them. Deriving
+// the row gap from the height pins the scale at 1, so the column gap below is
+// the gap that is drawn.
+//
+// The caller can then inset the series by the content's margin and get an exact
+// 1:1 drawing, which is what lets a node be a card with text of a known size
+// rather than a circle that may be scaled up or down.
 
 export interface LayoutNode {
   id: string;
@@ -49,6 +53,8 @@ export interface LayoutOptions {
   height?: number;
   columnGap?: number;
   rowGap?: number;
+  /** Floor for the derived row gap: a node has a height of its own. */
+  minRowGap?: number;
 }
 
 /** Bounds the derived gaps: too tight and labels collide, too wide and the
@@ -69,7 +75,7 @@ export function layeredLayout(
   edges: LayoutEdge[],
   options: LayoutOptions = {},
 ): Map<string, Point> {
-  const { columnGap: fixedColumnGap, rowGap: fixedRowGap } = options;
+  const { columnGap: fixedColumnGap, rowGap: fixedRowGap, minRowGap } = options;
   const indexOf = new Map<string, number>();
   nodes.forEach((node, index) => indexOf.set(node.id, index));
   const count = nodes.length;
@@ -169,7 +175,7 @@ export function layeredLayout(
     fixedColumnGap ??
     clamp(width / Math.max(columns.length - 1, 1), LIMITS.columnGap[0], LIMITS.columnGap[1]);
   const rowGap =
-    fixedRowGap ?? Math.max(LIMITS.rowGap, height / Math.max(tallest - 1, 1));
+    fixedRowGap ?? Math.max(minRowGap ?? LIMITS.rowGap, height / Math.max(tallest - 1, 1));
 
   const positions = new Map<string, Point>();
   columns.forEach((column, columnIndex) => {

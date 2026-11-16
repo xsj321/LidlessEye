@@ -47,6 +47,14 @@ pub struct PodMeta {
     /// shares that node's address, so the address alone cannot say which
     /// component a peer on port 9100 is; the port can.
     pub ports: Vec<u16>,
+    /// `status.phase` — `Running`, `Pending`, `Failed`, ...
+    pub phase: String,
+    /// Whether every container passed its readiness probe.
+    ///
+    /// A workload whose replicas are not ready still shows traffic (a restart
+    /// looks exactly like that), so the map needs both numbers: how many pods
+    /// exist and how many of them are serving.
+    pub ready: bool,
 }
 
 impl PodMeta {
@@ -81,6 +89,8 @@ impl PodMeta {
             service,
             ips: Vec::new(),
             ports: Vec::new(),
+            phase: String::new(),
+            ready: false,
         }
     }
 
@@ -93,6 +103,14 @@ impl PodMeta {
     /// Attach the container ports, as `spec.containers[].ports` declares them.
     pub fn with_ports(mut self, ports: Vec<u16>) -> Self {
         self.ports = ports;
+        self
+    }
+
+    /// Attach the pod's health, as `status.phase` and the `Ready` condition
+    /// report it.
+    pub fn with_health(mut self, phase: impl Into<String>, ready: bool) -> Self {
+        self.phase = phase.into();
+        self.ready = ready;
         self
     }
 
@@ -220,6 +238,18 @@ impl PodIndex {
             .find(|pod| pod.ports.contains(&port))
             .or_else(|| pods.first())
             .cloned()
+    }
+
+    /// The whole snapshot, for callers that need every pod rather than one
+    /// lookup — the service map counts replicas per workload this way.
+    ///
+    /// Handing back the `Arc` keeps the refresh path free to swap in a new
+    /// snapshot while the caller walks this one.
+    pub fn snapshot(&self) -> Arc<HashMap<String, PodMeta>> {
+        self.pods
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn len(&self) -> usize {

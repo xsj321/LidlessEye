@@ -406,6 +406,9 @@ impl FlowMapper {
                 "inbound connections whose client was rewritten by kube-proxy were left to the client's agent"
             );
         }
+        if !nodes.is_empty() {
+            attach_health(&mut nodes, &health_by_node(&self.pods));
+        }
         batch.nodes = nodes.into_values().collect();
         batch.edges = edges.into_values().collect();
         batch.end_ns = lidlesseye_core::now_ns();
@@ -545,6 +548,9 @@ impl Scanner {
                 sample = %sample.join(" "),
                 "service map peers with no name"
             );
+        }
+        if !nodes.is_empty() {
+            attach_health(&mut nodes, &health_by_node(&config.pods));
         }
         batch.nodes = nodes.into_values().collect();
         batch.end_ns = lidlesseye_core::now_ns();
@@ -775,15 +781,20 @@ fn external_node() -> ServiceNode {
     node
 }
 
-/// Id a pod contributes to the map. Must match
-/// `lidlesseye_core::servicemap::node_id` as used by the CPU join: the
-/// workload when the pod has one, its service name otherwise.
-fn pod_node(meta: &PodMeta) -> ServiceNode {
-    let name = meta
-        .workload
+/// The name a pod contributes to the map.
+///
+/// Must match `lidlesseye_core::servicemap::node_id` as used by the CPU join:
+/// the workload when the pod has one, its service name otherwise, and its own
+/// name for a bare pod, which has neither.
+fn map_name_of(meta: &PodMeta) -> String {
+    meta.workload
         .clone()
         .or_else(|| meta.service_name().map(str::to_string))
-        .unwrap_or_else(|| meta.name.clone());
+        .unwrap_or_else(|| meta.name.clone())
+}
+
+fn pod_node(meta: &PodMeta) -> ServiceNode {
+    let name = map_name_of(meta);
     let mut node = ServiceNode::new(
         lidlesseye_core::servicemap::node_id(&meta.namespace, &name),
         NodeKind::Workload,
@@ -792,6 +803,39 @@ fn pod_node(meta: &PodMeta) -> ServiceNode {
     node.workload = meta.workload.clone().unwrap_or_default();
     node.service = meta.service_name().unwrap_or(&name).to_string();
     node
+}
+
+/// Replica count and ready count per map node, from the cluster-wide pod
+/// snapshot the peer lookup already walks.
+///
+/// The map needs both: a workload with three pods and one ready is serving
+/// errors, and connections alone cannot say that. Every agent reads the same
+/// list, so the numbers agree across nodes.
+fn health_by_node(pods: &PodIndex) -> HashMap<String, (u32, u32)> {
+    let mut out: HashMap<String, (u32, u32)> = HashMap::new();
+    for meta in pods.snapshot().values() {
+        let id = lidlesseye_core::servicemap::node_id(&meta.namespace, &map_name_of(meta));
+        let slot = out.entry(id).or_insert((0, 0));
+        slot.0 += 1;
+        if meta.ready {
+            slot.1 += 1;
+        }
+    }
+    out
+}
+
+/// Stamp the replica gauges onto the nodes of a window.
+///
+/// Nodes the pod list does not know (a ClusterIP service, the outside world, a
+/// workload whose pods all went away mid-window) keep zero, which the UI reads
+/// as "no replicas to report" rather than "all replicas are down".
+fn attach_health(nodes: &mut HashMap<String, ServiceNode>, health: &HashMap<String, (u32, u32)>) {
+    for node in nodes.values_mut() {
+        if let Some(&(pods, ready)) = health.get(&node.id) {
+            node.pods = pods;
+            node.ready = ready;
+        }
+    }
 }
 
 fn resolve_peer(pods: &PodIndex, services: Option<&ServiceIndex>, ip: IpAddr, port: u16) -> Peer {
@@ -1232,5 +1276,70 @@ mod tests {
         let fields: Vec<&str> = text.lines().nth(1).unwrap().split_whitespace().collect();
         assert_eq!(fields[3], "0A");
         assert_eq!(u8::from_str_radix(fields[3], 16).unwrap(), TCP_LISTEN);
+    }
+
+    #[test]
+    fn a_workload_card_carries_its_replica_count() {
+        // Two replicas of one Deployment, the second failing its readiness
+        // probe: the map has one card for the workload and it must say 1/2.
+        let mut pods = HashMap::new();
+        for (uid, name, ip, ready) in [
+            ("u1", "checkout-1", "10.0.0.2", true),
+            ("u2", "checkout-2", "10.0.0.3", false),
+        ] {
+            let meta = PodMeta::new(
+                uid,
+                "shop",
+                name,
+                &BTreeMap::new(),
+                Some(("Deployment", "checkout")),
+                None,
+            )
+            .with_ips(vec![ip.parse().unwrap()])
+            .with_health("Running", ready);
+            pods.insert(uid.to_string(), meta);
+        }
+        let cart = PodMeta::new(
+            "u3",
+            "shop",
+            "cart",
+            &BTreeMap::new(),
+            Some(("Deployment", "cart")),
+            None,
+        )
+        .with_ips(vec!["10.0.0.7".parse().unwrap()])
+        .with_health("Running", true);
+        pods.insert("u3".to_string(), cart);
+        let index = PodIndex::new();
+        index.replace(pods);
+        let mapper = FlowMapper {
+            pods: Arc::new(index),
+            services: None,
+            node: "test-node".to_string(),
+        };
+
+        let batch = mapper.batch(
+            vec![flow(
+                ("10.0.0.2", 43210),
+                ("10.0.0.7", 8080),
+                Role::Client,
+                900,
+                2000,
+            )],
+            1,
+        );
+
+        let checkout = batch
+            .nodes
+            .iter()
+            .find(|node| node.id == "shop/checkout")
+            .expect("the client's workload is a node");
+        assert_eq!((checkout.pods, checkout.ready), (2, 1));
+        let cart = batch
+            .nodes
+            .iter()
+            .find(|node| node.id == "shop/cart")
+            .expect("the peer's workload is a node");
+        assert_eq!((cart.pods, cart.ready), (1, 1));
     }
 }

@@ -1201,8 +1201,8 @@ impl Store {
                 let mut stmt = conn
                     .prepare(
                         "INSERT INTO net_nodes (bucket_ns, node_id, namespace, workload, service, \
-                         kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
                     .map_err(db_err)?;
                 for node in &batch.nodes {
@@ -1218,6 +1218,8 @@ impl Store {
                         node.tx_bytes as i64,
                         node.connections as i64,
                         node.retransmits as i64,
+                        node.pods as i64,
+                        node.ready as i64,
                     ])
                     .map_err(db_err)?;
                 }
@@ -1268,7 +1270,8 @@ impl Store {
             .prepare(
                 "SELECT node_id, any_value(namespace), any_value(workload), any_value(service), \
                         any_value(kind), sum(rx_bytes), sum(tx_bytes), sum(connections), \
-                        sum(retransmits) \
+                        sum(retransmits), \
+                        arg_max(pods, (bucket_ns, pods)), arg_max(ready, (bucket_ns, pods)) \
                  FROM net_nodes WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY node_id \
                  ORDER BY sum(connections) + (sum(rx_bytes) + sum(tx_bytes)) / 1024 DESC LIMIT ?",
@@ -1291,6 +1294,12 @@ impl Store {
                 connections: row.get::<_, i64>(7).unwrap_or(0).max(0) as u64,
                 retransmits: row.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
                 cpu_ns: 0,
+                // The newest sample in the window, not the largest: a workload
+                // that scaled down must not keep reporting its peak replica
+                // count. Both columns come from the same row, so the pair is
+                // always consistent.
+                pods: row.get::<_, i64>(9).unwrap_or(0).max(0) as u32,
+                ready: row.get::<_, i64>(10).unwrap_or(0).max(0) as u32,
             });
         }
         Ok(out)
@@ -1424,7 +1433,9 @@ fn create_schema(conn: &Connection) -> Result<()> {
             rx_bytes BIGINT NOT NULL,
             tx_bytes BIGINT NOT NULL,
             connections BIGINT NOT NULL,
-            retransmits BIGINT NOT NULL
+            retransmits BIGINT NOT NULL,
+            pods BIGINT DEFAULT 0 NOT NULL,
+            ready BIGINT DEFAULT 0 NOT NULL
         );
         CREATE TABLE IF NOT EXISTS net_edges (
             bucket_ns BIGINT NOT NULL,
@@ -1452,33 +1463,48 @@ fn create_schema(conn: &Connection) -> Result<()> {
 /// is asked rather than relying on `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`,
 /// whose availability depends on the DuckDB build the agent was linked with.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    const ADDED: &[(&str, &str)] = &[
-        ("tx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
-        ("rx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
-        ("rtt_us_sum", "BIGINT DEFAULT 0 NOT NULL"),
-        ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
-    ];
+    add_columns(
+        conn,
+        "net_edges",
+        &[
+            ("tx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
+            ("rx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
+            ("rtt_us_sum", "BIGINT DEFAULT 0 NOT NULL"),
+            ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
+        ],
+    )?;
+    add_columns(
+        conn,
+        "net_nodes",
+        &[
+            ("pods", "BIGINT DEFAULT 0 NOT NULL"),
+            ("ready", "BIGINT DEFAULT 0 NOT NULL"),
+        ],
+    )
+}
+
+fn add_columns(conn: &Connection, table: &str, added: &[(&str, &str)]) -> Result<()> {
     let mut existing: Vec<String> = Vec::new();
     {
         let mut stmt = conn
             .prepare(
                 "SELECT column_name FROM information_schema.columns \
-                 WHERE table_name = 'net_edges'",
+                 WHERE table_name = ?",
             )
             .map_err(db_err)?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map(params![table], |row| row.get::<_, String>(0))
             .map_err(db_err)?;
         for row in rows {
             existing.push(row.map_err(db_err)?);
         }
     }
-    for (column, definition) in ADDED {
+    for (column, definition) in added {
         if existing.iter().any(|name| name == column) {
             continue;
         }
         conn.execute_batch(&format!(
-            "ALTER TABLE net_edges ADD COLUMN {column} {definition}"
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
         ))
         .map_err(db_err)?;
     }
@@ -1995,6 +2021,46 @@ mod tests {
         assert_eq!(store.stats().segment_count, before, "good batch survives");
         assert!(store.path().is_file(), "database file survives");
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn map_replicas_come_from_the_newest_window_not_the_peak() {
+        use crate::servicemap::ServiceNode;
+
+        let (store, dir) = temp_store("net-replicas");
+        let start = 1_700_000_000_000_000_000u64;
+        let window = |start_ns: u64, pods: u32, ready: u32| ServiceMapBatch {
+            start_ns,
+            end_ns: start_ns + 10_000_000_000,
+            nodes: vec![ServiceNode {
+                pods,
+                ready,
+                ..ServiceNode::new("shop/a", NodeKind::Workload)
+            }],
+            ..Default::default()
+        };
+        // A rollout that scaled down: three replicas, then one. Summing the
+        // gauges would report six, and taking the maximum would keep the peak.
+        store.append_servicemap(&window(start, 3, 3)).unwrap();
+        store
+            .append_servicemap(&window(start + 10_000_000_000, 1, 1))
+            .unwrap();
+        // Two agents write the same window, and one of them has not learned
+        // the workload yet: the tie must not report "no replicas" because the
+        // empty row happened to be read last.
+        store
+            .append_servicemap(&window(start + 20_000_000_000, 1, 1))
+            .unwrap();
+        store
+            .append_servicemap(&window(start + 20_000_000_000, 0, 0))
+            .unwrap();
+
+        let nodes = store.net_nodes(start, start + 60_000_000_000, 10).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!((nodes[0].pods, nodes[0].ready), (1, 1));
+
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

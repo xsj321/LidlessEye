@@ -99,6 +99,9 @@ export interface ServiceMapNode {
   connections?: number;
   retransmits?: number;
   cpu_ns?: number;
+  /** Replicas of this workload at the end of the window, and how many are ready. */
+  pods?: number;
+  ready?: number;
 }
 
 export interface ServiceMapEdge {

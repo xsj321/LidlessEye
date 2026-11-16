@@ -566,6 +566,21 @@ struct PodStatus {
     /// Dual-stack clusters report every address here.
     #[serde(default, rename = "podIPs")]
     pod_ips: Vec<PodIp>,
+    #[serde(default)]
+    phase: String,
+    /// Readiness lives here rather than in `phase`: a pod that is `Running`
+    /// with one failing container is up and serving errors, which is a
+    /// different thing from a pod that is fine.
+    #[serde(default)]
+    conditions: Vec<PodCondition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PodCondition {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,6 +640,12 @@ impl PodItem {
             .collect();
         ports.sort_unstable();
         ports.dedup();
+        let ready = self
+            .status
+            .conditions
+            .iter()
+            .any(|condition| condition.kind == "Ready" && condition.status == "True");
+        let phase = self.status.phase.clone();
         let pod = PodMeta::new(
             meta.uid.as_str(),
             meta.namespace.as_str(),
@@ -634,7 +655,8 @@ impl PodItem {
             template_hash,
         )
         .with_ips(ips)
-        .with_ports(ports);
+        .with_ports(ports)
+        .with_health(phase, ready);
         Some((meta.uid, pod))
     }
 }

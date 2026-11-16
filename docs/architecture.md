@@ -442,6 +442,23 @@ label: the query groups `samples` of type `cpu` by
 `k8s_namespace`/`k8s_workload`, which is the same string the agent uses as a
 node id.
 
+### Replicas
+
+A node also carries how many pods the workload has and how many of them are
+ready, read from the same cluster-wide pod list the peer lookup uses
+(`status.phase` and the `Ready` condition). The map is per workload, so these
+are gauges on the node rather than a per-pod view: `3/3` is a healthy
+Deployment, `2/3` is one that is running but not serving, and that distinction
+is invisible in the traffic counters — a pod that fails its readiness probe
+still accepts and refuses connections identically.
+
+Two aggregation rules follow from them being gauges. Merging two agents'
+batches takes the larger value, because every agent reads the same list and
+summing would multiply the replicas by the number of nodes. Reading a window
+takes `arg_max(pods, bucket_ns)` — the newest sample in the range — rather than
+the maximum, so a workload that scaled down does not keep reporting its peak;
+both columns come from the same row, so the pair is always consistent.
+
 Known limits, stated rather than hidden: there is no L7 parsing, so an edge's
 protocol is inferred from the server port and an edge reports connections, not
 requests; traffic in a pod's own namespace (`localhost`) is ignored; a
