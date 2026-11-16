@@ -174,10 +174,14 @@ export function SloTab({ node, data, inbound, outbound, windowSec, nodes, onSele
         <Stat
           label="Budget left"
           value={formatPercent(budget, 0)}
-          hint={`${formatCount(errors)} of ${formatCount(total)}`}
+          hint={`${formatCount(errors)} retx in ${formatCount(total)} conns`}
           tone={budget < 0.2 ? "warn" : "ok"}
         />
-        <Stat label="Mean RTT" value={latency ? formatRtt(latency) : "—"} hint="over this node's edges" />
+        <Stat
+          label="Mean RTT"
+          value={latency ? formatRtt(latency) : "—"}
+          hint={latency ? "over this node's edges" : "no closed connection this window"}
+        />
       </StatRow>
 
       <Section title="Error rate over the window" hint="retransmits / connections">
@@ -468,13 +472,20 @@ export function NetTab({ node, data, inbound, outbound, windowSec, nodes, onSele
         />
         <Stat
           label="New conn/s"
-          value={`${formatRate(rateIn)} in`}
-          hint={`${formatRate(rateOut)} out`}
+          value={formatRate(rateIn + rateOut)}
+          hint={`${formatRate(rateIn)} in · ${formatRate(rateOut)} out`}
         />
         <Stat
           label="Mean RTT"
           value={meanRtt ? formatRtt(meanRtt) : "—"}
-          hint={`${formatCount(node.retransmits ?? 0)} retransmits`}
+          // A dash on its own reads as a broken card. The reason latency is
+          // missing is structural — samples arrive when a connection closes —
+          // so the hint says that instead of borrowing an unrelated number.
+          hint={
+            meanRtt
+              ? `${formatCount(node.retransmits ?? 0)} retransmits`
+              : "no closed connection this window"
+          }
         />
       </StatRow>
 

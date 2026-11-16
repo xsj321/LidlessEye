@@ -200,12 +200,15 @@ are ready. Three signals share the card without competing:
 Every edge is labelled with its own numbers: new connections per second and the
 mean round-trip time of the connections that closed in the window
 (`0.31/s · 149µs`). Labels are *placed*, not dropped at the geometric midpoint —
-each is tried at seven points along its curve and five offsets from each, and
-takes the first spot that hits neither a card nor another label. An edge whose
-label has nowhere to go keeps its curve but loses its text, which is the better
-failure: overlapping digits are not information. Retransmits turn an edge red
-and dashed; an edge that runs against the column flow (a callback, a retry)
-bends out and arrives on the far side.
+each is tried at nine points along its curve and seven offsets from each, and
+takes the first spot that clears every card by 4px and every other label by 2px.
+When even that fails the label drops the latency and keeps the rate, because the
+rate is the number that says a hop is alive; only when neither fits does the
+edge keep its curve and lose its text. Overlapping digits are not information,
+so nothing is drawn on top of anything else: paths go in one pass and labels in
+a second, or the edge drawn last would strike a line through the number.
+Retransmits turn an edge red and dashed; an edge that runs against the column
+flow (a callback, a retry) bends out and arrives on the far side.
 
 The graph is laid out in columns, one per dependency depth: an entry point sits
 in the leftmost column and everything it calls sits to its right. Cycles are

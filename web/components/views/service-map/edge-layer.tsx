@@ -17,6 +17,10 @@
 // along its own curve and five offsets from each, and takes the first spot that
 // hits neither a card nor another label. A label with nowhere to go is skipped
 // rather than drawn on top of its neighbour.
+//
+// Paths are drawn before labels, in a separate pass: a label's whole reason to
+// exist is being read, and an edge that happens to be drawn later would strike
+// a line straight through the number.
 
 import { edgePath, edgeRate, formatRate, formatRtt, pointOnEdge } from "@/lib/servicemap-graph";
 import type { Box, EdgePath } from "@/lib/servicemap-graph";
@@ -35,6 +39,10 @@ const LINE = {
   labelText: "#9aa5b6",
 };
 
+// The label has to fit in the channel between two card columns, and that
+// channel is what decides its size: 9px monospace with 10px of padding leaves
+// the pill narrow enough to clear the cards on both sides, which is what lets
+// every edge keep its own number instead of half of them being dropped.
 const LABEL = { height: 14, font: 9, advance: 4.9, pad: 10 };
 
 interface Rect {
@@ -57,8 +65,8 @@ function placeLabel(
   cards: Rect[],
   taken: Rect[],
 ): Rect | null {
-  const stops = [0.5, 0.62, 0.38, 0.74, 0.26, 0.86, 0.14];
-  const offsets = [0, -13, 13, -26, 26];
+  const stops = [0.5, 0.6, 0.4, 0.7, 0.3, 0.8, 0.2, 0.9, 0.1];
+  const offsets = [0, -13, 13, -26, 26, -39, 39];
   for (const t of stops) {
     const point = pointOnEdge(path, t);
     for (const dy of offsets) {
@@ -68,10 +76,12 @@ function placeLabel(
         w: width,
         h: LABEL.height,
       };
-      // 8px of clearance, not 0: a card's drop shadow sits outside its box, and
-      // a label tucked under it reads as a clipped one.
-      if (cards.some((card) => overlaps(rect, card, 8))) continue;
-      if (taken.some((other) => overlaps(rect, other, 3))) continue;
+      // 4px of clearance, not 0: a card's shadow reaches outside its box, and a
+      // label tucked under it reads as a clipped one. Eight was safe and
+      // expensive — in a graph whose columns are 104px apart it left two pixels
+      // of channel to spare, and half the edges lost their number.
+      if (cards.some((card) => overlaps(rect, card, 4))) continue;
+      if (taken.some((other) => overlaps(rect, other, 2))) continue;
       return rect;
     }
   }
@@ -111,11 +121,21 @@ export function EdgeLayer({
     if (!from || !to) return [];
     const path = edgePath(from, to);
     const rate = edgeRate(edge, windowSec);
-    const text = edge.rtt_us
-      ? `${formatRate(rate)} · ${formatRtt(edge.rtt_us)}`
-      : formatRate(rate);
-    const labelWidth = Math.round(text.length * LABEL.advance + LABEL.pad);
-    const spot = showLabels ? placeLabel(path, labelWidth, cards, taken) : null;
+    const rateText = formatRate(rate);
+    const fullText = edge.rtt_us ? `${rateText} · ${formatRtt(edge.rtt_us)}` : rateText;
+    const widthOf = (text: string) => Math.round(text.length * LABEL.advance + LABEL.pad);
+
+    // The number that matters most is the rate, so a crowded wire keeps it and
+    // gives up the latency rather than giving up both: the panel lists the RTT
+    // of every hop anyway, and a missing rate is an edge with nothing to say.
+    let text = fullText;
+    let labelWidth = widthOf(fullText);
+    let spot = showLabels ? placeLabel(path, labelWidth, cards, taken) : null;
+    if (showLabels && !spot && fullText !== rateText) {
+      text = rateText;
+      labelWidth = widthOf(rateText);
+      spot = placeLabel(path, labelWidth, cards, taken);
+    }
     if (spot) taken.push(spot);
 
     return [{ edge, path, text, labelWidth, spot, rate }];
@@ -154,7 +174,28 @@ export function EdgeLayer({
         </marker>
       </defs>
 
-      {drawn.map(({ edge, path, text, labelWidth, spot, rate }) => {
+      {drawn.map(({ edge, path, rate }) => {
+        const warn = (edge.retransmits ?? 0) > 0;
+        const touched = !selected || edge.client === selected || edge.server === selected;
+        return (
+          <path
+            key={edgeKey(edge)}
+            d={path.d}
+            fill="none"
+            opacity={touched ? 1 : 0.16}
+            stroke={warn ? LINE.warn : touched && selected ? LINE.focused : LINE.idle}
+            strokeWidth={1 + Math.min(3.2, Math.log10(1 + rate * 20 + (edge.tx_bytes ?? 0) / 8192 + 1) * 1.4)}
+            strokeOpacity={touched ? 0.9 : 0.5}
+            strokeLinecap="round"
+            markerEnd={warn ? "url(#se-arrow-warn)" : "url(#se-arrow)"}
+            strokeDasharray={warn ? "5 4" : undefined}
+            style={{ transition: "opacity 150ms ease" }}
+          />
+        );
+      })}
+
+      {drawn.map(({ edge, text, spot }) => {
+        if (!spot) return null;
         const warn = (edge.retransmits ?? 0) > 0;
         const touched = !selected || edge.client === selected || edge.server === selected;
         return (
@@ -162,43 +203,30 @@ export function EdgeLayer({
             key={edgeKey(edge)}
             opacity={touched ? 1 : 0.16}
             style={{ transition: "opacity 150ms ease" }}
+            transform={`translate(${spot.x + spot.w / 2},${spot.y + spot.h / 2})`}
           >
-            <path
-              d={path.d}
-              fill="none"
-              stroke={warn ? LINE.warn : touched && selected ? LINE.focused : LINE.idle}
-              strokeWidth={1 + Math.min(3.2, Math.log10(1 + rate * 20 + (edge.tx_bytes ?? 0) / 8192 + 1) * 1.4)}
-              strokeOpacity={touched ? 0.9 : 0.5}
-              strokeLinecap="round"
-              markerEnd={warn ? "url(#se-arrow-warn)" : "url(#se-arrow)"}
-              strokeDasharray={warn ? "5 4" : undefined}
+            <rect
+              x={-spot.w / 2}
+              y={-LABEL.height / 2}
+              width={spot.w}
+              height={LABEL.height}
+              rx={3}
+              fill={LINE.label}
+              fillOpacity={0.92}
+              stroke={LINE.labelBorder}
+              strokeWidth={0.75}
             />
-            {spot ? (
-              <g transform={`translate(${spot.x + spot.w / 2},${spot.y + spot.h / 2})`}>
-                <rect
-                  x={-labelWidth / 2}
-                  y={-LABEL.height / 2}
-                  width={labelWidth}
-                  height={LABEL.height}
-                  rx={3}
-                  fill={LINE.label}
-                  fillOpacity={0.88}
-                  stroke={LINE.labelBorder}
-                  strokeWidth={0.75}
-                />
-                <text
-                  x={0}
-                  y={0.5}
-                  textAnchor="middle"
-                  dominantBaseline="middle"
-                  fontSize={LABEL.font}
-                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
-                  fill={warn ? "#f0a1a1" : LINE.labelText}
-                >
-                  {text}
-                </text>
-              </g>
-            ) : null}
+            <text
+              x={0}
+              y={0.5}
+              textAnchor="middle"
+              dominantBaseline="middle"
+              fontSize={LABEL.font}
+              fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+              fill={warn ? "#f0a1a1" : LINE.labelText}
+            >
+              {text}
+            </text>
           </g>
         );
       })}
