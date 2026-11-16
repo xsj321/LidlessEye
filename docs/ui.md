@@ -83,6 +83,12 @@ analyse*.
 | drag across the histogram | draw a new window |
 | click inside a narrowed bracket | jump there, keeping the span |
 | **Full** (top right of a bracket) | back to the whole chosen range |
+| **Hide chart** / **Show chart** | collapse or reopen the histogram row |
+
+Collapsing leaves the range controls visible and gives the main view the space
+back. The brushes stay mounted with their selection and data; the choice is
+kept in localStorage and does not appear in the URL. Compare mode keeps both
+brushes behind the same toggle.
 
 While the bracket covers the whole range there is nothing to move, so dragging
 inside starts a new selection — zoom in, then pan. The minimum span is 1/300 of

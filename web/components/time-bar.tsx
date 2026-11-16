@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { ChartNoAxesCombined, ChevronDown, ChevronUp } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,6 +13,7 @@ import { fromLocalInput, nowNs, resolveBaseline, resolveDomain, resolveWindow, t
 import type { Window } from "@/lib/time";
 import type { TimeseriesPayload } from "@/lib/types";
 import { useDashboard } from "@/lib/use-dashboard";
+import { cn } from "@/lib/utils";
 
 /**
  * One histogram brush. The class owns the canvas; React owns the readout, and
@@ -177,8 +179,41 @@ function AbsoluteRangeInputs({ domain }: { domain: Window }) {
   );
 }
 
+const COLLAPSED_KEY = "lidlesseye.histogram.collapsed";
+
+function storedCollapsed(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 export function TimeBar() {
   const state = useDashboard();
+  // The histogram is useful for picking a window but expensive in vertical
+  // space once the window is set. Collapsing is a local view preference: it
+  // stays out of the URL, survives a reload and keeps the brush mounted so its
+  // selection and histogram data are still there when it opens again.
+  const [collapsed, setCollapsed] = useState(false);
+
+  useEffect(() => {
+    setCollapsed(storedCollapsed());
+  }, []);
+
+  const toggle = () => {
+    setCollapsed((current) => {
+      const next = !current;
+      try {
+        window.localStorage.setItem(COLLAPSED_KEY, next ? "1" : "0");
+      } catch {
+        /* storage is optional */
+      }
+      return next;
+    });
+  };
+
   const domain = resolveDomain(state);
   const win = resolveWindow(state);
   const baseline = resolveBaseline(state);
@@ -234,39 +269,72 @@ export function TimeBar() {
             Use data range
           </Button>
         ) : null}
+
+        <Button
+          variant="ghost"
+          size="xs"
+          id="histogram-toggle"
+          data-testid="histogram-toggle"
+          aria-expanded={!collapsed}
+          aria-controls="time-histogram"
+          title={collapsed ? "Show the histogram" : "Hide the histogram"}
+          onClick={toggle}
+          className="gap-1 text-muted-foreground"
+        >
+          {collapsed ? <ChevronDown /> : <ChevronUp />}
+          <ChartNoAxesCombined />
+          {collapsed ? "Show chart" : "Hide chart"}
+        </Button>
       </div>
 
-      {state.view === "compare" ? (
-        <div className="grid gap-1.5">
-          {/* One host per brush: a brush paints into its own canvas, so two
-              brushes in one row would fight over the same width. */}
-          <Brush
-            label="A · Baseline"
-            domain={domain}
-            selection={baseline}
-            histogram={state.histData}
-            ready={state.ready}
-            onCommit={(from, until) => dashboardStore.setBaseline(from, until)}
-          />
-          <Brush
-            label="B · Comparison"
-            domain={domain}
-            selection={win}
-            histogram={state.histData}
-            ready={state.ready}
-            onCommit={(from, until) => dashboardStore.setWindow(from, until)}
-          />
+      {/* A zero-height grid row keeps both brushes mounted: the canvas keeps
+          its domain, selection and histogram, and the ResizeObserver redraws it
+          at the right width when the row opens again. */}
+      <div
+        id="time-histogram"
+        data-testid="time-histogram"
+        data-collapsed={collapsed ? "true" : "false"}
+        className={cn(
+          "grid motion-safe:transition-[grid-template-rows,opacity] motion-safe:duration-200",
+          collapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100",
+        )}
+      >
+        <div className="min-h-0 overflow-hidden">
+          {state.view === "compare" ? (
+            <div className="grid gap-1.5 pt-1">
+              {/* One host per brush: a brush paints into its own canvas, so two
+                  brushes in one row would fight over the same width. */}
+              <Brush
+                label="A · Baseline"
+                domain={domain}
+                selection={baseline}
+                histogram={state.histData}
+                ready={state.ready}
+                onCommit={(from, until) => dashboardStore.setBaseline(from, until)}
+              />
+              <Brush
+                label="B · Comparison"
+                domain={domain}
+                selection={win}
+                histogram={state.histData}
+                ready={state.ready}
+                onCommit={(from, until) => dashboardStore.setWindow(from, until)}
+              />
+            </div>
+          ) : (
+            <div className="pt-1">
+              <Brush
+                label="Time range"
+                domain={domain}
+                selection={win}
+                histogram={state.histData}
+                ready={state.ready}
+                onCommit={(from, until) => dashboardStore.setWindow(from, until)}
+              />
+            </div>
+          )}
         </div>
-      ) : (
-        <Brush
-          label="Time range"
-          domain={domain}
-          selection={win}
-          histogram={state.histData}
-          ready={state.ready}
-          onCommit={(from, until) => dashboardStore.setWindow(from, until)}
-        />
-      )}
+      </div>
     </div>
   );
 }

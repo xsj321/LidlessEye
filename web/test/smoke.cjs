@@ -362,6 +362,22 @@ async function main() {
   );
   await page.click("#settings-edge-labels");
   await page.keyboard.press("Escape");
+
+  await page.click("#histogram-toggle");
+  check(
+    (await page.locator("#time-histogram").getAttribute("data-collapsed")) === "true",
+    "the histogram collapses",
+  );
+  check(
+    (await page.locator("#histogram-toggle").getAttribute("aria-expanded")) === "false",
+    "the toggle reports the collapsed state",
+  );
+  await page.click("#histogram-toggle");
+  check(
+    (await page.locator("#time-histogram").getAttribute("data-collapsed")) === "false",
+    "the histogram expands again",
+  );
+
   await page.click('#tabs [data-view="flamegraph"]');
   await page.waitForSelector("canvas.fg-canvas", { timeout: 20000 });
   await checkActiveTab(page, "flamegraph");

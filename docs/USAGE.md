@@ -73,6 +73,8 @@ Two levels, in this order:
 
 `Auto` toggles periodic reloading. Its interval is configured in Settings (default 30 s). With a relative domain, the window follows the clock; an absolute domain stays pinned.
 
+Once the window is set, click **Hide chart** at the right of the time bar to collapse the histogram and give the main view more room; **Show chart** brings it back with the same window still selected. The choice is remembered in this browser.
+
 ---
 
 ## 5. Read the service map
