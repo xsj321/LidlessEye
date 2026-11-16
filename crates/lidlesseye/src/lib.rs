@@ -55,6 +55,8 @@
 //! http://host:4040`, `lidlesseye query --data-dir ./data --top`.
 
 pub mod k8s;
+#[cfg(target_os = "linux")]
+pub mod netmap;
 pub mod publisher;
 
 pub use publisher::{PublisherConfig, PublisherHandle};
@@ -124,6 +126,7 @@ pub struct Builder {
     enrich_kubernetes_labels: bool,
     k8s_pod_metadata: bool,
     k8s_pod_refresh: Duration,
+    collect_netmap: bool,
 }
 
 impl Default for Builder {
@@ -158,6 +161,7 @@ impl Default for Builder {
             enrich_kubernetes_labels: true,
             k8s_pod_metadata: true,
             k8s_pod_refresh: Duration::from_secs(30),
+            collect_netmap: true,
         }
     }
 }
@@ -323,6 +327,15 @@ impl Builder {
         self
     }
 
+    /// Build the service map from the pods' network namespaces.
+    ///
+    /// Needs the cluster pod index, so it is a no-op outside a cluster or with
+    /// [`Builder::k8s_pod_metadata`] disabled.
+    pub fn collect_netmap(mut self, enabled: bool) -> Self {
+        self.collect_netmap = enabled;
+        self
+    }
+
     fn server_config(&self) -> Result<ServerConfig> {
         let listen: SocketAddr = self.listen.parse().map_err(|err| {
             Error::Config(format!("invalid listen address `{}`: {err}", self.listen))
@@ -406,9 +419,41 @@ impl Builder {
             None
         };
 
+        #[cfg(target_os = "linux")]
+        let netmap = if self.agent && self.collect_netmap && self.k8s_pod_metadata {
+            match k8s::start_cluster_pod_index(self.k8s_pod_refresh) {
+                Some(pods) => {
+                    let services = k8s::start_service_index(self.k8s_pod_refresh);
+                    let mut config = netmap::NetMapConfig::new(pods);
+                    config.interval = self.flush_interval.max(Duration::from_secs(2));
+                    config.services = services;
+                    let state = http.state();
+                    let tenant = tenant.clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    Some(netmap::start(config, move |batch| {
+                        let state = state.clone();
+                        let tenant = tenant.clone();
+                        runtime.spawn(async move {
+                            if let Err(err) = state.ingest_servicemap(&tenant, batch).await {
+                                tracing::warn!(
+                                    error = %err,
+                                    "failed to store a service map window"
+                                );
+                            }
+                        });
+                    }))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         Ok(LidlessEye {
             http,
             collector,
+            #[cfg(target_os = "linux")]
+            _netmap: netmap,
             data_dir: self.data_dir,
             tenant,
         })
@@ -420,6 +465,8 @@ impl Builder {
 pub struct LidlessEye {
     http: lidlesseye_server::LidlessEye,
     collector: Option<lidlesseye_ebpf::CollectorHandle>,
+    #[cfg(target_os = "linux")]
+    _netmap: Option<netmap::NetMapHandle>,
     data_dir: PathBuf,
     tenant: lidlesseye_core::TenantId,
 }

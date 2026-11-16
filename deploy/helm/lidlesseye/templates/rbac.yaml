@@ -6,6 +6,9 @@ name, namespace and owning workload only exist in the API. Listing pods on one
 node (the agent filters with `spec.nodeName`) is the smallest permission that
 closes that gap — `watch` is not requested because the agent polls, and the
 Secret/ConfigMap the pods may mount is none of its business.
+
+The same role also lists Services, for the service map: a ClusterIP is the only
+name a client socket carries for a peer outside its own pod.
 */ -}}
 {{- if .Values.agent.enabled }}
 {{- $pods := .Values.agent.podMetadata | default dict }}
@@ -23,6 +26,12 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
+    verbs: ["list"]
+  # The service map resolves a peer address to a service. Without `services`
+  # every ClusterIP edge degrades to "external", which is exactly the traffic
+  # a service map is supposed to explain; the agent logs that and keeps going.
+  - apiGroups: [""]
+    resources: ["services"]
     verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

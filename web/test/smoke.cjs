@@ -232,7 +232,7 @@ async function main() {
   await page.waitForSelector("canvas.fg-canvas", { timeout: 20000 });
 
   check((await page.title()) === "LidlessEye", "page title");
-  check((await page.locator("#tabs [data-view]").count()) === 6, "six tabs are rendered");
+  check((await page.locator("#tabs [data-view]").count()) === 7, "seven tabs are rendered");
 
   const box = await page.locator("canvas.fg-canvas").boundingBox();
   check(box !== null && box.width > 100 && box.height > 100, "flamegraph canvas has a size", JSON.stringify(box));
@@ -461,6 +461,25 @@ async function main() {
   await checkActiveTab(page, "overview");
   check((await page.locator('[data-testid="overview-card"]').count()) >= 3, "overview renders its cards");
   await shot(page, "6-overview");
+
+  // ---- service map -----------------------------------------------------
+  // Outside a cluster there is no traffic to draw, so the check is that the
+  // view mounts and explains itself instead of rendering an empty canvas.
+  await page.click('#tabs [data-view="servicemap"]');
+  await checkActiveTab(page, "servicemap");
+  // No cluster, so no traffic: the view must explain itself rather than show
+  // an empty canvas, and still be a real mount of the new component.
+  await page.waitForFunction(
+    () =>
+      Boolean(document.querySelector('[data-testid="service-map-canvas"]')) ||
+      document.body.textContent.includes('No traffic in this range'),
+    null,
+    { timeout: 20000 },
+  );
+  check(true, "the service map view renders");
+  await shot(page, "7-servicemap");
+  await page.click('#tabs [data-view="overview"]');
+  await page.waitForSelector('[data-testid="overview-card"]', { timeout: 20000 });
 
   // ---- tenant switching ------------------------------------------------
   // The label click above narrowed the selector to acme's pod; a switched

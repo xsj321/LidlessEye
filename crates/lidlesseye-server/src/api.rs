@@ -16,9 +16,10 @@ use serde_json::{Value, json};
 use lidlesseye_core::folded::FoldedOptions;
 use lidlesseye_core::model::{Report, Unit};
 use lidlesseye_core::pprof::PprofOptions;
+use lidlesseye_core::servicemap::ServiceMapBatch;
 use lidlesseye_core::{
-    DiffFlamegraph, DiffOptions, Flamegraph, ProfileType, QueryOptions, Selector, Store,
-    TimeSeries, TimeSeriesOptions, TopResult, now_ns,
+    DiffFlamegraph, DiffOptions, Flamegraph, ProfileType, QueryOptions, Selector, ServiceMap,
+    Store, TimeSeries, TimeSeriesOptions, TopResult, now_ns,
 };
 
 use crate::error::ApiError;
@@ -585,6 +586,90 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     ];
     let body = state.metrics().render(&extra, state.uptime().as_secs());
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
+}
+
+/// Service-map ingestion accepts one window or a batch of them.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ServiceMapPayload {
+    Batch { batches: Vec<ServiceMapBatch> },
+    Single(ServiceMapBatch),
+}
+
+/// `POST /api/v1/servicemap/ingest`
+///
+/// Agents post one delta per collection window. Windows are append-only and
+/// queries sum them, so a retry that lands twice inflates that window; the
+/// publisher therefore retries only on connection errors, not on timeouts that
+/// may have been processed.
+pub async fn servicemap_ingest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let caller = state.authorize(&headers)?;
+    if state.config().read_only {
+        return Err(ApiError::forbidden("server is read-only"));
+    }
+    let payload: ServiceMapPayload = serde_json::from_slice(&body)
+        .map_err(|err| ApiError::bad_request(format!("invalid service map JSON: {err}")))?;
+    let batches = match payload {
+        ServiceMapPayload::Single(batch) => vec![batch],
+        ServiceMapPayload::Batch { batches } => batches,
+    };
+    if batches.len() > 512 {
+        return Err(ApiError::bad_request("too many batches in one request"));
+    }
+    let store = state.writable_tenant(&caller.tenant)?;
+
+    let accepted = batches.len();
+    let (mut nodes, mut edges) = (0usize, 0usize);
+    for batch in &batches {
+        nodes += batch.nodes.len();
+        edges += batch.edges.len();
+    }
+    let result = tokio::task::spawn_blocking(move || -> lidlesseye_core::Result<()> {
+        for batch in &batches {
+            store.append_servicemap(batch)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| ApiError::internal(format!("ingest task failed: {err}")))?;
+    result.map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "accepted": accepted,
+        "nodes": nodes,
+        "edges": edges,
+    })))
+}
+
+/// `GET /api/v1/servicemap`
+///
+/// Same `from`/`until` parameters as every other query, so the map follows the
+/// time range selected for the flamegraph.
+pub async fn servicemap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Params,
+) -> Result<Json<ServiceMap>, ApiError> {
+    let caller = state.authorize(&headers)?;
+    let now = now_ns();
+    let (from, until) = params.range(now)?;
+    let Some(store) = maybe_store(&state, &caller) else {
+        return Ok(Json(ServiceMap {
+            from_ns: from,
+            until_ns: until,
+            ..Default::default()
+        }));
+    };
+    let started = Instant::now();
+    let map = tokio::task::spawn_blocking(move || lidlesseye_core::servicemap(&store, from, until))
+        .await
+        .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
+        .map_err(ApiError::from)?;
+    state.record_query(&caller.tenant, started);
+    Ok(Json(map))
 }
 
 impl AppState {

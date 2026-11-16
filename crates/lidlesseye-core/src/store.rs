@@ -43,6 +43,7 @@ use tracing::{debug, warn};
 use crate::error::{Error, Result};
 use crate::model::{Frame, ProfileType, Report, SERVICE_NAME_LABEL};
 use crate::selector::{MatchOp, Selector};
+use crate::servicemap::{MapEdge, MapNode, NodeKind, ServiceMapBatch, node_id};
 use crate::time::now_ns;
 
 /// Version of the table layout. Bumped when a change needs a migration.
@@ -974,6 +975,18 @@ impl Store {
                     .map_err(db_err)?;
                 conn.execute("DELETE FROM batches WHERE end_ns < ?", params![ts(cutoff)])
                     .map_err(db_err)?;
+                // The map is a second, independent table family: it has no
+                // batches, so it needs its own cutoff.
+                conn.execute(
+                    "DELETE FROM net_nodes WHERE bucket_ns < ?",
+                    params![ts(cutoff)],
+                )
+                .map_err(db_err)?;
+                conn.execute(
+                    "DELETE FROM net_edges WHERE bucket_ns < ?",
+                    params![ts(cutoff)],
+                )
+                .map_err(db_err)?;
                 stats.removed_segments += removed.max(0) as usize;
             }
 
@@ -1024,7 +1037,8 @@ impl Store {
     pub fn clear(&self) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute_batch(
-            "DELETE FROM samples; DELETE FROM stacks; DELETE FROM frames; DELETE FROM batches;",
+            "DELETE FROM samples; DELETE FROM stacks; DELETE FROM frames; DELETE FROM batches; \
+             DELETE FROM net_nodes; DELETE FROM net_edges;",
         )
         .map_err(db_err)?;
         conn.execute_batch("CHECKPOINT").map_err(db_err)?;
@@ -1171,6 +1185,178 @@ impl Store {
     }
 }
 
+/// One service-map window written by an agent.
+impl Store {
+    /// Persist a service-map delta. Nodes and edges of one window go in one
+    /// transaction: a half-written window would draw edges to nothing.
+    pub fn append_servicemap(&self, batch: &ServiceMapBatch) -> Result<()> {
+        if batch.nodes.is_empty() && batch.edges.is_empty() {
+            return Ok(());
+        }
+        let bucket = ts(batch.start_ns);
+        let conn = self.conn.lock();
+        conn.execute_batch("BEGIN TRANSACTION").map_err(db_err)?;
+        let result = (|| -> Result<()> {
+            if !batch.nodes.is_empty() {
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO net_nodes (bucket_ns, node_id, namespace, workload, service, \
+                         kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .map_err(db_err)?;
+                for node in &batch.nodes {
+                    stmt.execute(params![
+                        bucket,
+                        node.id,
+                        node.namespace,
+                        node.workload,
+                        node.service,
+                        node.kind.as_str(),
+                        node.node,
+                        node.rx_bytes as i64,
+                        node.tx_bytes as i64,
+                        node.connections as i64,
+                        node.retransmits as i64,
+                    ])
+                    .map_err(db_err)?;
+                }
+            }
+            if !batch.edges.is_empty() {
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO net_edges (bucket_ns, client_id, server_id, protocol, \
+                         connections, retransmits) VALUES (?, ?, ?, ?, ?, ?)",
+                    )
+                    .map_err(db_err)?;
+                for edge in &batch.edges {
+                    stmt.execute(params![
+                        bucket,
+                        edge.client,
+                        edge.server,
+                        edge.protocol,
+                        edge.connections as i64,
+                        edge.retransmits as i64,
+                    ])
+                    .map_err(db_err)?;
+                }
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT").map_err(db_err)?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    /// Nodes of the map, busiest first.
+    pub fn net_nodes(&self, from_ns: u64, until_ns: u64, limit: usize) -> Result<Vec<MapNode>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_id, any_value(namespace), any_value(workload), any_value(service), \
+                        any_value(kind), sum(rx_bytes), sum(tx_bytes), sum(connections), \
+                        sum(retransmits) \
+                 FROM net_nodes WHERE bucket_ns >= ? AND bucket_ns < ? \
+                 GROUP BY node_id ORDER BY sum(connections) DESC LIMIT ?",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt
+            .query(params![ts(from_ns), ts(until_ns), limit as i64])
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let kind: String = row.get(4).map_err(db_err)?;
+            out.push(MapNode {
+                id: row.get(0).map_err(db_err)?,
+                namespace: row.get(1).map_err(db_err)?,
+                workload: row.get(2).map_err(db_err)?,
+                service: row.get(3).map_err(db_err)?,
+                kind: NodeKind::parse(&kind),
+                rx_bytes: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
+                tx_bytes: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
+                connections: row.get::<_, i64>(7).unwrap_or(0).max(0) as u64,
+                retransmits: row.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
+                cpu_ns: 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Edges of the map, aggregated over the window.
+    pub fn net_edges(&self, from_ns: u64, until_ns: u64) -> Result<Vec<MapEdge>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT client_id, server_id, protocol, sum(connections), sum(retransmits) \
+                 FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
+                 GROUP BY client_id, server_id, protocol \
+                 HAVING sum(connections) > 0 \
+                 ORDER BY sum(connections) DESC LIMIT 4000",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt
+            .query(params![ts(from_ns), ts(until_ns)])
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(db_err)? {
+            out.push(MapEdge {
+                client: row.get(0).map_err(db_err)?,
+                server: row.get(1).map_err(db_err)?,
+                protocol: row.get(2).map_err(db_err)?,
+                connections: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                retransmits: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    /// On-CPU nanoseconds per map node, so the map can be coloured by cost.
+    ///
+    /// The join is by label, not by table key: a profile series carries
+    /// `k8s_namespace`/`k8s_workload`, which is exactly what [`node_id`]
+    /// builds. Series without those labels (host processes) fall back to
+    /// `service_name` and land on a node with the same id the agent would use.
+    pub fn cpu_by_service(&self, from_ns: u64, until_ns: u64) -> Result<HashMap<String, u64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT service_name, labels, sum(value) FROM samples \
+                 WHERE profile_type = 'cpu' AND start_ns < ? AND end_ns > ? \
+                 GROUP BY service_name, labels",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt
+            .query(params![ts(until_ns), ts(from_ns)])
+            .map_err(db_err)?;
+        let mut out: HashMap<String, u64> = HashMap::new();
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let service: String = row.get(0).map_err(db_err)?;
+            let labels: String = row.get(1).map_err(db_err)?;
+            let value: i64 = row.get(2).unwrap_or(0);
+            let labels = decode_labels(&labels);
+            let namespace = labels
+                .get("k8s_namespace")
+                .map(String::as_str)
+                .unwrap_or("");
+            let name = labels
+                .get("k8s_workload")
+                .or_else(|| labels.get(SERVICE_NAME_LABEL))
+                .map(String::as_str)
+                .unwrap_or(service.as_str());
+            *out.entry(node_id(namespace, name)).or_insert(0) += value.max(0) as u64;
+        }
+        Ok(out)
+    }
+}
+
 fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS batches (
@@ -1205,6 +1391,29 @@ fn create_schema(conn: &Connection) -> Result<()> {
             symbol VARCHAR NOT NULL,
             file VARCHAR NOT NULL,
             line INTEGER NOT NULL
+        );
+        /* Service map: one row per observation window. Agents ship deltas, so
+         * a query is a plain SUM over the buckets the window overlaps. */
+        CREATE TABLE IF NOT EXISTS net_nodes (
+            bucket_ns BIGINT NOT NULL,
+            node_id VARCHAR NOT NULL,
+            namespace VARCHAR NOT NULL,
+            workload VARCHAR NOT NULL,
+            service VARCHAR NOT NULL,
+            kind VARCHAR NOT NULL,
+            k8s_node VARCHAR NOT NULL,
+            rx_bytes BIGINT NOT NULL,
+            tx_bytes BIGINT NOT NULL,
+            connections BIGINT NOT NULL,
+            retransmits BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS net_edges (
+            bucket_ns BIGINT NOT NULL,
+            client_id VARCHAR NOT NULL,
+            server_id VARCHAR NOT NULL,
+            protocol VARCHAR NOT NULL,
+            connections BIGINT NOT NULL,
+            retransmits BIGINT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);
         INSERT OR REPLACE INTO meta VALUES ('schema_version', '{SCHEMA_VERSION}');"

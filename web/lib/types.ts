@@ -10,6 +10,7 @@ export type View =
   | "top"
   | "timeseries"
   | "labels"
+  | "servicemap"
   | "overview";
 
 export const VIEWS: readonly View[] = [
@@ -18,6 +19,7 @@ export const VIEWS: readonly View[] = [
   "top",
   "timeseries",
   "labels",
+  "servicemap",
   "overview",
 ];
 
@@ -84,8 +86,38 @@ export interface TimeseriesPayload {
   series: TimeseriesSeries[];
 }
 
-export interface ProfileType {
-  name: string;
+export type NodeKind = "workload" | "service" | "external";
+
+export interface ServiceMapNode {
+  id: string;
+  namespace?: string;
+  workload?: string;
+  service?: string;
+  kind?: NodeKind;
+  rx_bytes?: number;
+  tx_bytes?: number;
+  connections?: number;
+  retransmits?: number;
+  cpu_ns?: number;
+}
+
+export interface ServiceMapEdge {
+  client: string;
+  server: string;
+  protocol: string;
+  connections: number;
+  retransmits?: number;
+}
+
+export interface ServiceMapPayload {
+  from_ns: number;
+  until_ns: number;
+  nodes: ServiceMapNode[];
+  edges: ServiceMapEdge[];
+  truncated?: boolean;
+}
+
+export interface ProfileType {  name: string;
   unit: string;
   total_value: number;
   segment_count: number;

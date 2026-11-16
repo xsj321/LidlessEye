@@ -16,6 +16,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
+    "echarts": "^6.1.0",
     "lucide-react": "^1.72.0",
     "next": "^15.5.29",
     "radix-ui": "^1.8.1",

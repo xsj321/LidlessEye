@@ -28,6 +28,7 @@ pub mod model;
 pub mod pprof;
 pub mod query;
 pub mod selector;
+pub mod servicemap;
 pub mod store;
 pub mod tenant;
 pub mod time;
@@ -44,6 +45,9 @@ pub use query::{
     TimeSeriesOptions, TopEntry, TopResult, TreeNode, diff, flamegraph, timeseries, top,
 };
 pub use selector::{MatchOp, Matcher, Selector, glob_match};
+pub use servicemap::{
+    MapEdge, MapNode, NodeKind, ServiceEdge, ServiceMap, ServiceMapBatch, ServiceNode, servicemap,
+};
 pub use store::{
     BatchMeta, DB_FILE, MAX_SCAN_ROWS, PruneStats, SCHEMA_VERSION, SampleRow, ScanQuery,
     ScanResult, SeriesInfo, Store, StoreConfig, StoreStats, duckdb_version,

@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use lidlesseye_core::Report;
+use lidlesseye_core::servicemap::ServiceMapBatch;
 use tokio::sync::mpsc;
 
 use crate::{Error, Result};
@@ -50,6 +51,7 @@ impl PublisherConfig {
 #[derive(Clone)]
 pub struct PublisherHandle {
     tx: mpsc::UnboundedSender<Report>,
+    map_tx: mpsc::UnboundedSender<ServiceMapBatch>,
     client: reqwest::Client,
     url: String,
 }
@@ -59,6 +61,14 @@ impl PublisherHandle {
     pub fn send(&self, report: Report) {
         if self.tx.send(report).is_err() {
             tracing::debug!("publisher stopped, dropping report");
+        }
+    }
+
+    /// Queue one service-map window. Independent of the profile queue: a slow
+    /// profile upload must not delay the map, and vice versa.
+    pub fn send_servicemap(&self, batch: ServiceMapBatch) {
+        if self.map_tx.send(batch).is_err() {
+            tracing::debug!("publisher stopped, dropping service map window");
         }
     }
 
@@ -109,7 +119,9 @@ impl PublisherHandle {
 
 /// Spawn the background uploader.
 pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::JoinHandle<()>)> {
-    let url = format!("{}/ingest", cfg.server_url.trim_end_matches('/'));
+    let base = cfg.server_url.trim_end_matches('/').to_string();
+    let url = format!("{base}/ingest");
+    let map_url = format!("{base}/api/v1/servicemap/ingest");
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(token) = &cfg.auth_token {
         let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
@@ -141,11 +153,66 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
         .map_err(|err| Error::Http(err.to_string()))?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Report>();
+    let (map_tx, mut map_rx) = mpsc::unbounded_channel::<ServiceMapBatch>();
     let handle = PublisherHandle {
         tx,
+        map_tx,
         client: client.clone(),
         url: url.clone(),
     };
+
+    // The map runs on its own task: its windows are independent of profile
+    // batches, and a map upload that stalls must not hold back profiles.
+    {
+        let client = client.clone();
+        let map_url = map_url.clone();
+        let max_delay = cfg.max_delay;
+        tokio::spawn(async move {
+            let mut buffer: Vec<ServiceMapBatch> = Vec::with_capacity(32);
+            loop {
+                let Some(first) = map_rx.recv().await else {
+                    break;
+                };
+                buffer.push(first);
+                let deadline = tokio::time::sleep(max_delay);
+                tokio::pin!(deadline);
+                while buffer.len() < 32 {
+                    tokio::select! {
+                        maybe = map_rx.recv() => match maybe {
+                            Some(batch) => buffer.push(batch),
+                            None => break,
+                        },
+                        _ = &mut deadline => break,
+                    }
+                }
+                let batch = std::mem::take(&mut buffer);
+                let count = batch.len();
+                let mut attempt = 0u32;
+                loop {
+                    match post_service_map(&client, &map_url, &batch).await {
+                        Ok(()) => {
+                            tracing::debug!(windows = count, "uploaded service map");
+                            break;
+                        }
+                        Err(err) => {
+                            attempt += 1;
+                            if attempt >= 6 {
+                                tracing::warn!(
+                                    windows = count,
+                                    error = %err,
+                                    "dropping service map windows after repeated upload failures"
+                                );
+                                break;
+                            }
+                            let backoff =
+                                Duration::from_millis(250 * 2u64.pow((attempt - 1).min(4)));
+                            tokio::time::sleep(backoff).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let task = tokio::spawn(async move {
         let max_batch = cfg.max_batch.max(1);
@@ -224,6 +291,26 @@ async fn post_batch(
     reports: Vec<Report>,
 ) -> Result<()> {
     let body = serde_json::json!({ "reports": reports });
+    let response = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|err| Error::Http(err.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(Error::Http(format!("server returned {status}: {text}")));
+    }
+    Ok(())
+}
+
+async fn post_service_map(
+    client: &reqwest::Client,
+    url: &str,
+    batches: &[ServiceMapBatch],
+) -> Result<()> {
+    let body = serde_json::json!({ "batches": batches });
     let response = client
         .post(url)
         .json(&body)

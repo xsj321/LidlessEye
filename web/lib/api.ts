@@ -11,6 +11,7 @@ import type {
   LabelValuesPayload,
   ProfileTypesPayload,
   SeriesPayload,
+  ServiceMapPayload,
   StatsPayload,
   TenantsPayload,
   TimeseriesPayload,
@@ -140,4 +141,9 @@ export const api = {
   top: (params: QueryParams) => request<TopPayload>("/api/v1/top", { limit: 100, ...params }),
   timeseries: (params: QueryParams) =>
     request<TimeseriesPayload>("/api/v1/timeseries", { buckets: 90, ...params }),
+
+  // The map follows the same from/until window as the flamegraph; profile_type
+  // and selector are deliberately not sent, it is a network view.
+  serviceMap: (params: QueryParams) =>
+    request<ServiceMapPayload>("/api/v1/servicemap", params),
 };

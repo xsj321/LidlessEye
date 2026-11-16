@@ -25,8 +25,9 @@
 //! always had.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use lidlesseye_ebpf::k8s::{PodIndex, PodMeta};
@@ -115,6 +116,20 @@ impl ClusterApi {
     /// rotated in place, and caching the string would start failing an hour
     /// after start-up, which looks exactly like a revoked permission.
     pub async fn list_pods(&self) -> Result<HashMap<String, PodMeta>> {
+        self.fetch_pods(true).await
+    }
+
+    /// Every pod in the cluster, not just the ones on this node.
+    ///
+    /// The service map resolves a TCP peer by address, and that peer can be
+    /// scheduled anywhere; a node-scoped list would label half of the map
+    /// "external". The payload is bigger but the permission is the same one
+    /// the ClusterRole already grants.
+    pub async fn list_all_pods(&self) -> Result<HashMap<String, PodMeta>> {
+        self.fetch_pods(false).await
+    }
+
+    async fn fetch_pods(&self, node_scoped: bool) -> Result<HashMap<String, PodMeta>> {
         let token = std::fs::read_to_string(&self.token)
             .map_err(|err| Error::Http(format!("reading {}: {err}", self.token.display())))?;
         let token = token.trim().to_string();
@@ -123,7 +138,7 @@ impl ClusterApi {
         let mut cont: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let mut query: Vec<(&str, String)> = vec![("limit", "500".to_string())];
-            if let Some(node) = &self.node {
+            if let (true, Some(node)) = (node_scoped, &self.node) {
                 query.push(("fieldSelector", format!("spec.nodeName={node}")));
             }
             if let Some(token) = &cont {
@@ -163,6 +178,76 @@ impl ClusterApi {
             }
         }
         Ok(pods)
+    }
+
+    /// Every Service and the addresses it answers on.
+    pub async fn list_services(&self) -> Result<Vec<(IpAddr, Vec<u16>, ServiceRef)>> {
+        let token = std::fs::read_to_string(&self.token)
+            .map_err(|err| Error::Http(format!("reading {}: {err}", self.token.display())))?;
+        let token = token.trim().to_string();
+
+        let mut out = Vec::new();
+        let mut cont: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut query: Vec<(&str, String)> = vec![("limit", "500".to_string())];
+            if let Some(token) = &cont {
+                query.push(("continue", token.clone()));
+            }
+            let response = self
+                .client
+                .get(format!("{}/api/v1/services", self.base))
+                .bearer_auth(&token)
+                .query(&query)
+                .send()
+                .await
+                .map_err(|err| Error::Http(format!("listing services: {err}")))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let body: String = body.trim().chars().take(400).collect();
+                return Err(Error::Http(format!(
+                    "listing services: HTTP {status}: {body}"
+                )));
+            }
+            let list: ServiceList = response
+                .json()
+                .await
+                .map_err(|err| Error::Http(format!("parsing the service list: {err}")))?;
+            for item in list.items {
+                let namespace = item.metadata.namespace;
+                let name = item.metadata.name;
+                if namespace.is_empty() || name.is_empty() {
+                    continue;
+                }
+                let mut ips: Vec<IpAddr> = item
+                    .spec
+                    .cluster_ips
+                    .iter()
+                    .chain(std::iter::once(&item.spec.cluster_ip))
+                    .filter_map(|ip| ip.parse().ok())
+                    .collect();
+                ips.sort();
+                ips.dedup();
+                if ips.is_empty() {
+                    // Headless Services have no ClusterIP: their traffic goes
+                    // straight to pod addresses, which the pod index covers.
+                    continue;
+                }
+                let ports: Vec<u16> = item.spec.ports.iter().map(|p| p.port).collect();
+                let service = ServiceRef { namespace, name };
+                for ip in ips {
+                    out.push((ip, ports.clone(), service.clone()));
+                }
+            }
+            cont = list
+                .metadata
+                .continue_token
+                .filter(|token| !token.is_empty());
+            if cont.is_none() {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// The node the list is filtered by, for log lines.
@@ -232,6 +317,158 @@ pub fn start_pod_index(refresh: Duration) -> Option<Arc<PodIndex>> {
     Some(index)
 }
 
+/// Start a cluster-wide pod index, for the service map.
+///
+/// The profiling index is node-scoped on purpose (it only ever answers "what is
+/// UID X"), but a TCP peer has no UID: the map has to resolve an address, and
+/// the pod behind it can be on any node. `None` outside a cluster.
+pub fn start_cluster_pod_index(refresh: Duration) -> Option<Arc<PodIndex>> {
+    let api = ClusterApi::in_cluster()?;
+    let refresh = refresh.max(MIN_REFRESH);
+    let index = Arc::new(PodIndex::new());
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let shared = Arc::clone(&index);
+    runtime.spawn(async move {
+        let mut last_error: Option<String> = None;
+        loop {
+            match api.list_all_pods().await {
+                Ok(pods) => {
+                    if let Some(err) = last_error.take() {
+                        info!(previous = %err, "cluster pod index is readable again");
+                    }
+                    let count = pods.len();
+                    shared.replace(pods);
+                    debug!(pods = count, "refreshed cluster-wide pod metadata");
+                }
+                Err(err) => {
+                    let text = err.to_string();
+                    if last_error.as_deref() != Some(text.as_str()) {
+                        warn!(error = %text, "cannot refresh the cluster pod index");
+                    }
+                    last_error = Some(text);
+                }
+            }
+            tokio::time::sleep(refresh).await;
+        }
+    });
+    Some(index)
+}
+
+/// A ClusterIP Service, as far as the map is concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRef {
+    pub namespace: String,
+    pub name: String,
+}
+
+impl ServiceRef {
+    pub fn id(&self) -> String {
+        lidlesseye_core::servicemap::node_id(&self.namespace, &self.name)
+    }
+}
+
+impl std::fmt::Display for ServiceRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.namespace, self.name)
+    }
+}
+
+/// ClusterIP -> Service, so `10.96.0.10:443` becomes `default/kubernetes`
+/// instead of "external".
+///
+/// The port matters: one ClusterIP can expose several ports, and Kubernetes
+/// uses that to route to different backends. Lookups fall back to the address
+/// alone when the port is not one the Service declares (a client connecting to
+/// a port the Service does not own is a misconfiguration worth seeing anyway).
+#[derive(Debug, Default)]
+pub struct ServiceIndex {
+    by_addr: RwLock<Arc<HashMap<(IpAddr, u16), ServiceRef>>>,
+    by_ip: RwLock<Arc<HashMap<IpAddr, ServiceRef>>>,
+}
+
+impl ServiceIndex {
+    pub fn new() -> Self {
+        ServiceIndex::default()
+    }
+
+    /// Install a snapshot, returning how many addresses it covers.
+    pub fn replace(&self, services: Vec<(IpAddr, Vec<u16>, ServiceRef)>) -> usize {
+        let mut by_addr = HashMap::new();
+        let mut by_ip = HashMap::new();
+        for (ip, ports, service) in services {
+            for port in ports {
+                by_addr.insert((ip, port), service.clone());
+            }
+            by_ip.insert(ip, service);
+        }
+        let len = by_ip.len();
+        *self
+            .by_addr
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(by_addr);
+        *self
+            .by_ip
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(by_ip);
+        len
+    }
+
+    pub fn lookup(&self, ip: IpAddr, port: u16) -> Option<ServiceRef> {
+        let by_addr = self
+            .by_addr
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(service) = by_addr.get(&(ip, port)) {
+            return Some(service.clone());
+        }
+        let by_ip = self
+            .by_ip
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        by_ip.get(&ip).cloned()
+    }
+}
+
+/// Start refreshing the Service index. A missing RBAC rule is reported once and
+/// degrades to "ClusterIP edges look external"; it never stops the collector.
+pub fn start_service_index(refresh: Duration) -> Option<Arc<ServiceIndex>> {
+    let api = ClusterApi::in_cluster()?;
+    let refresh = refresh.max(MIN_REFRESH);
+    let index = Arc::new(ServiceIndex::new());
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let shared = Arc::clone(&index);
+    runtime.spawn(async move {
+        let mut last_error: Option<String> = None;
+        loop {
+            match api.list_services().await {
+                Ok(services) => {
+                    if let Some(err) = last_error.take() {
+                        info!(previous = %err, "the Service list is readable again");
+                    }
+                    let count = services.len();
+                    shared.replace(services);
+                    debug!(services = count, "refreshed ClusterIP services");
+                }
+                Err(err) => {
+                    let text = err.to_string();
+                    if last_error.as_deref() != Some(text.as_str()) {
+                        warn!(
+                            error = %text,
+                            "cannot list Services; ClusterIP edges will look external \
+                             (grant `services` `list` to fix it)"
+                        );
+                    }
+                    last_error = Some(text);
+                }
+            }
+            tokio::time::sleep(refresh).await;
+        }
+    });
+    Some(index)
+}
+
 /// Log what was indexed, and complain when the filter matched nothing — an
 /// agent whose `spec.nodeName` disagrees with the API's idea of the node names
 /// would otherwise look like a cluster with no pods.
@@ -255,6 +492,37 @@ struct PodList {
     metadata: ListMeta,
 }
 
+#[derive(Debug, Deserialize)]
+struct ServiceList {
+    #[serde(default)]
+    items: Vec<ServiceItem>,
+    #[serde(default)]
+    metadata: ListMeta,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceItem {
+    metadata: ObjectMeta,
+    #[serde(default)]
+    spec: ServiceSpec,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ServiceSpec {
+    #[serde(default, rename = "clusterIP")]
+    cluster_ip: String,
+    #[serde(default, rename = "clusterIPs")]
+    cluster_ips: Vec<String>,
+    #[serde(default)]
+    ports: Vec<ServicePort>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServicePort {
+    #[serde(default)]
+    port: u16,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ListMeta {
     #[serde(default, rename = "continue")]
@@ -264,6 +532,45 @@ struct ListMeta {
 #[derive(Debug, Deserialize)]
 struct PodItem {
     metadata: ObjectMeta,
+    #[serde(default)]
+    status: PodStatus,
+    #[serde(default)]
+    spec: PodSpec,
+}
+
+/// Only the declared container ports: they are what tells two host-network pods
+/// sharing a node address apart on the service map.
+#[derive(Debug, Default, Deserialize)]
+struct PodSpec {
+    #[serde(default)]
+    containers: Vec<PodContainer>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PodContainer {
+    #[serde(default)]
+    ports: Vec<PodContainerPort>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PodContainerPort {
+    #[serde(default, rename = "containerPort")]
+    container_port: u16,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PodStatus {
+    /// Single-stack clusters only report this one.
+    #[serde(default, rename = "podIP")]
+    pod_ip: String,
+    /// Dual-stack clusters report every address here.
+    #[serde(default, rename = "podIPs")]
+    pod_ips: Vec<PodIp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PodIp {
+    ip: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -298,6 +605,26 @@ impl PodItem {
             .first()
             .map(|owner| (owner.kind.as_str(), owner.name.as_str()));
         let template_hash = meta.labels.get("pod-template-hash").map(String::as_str);
+        let mut ips: Vec<IpAddr> = self
+            .status
+            .pod_ips
+            .iter()
+            .filter_map(|entry| entry.ip.parse().ok())
+            .collect();
+        if let Ok(ip) = self.status.pod_ip.parse::<IpAddr>() {
+            ips.push(ip);
+        }
+        ips.sort();
+        ips.dedup();
+        let mut ports: Vec<u16> = self
+            .spec
+            .containers
+            .iter()
+            .flat_map(|container| container.ports.iter())
+            .map(|port| port.container_port)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
         let pod = PodMeta::new(
             meta.uid.as_str(),
             meta.namespace.as_str(),
@@ -305,7 +632,9 @@ impl PodItem {
             &meta.labels,
             owner,
             template_hash,
-        );
+        )
+        .with_ips(ips)
+        .with_ports(ports);
         Some((meta.uid, pod))
     }
 }

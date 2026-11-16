@@ -121,6 +121,9 @@ struct ServeArgs {
     /// How often the pod metadata cache is refreshed.
     #[arg(long, default_value = "30s")]
     k8s_pod_refresh: String,
+    /// Do not build the service map (network topology) from `/proc`.
+    #[arg(long)]
+    no_netmap: bool,
 }
 
 #[derive(Debug, Args)]
@@ -159,6 +162,9 @@ struct CollectArgs {
     /// How often the pod metadata cache is refreshed.
     #[arg(long, default_value = "30s")]
     k8s_pod_refresh: String,
+    /// Do not build the service map (network topology) from `/proc`.
+    #[arg(long)]
+    no_netmap: bool,
     /// Stop after this long (used by tests); run forever by default.
     #[arg(long)]
     duration: Option<String>,
@@ -304,6 +310,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .enrich_kubernetes_labels(!args.no_k8s_labels)
         .k8s_pod_metadata(!args.no_k8s_pod_metadata)
         .k8s_pod_refresh(parse_duration(&args.k8s_pod_refresh)?)
+        .collect_netmap(!args.no_netmap)
         .tenant(args.tenant)
         .tenant_header(args.tenant_header)
         .max_tenants(args.max_tenants);
@@ -335,6 +342,25 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+/// Start the service map collector, or `None` outside a cluster (without pod
+/// metadata a socket peer cannot be named, and the map would be one node).
+fn start_netmap<F>(
+    refresh: Duration,
+    interval: Duration,
+    sink: F,
+) -> Option<lidlesseye::netmap::NetMapHandle>
+where
+    F: Fn(lidlesseye::core::ServiceMapBatch) + Send + 'static,
+{
+    let pods = lidlesseye::k8s::start_cluster_pod_index(refresh)?;
+    let services = lidlesseye::k8s::start_service_index(refresh);
+    let mut config = lidlesseye::netmap::NetMapConfig::new(pods);
+    config.interval = interval.max(Duration::from_secs(2));
+    config.services = services;
+    Some(lidlesseye::netmap::start(config, sink))
+}
+
 async fn collect(args: CollectArgs) -> anyhow::Result<()> {
     lidlesseye::init_tracing("lidlesseye=info");
     if !cfg!(target_os = "linux") {
@@ -364,6 +390,14 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
     }
 
     let labels: BTreeMap<String, String> = args.labels.into_iter().collect();
+    let pod_refresh = parse_duration(&args.k8s_pod_refresh)?;
+    // Profiles only need the pods on this node, but the service map resolves
+    // peers by address, so it needs the cluster-wide index as well.
+    let pods = if !args.no_k8s_labels && !args.no_k8s_pod_metadata {
+        lidlesseye::k8s::start_pod_index(pod_refresh)
+    } else {
+        None
+    };
     let collector_cfg = lidlesseye::ebpf::CollectorConfig {
         service_name: args.service_name,
         labels,
@@ -372,11 +406,7 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
         collect_cpu: !args.no_cpu,
         collect_off_cpu: !args.no_offcpu,
         enrich_kubernetes_labels: !args.no_k8s_labels,
-        pods: if !args.no_k8s_labels && !args.no_k8s_pod_metadata {
-            lidlesseye::k8s::start_pod_index(parse_duration(&args.k8s_pod_refresh)?)
-        } else {
-            None
-        },
+        pods: pods.clone(),
         ..Default::default()
     };
     let sink = publisher.clone();
@@ -384,6 +414,16 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
         sink.send(report);
     })
     .map_err(anyhow::Error::msg)?;
+
+    #[cfg(target_os = "linux")]
+    let mut netmap = if args.no_netmap {
+        None
+    } else {
+        start_netmap(pod_refresh, parse_duration(&args.flush)?, {
+            let publisher = publisher.clone();
+            move |batch| publisher.send_servicemap(batch)
+        })
+    };
 
     match args.duration {
         Some(duration) => tokio::time::sleep(parse_duration(&duration)?).await,
@@ -393,6 +433,10 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
     }
     let stats = handle.stats();
     handle.stop();
+    #[cfg(target_os = "linux")]
+    if let Some(netmap) = &mut netmap {
+        netmap.stop();
+    }
     println!(
         "collected {} cpu / {} off-cpu records in {} flushes",
         stats.cpu_records, stats.offcpu_records, stats.drains

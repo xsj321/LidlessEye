@@ -13,6 +13,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { FlamegraphView } from "@/components/views/flamegraph-view";
 import { LabelsView } from "@/components/views/labels-view";
 import { OverviewView } from "@/components/views/overview-view";
+import { ServiceMapView } from "@/components/views/service-map-view";
 import { TimeseriesView } from "@/components/views/timeseries-view";
 import { TopView } from "@/components/views/top-view";
 import { dashboardStore } from "@/lib/store";
@@ -25,6 +26,7 @@ const NAV: ReadonlyArray<{ value: View; label: string }> = [
   { value: "top", label: "Top functions" },
   { value: "timeseries", label: "Time series" },
   { value: "labels", label: "Labels" },
+  { value: "servicemap", label: "Service map" },
   { value: "overview", label: "Overview" },
 ];
 
@@ -57,6 +59,8 @@ function ViewSwitch({ view }: { view: View }) {
       return <TimeseriesView />;
     case "labels":
       return <LabelsView />;
+    case "servicemap":
+      return <ServiceMapView />;
     case "overview":
       return <OverviewView />;
     default:

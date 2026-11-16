@@ -340,6 +340,79 @@ is what makes a URL reproduce a view exactly. Routing stays hash-based
 (`#/flamegraph?…`), so the single exported `index.html` serves every view and
 pre-existing deep links keep working.
 
+The service map is the one view that is not drawn by hand: it uses ECharts'
+canvas `graph` series (force layout, pan/zoom and hit testing in the library),
+because a service graph has no fixed geometry to precompute and a few hundred
+nodes is exactly where a React node-per-service diagram stops being smooth. The
+node colour is the on-CPU time of the profiles behind it, so the map and the
+flamegraph are two views of the same window.
+
+## Service map
+
+The map answers "who talks to whom, and what does it cost". It is a *network*
+graph — L4 edges with connection and retransmit counts — plus the profiles
+already stored, joined per workload.
+
+Collecting it does not need a second eBPF program. `/proc/<pid>/net/tcp` of any
+process in a pod is resolved by the kernel in that pod's network namespace, so
+one `hostPID` agent can read every pod's TCP table without `setns`, and
+`/proc/<pid>/net/dev` gives the same pod's cumulative byte counters. Reading
+`struct sock` from a kprobe would add RTT and per-socket bytes, but it also means
+matching a kernel struct layout with CO-RE for every supported release; the
+addresses in `/proc` are already enough to name both endpoints.
+
+Attribution rules:
+
+| Case | Who counts the edge |
+| --- | --- |
+| pod → pod | the client's agent; the server's side skips it, or every edge would double |
+| pod → ClusterIP | the client, resolved through the Service index (`default/kubernetes`, not "external") |
+| outside → pod | the server, as `external → workload` |
+| pod → outside | the client, as `workload → external` |
+
+Two details decide whether the map names the right thing:
+
+*Peers are resolved by address and port.* Every `hostNetwork` pod on a node
+reports that node's address, so "172.18.0.4:9100" is only the node exporter if
+the port is part of the lookup. The pod index therefore keeps the container
+ports from `spec.containers[].ports` and prefers the pod that declares the port
+before falling back to any pod on the address.
+
+*A shared network namespace is not the pod's.* For a `hostNetwork` pod,
+`/proc/<pid>/net/tcp` is the node's table: every socket on the machine. Read
+naively, kube-proxy, kindnet and node-exporter each come out with the whole
+node's traffic (their byte counters are identical, which is the tell). The agent
+compares `/proc/<pid>/ns/net` against pid 1's and, for a match, keeps only the
+sockets whose inode appears in that process's `/proc/<pid>/fd`. The interface
+counters have no per-pod equivalent in that case, so such pods report no bytes
+rather than the node's totals; their connections are still counted.
+
+A connection is counted once, on first sight; retransmits are a delta against
+the previous scan. Windows are appended to `net_nodes`/`net_edges` and summed by
+the query, which is what makes the map follow the same `from`/`until` as the
+flamegraph. CPU is joined by label: the query groups `samples` of type `cpu` by
+`k8s_namespace`/`k8s_workload`, which is the same string the agent uses as a
+node id.
+
+Polling a table sees only what is open at that instant, so counting
+`TIME_WAIT`/`CLOSE_WAIT`/`FIN_WAIT` alongside `ESTABLISHED` is what keeps a
+scrape or an API call visible after it has already finished; `SYN_SENT` is left
+out, because a refused connect is not a connection. The closing states also
+linger when the process is gone, which is why a pod that restarts still shows
+the traffic it served.
+
+Known limits, stated rather than hidden: there is no L7 parsing, so an edge's
+protocol is inferred from the server port and an edge reports connections, not
+requests; traffic in a pod's own namespace (`localhost`) is ignored; and a
+long-lived idle connection is counted when it appears, not re-counted per
+window. Same-node traffic to a ClusterIP is masqueraded to the node's bridge
+address (`10.244.x.1`), so it arrives with no client name and shows up as
+`external → pod` — the named `pod → ClusterIP` edge exists as well, from the
+client's own table, so the pair describes one connection from both ends.
+Static pods are owned by their `Node` in `ownerReferences`; treating that as a
+workload would merge every control-plane component on a node into one entry, so
+it is ignored and each pod keeps its own name.
+
 The histogram behind the time-range selector is `GET /api/v1/timeseries` over
 the tenant's extent — the same endpoint the time-series view uses, at 120
 buckets instead of 90 — summed across series. It is fetched separately from the

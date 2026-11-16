@@ -313,6 +313,25 @@ impl AppState {
         }
         Ok(metas)
     }
+
+    /// Persist one service-map window for the embedded agent.
+    ///
+    /// The in-process agent has no HTTP round trip to make; this is the same
+    /// write the ingest endpoint performs, minus the serialisation.
+    pub async fn ingest_servicemap(
+        &self,
+        tenant: &TenantId,
+        batch: lidlesseye_core::ServiceMapBatch,
+    ) -> Result<(), ApiError> {
+        if self.inner.cfg.read_only {
+            return Err(ApiError::forbidden("server is read-only"));
+        }
+        let store = self.writable_tenant(tenant)?;
+        tokio::task::spawn_blocking(move || store.append_servicemap(&batch))
+            .await
+            .map_err(|err| ApiError::internal(format!("service map task failed: {err}")))?
+            .map_err(ApiError::from)
+    }
 }
 
 /// Number of reports that would introduce a series the store has never seen.
@@ -600,6 +619,8 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/diff", get(api::diff))
         .route("/api/v1/top", get(api::top))
         .route("/api/v1/timeseries", get(api::timeseries))
+        .route("/api/v1/servicemap", get(api::servicemap))
+        .route("/api/v1/servicemap/ingest", post(api::servicemap_ingest))
         .route("/api/v1/version", get(api::version))
         .route("/metrics", get(api::metrics))
         .fallback(ui::fallback)

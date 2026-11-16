@@ -14,6 +14,7 @@
 //! exactly the ones the cgroup path already provided.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
 /// The pod labels that name a service, in the order Kubernetes itself
@@ -39,6 +40,13 @@ pub struct PodMeta {
     pub workload_kind: Option<String>,
     /// Value of the first label in [`SERVICE_LABELS`] the pod carries.
     pub service: Option<String>,
+    /// Pod IPs. The service map resolves a TCP peer to a pod through these,
+    /// which is the only thing connecting a socket to a workload.
+    pub ips: Vec<IpAddr>,
+    /// Ports the pod's containers declare. Every host-network pod on a node
+    /// shares that node's address, so the address alone cannot say which
+    /// component a peer on port 9100 is; the port can.
+    pub ports: Vec<u16>,
 }
 
 impl PodMeta {
@@ -71,7 +79,21 @@ impl PodMeta {
             workload,
             workload_kind,
             service,
+            ips: Vec::new(),
+            ports: Vec::new(),
         }
+    }
+
+    /// Attach the pod's addresses, as `status.podIPs` reports them.
+    pub fn with_ips(mut self, ips: Vec<IpAddr>) -> Self {
+        self.ips = ips;
+        self
+    }
+
+    /// Attach the container ports, as `spec.containers[].ports` declares them.
+    pub fn with_ports(mut self, ports: Vec<u16>) -> Self {
+        self.ports = ports;
+        self
     }
 
     /// The name a series should use, if the pod offers a better one than the
@@ -104,6 +126,13 @@ fn workload_of(
     name: &str,
     template_hash: Option<&str>,
 ) -> (Option<String>, Option<String>) {
+    // A static pod (kube-apiserver, etcd, ...) is owned by its Node: the mirror
+    // pod carries `ownerReferences: [{kind: Node, name: <node>}]`. Treating
+    // that as a workload would collapse every control-plane component on a node
+    // into one entry named after the node, which is not a workload at all.
+    if kind == "Node" {
+        return (None, None);
+    }
     if kind == "ReplicaSet"
         && let Some(hash) = template_hash
         && let Some(deployment) = name.strip_suffix(&format!("-{hash}"))
@@ -122,6 +151,7 @@ fn workload_of(
 #[derive(Debug, Default)]
 pub struct PodIndex {
     pods: RwLock<Arc<HashMap<String, PodMeta>>>,
+    by_ip: RwLock<Arc<HashMap<IpAddr, Vec<PodMeta>>>>,
 }
 
 impl PodIndex {
@@ -135,11 +165,27 @@ impl PodIndex {
     /// pods that have been deleted — a merge would keep them forever.
     pub fn replace(&self, pods: HashMap<String, PodMeta>) -> usize {
         let len = pods.len();
+        // The IP index is rebuilt from the same snapshot, never updated in
+        // place: a pod that changed address must not stay reachable under the
+        // old one, and a recycled pod IP must point at the new owner.
+        let mut by_ip: HashMap<IpAddr, Vec<PodMeta>> = HashMap::with_capacity(len);
+        for pod in pods.values() {
+            for ip in &pod.ips {
+                by_ip.entry(*ip).or_default().push(pod.clone());
+            }
+        }
+        {
+            let mut slot = self
+                .pods
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Arc::new(pods);
+        }
         let mut slot = self
-            .pods
+            .by_ip
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *slot = Arc::new(pods);
+        *slot = Arc::new(by_ip);
         len
     }
 
@@ -154,6 +200,26 @@ impl PodIndex {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         snapshot.get(uid).cloned()
+    }
+
+    /// Metadata for a pod address — how the service map turns a socket peer
+    /// into a service.
+    ///
+    /// `port` breaks the tie between host-network pods, which all report the
+    /// node's address: a peer on 9100 is the node exporter even though kube-proxy
+    /// and the apiserver share its IP. Without a match the first pod is used,
+    /// because an approximate name beats naming no service at all.
+    pub fn lookup_ip(&self, ip: IpAddr, port: u16) -> Option<PodMeta> {
+        let snapshot = self
+            .by_ip
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let pods = snapshot.get(&ip)?;
+        pods.iter()
+            .find(|pod| pod.ports.contains(&port))
+            .or_else(|| pods.first())
+            .cloned()
     }
 
     pub fn len(&self) -> usize {
@@ -291,10 +357,7 @@ mod tests {
         );
         assert_eq!(index.replace(first), 1);
         assert_eq!(
-            index
-                .lookup("a")
-                .and_then(|m| m.service.map(|s| s))
-                .as_deref(),
+            index.lookup("a").and_then(|m| m.service).as_deref(),
             Some("svc")
         );
 
@@ -303,5 +366,63 @@ mod tests {
         index.replace(HashMap::new());
         assert_eq!(index.lookup("a"), None);
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn mirror_pods_are_not_owned_by_their_node() {
+        // kube-apiserver and friends carry `ownerReferences: [{kind: Node}]`.
+        // Naming them after the node merges every control-plane component on it
+        // into one entry, which is the opposite of a service map.
+        let meta = PodMeta::new(
+            "uid",
+            "kube-system",
+            "kube-apiserver-desktop-control-plane",
+            &labels(&[]),
+            Some(("Node", "desktop-control-plane")),
+            None,
+        );
+        assert_eq!(meta.workload, None);
+        assert_eq!(meta.workload_kind, None);
+        assert_eq!(meta.service_name(), None);
+    }
+
+    #[test]
+    fn a_shared_node_address_resolves_by_port() {
+        let node_ip: IpAddr = "172.18.0.4".parse().unwrap();
+        let mut pods = HashMap::new();
+        // Every host-network pod on the node reports the node's address.
+        pods.insert(
+            "proxy".to_string(),
+            PodMeta::new(
+                "proxy",
+                "kube-system",
+                "kube-proxy-x",
+                &labels(&[]),
+                None,
+                None,
+            )
+            .with_ips(vec![node_ip]),
+        );
+        pods.insert(
+            "exporter".to_string(),
+            PodMeta::new(
+                "exporter",
+                "default",
+                "node-exporter-x",
+                &labels(&[]),
+                None,
+                None,
+            )
+            .with_ips(vec![node_ip])
+            .with_ports(vec![9100]),
+        );
+        let index = PodIndex::new();
+        index.replace(pods);
+
+        let found = index.lookup_ip(node_ip, 9100).expect("a pod");
+        assert_eq!(found.uid, "exporter");
+        // A port nobody declares still resolves, to whichever pod is first: a
+        // rough name is better than dropping the peer.
+        assert!(index.lookup_ip(node_ip, 10250).is_some());
     }
 }

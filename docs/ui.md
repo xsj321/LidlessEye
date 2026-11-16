@@ -181,13 +181,34 @@ Store statistics (batches, physical and logical bytes, value, oldest/newest),
 the profile types present, and the series table with per-series value and time
 range. This is the view that answers "is anything arriving at all?".
 
+### Service map
+
+The network graph of the selected window: nodes are workloads, ClusterIP
+Services and the outside world; edges are TCP connections between them. Node
+size grows with new connections, node colour is the on-CPU time of that
+workload's profiles (blue = idle, orange = hot), and an orange edge carries
+retransmits. Drag to move a node, scroll to zoom, drag the background to pan.
+
+Selecting a node opens its panel — CPU, connections, bytes in/out, retransmits —
+and *Profile this service* replaces the filter bar with `k8s_namespace` +
+`k8s_workload` (or `service_name` for a ClusterIP) and switches to the
+flamegraph. The time range is the one chosen above: dragging the bracket
+re-queries the map exactly as it re-queries a flamegraph.
+
+The protocol label on an edge comes from the server port; the map does not parse
+payloads, so it reports connections rather than requests. *External* collects
+everything the map cannot name: traffic that really does come from outside the
+cluster, and same-node traffic to a ClusterIP, which the kernel masquerades to
+the node's bridge address before it reaches the server. See
+[architecture.md](architecture.md#service-map) for what the agent reads and why.
+
 ## URL reference
 
 The hash carries the view and everything that shapes the query:
 
 | Parameter | Example | Meaning |
 | --- | --- | --- |
-| view | `#/flamegraph` | `flamegraph`, `compare`, `top`, `timeseries`, `labels`, `overview` |
+| view | `#/flamegraph` | `flamegraph`, `compare`, `top`, `timeseries`, `labels`, `servicemap`, `overview` |
 | `type` | `off_cpu` | profile type, including the virtual `wall` |
 | `range` | `1h` | relative range: the preset the bracket may slide in |
 | `from`, `until` | `1794486354991000000` | absolute range, nanoseconds (replaces `range`) |

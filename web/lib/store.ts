@@ -34,6 +34,7 @@ import type {
   LabelValueRow,
   ProfileType,
   SeriesRow,
+  ServiceMapPayload,
   StatsPayload,
   TimeseriesPayload,
   TopPayload,
@@ -91,6 +92,7 @@ export interface DashboardState {
   flamegraph: FlamegraphPayload | DiffPayload | null;
   top: TopPayload | null;
   series: TimeseriesPayload | null;
+  serviceMap: ServiceMapPayload | null;
   overview: OverviewData | null;
 
   /** Label explorer (own window-scoped name list, independent of the toolbar). */
@@ -139,6 +141,7 @@ function initialState(): DashboardState {
     flamegraph: null,
     top: null,
     series: null,
+    serviceMap: null,
     overview: null,
 
     explorerNames: [],
@@ -338,6 +341,7 @@ export class DashboardStore {
       flamegraph: null,
       top: null,
       series: null,
+      serviceMap: null,
       overview: null,
       explorerNames: [],
       explorerValues: [],
@@ -368,6 +372,7 @@ export class DashboardStore {
       flamegraph: null,
       top: null,
       series: null,
+      serviceMap: null,
       overview: null,
       empty: null,
     });
@@ -505,6 +510,21 @@ export class DashboardStore {
   filterByLabel(label: string, value: string) {
     this.valueCache.clear();
     this.commit({ filters: [{ label, op: "=", value }], activeLabel: label });
+    this.setView("flamegraph");
+  }
+
+  /**
+   * Jump from a service-map node to the profiles behind it.
+   *
+   * The map knows a node as `namespace/workload`; the profiles behind it carry
+   * several labels, so the caller passes the exact matchers (namespace plus
+   * workload, or `service_name` for a ClusterIP). Replacing the filter bar
+   * rather than appending keeps the drill-down predictable: what you click is
+   * what you see.
+   */
+  showProfile(filters: LabelFilter[]) {
+    this.valueCache.clear();
+    this.commit({ filters, activeLabel: null });
     this.setView("flamegraph");
   }
 
@@ -691,6 +711,27 @@ export class DashboardStore {
 
       if (view === "labels") {
         await this.loadLabels(id, params);
+        return;
+      }
+
+      if (view === "servicemap") {
+        // The map is a network view: `profile_type` would be ignored by the
+        // server, and the selector would only make the map lie about its
+        // completeness. Only the window is sent.
+        const win = this.resolveWindow();
+        const result = await api.serviceMap({ from: iso(win.from), until: iso(win.until) });
+        if (id !== this.requestId) return;
+        if (!result.nodes?.length && !result.edges?.length) {
+          this.commit({
+            serviceMap: null,
+            empty: {
+              title: "No traffic in this range",
+              hint: "The service map is built from the pods' TCP tables on each node. Widen the range, or check that the agent is running with pod metadata enabled.",
+            },
+          });
+          return;
+        }
+        this.commit({ serviceMap: result });
       }
     } catch (err) {
       if (id !== this.requestId) return;
