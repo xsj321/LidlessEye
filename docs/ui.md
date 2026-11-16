@@ -46,17 +46,25 @@ there is nothing to choose.
 ## Layout
 
 ```
-┌ drawer ┬ top bar ─ name · version · refresh ──────────────────────────┐
-│        ├ toolbar ─ tenant · profile · group by · range · auto ───────┤
+┌ drawer ┬ top bar ───────────── tenant · version · refresh ───────────┐
+│        ├ toolbar ─ profile · group by · range · auto (not on map) ───┤
 │  nav   ├ filter rows ─ [+ Filter]  label = value  … ──────────────────┤
-│        ├ time bar ─ mode · date pickers · histogram ─────────────────┤
+│        ├ time bar ─ mode · relative range · histogram ───────────────┤
 │Settings├ main ─────── the selected view ─────────────────────────────┤
 └────────┴──────────────────────────────────────────────────────────────┘
 ```
 
 The **drawer** is a `<nav>` landmark whose buttons carry `aria-current="page"`:
 these are pages, not sibling tabs. It collapses to icons; the choice is kept in
-localStorage. **Settings** sits at its foot (see [Settings](#settings)).
+localStorage. The collapse button sits beside the wordmark when expanded; once
+collapsed it disappears and the expand button becomes the last option of the
+icon rail. **Settings** sits at its foot (see [Settings](#settings)).
+
+The top bar intentionally has no title — the brand is already in the drawer.
+The tenant selector is on its right, immediately before the build version. The
+profile toolbar is omitted entirely on the service map: profile type, grouping,
+auto-refresh and Apply all describe a profile query, and the map's relative
+range is picked in the time bar next to the histogram.
 
 Everything to the right of `main`'s siblings is shared by all views: changing
 the window, a filter or the profile type re-queries whatever view is open.
@@ -68,9 +76,10 @@ The time selector works in two steps, because the two questions are different:
 analyse*.
 
 1. **Choose the range first** — the segmented control **Relative | Absolute**.
-   - *Relative* keeps the preset from the toolbar's **Range** dropdown: `Last
-     hour` means the hour before now, and **Auto** (a 30-second reload) makes it
-     follow the clock.
+   - *Relative* keeps the preset from the **Range** dropdown on the right of the
+     time bar (profile views also have one in the toolbar): `Last hour` means
+     the hour before now, and **Auto** (a 30-second reload) makes it follow the
+     clock.
    - *Absolute* opens a `From → To` pair of date-time pickers (`Apply`, or
      `Enter` in either field). `Now` moves the end to the present.
 2. **Then slide inside it** — the histogram spans exactly the range you chose,
@@ -298,6 +307,7 @@ explicit view or range picks up the start-up values.
 
 | Setting | Default | What it changes |
 | --- | --- | --- |
+| Language | `en` | `en` / `zh`; switches every interface string in place and is stored in the same preference object. |
 | Default view | Service map | Landing view for a bare URL. |
 | Default range | `1h` | Relative range on a fresh load. |
 | Auto-refresh interval | 30 s | 10 s / 30 s / 1 min / 5 min; re-arms an active Auto timer immediately. |
@@ -416,9 +426,13 @@ State lives in one store (`lib/store.ts`) read through `useSyncExternalStore`.
 which is why a URL reproduces a view exactly; the shell swaps views by changing
 one field, and each view is a component that draws from the store's payload.
 
-The histograms are filled from `/api/v1/timeseries` over the extent, bucketed
-120 ways, and summed across series; the window itself is client state until it
-lands in the URL.
+Profile histograms are filled from `/api/v1/timeseries` over the extent,
+bucketed 120 ways, and summed across series. The service map asks
+`/api/v1/servicemap/histogram` instead: it sums `net_edges.connections` per
+bucket over the whole map, so the brush shows request density rather than CPU
+samples. Both are converted to the same `TimeseriesPayload` envelope before
+reaching `TimeBrush`; the window itself is client state until it lands in the
+URL.
 
 ### Testing it
 

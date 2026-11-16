@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { useT } from "@/lib/i18n";
 import { RANGES } from "@/lib/time";
 import { dashboardStore } from "@/lib/store";
 import {
@@ -105,6 +106,7 @@ function NumberSelect({
 
 export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
   const settings = useSettings();
+  const t = useT();
 
   const update = (patch: Partial<Settings>) => {
     settingsStore.update(patch);
@@ -121,7 +123,7 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
           className="w-full justify-start gap-2 px-2 text-xs text-muted-foreground hover:text-foreground"
         >
           <Settings2 />
-          <span className={collapsed ? "sr-only" : "truncate"}>Settings</span>
+          <span className={collapsed ? "sr-only" : "truncate"}>{t("Settings")}</span>
         </Button>
       </DialogTrigger>
       <DialogContent
@@ -131,18 +133,40 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Settings2 className="size-4 text-primary" />
-            Settings
+            {t("Settings")}
           </DialogTitle>
           <DialogDescription>
-            Preferences are stored in this browser. They do not travel with a shared link.
+            {t("Preferences are stored in this browser. They do not travel with a shared link.")}
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-1 py-1">
           <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-            Start-up
+            {t("General")}
           </div>
-          <Row label="Default view" hint="Used only when the URL does not name a view.">
+          <Row label={t("Language")} hint={t("Interface language")} htmlFor="settings-language">
+            <Select
+              value={settings.language}
+              onValueChange={(value) => update({ language: value as Settings["language"] })}
+            >
+              <SelectTrigger id="settings-language" className="h-7 w-36 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="en" className="text-xs">
+                  {t("English")}
+                </SelectItem>
+                <SelectItem value="zh" className="text-xs">
+                  {t("Chinese")}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </Row>
+
+          <div className="mt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            {t("Start-up")}
+          </div>
+          <Row label={t("Default view")} hint={t("Used only when the URL does not name a view.")}>
             <Select
               value={settings.defaultView}
               onValueChange={(value) => update({ defaultView: value as Settings["defaultView"] })}
@@ -153,13 +177,13 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
               <SelectContent>
                 {VIEWS.map((view) => (
                   <SelectItem key={view} value={view} className="text-xs">
-                    {VIEW_LABELS[view] ?? view}
+                    {t(VIEW_LABELS[view] ?? view)}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </Row>
-          <Row label="Default range" hint="The relative window on a fresh load.">
+          <Row label={t("Default range")} hint={t("The relative window on a fresh load.")}>
             <Select
               value={settings.defaultRange}
               onValueChange={(value) => update({ defaultRange: value })}
@@ -170,7 +194,7 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
               <SelectContent>
                 {RANGES.map(([value, label]) => (
                   <SelectItem key={value} value={value} className="text-xs">
-                    {label}
+                    {t(label)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -179,11 +203,11 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
 
           <Separator className="my-2" />
           <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-            Refresh
+            {t("Refresh")}
           </div>
           <Row
-            label="Auto-refresh interval"
-            hint="How often the current view reloads when auto-refresh is on."
+            label={t("Auto-refresh interval")}
+            hint={t("How often the current view reloads when auto-refresh is on.")}
           >
             <NumberSelect
               id="settings-refresh"
@@ -196,19 +220,19 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
 
           <Separator className="my-2" />
           <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-            Service map
+            {t("Service map")}
           </div>
-          <Row label="Edge labels" hint="Show connections/s and mean RTT on each edge.">
+          <Row label={t("Edge labels")} hint={t("Show connections/s and mean RTT on each edge.")}>
             <Switch
               id="settings-edge-labels"
               checked={settings.edgeLabels}
               onCheckedChange={(checked) => update({ edgeLabels: checked })}
-              aria-label="Show edge labels"
+              aria-label={t("Edge labels")}
             />
           </Row>
           <Row
-            label="Label zoom threshold"
-            hint="Labels appear once the map is zoomed past this point."
+            label={t("Label zoom threshold")}
+            hint={t("Labels appear once the map is zoomed past this point.")}
           >
             <div className="flex w-36 items-center gap-2">
               <input
@@ -220,7 +244,7 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
                 value={settings.labelZoom}
                 onChange={(event) => update({ labelZoom: Number(event.target.value) })}
                 className="h-1.5 w-full cursor-pointer accent-primary"
-                aria-label="Label zoom threshold"
+                aria-label={t("Label zoom threshold")}
               />
               <span className="w-7 shrink-0 text-right font-mono text-[10px] text-muted-foreground">
                 {Math.round(settings.labelZoom * 100)}
@@ -230,9 +254,12 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
 
           <Separator className="my-2" />
           <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-            Charts
+            {t("Charts")}
           </div>
-          <Row label="Flamegraph frame cap" hint="Higher caps draw more frames but cost memory.">
+          <Row
+            label={t("Flamegraph frame cap")}
+            hint={t("Higher caps draw more frames but cost memory.")}
+          >
             <NumberSelect
               id="settings-max-nodes"
               value={settings.flamegraphMaxNodes}
@@ -241,7 +268,10 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
               onChange={(value) => update({ flamegraphMaxNodes: value })}
             />
           </Row>
-          <Row label="Histogram buckets" hint="Resolution of the time brush above the views.">
+          <Row
+            label={t("Histogram buckets")}
+            hint={t("Resolution of the time brush above the views.")}
+          >
             <NumberSelect
               id="settings-buckets"
               value={settings.histogramBuckets}
@@ -262,10 +292,10 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
             }}
           >
             <RotateCcw />
-            Reset to defaults
+            {t("Reset to defaults")}
           </Button>
           <DialogClose asChild>
-            <Button size="sm">Done</Button>
+            <Button size="sm">{t("Done")}</Button>
           </DialogClose>
         </DialogFooter>
       </DialogContent>

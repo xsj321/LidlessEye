@@ -18,8 +18,8 @@ use lidlesseye_core::model::{Report, Unit};
 use lidlesseye_core::pprof::PprofOptions;
 use lidlesseye_core::servicemap::ServiceMapBatch;
 use lidlesseye_core::{
-    DiffFlamegraph, DiffOptions, Flamegraph, MapHistory, ProfileType, QueryOptions, Selector,
-    ServiceMap, Store, TimeSeries, TimeSeriesOptions, TopResult, now_ns,
+    DiffFlamegraph, DiffOptions, Flamegraph, MapHistogram, MapHistory, ProfileType, QueryOptions,
+    Selector, ServiceMap, Store, TimeSeries, TimeSeriesOptions, TopResult, now_ns,
 };
 
 use crate::error::ApiError;
@@ -709,6 +709,41 @@ pub async fn servicemap_history(
     .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
     Ok(Json(history))
+}
+
+/// `GET /api/v1/servicemap/histogram`
+///
+/// New connections per bucket, summed over every edge in the map. This is what
+/// the time brush above the service map draws: traffic density, not the CPU
+/// sample density a profile query would return. The array is dense so the
+/// browser can paint bucket `i` at `from_ns + i * step_ns`.
+pub async fn servicemap_histogram(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Params,
+) -> Result<Json<MapHistogram>, ApiError> {
+    let caller = state.authorize(&headers)?;
+    let now = now_ns();
+    let (from, until) = params.range(now)?;
+    let buckets = params.usize_param("buckets", 120).clamp(1, 600);
+    let step_ns = ((until.saturating_sub(from)) / buckets as u64).max(1);
+    let Some(store) = maybe_store(&state, &caller) else {
+        return Ok(Json(MapHistogram {
+            from_ns: from,
+            until_ns: until,
+            step_ns,
+            connections: vec![0; buckets],
+        }));
+    };
+    let started = Instant::now();
+    let histogram = tokio::task::spawn_blocking(move || {
+        lidlesseye_core::servicemap_histogram(&store, from, until, buckets)
+    })
+    .await
+    .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
+    .map_err(ApiError::from)?;
+    state.record_query(&caller.tenant, started);
+    Ok(Json(histogram))
 }
 
 impl AppState {

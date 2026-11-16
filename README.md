@@ -72,7 +72,7 @@ The dashboard opens on the **service map**. Click any node to inspect its SLO, r
 
 ## Dashboard tour
 
-The left drawer switches between Service map, Overview, Flamegraph, Compare, Top functions, Time series and Labels. It collapses to icons with a single click; the choice is remembered in this browser. **Settings** sits at the bottom of the drawer and controls the start-up view, default range, refresh interval, map edge labels and their zoom threshold, flamegraph frame cap and histogram resolution.
+The left drawer switches between Service map, Overview, Flamegraph, Compare, Top functions, Time series and Labels. It collapses to icons with a single click; the choice is remembered in this browser. The header bar holds the tenant selector (left of the version) and Refresh; the profile toolbar is hidden on the service map, where the relative range is picked beside the histogram. The histogram above the map counts requests (new connections), not CPU samples. **Settings** sits at the bottom of the drawer and controls the interface language (English / 简体中文), start-up view, default range, refresh interval, map edge labels and their zoom threshold, flamegraph frame cap and histogram resolution.
 
 Every view reads the same window and filters from the URL. Copy the address bar to share exactly what you are seeing. See [the step-by-step guide](docs/USAGE.md) for the full walkthrough.
 

@@ -17,7 +17,11 @@ import { RANGES } from "./time";
 import type { View } from "./types";
 import { VIEWS } from "./types";
 
+export type Language = "en" | "zh";
+
 export interface Settings {
+  /** Interface language. A behaviour preference, so it stays out of the URL. */
+  language: Language;
   /** Landing view when a URL carries no view (a bare/bookmarked root URL). */
   defaultView: View;
   /** Relative range used on a fresh load when the URL has no range. */
@@ -35,6 +39,7 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
+  language: "en",
   defaultView: "servicemap",
   defaultRange: "1h",
   autoRefreshMs: 30_000,
@@ -59,6 +64,7 @@ export function sanitiseSettings(raw: unknown): Settings {
   const value = (raw ?? {}) as Partial<Settings>;
   const zoom = Number(value.labelZoom);
   return {
+    language: pick<Language>(value.language, ["en", "zh"], DEFAULT_SETTINGS.language),
     defaultView: pick<View>(value.defaultView, VIEWS, DEFAULT_SETTINGS.defaultView),
     defaultRange: pick(
       value.defaultRange,

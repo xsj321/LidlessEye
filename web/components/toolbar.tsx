@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
 import { RANGES } from "@/lib/time";
 import { useDashboard } from "@/lib/use-dashboard";
@@ -41,37 +42,24 @@ function Field({
 }
 
 export function Toolbar() {
-  const { tenant, tenants, type, profileTypes, groupBy, labelNames, range, mode, auto } =
-    useDashboard();
+  const { view, type, profileTypes, groupBy, labelNames, range, mode, auto } = useDashboard();
+  const t = useT();
 
-  // A tenant-scoped token cannot enumerate tenants: the selector then shows the
-  // one it is pinned to instead of pretending there is a choice.
-  const showTenant = tenants.length > 1 || Boolean(tenant);
+  // The service map is a network view: profile type, grouping, auto-refresh and
+  // Apply all describe a *profile* query and would only mislead here. Its time
+  // range is selected in the time bar, right next to the histogram brush.
+  // Rendering an empty bordered strip would look like a broken control row, so
+  // the row is omitted altogether on that view.
+  if (view === "servicemap") return null;
+
   const typeOptions = profileTypes.length ? profileTypes : ["cpu"];
   const groupOptions = ["", "service_name", ...labelNames];
 
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b bg-card px-3 py-2">
-      {showTenant ? (
-        <Field label="Tenant">
-          <Select value={tenant} onValueChange={(value) => dashboardStore.setTenantId(value)}>
-            <SelectTrigger size="sm" id="tenant" className="w-36" aria-label="Tenant">
-              <SelectValue placeholder="default" />
-            </SelectTrigger>
-            <SelectContent>
-              {(tenants.length ? tenants : [tenant || "default"]).map((id) => (
-                <SelectItem key={id} value={id}>
-                  {id}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </Field>
-      ) : null}
-
-      <Field label="Profile">
+      <Field label={t("Profile")}>
         <Select value={type} onValueChange={(value) => dashboardStore.setType(value)}>
-          <SelectTrigger size="sm" id="profile-type" className="w-32" aria-label="Profile type">
+          <SelectTrigger size="sm" id="profile-type" className="w-32" aria-label={t("Profile type")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -84,27 +72,27 @@ export function Toolbar() {
         </Select>
       </Field>
 
-      <Field label="Group by">
+      <Field label={t("Group by")}>
         <Select
           value={groupBy || NO_GROUP}
           onValueChange={(value) =>
             dashboardStore.setGroupBy(value === NO_GROUP ? "" : value)
           }
         >
-          <SelectTrigger size="sm" id="group-by" className="w-36" aria-label="Group by">
+          <SelectTrigger size="sm" id="group-by" className="w-36" aria-label={t("Group by")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             {groupOptions.map((name) => (
               <SelectItem key={name || NO_GROUP} value={name || NO_GROUP}>
-                {name || "none"}
+                {name || t("none")}
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
       </Field>
 
-      <Field label="Range">
+      <Field label={t("Range")}>
         <Select
           value={mode === "absolute" ? CUSTOM_RANGE : range}
           onValueChange={(value) => {
@@ -115,25 +103,25 @@ export function Toolbar() {
             dashboardStore.setRelativeRange(value);
           }}
         >
-          <SelectTrigger size="sm" id="range" className="w-44" aria-label="Range">
+          <SelectTrigger size="sm" id="range" className="w-44" aria-label={t("Range")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             {RANGES.map(([value, label]) => (
               <SelectItem key={value} value={value}>
-                {label}
+                {t(label)}
               </SelectItem>
             ))}
-            <SelectItem value={CUSTOM_RANGE}>Custom range</SelectItem>
+            <SelectItem value={CUSTOM_RANGE}>{t("Custom range")}</SelectItem>
           </SelectContent>
         </Select>
       </Field>
 
-      <Field label="Auto" className="gap-1.5">
+      <Field label={t("Auto")} className="gap-1.5">
         <Switch
           checked={auto}
           onCheckedChange={(checked) => dashboardStore.setAuto(checked)}
-          aria-label="Auto-refresh (interval set in Settings)"
+          aria-label={t("Auto-refresh (interval set in Settings)")}
         />
       </Field>
 
@@ -141,10 +129,10 @@ export function Toolbar() {
         <TooltipTrigger asChild>
           <Button size="sm" id="apply" onClick={() => void dashboardStore.reload()}>
             <Play className="size-3.5" />
-            Apply
+            {t("Apply")}
           </Button>
         </TooltipTrigger>
-        <TooltipContent>Re-run the query with the current filters</TooltipContent>
+        <TooltipContent>{t("Re-run the query with the current filters")}</TooltipContent>
       </Tooltip>
     </div>
   );

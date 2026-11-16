@@ -8,6 +8,13 @@ import { Sidebar } from "@/components/sidebar";
 import { TimeBar } from "@/components/time-bar";
 import { Toolbar } from "@/components/toolbar";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { FlamegraphView } from "@/components/views/flamegraph-view";
@@ -16,6 +23,7 @@ import { OverviewView } from "@/components/views/overview-view";
 import { ServiceMapView } from "@/components/views/service-map-view";
 import { TimeseriesView } from "@/components/views/timeseries-view";
 import { TopView } from "@/components/views/top-view";
+import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
 import type { View } from "@/lib/types";
 import { useDashboard } from "@/lib/use-dashboard";
@@ -42,6 +50,12 @@ function ViewSwitch({ view }: { view: View }) {
 
 export function Dashboard() {
   const state = useDashboard();
+  const t = useT();
+
+  // A tenant-scoped token cannot enumerate tenants: keep showing the one it is
+  // pinned to rather than pretending there is a choice. The control lives in
+  // the header now — it changes the whole screen, not just the query row.
+  const showTenant = state.tenants.length > 1 || Boolean(state.tenant);
 
   return (
     <div id="app-shell">
@@ -49,12 +63,33 @@ export function Dashboard() {
 
       <div id="app-content" className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-3 border-b bg-card px-3">
-          <h1 className="truncate text-sm font-medium tracking-tight">LidlessEye</h1>
-          <span className="hidden text-[11px] text-muted-foreground sm:inline">
-            continuous profiling
-          </span>
-
+          {/* The brand already lives in the navigation drawer; repeating it
+              here only pushed the useful controls to the right. */}
           <div className="ml-auto flex items-center gap-2">
+            {showTenant ? (
+              <Select
+                value={state.tenant}
+                onValueChange={(value) => dashboardStore.setTenantId(value)}
+              >
+                <SelectTrigger
+                  size="sm"
+                  id="tenant"
+                  className="w-36"
+                  aria-label={t("Tenant")}
+                >
+                  <SelectValue placeholder={t("default")} />
+                </SelectTrigger>
+                <SelectContent>
+                  {(state.tenants.length ? state.tenants : [state.tenant || "default"]).map(
+                    (id) => (
+                      <SelectItem key={id} value={id}>
+                        {id}
+                      </SelectItem>
+                    ),
+                  )}
+                </SelectContent>
+              </Select>
+            ) : null}
             <span className="font-mono text-[11px] text-muted-foreground" data-testid="build-info">
               {state.build}
             </span>
@@ -69,10 +104,10 @@ export function Dashboard() {
                   }}
                 >
                   <RefreshCw />
-                  Refresh
+                  {t("Refresh")}
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>Reload (R)</TooltipContent>
+              <TooltipContent>{t("Reload (R)")}</TooltipContent>
             </Tooltip>
           </div>
         </header>

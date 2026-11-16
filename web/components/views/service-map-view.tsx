@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/empty-state";
 import { formatCount, formatDuration } from "@/lib/format";
+import { useT } from "@/lib/i18n";
 import { KIND, nodeLabel } from "@/lib/servicemap-graph";
 import { dashboardStore } from "@/lib/store";
 import type { ServiceMapNode } from "@/lib/types";
@@ -48,6 +49,7 @@ function StatusGlyphLegend({ tone }: { tone: "ok" | "warn" | "muted" }) {
 
 export function ServiceMapView() {
   const state = useDashboard();
+  const t = useT();
   const map = state.serviceMap;
   const [selected, setSelected] = useState<string | null>(null);
 
@@ -86,10 +88,18 @@ export function ServiceMapView() {
     return (
       <EmptyState
         info={
-          state.empty ?? {
-            title: "No service map yet",
-            hint: "The map is built by the agent from the pods' TCP tables and stored with the profiles.",
-          }
+          state.empty
+            ? {
+                ...state.empty,
+                title: t(state.empty.title),
+                hint: t(state.empty.hint),
+              }
+            : {
+                title: t("No service map yet"),
+                hint: t(
+                  "The map is built by the agent from the pods' TCP tables and stored with the profiles.",
+                ),
+              }
         }
       />
     );
@@ -106,12 +116,12 @@ export function ServiceMapView() {
     <div className="relative flex h-full min-h-0 flex-col gap-2">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pr-1 text-[11px] text-muted-foreground">
         <span data-testid="map-summary">
-          {workloads} workloads · {services} services · {map.edges.length} edges ·{" "}
-          {formatCount(totalConnections)} new connections
+          {workloads} {t("workloads")} · {services} {t("services")} · {map.edges.length}{" "}
+          {t("edges")} · {formatCount(totalConnections)} {t("new connections")}
         </span>
         <span className="flex items-center gap-1">
           <LegendSwatch kind="workload" />
-          workload
+          {t("workload")}
         </span>
         <span className="flex items-center gap-1">
           <LegendSwatch kind="service" />
@@ -119,33 +129,35 @@ export function ServiceMapView() {
         </span>
         <span className="flex items-center gap-1">
           <LegendSwatch kind="external" />
-          external
+          {t("external")}
         </span>
         <span className="flex items-center gap-1">
           <StatusGlyphLegend tone="ok" />
-          all ready
+          {t("all ready")}
         </span>
         <span className="flex items-center gap-1">
           <StatusGlyphLegend tone="warn" />
-          degraded
+          {t("degraded")}
         </span>
         <span className="flex items-center gap-1">
           <StatusGlyphLegend tone="muted" />
-          no replicas
+          {t("no replicas")}
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block h-[2px] w-4 rounded bg-[#f2a65a]" />
           CPU
         </span>
         <span className="text-muted-foreground/70">
-          edge labels: new connections/s · mean RTT
+          {t("edge labels: new connections/s · mean RTT")}
         </span>
-        {map.truncated ? <Badge variant="secondary">clipped to 600 nodes</Badge> : null}
+        {map.truncated ? <Badge variant="secondary">{t("clipped to 600 nodes")}</Badge> : null}
         {selectedNode ? (
           <span className="ml-auto flex items-center gap-2 text-[10px]">
             <span className="text-foreground">{nodeLabel(selectedNode)}</span>
             {cpuOfSelected ? <span>· CPU {formatDuration(cpuOfSelected)}</span> : null}
-            <span>· {selectedNode.connections ?? 0} connections</span>
+            <span>
+              · {selectedNode.connections ?? 0} {t("connections")}
+            </span>
           </span>
         ) : null}
       </div>

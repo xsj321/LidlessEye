@@ -1428,6 +1428,46 @@ impl Store {
         Ok(out)
     }
 
+    /// New connections per bucket across the whole map.
+    ///
+    /// Unlike the per-node history this is a dense array: the time brush draws
+    /// bucket index `i` at `from_ns + i * step_ns`, so an absent bucket must be
+    /// a zero rather than a missing row. Buckets are relative to `from_ns` for
+    /// the same reason as [`Store::net_node_history`] — the absolute ns value
+    /// is far past the exact integer range of a double.
+    pub fn net_histogram(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+        buckets: usize,
+    ) -> Result<Vec<u64>> {
+        let mut out = vec![0u64; buckets.max(1)];
+        let step = ts(step_ns.max(1));
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST((bucket_ns - ?) / ? AS BIGINT) AS slot, sum(connections) \
+                 FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
+                 GROUP BY slot ORDER BY slot",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt
+            .query(params![ts(from_ns), step, ts(from_ns), ts(until_ns)])
+            .map_err(db_err)?;
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let slot: i64 = row.get(0).map_err(db_err)?;
+            if slot < 0 {
+                continue;
+            }
+            let value = row.get::<_, i64>(1).unwrap_or(0).max(0) as u64;
+            if let Some(cell) = out.get_mut(slot as usize) {
+                *cell = value;
+            }
+        }
+        Ok(out)
+    }
+
     /// On-CPU nanoseconds per map node, so the map can be coloured by cost.
     ///
     /// The join is by label, not by table key: a profile series carries
@@ -2233,6 +2273,15 @@ mod tests {
             (3, 3),
             "a gauge inside a bucket reports its peak, not its sum"
         );
+
+        // The whole-map histogram the time brush draws: dense, and summing the
+        // same edge counters the per-node history showed.
+        let histogram = store
+            .net_histogram(start, start + 2 * step, step, 2)
+            .unwrap();
+        assert_eq!(histogram.len(), 2, "the brush gets one entry per bucket");
+        assert_eq!(histogram[0], edges[0].connections);
+        assert_eq!(histogram[1], edges[1].connections);
 
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

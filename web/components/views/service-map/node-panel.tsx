@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useT } from "@/lib/i18n";
 import { KIND, healthTone, nodeLabel } from "@/lib/servicemap-graph";
 import type { ServiceMapEdge, ServiceMapNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -84,6 +85,7 @@ export interface NodePanelProps {
 }
 
 export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: NodePanelProps) {
+  const t = useT();
   // The last node stays mounted while the panel slides out, so the drawer does
   // not empty itself in the middle of its own animation.
   const [shown, setShown] = useState<ServiceMapNode | null>(node);
@@ -249,14 +251,14 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
       <div
         role="separator"
         aria-orientation="vertical"
-        aria-label="Resize node panel"
+        aria-label={t("Resize node panel")}
         aria-valuemin={MIN_WIDTH}
         aria-valuemax={typeof window === "undefined" ? 1280 : Math.max(MIN_WIDTH, window.innerWidth - EDGE_KEEP_FREE)}
         aria-valuenow={width}
         tabIndex={open ? 0 : -1}
         data-testid="map-panel-resize"
         data-dragging={resizing ? "true" : "false"}
-        title="Drag to resize · arrow keys to nudge"
+        title={t("Drag to resize · arrow keys to nudge")}
         onPointerDown={onResizeDown}
         onPointerMove={onResizeMove}
         onPointerUp={onResizeEnd}
@@ -310,7 +312,7 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
             <Button
               variant="ghost"
               size="xs"
-              aria-label="Close panel"
+              aria-label={t("Close panel")}
               data-testid="map-panel-close"
               onClick={onClose}
             >
@@ -320,7 +322,7 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
 
           <div className="border-b px-3 py-2">
             <div className="mb-1 flex items-center justify-between text-[9px] uppercase tracking-wide text-muted-foreground">
-              <span>Neighbours</span>
+              <span>{t("Neighbours")}</span>
               <span className="font-mono normal-case tracking-normal">
                 {inbound.length} in · {outbound.length} out
               </span>
@@ -344,7 +346,7 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
                     data-testid={`map-tab-${tab.value}`}
                     className="flex-none px-2 text-[11px] data-[state=active]:text-foreground"
                   >
-                    {tab.label}
+                    {t(tab.label)}
                   </TabsTrigger>
                 ))}
               </TabsList>
@@ -381,7 +383,7 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
           </Tabs>
           <Separator />
           <footer className="px-3 py-1.5 text-[9.5px] text-muted-foreground/70">
-            Window from the toolbar · the same one the flamegraph uses
+            {t("Window from the toolbar · the same one the flamegraph uses")}
           </footer>
         </>
       ) : null}

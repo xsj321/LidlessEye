@@ -431,6 +431,37 @@ pub fn servicemap_history(
     })
 }
 
+/// `GET /api/v1/servicemap/histogram` response.
+///
+/// The time brush above the map shows how many connections were opened in each
+/// bucket — the map's equivalent of a request count — rather than CPU samples.
+/// `connections` is dense: index `i` covers `[from_ns + i*step_ns, … + step_ns)`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MapHistogram {
+    pub from_ns: u64,
+    pub until_ns: u64,
+    pub step_ns: u64,
+    #[serde(default)]
+    pub connections: Vec<u64>,
+}
+
+/// Per-bucket connection totals over the whole map.
+pub fn servicemap_histogram(
+    store: &Store,
+    from_ns: u64,
+    until_ns: u64,
+    buckets: usize,
+) -> Result<MapHistogram> {
+    let buckets = buckets.max(1);
+    let step_ns = ((until_ns.saturating_sub(from_ns)) / buckets as u64).max(1);
+    Ok(MapHistogram {
+        from_ns,
+        until_ns,
+        step_ns,
+        connections: store.net_histogram(from_ns, until_ns, step_ns, buckets)?,
+    })
+}
+
 /// Best-effort protocol name from a port number.
 ///
 /// This is a label, not a promise: telling HTTP from gRPC needs payload

@@ -295,6 +295,10 @@ async function main() {
 
   check((await page.title()) === "LidlessEye", "page title");
   check((await page.locator("#tabs [data-view]").count()) === 7, "seven tabs are rendered");
+  check(
+    (await page.locator("header #tenant").count()) === 1,
+    "the tenant selector lives in the header bar",
+  );
 
   const box = await page.locator("canvas.fg-canvas").boundingBox();
   check(box !== null && box.width > 100 && box.height > 100, "flamegraph canvas has a size", JSON.stringify(box));
@@ -339,12 +343,21 @@ async function main() {
     (await page.locator("#tabs [data-view]").count()) === 7,
     "collapsing keeps every view reachable",
   );
+  check(
+    (await page.locator("#tabs #sidebar-toggle").count()) === 1,
+    "the expand button is the last option of the collapsed rail",
+  );
   await page.click('#tabs [data-view="top"]');
   await checkActiveTab(page, "top");
   await page.click("#sidebar-toggle");
   check(
     (await page.locator("#sidebar").getAttribute("data-collapsed")) === "false",
     "the navigation drawer expands again",
+  );
+  check(
+    (await page.locator("#tabs #sidebar-toggle").count()) === 0 &&
+      (await page.locator("#sidebar-toggle").count()) === 1,
+    "the toggle leaves the icon rail when expanded and no longer overlaps the brand",
   );
 
   await page.click("#settings");
@@ -698,8 +711,50 @@ async function main() {
   // picker test. The seeded ClusterIP node matches `service_name=checkout`,
   // the label carried by the seeded profiles.
   const mapPage = await context.newPage();
+  const mapApiCalls = [];
+  mapPage.on("response", (response) => {
+    if (response.url().includes("/api/")) mapApiCalls.push(response.url());
+  });
   await mapPage.goto(`${BASE}/?tenant=acme#/servicemap`, { waitUntil: "load" });
   await mapPage.waitForSelector('[data-testid="map-node"]', { timeout: 20000 });
+  // Profile-only controls belong to the profile queries, not to a network map.
+  for (const selector of ["#profile-type", "#group-by", "#range", "#apply"]) {
+    check(
+      (await mapPage.locator(selector).count()) === 0,
+      `the service map hides ${selector}`,
+    );
+  }
+  check(
+    await mapPage.locator("#relative-range").isVisible(),
+    "relative mode offers a time range picker beside the brush",
+  );
+  check(
+    (await mapPage.locator(".brush-label").first().innerText()).trim() === "Requests",
+    "the service map histogram is labelled as request counts",
+  );
+  check(
+    mapApiCalls.some((url) => url.includes("/api/v1/servicemap/histogram")),
+    "the map asks for its own histogram",
+    mapApiCalls.join(" | "),
+  );
+  check(
+    !mapApiCalls.some((url) => url.includes("/api/v1/timeseries")),
+    "the map never loads the CPU timeseries for its brush",
+    mapApiCalls.join(" | "),
+  );
+  const mapHistResponse = await fetch(
+    `${BASE}/api/v1/servicemap/histogram?from=now-1h&buckets=60`,
+    { headers: { "x-scope-orgid": "acme" } },
+  );
+  const mapHist = await mapHistResponse.json();
+  check(
+    mapHistResponse.ok &&
+      Array.isArray(mapHist.connections) &&
+      mapHist.connections.length === 60 &&
+      mapHist.connections.some((value) => value > 0),
+    "the histogram endpoint returns per-bucket request counts",
+    JSON.stringify(mapHist).slice(0, 200),
+  );
   check(
     (await mapPage.locator('[data-testid="service-map-canvas"] svg text').count()) > 0,
     "the service map labels its seeded edge",
@@ -750,7 +805,32 @@ async function main() {
     "dragging the drawer edge widens it",
     `${widthBefore} -> ${widthAfter}`,
   );
+
+  // The node drawer spans the full window height and overlaps the time bar;
+  // close it before reaching for the range control behind it.
+  await mapPage.click('[data-testid="map-panel-close"]');
+  await choose(mapPage, "#relative-range", "Last 15 minutes");
+  check(
+    (await mapPage.evaluate(() => window.lidlesseye.state.range)) === "15m",
+    "the relative range picker changes the time window",
+  );
   await mapPage.close();
+
+  // ---- language switch -------------------------------------------------
+  await page.click("#settings");
+  await page.waitForSelector('[data-testid="settings-dialog"]', { timeout: 10000 });
+  await choose(page, "#settings-language", "Chinese");
+  check(
+    (await page.locator('#tabs [data-view="servicemap"] span').first().innerText()).trim() ===
+      "服务地图",
+    "switching the language translates the navigation",
+  );
+  check(
+    (await page.locator("header button").filter({ hasText: "刷新" }).count()) === 1,
+    "switching the language translates the header",
+  );
+  await choose(page, "#settings-language", "English");
+  await page.keyboard.press("Escape");
 
   // Nothing above is worth much if the page is throwing while it renders.
   check(consoleErrors.length === 0, "no console errors", consoleErrors.join(" | "));

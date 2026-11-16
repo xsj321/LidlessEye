@@ -818,12 +818,41 @@ export class DashboardStore {
   async loadHistogram() {
     const token = ++this.histToken;
     const domain = this.resolveDomain();
+    const buckets = settingsStore.getSnapshot().histogramBuckets;
+
+    // The map describes connections, not CPU samples. Drawing the CPU
+    // timeseries underneath it made the height of each bar mean something
+    // unrelated to the nodes above, so this view asks for total request counts
+    // instead. The timeseries envelope is reused so the brush has one format.
+    if (this.state.view === "servicemap") {
+      try {
+        const payload = await api.serviceMapHistogram({
+          from: iso(domain.from),
+          until: iso(domain.until),
+          buckets,
+        });
+        if (token !== this.histToken) return;
+        const points = payload.connections ?? [];
+        const data: TimeseriesPayload = {
+          from_ns: payload.from_ns,
+          until_ns: payload.until_ns,
+          step_ns: payload.step_ns,
+          series: [{ service_name: "requests", points }],
+        };
+        this.commit({ histData: data, histEmpty: points.every((point) => !point) });
+      } catch {
+        // Decoration on top of a working map: a failed histogram must not
+        // blank the view.
+      }
+      return;
+    }
+
     const selector = composeSelector(this.state.filters);
     const params: Record<string, string | number> = {
       profile_type: this.state.type,
       from: iso(domain.from),
       until: iso(domain.until),
-      buckets: settingsStore.getSnapshot().histogramBuckets,
+      buckets,
     };
     if (selector) params.selector = selector;
     try {

@@ -621,6 +621,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/timeseries", get(api::timeseries))
         .route("/api/v1/servicemap", get(api::servicemap))
         .route("/api/v1/servicemap/history", get(api::servicemap_history))
+        .route(
+            "/api/v1/servicemap/histogram",
+            get(api::servicemap_histogram),
+        )
         .route("/api/v1/servicemap/ingest", post(api::servicemap_ingest))
         .route("/api/v1/version", get(api::version))
         .route("/metrics", get(api::metrics))

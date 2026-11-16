@@ -46,8 +46,8 @@ pub use query::{
 };
 pub use selector::{MatchOp, Matcher, Selector, glob_match};
 pub use servicemap::{
-    MapEdge, MapHistory, MapHistoryPoint, MapNode, NodeKind, ServiceEdge, ServiceMap,
-    ServiceMapBatch, ServiceNode, servicemap, servicemap_history,
+    MapEdge, MapHistogram, MapHistory, MapHistoryPoint, MapNode, NodeKind, ServiceEdge, ServiceMap,
+    ServiceMapBatch, ServiceNode, servicemap, servicemap_histogram, servicemap_history,
 };
 pub use store::{
     BatchMeta, DB_FILE, MAX_SCAN_ROWS, PruneStats, SCHEMA_VERSION, SampleRow, ScanQuery,

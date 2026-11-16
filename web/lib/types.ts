@@ -165,6 +165,20 @@ export interface MapHistoryPayload {
   edges: MapHistoryPoint[];
 }
 
+/**
+ * Whole-map request counts over the brush domain.
+ *
+ * `connections` is the number of TCP connections opened in each bucket across
+ * every edge — the map's closest equivalent of a request rate. It is returned
+ * as a dense array so the brush can draw bucket index i at time from + i*step.
+ */
+export interface MapHistogramPayload {
+  from_ns: number;
+  until_ns: number;
+  step_ns: number;
+  connections: number[];
+}
+
 export interface ProfileType {  name: string;
   unit: string;
   total_value: number;

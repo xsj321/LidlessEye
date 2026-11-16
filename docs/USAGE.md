@@ -32,13 +32,13 @@ Open <http://localhost:4040>. A bare URL opens the **service map**.
 
 ```
 ┌──────────┬──────────────────────────────────────────────────────────┐
-│ Service  │ LidlessEye                            v0.1.0   Refresh  │
+│ Service  │                        Tenant  v0.1.0   Refresh         │
 │ map      ├──────────────────────────────────────────────────────────┤
-│ Overview │ Tenant · Profile · Group by · Range · Auto · Apply      │
+│ Overview │ Profile · Group by · Range · Auto · Apply (profiles only)│
 │ Flame…   ├──────────────────────────────────────────────────────────┤
 │ Compare  │ Filter                                                  │
 │ Top …    ├──────────────────────────────────────────────────────────┤
-│ Time …   │ Relative | Absolute    [histogram with draggable bracket]│
+│ Time …   │ Relative | Absolute   Last hour ▾  [histogram + bracket]│
 │ Labels   ├──────────────────────────────────────────────────────────┤
 │          │                                                          │
 │ Settings │                     main view                            │
@@ -46,10 +46,10 @@ Open <http://localhost:4040>. A bare URL opens the **service map**.
 ```
 
 - **Left drawer** — switches the whole page. The highlighted item has `aria-current="page"`.
-- **Top row** — build version and manual `Refresh` (keyboard `R`).
-- **Toolbar** — tenant, profile type, grouping, relative range, auto-refresh.
+- **Top row** — tenant selector (left of the version) and manual `Refresh` (keyboard `R`). There is no repeated title here: the brand lives in the drawer.
+- **Toolbar** — profile type, grouping, relative range, auto-refresh. It is hidden on the service map, where those controls have no meaning.
 - **Filter bar** — structured label matchers.
-- **Time bar** — relative/absolute mode and the histogram with a draggable window bracket.
+- **Time bar** — relative/absolute mode, the relative range picker, and the histogram with a draggable window bracket.
 - **Main** — the view itself. Only this pane scrolls.
 
 ---
@@ -57,7 +57,7 @@ Open <http://localhost:4040>. A bare URL opens the **service map**.
 ## 3. Navigate and collapse the drawer
 
 1. Click **Service map**, **Overview**, **Flamegraph**, **Compare**, **Top functions**, **Time series**, or **Labels** in the left drawer.
-2. Click the **collapse** button at the drawer's top right. The drawer shrinks to icons; hover an icon for its name. Click the same button again to expand.
+2. Click the **collapse** button beside the wordmark. The drawer shrinks to icons; hover an icon for its name. The collapse button disappears from the header, and the **expand** button becomes the last option of the icon rail — click it to expand again.
 3. The collapsed state is stored in this browser and survives a reload.
 
 The URL hash changes with the view, e.g. `#/servicemap?type=cpu&range=1h&...`. Copy the address bar to send someone the exact screen.
@@ -68,7 +68,7 @@ The URL hash changes with the view, e.g. `#/servicemap?type=cpu&range=1h&...`. C
 
 Two levels, in this order:
 
-1. **Domain** — the span the histogram draws. In the toolbar, pick a relative preset from **Range** (`5m`, `15m`, `1h`, `6h`, `24h`, `7d`) or choose **Custom range** and switch the time bar to **Absolute**, fill **From** and **To**, then click **Apply**.
+1. **Domain** — the span the histogram draws. In **Relative** mode, pick a preset (`5m`, `15m`, `1h`, `6h`, `24h`, `7d`) from the range selector on the right of the time bar; profile views also offer the same **Range** control in their toolbar, plus **Custom range**. For a custom window, switch the time bar to **Absolute**, fill **From** and **To**, then click **Apply**.
 2. **Window** — the bracket inside the domain. It is what every query uses. Drag the shaded bracket in the histogram to move it, drag its edges to resize, or click elsewhere to jump. `Reset` restores the whole domain.
 
 `Auto` toggles periodic reloading. Its interval is configured in Settings (default 30 s). With a relative domain, the window follows the clock; an absolute domain stays pinned.
@@ -85,6 +85,8 @@ The map is a left-to-right graph: entry points on the left, what they call on th
 - **Status glyph** — green dot: all replicas ready; amber triangle: degraded; hollow circle: no replicas reported.
 - **CPU heat bar** — a thin strip on each card shows on-CPU time relative to the busiest node.
 - **Edge label** — `connections/s · mean RTT`. Labels are placed to avoid cards and each other; on a crowded wire only the rate survives. They appear once the map is zoomed in past the threshold in Settings (default 62 %). Red dashed edges are retransmitting.
+
+The histogram above the map is labelled **Requests**: its bars count new connections opened across all edges in each bucket, not CPU samples. It answers "when was the system busy" for the topology you are looking at.
 
 Use the `+` / `−` buttons to zoom, the fit button to frame the whole graph, and drag the background to pan.
 
@@ -158,7 +160,7 @@ Filters apply to profile views. The service map is a network view and deliberate
 
 ## 10. Work with tenants
 
-When the server has more than one tenant, **Tenant** appears in the toolbar. Switching it re-runs every query. `?tenant=acme` in the query string selects that tenant on a pasted link; an explicit hash parameter still wins.
+When the server has more than one tenant, **Tenant** appears in the top bar, immediately left of the version. Switching it re-runs every query. `?tenant=acme` in the query string selects that tenant on a pasted link; an explicit hash parameter still wins.
 
 Tokens are bound to tenants with `--tenant-token`. If a 403 appears, either switch to the tenant the token allows or clear `lidlesseye.tenant` from local storage.
 
@@ -170,6 +172,7 @@ Click **Settings** at the bottom of the drawer.
 
 | Setting | Effect |
 | --- | --- |
+| Language | `English` or `简体中文`. Switches the interface immediately; stored in this browser. |
 | Default view | Landing page when the URL does not name one (default: Service map). |
 | Default range | Relative range on a fresh load (default: last hour). |
 | Auto-refresh interval | 10 s / 30 s / 1 min / 5 min. Takes effect immediately if Auto is on. |

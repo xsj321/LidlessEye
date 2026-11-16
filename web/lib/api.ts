@@ -9,6 +9,7 @@ import type {
   FlamegraphPayload,
   LabelNamesPayload,
   LabelValuesPayload,
+  MapHistogramPayload,
   MapHistoryPayload,
   ProfileTypesPayload,
   SeriesPayload,
@@ -150,4 +151,7 @@ export const api = {
   // One node's own buckets, for the panel behind a click.
   serviceMapHistory: (params: QueryParams) =>
     request<MapHistoryPayload>("/api/v1/servicemap/history", params),
+  // Whole-map request counts for the histogram brush above the map.
+  serviceMapHistogram: (params: QueryParams) =>
+    request<MapHistogramPayload>("/api/v1/servicemap/histogram", params),
 };

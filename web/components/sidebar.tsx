@@ -29,6 +29,7 @@ import type { LucideIcon } from "lucide-react";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
 import type { View } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -62,9 +63,54 @@ function storedCollapsed(): boolean {
   }
 }
 
-function Brand({ collapsed }: { collapsed: boolean }) {
+function CollapseButton({
+  collapsed,
+  toggle,
+  t,
+}: {
+  collapsed: boolean;
+  toggle: () => void;
+  t: (key: string) => string;
+}) {
+  const label = collapsed ? t("Expand navigation") : t("Collapse navigation");
   return (
-    <div className="flex h-12 shrink-0 items-center gap-2 border-b px-3">
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          id="sidebar-toggle"
+          data-testid="sidebar-toggle"
+          variant="ghost"
+          size="icon-xs"
+          className="shrink-0"
+          aria-label={label}
+          aria-expanded={!collapsed}
+          aria-controls="tabs"
+          onClick={toggle}
+        >
+          {collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="right">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function Brand({
+  collapsed,
+  toggle,
+  t,
+}: {
+  collapsed: boolean;
+  toggle: () => void;
+  t: (key: string) => string;
+}) {
+  return (
+    <div
+      className={cn(
+        "flex h-12 shrink-0 items-center gap-2 border-b px-3",
+        collapsed && "justify-center px-2",
+      )}
+    >
       <svg className="size-5 shrink-0 text-primary" viewBox="0 0 32 32" aria-hidden="true">
         <path
           d="M4 16c3.4-7 7.6-7 12 0s8.6 7 12 0"
@@ -75,15 +121,25 @@ function Brand({ collapsed }: { collapsed: boolean }) {
         />
         <circle cx="16" cy="16" r="3.4" fill="currentColor" />
       </svg>
-      <span className={cn("truncate text-sm font-medium tracking-tight", collapsed && "sr-only")}>
+      <span
+        className={cn(
+          "min-w-0 flex-1 truncate text-sm font-medium tracking-tight",
+          collapsed && "sr-only",
+        )}
+      >
         LidlessEye
       </span>
+      {/* Expanded: the button is a flex item beside the wordmark, never an
+          absolute overlay on top of it. Collapsed: it is hidden here and
+          rendered as the last option of the icon nav below. */}
+      {collapsed ? null : <CollapseButton collapsed={false} toggle={toggle} t={t} />}
     </div>
   );
 }
 
 export function Sidebar() {
   const state = useDashboard();
+  const t = useT();
   const [collapsed, setCollapsed] = useState(false);
 
   // Read the preference after hydration so the prerendered HTML and the first
@@ -109,40 +165,19 @@ export function Sidebar() {
       id="sidebar"
       data-testid="sidebar"
       data-collapsed={collapsed ? "true" : "false"}
-      aria-label="Application navigation"
+      aria-label={t("Application navigation")}
       className={cn(
         "flex h-full shrink-0 flex-col border-r bg-card",
         "motion-safe:transition-[width] motion-safe:duration-200 motion-safe:ease-out",
         collapsed ? "w-12" : "w-48",
       )}
     >
-      <div className="relative">
-        <Brand collapsed={collapsed} />
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              id="sidebar-toggle"
-              data-testid="sidebar-toggle"
-              variant="ghost"
-              size="icon-xs"
-              className="absolute top-3 right-2"
-              aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
-              aria-expanded={!collapsed}
-              aria-controls="tabs"
-              onClick={toggle}
-            >
-              {collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="right">
-            {collapsed ? "Expand navigation" : "Collapse navigation"}
-          </TooltipContent>
-        </Tooltip>
-      </div>
+      <Brand collapsed={collapsed} toggle={toggle} t={t} />
 
-      <nav id="tabs" aria-label="Dashboard views" className="flex-1 space-y-0.5 overflow-y-auto p-2">
+      <nav id="tabs" aria-label={t("Dashboard views")} className="flex-1 space-y-0.5 overflow-y-auto p-2">
         {NAV.map(({ value, label, icon: Icon }) => {
           const active = state.view === value;
+          const text = t(label);
           return (
             <Tooltip key={value}>
               <TooltipTrigger asChild>
@@ -151,7 +186,7 @@ export function Sidebar() {
                   data-view={value}
                   data-state={active ? "active" : "inactive"}
                   aria-current={active ? "page" : undefined}
-                  title={collapsed ? label : undefined}
+                  title={collapsed ? text : undefined}
                   onClick={() => dashboardStore.setView(value)}
                   className={cn(
                     "flex h-8 w-full items-center gap-2 rounded-md px-2 text-xs outline-none transition-colors",
@@ -161,13 +196,20 @@ export function Sidebar() {
                   )}
                 >
                   <Icon className="size-4 shrink-0" />
-                  <span className={cn("truncate", collapsed && "sr-only")}>{label}</span>
+                  <span className={cn("truncate", collapsed && "sr-only")}>{text}</span>
                 </button>
               </TooltipTrigger>
-              {collapsed ? <TooltipContent side="right">{label}</TooltipContent> : null}
+              {collapsed ? <TooltipContent side="right">{text}</TooltipContent> : null}
             </Tooltip>
           );
         })}
+        {/* The expand control is the last option of the collapsed rail, so it
+            never sits on top of the brand and stays easy to find by touch. */}
+        {collapsed ? (
+          <div className="pt-1">
+            <CollapseButton collapsed toggle={toggle} t={t} />
+          </div>
+        ) : null}
       </nav>
 
       <div className="border-t p-2">

@@ -5,11 +5,27 @@ import { ChartNoAxesCombined, ChevronDown, ChevronUp } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { domainText, selectionText, TimeBrush } from "@/lib/canvas/timebrush";
 import { formatClock } from "@/lib/format";
+import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
-import { fromLocalInput, nowNs, resolveBaseline, resolveDomain, resolveWindow, toLocalInput } from "@/lib/time";
+import {
+  fromLocalInput,
+  nowNs,
+  RANGES,
+  resolveBaseline,
+  resolveDomain,
+  resolveWindow,
+  toLocalInput,
+} from "@/lib/time";
 import type { Window } from "@/lib/time";
 import type { TimeseriesPayload } from "@/lib/types";
 import { useDashboard } from "@/lib/use-dashboard";
@@ -27,6 +43,7 @@ function Brush({
   histogram,
   onCommit,
   ready,
+  t,
 }: {
   label: string;
   domain: Window;
@@ -34,6 +51,7 @@ function Brush({
   histogram: TimeseriesPayload | null;
   onCommit: (from: number, until: number) => void;
   ready: boolean;
+  t: (key: string) => string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const brushRef = useRef<TimeBrush | null>(null);
@@ -95,10 +113,10 @@ function Brush({
           variant="ghost"
           size="xs"
           className="brush-action"
-          title="Reset this window to the whole range"
+          title={t("Reset this window to the whole range")}
           onClick={() => onCommit(domain.from, domain.until)}
         >
-          Full
+          {t("Full")}
         </Button>
       </div>
       <canvas ref={canvasRef} className="time-brush" height={68} />
@@ -106,7 +124,13 @@ function Brush({
   );
 }
 
-function AbsoluteRangeInputs({ domain }: { domain: Window }) {
+function AbsoluteRangeInputs({
+  domain,
+  t,
+}: {
+  domain: Window;
+  t: (key: string) => string;
+}) {
   const [from, setFrom] = useState(() => toLocalInput(domain.from));
   const [until, setUntil] = useState(() => toLocalInput(domain.until));
 
@@ -121,7 +145,7 @@ function AbsoluteRangeInputs({ domain }: { domain: Window }) {
     const start = fromLocalInput(from);
     const end = fromLocalInput(until);
     if (start === null || end === null) {
-      dashboardStore.setBanner({ tone: "warning", title: "Pick both ends of the range." });
+      dashboardStore.setBanner({ tone: "warning", title: t("Pick both ends of the range.") });
       return;
     }
     dashboardStore.setAbsoluteDomain(start, end);
@@ -130,7 +154,7 @@ function AbsoluteRangeInputs({ domain }: { domain: Window }) {
   return (
     <div className="flex items-center gap-1.5" id="abs-range" data-testid="absolute-range">
       <label className="flex items-center gap-1">
-        <span className="text-[11px] text-muted-foreground">From</span>
+        <span className="text-[11px] text-muted-foreground">{t("From")}</span>
         <Input
           type="datetime-local"
           id="abs-from"
@@ -141,12 +165,12 @@ function AbsoluteRangeInputs({ domain }: { domain: Window }) {
             if (event.key === "Enter") apply();
           }}
           className="h-7 w-[190px] text-xs"
-          aria-label="Absolute range start"
+          aria-label={t("Absolute range start")}
         />
       </label>
       <span className="text-muted-foreground">→</span>
       <label className="flex items-center gap-1">
-        <span className="text-[11px] text-muted-foreground">To</span>
+        <span className="text-[11px] text-muted-foreground">{t("To")}</span>
         <Input
           type="datetime-local"
           id="abs-until"
@@ -157,23 +181,23 @@ function AbsoluteRangeInputs({ domain }: { domain: Window }) {
             if (event.key === "Enter") apply();
           }}
           className="h-7 w-[190px] text-xs"
-          aria-label="Absolute range end"
+          aria-label={t("Absolute range end")}
         />
       </label>
       <Button variant="outline" size="xs" id="abs-apply" onClick={apply}>
-        Apply
+        {t("Apply")}
       </Button>
       <Button
         variant="ghost"
         size="xs"
         id="abs-now"
-        title="Move the end of the range to now"
+        title={t("Move the end of the range to now")}
         onClick={() => {
           const start = fromLocalInput(from) ?? domain.from;
           dashboardStore.setAbsoluteDomain(start, nowNs());
         }}
       >
-        Now
+        {t("Now")}
       </Button>
     </div>
   );
@@ -192,6 +216,7 @@ function storedCollapsed(): boolean {
 
 export function TimeBar() {
   const state = useDashboard();
+  const t = useT();
   // The histogram is useful for picking a window but expensive in vertical
   // space once the window is set. Collapsing is a local view preference: it
   // stays out of the URL, survives a reload and keeps the brush mounted so its
@@ -220,12 +245,12 @@ export function TimeBar() {
 
   const context =
     state.mode === "absolute"
-      ? `absolute · ${dashboardStore.domainSpanText()}`
-      : `${dashboardStore.rangeLabel().toLowerCase()} · ends now`;
+      ? `${t("absolute")} · ${dashboardStore.domainSpanText()}`
+      : `${t(dashboardStore.rangeLabel()).toLowerCase()} · ${t("ends now")}`;
 
   const hint =
     state.histEmpty && state.dataRange
-      ? `No samples here; data spans ${formatClock(state.dataRange.from)} → ${formatClock(
+      ? `${t("No samples here; data spans")} ${formatClock(state.dataRange.from)} → ${formatClock(
           state.dataRange.until,
         )}`
       : "";
@@ -242,19 +267,19 @@ export function TimeBar() {
           onValueChange={(value) => {
             if (value === "relative" || value === "absolute") dashboardStore.setMode(value);
           }}
-          aria-label="How the time range is chosen"
+          aria-label={t("How the time range is chosen")}
         >
           <ToggleGroupItem value="relative" data-mode="relative" className="h-7 px-2 text-xs">
-            Relative
+            {t("Relative")}
           </ToggleGroupItem>
           <ToggleGroupItem value="absolute" data-mode="absolute" className="h-7 px-2 text-xs">
-            Absolute
+            {t("Absolute")}
           </ToggleGroupItem>
         </ToggleGroup>
 
         <span className="text-[11px] text-muted-foreground">{context}</span>
 
-        {state.mode === "absolute" ? <AbsoluteRangeInputs domain={domain} /> : null}
+        {state.mode === "absolute" ? <AbsoluteRangeInputs domain={domain} t={t} /> : null}
 
         <span className="flex-1" />
 
@@ -266,8 +291,34 @@ export function TimeBar() {
             id="range-hint-use"
             onClick={() => dashboardStore.useDataRange()}
           >
-            Use data range
+            {t("Use data range")}
           </Button>
+        ) : null}
+
+        {/* A relative window still needs a range picker; on the service map it
+            is the only one, since the profile toolbar is deliberately hidden. */}
+        {state.mode === "relative" ? (
+          <Select
+            value={state.range}
+            onValueChange={(value) => dashboardStore.setRelativeRange(value)}
+          >
+            <SelectTrigger
+              size="sm"
+              id="relative-range"
+              data-testid="relative-range"
+              className="w-36"
+              aria-label={t("Range")}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {RANGES.map(([value, label]) => (
+                <SelectItem key={value} value={value}>
+                  {t(label)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         ) : null}
 
         <Button
@@ -277,13 +328,13 @@ export function TimeBar() {
           data-testid="histogram-toggle"
           aria-expanded={!collapsed}
           aria-controls="time-histogram"
-          title={collapsed ? "Show the histogram" : "Hide the histogram"}
+          title={t(collapsed ? "Show the histogram" : "Hide the histogram")}
           onClick={toggle}
           className="gap-1 text-muted-foreground"
         >
           {collapsed ? <ChevronDown /> : <ChevronUp />}
           <ChartNoAxesCombined />
-          {collapsed ? "Show chart" : "Hide chart"}
+          {t(collapsed ? "Show chart" : "Hide chart")}
         </Button>
       </div>
 
@@ -305,30 +356,33 @@ export function TimeBar() {
               {/* One host per brush: a brush paints into its own canvas, so two
                   brushes in one row would fight over the same width. */}
               <Brush
-                label="A · Baseline"
+                label={t("A · Baseline")}
                 domain={domain}
                 selection={baseline}
                 histogram={state.histData}
                 ready={state.ready}
+                t={t}
                 onCommit={(from, until) => dashboardStore.setBaseline(from, until)}
               />
               <Brush
-                label="B · Comparison"
+                label={t("B · Comparison")}
                 domain={domain}
                 selection={win}
                 histogram={state.histData}
                 ready={state.ready}
+                t={t}
                 onCommit={(from, until) => dashboardStore.setWindow(from, until)}
               />
             </div>
           ) : (
             <div className="pt-1">
               <Brush
-                label="Time range"
+                label={t(state.view === "servicemap" ? "Requests" : "Time range")}
                 domain={domain}
                 selection={win}
                 histogram={state.histData}
                 ready={state.ready}
+                t={t}
                 onCommit={(from, until) => dashboardStore.setWindow(from, until)}
               />
             </div>
