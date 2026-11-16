@@ -108,6 +108,18 @@ async function ingest(tenant, reports) {
   }
 }
 
+/** A small topology so the map and its node panel have something to open. */
+async function ingestMap(tenant, batch) {
+  const response = await fetch(`${BASE}/api/v1/servicemap/ingest`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-scope-orgid": tenant },
+    body: JSON.stringify(batch),
+  });
+  if (!response.ok) {
+    throw new Error(`service map ingest into ${tenant} failed: ${response.status} ${await response.text()}`);
+  }
+}
+
 /** Prove the seed is queryable before blaming the UI for an empty view. */
 async function expectData(tenant) {
   const response = await fetch(`${BASE}/api/v1/flamegraph?from=now-1h`, {
@@ -150,6 +162,40 @@ async function seed() {
       ],
     }),
   ]);
+  // A ClusterIP node's profiles are selected by `service_name`, which is what
+  // the seeded reports carry — the node panel's embedded flamegraph uses it.
+  await ingestMap("acme", {
+    // Keep the bucket clear of the `now-1h` boundary: storage buckets by the
+    // minute and a bucket starting exactly at `from` is excluded.
+    start_ns: nowNs - 30 * minute,
+    end_ns: nowNs,
+    node: "smoke-host",
+    nodes: [
+      {
+        id: "checkout",
+        service: "checkout",
+        kind: "service",
+        connections: 240,
+        retransmits: 2,
+        rx_bytes: 48_000,
+        tx_bytes: 24_000,
+      },
+      { id: "external", service: "external", kind: "external" },
+    ],
+    edges: [
+      {
+        client: "external",
+        server: "checkout",
+        protocol: "http",
+        connections: 240,
+        retransmits: 2,
+        rx_bytes: 48_000,
+        tx_bytes: 24_000,
+        rtt_us_sum: 36_000,
+        rtt_samples: 12,
+      },
+    ],
+  });
   await ingest("zeta", [
     report({
       service: "search",
@@ -226,6 +272,22 @@ async function main() {
     if (response.url().includes("/api/")) apiCalls.push(`${response.status()} ${response.url()}`);
   });
 
+  // ---- the front door --------------------------------------------------
+  // A bare URL is what people get when they bookmark the host itself. It must
+  // land on the map, not on one function in one profile.
+  const rootPage = await context.newPage();
+  await rootPage.goto(`${BASE}/`, { waitUntil: "load" });
+  await rootPage.waitForSelector('#tabs [data-view]', { timeout: 20000 });
+  const landing = await rootPage
+    .locator('#tabs [data-view][data-state="active"]')
+    .evaluateAll((links) => links.map((link) => link.dataset.view));
+  check(
+    landing.length === 1 && landing[0] === "servicemap",
+    "a bare URL opens the service map",
+    JSON.stringify(landing),
+  );
+  await rootPage.close();
+
   // ---- flamegraph ------------------------------------------------------
   const navigation = await page.goto(`${BASE}/#/flamegraph`, { waitUntil: "load" });
   check(navigation !== null && navigation.status() === 200, "the dashboard responds with 200", String(navigation && navigation.status()));
@@ -266,6 +328,43 @@ async function main() {
   );
 
   await shot(page, "1-flamegraph");
+
+  // ---- navigation drawer and settings ----------------------------------
+  await page.click("#sidebar-toggle");
+  check(
+    (await page.locator("#sidebar").getAttribute("data-collapsed")) === "true",
+    "the navigation drawer collapses",
+  );
+  check(
+    (await page.locator("#tabs [data-view]").count()) === 7,
+    "collapsing keeps every view reachable",
+  );
+  await page.click('#tabs [data-view="top"]');
+  await checkActiveTab(page, "top");
+  await page.click("#sidebar-toggle");
+  check(
+    (await page.locator("#sidebar").getAttribute("data-collapsed")) === "false",
+    "the navigation drawer expands again",
+  );
+
+  await page.click("#settings");
+  await page.waitForSelector('[data-testid="settings-dialog"]', { timeout: 10000 });
+  check(
+    await page.locator("#settings-default-view").isVisible(),
+    "settings exposes the start-up preferences",
+  );
+  await page.click("#settings-edge-labels");
+  const storedSettings = await page.evaluate(() => window.localStorage.getItem("lidlesseye.settings"));
+  check(
+    Boolean(storedSettings) && JSON.parse(storedSettings).edgeLabels === false,
+    "a settings change is persisted in this browser",
+    String(storedSettings),
+  );
+  await page.click("#settings-edge-labels");
+  await page.keyboard.press("Escape");
+  await page.click('#tabs [data-view="flamegraph"]');
+  await page.waitForSelector("canvas.fg-canvas", { timeout: 20000 });
+  await checkActiveTab(page, "flamegraph");
 
   // The tenant selector is only shown when more than one tenant exists.
   const initialTenant = (await page.locator("#tenant").innerText()).trim();
@@ -577,6 +676,31 @@ async function main() {
     "label values still load when the chosen range has no samples",
     String(valueCount),
   );
+
+  // ---- the node panel's own flamegraph --------------------------------
+  // Fresh page: the main one is parked on an empty absolute range after the
+  // picker test. The seeded ClusterIP node matches `service_name=checkout`,
+  // the label carried by the seeded profiles.
+  const mapPage = await context.newPage();
+  await mapPage.goto(`${BASE}/?tenant=acme#/servicemap`, { waitUntil: "load" });
+  await mapPage.waitForSelector('[data-testid="map-node"]', { timeout: 20000 });
+  check(
+    (await mapPage.locator('[data-testid="service-map-canvas"] svg text').count()) > 0,
+    "the service map labels its seeded edge",
+  );
+  await mapPage
+    .locator('[data-testid="map-node"]')
+    .filter({ hasText: "checkout" })
+    .first()
+    .click();
+  await mapPage.waitForSelector('[data-testid="map-panel"][data-state="open"]', { timeout: 10000 });
+  await mapPage.click('[data-testid="map-tab-profiling"]');
+  await mapPage.waitForSelector(
+    '[data-testid="map-profile-flamegraph"] canvas.fg-canvas',
+    { timeout: 20000 },
+  );
+  check(true, "the profiling tab embeds this node's flamegraph");
+  await mapPage.close();
 
   // Nothing above is worth much if the page is throwing while it renders.
   check(consoleErrors.length === 0, "no console errors", consoleErrors.join(" | "));

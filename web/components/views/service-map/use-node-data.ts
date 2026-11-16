@@ -17,9 +17,11 @@ import { useEffect, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
 import { composeSelector } from "@/lib/selector";
+import { settingsStore } from "@/lib/settings";
 import { profileFilters } from "@/lib/servicemap-graph";
 import { iso } from "@/lib/time";
 import type {
+  FlamegraphPayload,
   LabelFilter,
   MapHistoryPayload,
   ServiceMapNode,
@@ -39,6 +41,8 @@ export interface NodeData {
   /** Which profile type backed the memory chart, if any. */
   memoryType: string | null;
   top: TopPayload | null;
+  /** This node's own stack tree, filtered by the same labels as `top`. */
+  flamegraph: FlamegraphPayload | null;
   units: ProfileUnit[];
   loading: boolean;
   error: string | null;
@@ -50,6 +54,7 @@ const EMPTY: NodeData = {
   memory: null,
   memoryType: null,
   top: null,
+  flamegraph: null,
   units: [],
   loading: false,
   error: null,
@@ -119,12 +124,26 @@ export function useNodeData(
       const typesPromise = api.profileTypes({ from: params.from, until: params.until });
       const cpuPromise = api.timeseries({ ...params, profile_type: "cpu", selector });
       const topPromise = api.top({ ...params, profile_type: "cpu", selector, limit: 12 });
+      // An external node has no labels to match profiles; asking for a
+      // flamegraph there would draw the whole cluster under the wrong name.
+      const flamegraphPromise = selector
+        ? api
+            .flamegraph({
+              ...params,
+              profile_type: "cpu",
+              selector,
+              max_nodes: settingsStore.getSnapshot().flamegraphMaxNodes,
+            })
+            .then((result) => (result.total ? result : null))
+            .catch(() => null)
+        : Promise.resolve(null);
 
-      const [history, types, cpu, top] = await Promise.all([
+      const [history, types, cpu, top, flamegraph] = await Promise.all([
         historyPromise,
         typesPromise.catch(() => ({ profile_types: [] })),
         cpuPromise.catch(() => null),
         topPromise.catch(() => null),
+        flamegraphPromise,
       ]);
 
       const units: ProfileUnit[] = (types.profile_types ?? []).map((row) => ({
@@ -138,7 +157,7 @@ export function useNodeData(
             .catch(() => null)
         : null;
 
-      return { history, cpu, memory, memoryType, top, units };
+      return { history, cpu, memory, memoryType, top, flamegraph, units };
     };
 
     load()

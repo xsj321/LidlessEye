@@ -2,6 +2,8 @@
 
 | Document | Read it when you want to… |
 | --- | --- |
+| [USAGE.md](USAGE.md) | follow the dashboard step by step, from starting the server to reading a node's flamegraph (English) |
+| [USAGE.zh-CN.md](USAGE.zh-CN.md) | 同上，中文逐步使用指南 |
 | [ui.md](ui.md) | use the dashboard: time-range histogram, label filters, compare view, URL deep links |
 | [architecture.md](architecture.md) | understand the design: crates, data flow, DuckDB schema, query pipeline, concurrency, benchmarks |
 | [api.md](api.md) | call the HTTP API: endpoints, parameters, payloads, status codes, metrics |

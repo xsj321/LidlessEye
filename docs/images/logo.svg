@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="132" viewBox="0 0 560 132" role="img" aria-label="LidlessEye">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#171d25"/>
+      <stop offset="1" stop-color="#0e1014"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f2a65a"/>
+      <stop offset="1" stop-color="#f0d0a8"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="8" width="116" height="116" rx="26" fill="url(#bg)" stroke="#2a3441"/>
+  <path d="M26 66c10-22 22-22 32 0s22 22 32 0" fill="none" stroke="url(#wave)" stroke-width="5.5" stroke-linecap="round"/>
+  <circle cx="58" cy="66" r="9" fill="#e05c5c"/>
+  <circle cx="58" cy="66" r="15" fill="none" stroke="#e05c5c" stroke-opacity="0.35" stroke-width="1.5"/>
+
+  <text x="140" y="62" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="40" font-weight="700" letter-spacing="-1" fill="#e7eaf0">LidlessEye</text>
+  <text x="142" y="88" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" letter-spacing="0.5" fill="#96a0b2">continuous profiling for Linux</text>
+  <rect x="142" y="100" width="72" height="3" rx="1.5" fill="#f2a65a"/>
+</svg>

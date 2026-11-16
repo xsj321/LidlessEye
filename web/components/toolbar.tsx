@@ -133,7 +133,7 @@ export function Toolbar() {
         <Switch
           checked={auto}
           onCheckedChange={(checked) => dashboardStore.setAuto(checked)}
-          aria-label="Reload every 30 seconds"
+          aria-label="Auto-refresh (interval set in Settings)"
         />
       </Field>
 

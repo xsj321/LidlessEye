@@ -7,6 +7,11 @@ the same port as the API — nothing to build, nothing to host separately.
 http://localhost:4040/
 ```
 
+A bare URL opens the **service map** — the system's shape before any one
+function is chosen. The map's left drawer switches to the other views; see
+[USAGE.md](USAGE.md) for a step-by-step walkthrough in English and
+[USAGE.zh-CN.md](USAGE.zh-CN.md) in Chinese.
+
 This page is the *user* guide: what each control does, how to reproduce a view
 in a URL, and what to expect from the rendering. The endpoint shapes are in
 [api.md](api.md); the storage and query design are in
@@ -41,15 +46,20 @@ there is nothing to choose.
 ## Layout
 
 ```
-┌ top bar ─ tabs · tenant · version · refresh ──────────────────────────┐
-├ filter bar ─ profile · group by · range preset · auto · apply ────────┤
-├ filter rows ─ [+ Filter]  label = value  … ───────────────────────────┤
-├ time bar ─ mode · date pickers · histogram of the chosen range ───────┤
-└ main ─────── the selected view ───────────────────────────────────────┘
+┌ drawer ┬ top bar ─ name · version · refresh ──────────────────────────┐
+│        ├ toolbar ─ tenant · profile · group by · range · auto ───────┤
+│  nav   ├ filter rows ─ [+ Filter]  label = value  … ──────────────────┤
+│        ├ time bar ─ mode · date pickers · histogram ─────────────────┤
+│Settings├ main ─────── the selected view ─────────────────────────────┤
+└────────┴──────────────────────────────────────────────────────────────┘
 ```
 
-Everything above `main` is shared by all views: changing the window, a filter
-or the profile type re-queries whatever view is open.
+The **drawer** is a `<nav>` landmark whose buttons carry `aria-current="page"`:
+these are pages, not sibling tabs. It collapses to icons; the choice is kept in
+localStorage. **Settings** sits at its foot (see [Settings](#settings)).
+
+Everything to the right of `main`'s siblings is shared by all views: changing
+the window, a filter or the profile type re-queries whatever view is open.
 
 ## Time range
 
@@ -136,8 +146,9 @@ does not match a frame name and reports how many frames matched.
 
 With **Group by** set, the first row under the root is one synthetic frame per
 label value (`pod=cart-1`, …), which is the fastest way to see whether one pod
-differs from the rest. Very large trees are capped at 50 000 nodes; the legend
-says when the result was truncated.
+differs from the rest. Very large trees are capped at 50 000 nodes by default;
+the cap is configurable in [Settings](#settings), and the legend says when the
+result was truncated.
 
 Both the load and every zoom are animated (see [Motion](#motion)). The graph is
 a canvas, so text is not selectable and not exposed to screen readers — the
@@ -236,7 +247,7 @@ Below the neighbourhood are seven tabs:
 | Memory | the same shape for a heap profile type | whatever memory type the emitters ship, if any |
 | Net | bytes per second in and out, RTT, per-peer rates | the node's counters and its edges |
 | DNS | lookup latency per nameserver | edges on TCP/53 |
-| Profiling | the hottest functions, and the jump to the flamegraph | `/api/v1/top` for the same selector |
+| Profiling | the hottest functions, the node's own flamegraph, and the jump to the full view | `/api/v1/top` and `/api/v1/flamegraph` for the same selector |
 
 Charts follow what the data means rather than one house style: a line with an
 area fill for anything that moves over time, a step line where the value is a
@@ -245,16 +256,45 @@ availability percentage — where the interesting variation is in the last
 fraction of a percent. When a tab has no data it says which measurement is
 missing and what would produce it, instead of drawing an empty chart.
 
-*Open in the flamegraph* replaces the filter bar with `k8s_namespace` +
-`k8s_workload` (or `service_name` for a ClusterIP) and switches views. The time
-range is the one chosen above: dragging the bracket re-queries the map exactly
-as it re-queries a flamegraph.
+The **Profiling** tab embeds the real `FlamegraphCanvas` below the ranking: it
+runs `/api/v1/flamegraph` with the node's selector and the same window, so
+search, click-to-zoom, breadcrumbs and the hover tooltip behave exactly as they
+do in the full view. An external node has no labels to match, so the tab says
+so rather than drawing every stack in the cluster under that name. *Open full
+flamegraph view* replaces the filter bar with the same selector and switches
+pages. The time range is the one chosen above: dragging the bracket re-queries
+the map exactly as it re-queries a flamegraph.
+
+Edge labels appear once the map is zoomed past a threshold (62 % by default),
+both to keep the initial whole-graph view readable and because the pills do not
+scale with the canvas transform. Both the switch and the threshold are in
+[Settings](#settings).
 
 The protocol on an edge comes from the server port; the map does not parse
 payloads, so the rate is *new connections* per second, not requests. *External*
 collects everything the map cannot name — traffic that really does come from
 outside the cluster — so an edge to it is worth a second look. See
 [architecture.md](architecture.md#service-map) for what the agent reads and why.
+
+## Settings
+
+Opened from the foot of the drawer. Preferences are kept in
+`localStorage["lidlesseye.settings"]` and deliberately stay **out of the URL**:
+a link describes a screen, settings describe the tool. Only a URL without an
+explicit view or range picks up the start-up values.
+
+| Setting | Default | What it changes |
+| --- | --- | --- |
+| Default view | Service map | Landing view for a bare URL. |
+| Default range | `1h` | Relative range on a fresh load. |
+| Auto-refresh interval | 30 s | 10 s / 30 s / 1 min / 5 min; re-arms an active Auto timer immediately. |
+| Edge labels | on | The rate/RTT pills on service-map edges. |
+| Label zoom threshold | 62 % | Zoom level at which those pills appear. |
+| Flamegraph frame cap | 50 000 | `max_nodes` on `/flamegraph` and `/diff`, including the panel's embedded graph. |
+| Histogram buckets | 120 | 60 / 120 / 240 buckets in the time brush. |
+
+`Reset to defaults` restores every field. Invalid stored values (a deleted view,
+an out-of-range number) fall back to the default rather than breaking startup.
 
 ## URL reference
 

@@ -12,9 +12,11 @@
 import { ArrowDownLeft, ArrowUpRight, Flame, Gauge, HardDrive, Network, Server } from "lucide-react";
 import type { ReactNode } from "react";
 
+import { FlamegraphCanvas } from "@/components/canvas/flamegraph-canvas";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
 import { formatBytes, formatCount, formatDuration, formatPercent, formatValue } from "@/lib/format";
 import { edgeRate, edgeWeight, formatRate, formatRtt, profileFilters } from "@/lib/servicemap-graph";
 import { dashboardStore } from "@/lib/store";
@@ -685,6 +687,29 @@ export function ProfilingTab({ node, data }: TabProps) {
         )}
       </Section>
 
+      <Section
+        title="Flamegraph"
+        hint={filters ? 'this node only · on-CPU' : 'no profiles behind this node'}
+      >
+        {data.loading ? (
+          <Skeleton className="h-48 w-full rounded-md" data-testid="map-profile-flamegraph-loading" />
+        ) : data.flamegraph ? (
+          // The same canvas the full Flamegraph view uses, so search, zoom and
+          // the hover tooltip behave identically — only the selector is scoped
+          // to this node. It lives in the tab rather than a new page because
+          // the operator is comparing it with the ranking just above.
+          <div data-testid="map-profile-flamegraph">
+            <FlamegraphCanvas payload={data.flamegraph} />
+          </div>
+        ) : (
+          <Missing
+            icon={<Flame className="size-4" />}
+            title="No stacks for this node in the window"
+            hint="The flamegraph asks for the same profile type and selector as the ranking above. Widen the range or check that the agent resolved this workload's labels."
+          />
+        )}
+      </Section>
+
       {filters ? (
         <Button
           size="sm"
@@ -693,7 +718,7 @@ export function ProfilingTab({ node, data }: TabProps) {
           onClick={() => dashboardStore.showProfile(filters)}
         >
           <ArrowUpRight />
-          Open in the flamegraph
+          Open full flamegraph view
         </Button>
       ) : (
         <Note>Traffic to or from outside the cluster has no profiles behind it.</Note>

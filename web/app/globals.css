@@ -116,10 +116,20 @@
     overflow: hidden;
   }
 
-  /* The shell is a fixed-height column: only the main pane scrolls. */
+  /* The shell is a fixed-height row: a navigation drawer on the left and one
+     column on the right. Only the main pane scrolls; the drawer and the filter
+     bars stay put. */
   #app-shell {
     display: flex;
+    flex-direction: row;
+    height: 100%;
+  }
+
+  #app-content {
+    display: flex;
     flex-direction: column;
+    flex: 1 1 0%;
+    min-width: 0;
     height: 100%;
   }
 

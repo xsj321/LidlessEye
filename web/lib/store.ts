@@ -14,6 +14,7 @@ import { ApiError, api, getTenant, setTenant } from "./api";
 import { buildHash, parseHash } from "./hash";
 import type { HashPatch } from "./hash";
 import { composeSelector, parseSelector } from "./selector";
+import { settingsStore } from "./settings";
 import {
   defaultBaseline,
   domainSpanText,
@@ -110,7 +111,10 @@ export interface FilterValues {
 
 function initialState(): DashboardState {
   return {
-    view: "flamegraph",
+    // The service map is the front door: it is the only view that shows the
+    // shape of the system before you pick a function to look at. A URL with an
+    // explicit view still wins — see initialize().
+    view: "servicemap",
     type: "cpu",
     mode: "relative",
     range: "1h",
@@ -151,8 +155,6 @@ function initialState(): DashboardState {
     empty: null,
   };
 }
-
-const AUTO_REFRESH_MS = 30_000;
 
 export class DashboardStore {
   private state: DashboardState = initialState();
@@ -246,6 +248,13 @@ export class DashboardStore {
 
     const patch = parseHash(window.location.hash);
     this.applyPatch(patch);
+    // Only a bare URL picks up the preferences. Once a view or range is in the
+    // hash the link is a description of a screen, not a request for defaults.
+    const settings = settingsStore.getSnapshot();
+    if (!patch.view) this.state = { ...this.state, view: settings.defaultView };
+    if (this.state.mode === "relative" && !patch.range) {
+      this.state = { ...this.state, range: settings.defaultRange };
+    }
     this.lastDomain = this.resolveDomain();
 
     window.addEventListener("hashchange", this.onHashChange);
@@ -424,7 +433,12 @@ export class DashboardStore {
       this.commit({});
       void this.reload();
       void this.loadHistogram();
-    }, AUTO_REFRESH_MS);
+    }, settingsStore.getSnapshot().autoRefreshMs);
+  }
+
+  /** Re-arm the interval after the refresh period changes in Settings. */
+  refreshAuto() {
+    if (this.state.auto) this.setAuto(true);
   }
 
   setRelativeRange(preset: string) {
@@ -656,7 +670,10 @@ export class DashboardStore {
       }
 
       if (view === "flamegraph") {
-        const result = await api.flamegraph(params);
+        const result = await api.flamegraph({
+          ...params,
+          max_nodes: settingsStore.getSnapshot().flamegraphMaxNodes,
+        });
         if (id !== this.requestId) return;
         if (!result.total) {
           this.commit({ flamegraph: null, empty: this.emptyFlamegraph() });
@@ -667,7 +684,10 @@ export class DashboardStore {
       }
 
       if (view === "compare") {
-        const result = await api.diff(this.diffParams());
+        const result = await api.diff({
+          ...this.diffParams(),
+          max_nodes: settingsStore.getSnapshot().flamegraphMaxNodes,
+        });
         if (id !== this.requestId) return;
         if (!result.total_left && !result.total_right) {
           this.commit({
@@ -803,7 +823,7 @@ export class DashboardStore {
       profile_type: this.state.type,
       from: iso(domain.from),
       until: iso(domain.until),
-      buckets: 120,
+      buckets: settingsStore.getSnapshot().histogramBuckets,
     };
     if (selector) params.selector = selector;
     try {

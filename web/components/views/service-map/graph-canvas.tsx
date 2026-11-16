@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Maximize2, Minus, Plus } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { useSettings } from "@/lib/settings";
 import { placeNodes, worldBounds } from "@/lib/servicemap-graph";
 import type { Box } from "@/lib/servicemap-graph";
 import type { ServiceMapEdge, ServiceMapNode } from "@/lib/types";
@@ -52,6 +53,7 @@ export function ServiceGraph({
   onSelect,
   testId,
 }: ServiceGraphProps) {
+  const { edgeLabels, labelZoom } = useSettings();
   const container = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [view, setView] = useState<View>({ x: 0, y: 0, k: 1 });
@@ -205,7 +207,7 @@ export function ServiceGraph({
           boxes={boxes}
           windowSec={windowSec}
           selected={selected}
-          showLabels={view.k >= 0.62}
+          showLabels={edgeLabels && view.k >= labelZoom}
           width={world.width}
           height={world.height}
         />
