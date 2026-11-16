@@ -1226,7 +1226,8 @@ impl Store {
                 let mut stmt = conn
                     .prepare(
                         "INSERT INTO net_edges (bucket_ns, client_id, server_id, protocol, \
-                         connections, retransmits) VALUES (?, ?, ?, ?, ?, ?)",
+                         connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
                     .map_err(db_err)?;
                 for edge in &batch.edges {
@@ -1237,6 +1238,10 @@ impl Store {
                         edge.protocol,
                         edge.connections as i64,
                         edge.retransmits as i64,
+                        edge.tx_bytes as i64,
+                        edge.rx_bytes as i64,
+                        edge.rtt_us_sum as i64,
+                        edge.rtt_samples as i64,
                     ])
                     .map_err(db_err)?;
                 }
@@ -1265,7 +1270,8 @@ impl Store {
                         any_value(kind), sum(rx_bytes), sum(tx_bytes), sum(connections), \
                         sum(retransmits) \
                  FROM net_nodes WHERE bucket_ns >= ? AND bucket_ns < ? \
-                 GROUP BY node_id ORDER BY sum(connections) DESC LIMIT ?",
+                 GROUP BY node_id \
+                 ORDER BY sum(connections) + (sum(rx_bytes) + sum(tx_bytes)) / 1024 DESC LIMIT ?",
             )
             .map_err(db_err)?;
         let mut rows = stmt
@@ -1291,15 +1297,21 @@ impl Store {
     }
 
     /// Edges of the map, aggregated over the window.
+    ///
+    /// The `HAVING` keeps an edge that carried traffic but opened no new
+    /// connection in the window: a busy long-lived connection has
+    /// `connections = 0` and a lot of bytes, and dropping it would make the
+    /// map flicker as connections stop being re-established.
     pub fn net_edges(&self, from_ns: u64, until_ns: u64) -> Result<Vec<MapEdge>> {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT client_id, server_id, protocol, sum(connections), sum(retransmits) \
+                "SELECT client_id, server_id, protocol, sum(connections), sum(retransmits), \
+                        sum(tx_bytes), sum(rx_bytes), sum(rtt_us_sum), sum(rtt_samples) \
                  FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY client_id, server_id, protocol \
-                 HAVING sum(connections) > 0 \
-                 ORDER BY sum(connections) DESC LIMIT 4000",
+                 HAVING sum(connections) + sum(tx_bytes) + sum(rx_bytes) > 0 \
+                 ORDER BY sum(connections) + sum(tx_bytes) / 1024 DESC LIMIT 4000",
             )
             .map_err(db_err)?;
         let mut rows = stmt
@@ -1307,12 +1319,19 @@ impl Store {
             .map_err(db_err)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(db_err)? {
+            let rtt_us_sum = row.get::<_, i64>(7).unwrap_or(0).max(0) as u64;
+            let rtt_samples = row.get::<_, i64>(8).unwrap_or(0).max(0) as u64;
             out.push(MapEdge {
                 client: row.get(0).map_err(db_err)?,
                 server: row.get(1).map_err(db_err)?,
                 protocol: row.get(2).map_err(db_err)?,
                 connections: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
                 retransmits: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                tx_bytes: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
+                rx_bytes: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
+                // Mean round-trip time over the connections that closed inside
+                // the window; zero when none did.
+                rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
             });
         }
         Ok(out)
@@ -1413,12 +1432,57 @@ fn create_schema(conn: &Connection) -> Result<()> {
             server_id VARCHAR NOT NULL,
             protocol VARCHAR NOT NULL,
             connections BIGINT NOT NULL,
-            retransmits BIGINT NOT NULL
+            retransmits BIGINT NOT NULL,
+            tx_bytes BIGINT NOT NULL,
+            rx_bytes BIGINT NOT NULL,
+            rtt_us_sum BIGINT NOT NULL,
+            rtt_samples BIGINT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);
         INSERT OR REPLACE INTO meta VALUES ('schema_version', '{SCHEMA_VERSION}');"
     ))
-    .map_err(db_err)
+    .map_err(db_err)?;
+    add_missing_columns(conn)
+}
+
+/// Add the columns a store written by an older release does not have yet.
+///
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a database
+/// that predates a column keeps missing it until it is added here. The catalog
+/// is asked rather than relying on `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`,
+/// whose availability depends on the DuckDB build the agent was linked with.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    const ADDED: &[(&str, &str)] = &[
+        ("tx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
+        ("rx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
+        ("rtt_us_sum", "BIGINT DEFAULT 0 NOT NULL"),
+        ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
+    ];
+    let mut existing: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = 'net_edges'",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_err)?;
+        for row in rows {
+            existing.push(row.map_err(db_err)?);
+        }
+    }
+    for (column, definition) in ADDED {
+        if existing.iter().any(|name| name == column) {
+            continue;
+        }
+        conn.execute_batch(&format!(
+            "ALTER TABLE net_edges ADD COLUMN {column} {definition}"
+        ))
+        .map_err(db_err)?;
+    }
+    Ok(())
 }
 
 /// Render the parts of a selector that SQL can express.

@@ -22,6 +22,12 @@
 
 #[cfg(target_os = "linux")]
 mod collector;
+/// Connection-level accounting from eBPF, for the service map.
+///
+/// A separate object from the profiler's on purpose: a kernel that rejects
+/// these programs costs the map its counters, not the flamegraph its samples.
+#[cfg(target_os = "linux")]
+pub mod conntrack;
 #[cfg(target_os = "linux")]
 mod gopclntab;
 /// Pod metadata, keyed by UID, that names the series of a pod.

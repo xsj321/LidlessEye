@@ -351,7 +351,7 @@ fn start_netmap<F>(
     sink: F,
 ) -> Option<lidlesseye::netmap::NetMapHandle>
 where
-    F: Fn(lidlesseye::core::ServiceMapBatch) + Send + 'static,
+    F: Fn(lidlesseye::core::ServiceMapBatch) + Send + Sync + 'static,
 {
     let pods = lidlesseye::k8s::start_cluster_pod_index(refresh)?;
     let services = lidlesseye::k8s::start_service_index(refresh);

@@ -341,25 +341,69 @@ is what makes a URL reproduce a view exactly. Routing stays hash-based
 pre-existing deep links keep working.
 
 The service map is the one view that is not drawn by hand: it uses ECharts'
-canvas `graph` series (force layout, pan/zoom and hit testing in the library),
-because a service graph has no fixed geometry to precompute and a few hundred
-nodes is exactly where a React node-per-service diagram stops being smooth. The
-node colour is the on-CPU time of the profiles behind it, so the map and the
-flamegraph are two views of the same window.
+canvas `graph` series (pan/zoom and hit testing in the library), because a few
+hundred nodes is exactly where a React node-per-service diagram stops being
+smooth. The positions are not ECharts' force layout, though — they come from
+`lib/servicemap-layout.ts`, which ranks the graph by dependency depth so entry
+points sit on the left and what they call sits to their right. The node colour
+is the on-CPU time of the profiles behind it, so the map and the flamegraph are
+two views of the same window.
 
 ## Service map
 
 The map answers "who talks to whom, and what does it cost". It is a *network*
-graph — L4 edges with connection and retransmit counts — plus the profiles
-already stored, joined per workload.
+graph — L4 edges with connection counts, bytes, retransmits and round-trip time
+— plus the profiles already stored, joined per workload.
 
-Collecting it does not need a second eBPF program. `/proc/<pid>/net/tcp` of any
-process in a pod is resolved by the kernel in that pod's network namespace, so
-one `hostPID` agent can read every pod's TCP table without `setns`, and
-`/proc/<pid>/net/dev` gives the same pod's cumulative byte counters. Reading
-`struct sock` from a kprobe would add RTT and per-socket bytes, but it also means
-matching a kernel struct layout with CO-RE for every supported release; the
-addresses in `/proc` are already enough to name both endpoints.
+### Two collectors, one rule set
+
+The agent prefers an eBPF collector and falls back to the pods' TCP tables.
+
+*eBPF* (`crates/lidlesseye-ebpf/bpf/net.bpf.c`, its own object so a failure
+here cannot take the profiler down) hooks four kernel functions:
+
+| Program | Symbol | What it adds |
+| --- | --- | --- |
+| `lidlesseye_tcp_state` | `tcp_set_state` | a new connection, and which end opened it |
+| `lidlesseye_tcp_send` | `tcp_sendmsg` | bytes sent, retransmit accounting |
+| `lidlesseye_tcp_recv` | `tcp_cleanup_rbuf` | bytes received |
+| `lidlesseye_tcp_retrans` | `tcp_retransmit_skb` | retransmits |
+
+Kprobes rather than tracepoints or fentry: `sock:inet_sock_set_state` has three
+arguments on 6.x and four on 5.x, and an fentry program on `tcp_sendmsg` fails
+to load because the verifier cannot size the anonymous union inside `msghdr`
+through BTF. A kprobe's arguments are in registers on every release, so the
+only version-dependent piece is the `pt_regs` layout, which CO-RE resolves by
+field name. The probes attach by a candidate list of symbols (`tcp_set_state`,
+then `.isra.0`, `.constprop.0`) because the compiler is free to clone them.
+
+Each program writes into a `flows` hash keyed by the 5-tuple, and a per-socket
+map remembers the key so the byte counters can find it again without re-parsing
+the sock. Every window the map is drained and removed, which is what makes a
+window's numbers a delta rather than a running total.
+
+Because the handshake is seen, the *direction* is not a guess: a socket that
+reaches `TCP_ESTABLISHED` from `TCP_SYN_SENT` is the client, one that reaches it
+from `TCP_SYN_RECV` is the server. Addresses are the ones the application wrote,
+before kube-proxy rewrites them, so a pod-to-ClusterIP connection is reported as
+`workload → service` and the hairpin-masqueraded copy at the server end is
+recognised (its peer is a private address that names no pod) and dropped instead
+of being counted as an outside client.
+
+Connections that predate the agent — a keep-alive between kube-apiserver and
+kube-scheduler, for instance — never see a handshake. For those the role is
+inferred from the pod spec: a pod listening on the local port is the server, a
+peer whose pod declares the remote port makes this pod the client. When neither
+holds the connection is dropped rather than drawn backwards.
+
+*Fallback* (`/proc/<pid>/net/tcp`) is what the agent used before the eBPF
+collector existed and still runs when the programs cannot be loaded.
+`/proc/<pid>/net/tcp` of any process in a pod is resolved by the kernel in that
+pod's network namespace, so one `hostPID` agent can read every pod's TCP table
+without `setns`. It has no bytes and no RTT, and polling only sees what is open
+at the instant of the scan, so it counts `TIME_WAIT`/`CLOSE_WAIT`/`FIN_WAIT`
+alongside `ESTABLISHED` to recover the connections that closed between scans;
+`SYN_SENT` is left out, because a refused connect is not a connection.
 
 Attribution rules:
 
@@ -385,33 +429,28 @@ node's traffic (their byte counters are identical, which is the tell). The agent
 compares `/proc/<pid>/ns/net` against pid 1's and, for a match, keeps only the
 sockets whose inode appears in that process's `/proc/<pid>/fd`. The interface
 counters have no per-pod equivalent in that case, so such pods report no bytes
-rather than the node's totals; their connections are still counted.
+rather than the node's totals; their connections are still counted. The eBPF
+collector needs no such test — it never reads a table — but it shares the
+consequence: a `hostNetwork` pod is identified by the node address plus a port
+it declares, so its listening side is named correctly while its own outgoing
+sockets, on an ephemeral port, fall back to whichever pod shares that address.
 
-A connection is counted once, on first sight; retransmits are a delta against
-the previous scan. Windows are appended to `net_nodes`/`net_edges` and summed by
-the query, which is what makes the map follow the same `from`/`until` as the
-flamegraph. CPU is joined by label: the query groups `samples` of type `cpu` by
+Retransmits from `/proc` are a delta against the previous scan. Windows are
+appended to `net_nodes`/`net_edges` and summed by the query, which is what makes
+the map follow the same `from`/`until` as the flamegraph. CPU is joined by
+label: the query groups `samples` of type `cpu` by
 `k8s_namespace`/`k8s_workload`, which is the same string the agent uses as a
 node id.
 
-Polling a table sees only what is open at that instant, so counting
-`TIME_WAIT`/`CLOSE_WAIT`/`FIN_WAIT` alongside `ESTABLISHED` is what keeps a
-scrape or an API call visible after it has already finished; `SYN_SENT` is left
-out, because a refused connect is not a connection. The closing states also
-linger when the process is gone, which is why a pod that restarts still shows
-the traffic it served.
-
 Known limits, stated rather than hidden: there is no L7 parsing, so an edge's
 protocol is inferred from the server port and an edge reports connections, not
-requests; traffic in a pod's own namespace (`localhost`) is ignored; and a
+requests; traffic in a pod's own namespace (`localhost`) is ignored; a
 long-lived idle connection is counted when it appears, not re-counted per
-window. Same-node traffic to a ClusterIP is masqueraded to the node's bridge
-address (`10.244.x.1`), so it arrives with no client name and shows up as
-`external → pod` — the named `pod → ClusterIP` edge exists as well, from the
-client's own table, so the pair describes one connection from both ends.
-Static pods are owned by their `Node` in `ownerReferences`; treating that as a
-workload would merge every control-plane component on a node into one entry, so
-it is ignored and each pod keeps its own name.
+window; and the round-trip time is sampled once, when the connection closes, so
+a connection still open in this window contributes bytes but no latency. Static
+pods are owned by their `Node` in `ownerReferences`; treating that as a workload
+would merge every control-plane component on a node into one entry, so it is
+ignored and each pod keeps its own name.
 
 The histogram behind the time-range selector is `GET /api/v1/timeseries` over
 the tenant's extent — the same endpoint the time-series view uses, at 120

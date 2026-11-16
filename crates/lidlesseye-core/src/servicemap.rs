@@ -131,6 +131,22 @@ pub struct ServiceEdge {
     pub connections: u64,
     #[serde(default)]
     pub retransmits: u64,
+    /// Bytes the client sent to the server during the window.
+    ///
+    /// Only the eBPF source can report these; the `/proc` fallback leaves them
+    /// at zero rather than inventing a number.
+    #[serde(default)]
+    pub tx_bytes: u64,
+    /// Bytes the server sent back.
+    #[serde(default)]
+    pub rx_bytes: u64,
+    /// Sum of the round-trip times sampled when connections closed, in
+    /// microseconds, together with how many samples it is the sum of. Stored
+    /// this way so that summing windows keeps the average exact.
+    #[serde(default)]
+    pub rtt_us_sum: u64,
+    #[serde(default)]
+    pub rtt_samples: u64,
 }
 
 /// One collection window, produced by an agent.
@@ -200,6 +216,10 @@ impl ServiceMapBatch {
                 Some(&i) => {
                     self.edges[i].connections += edge.connections;
                     self.edges[i].retransmits += edge.retransmits;
+                    self.edges[i].tx_bytes += edge.tx_bytes;
+                    self.edges[i].rx_bytes += edge.rx_bytes;
+                    self.edges[i].rtt_us_sum += edge.rtt_us_sum;
+                    self.edges[i].rtt_samples += edge.rtt_samples;
                 }
                 None => {
                     edge_index.insert(key, self.edges.len());
@@ -243,6 +263,17 @@ pub struct MapEdge {
     pub protocol: String,
     pub connections: u64,
     pub retransmits: u64,
+    /// Bytes the client sent to the server over the window.
+    #[serde(default)]
+    pub tx_bytes: u64,
+    /// Bytes the server sent back.
+    #[serde(default)]
+    pub rx_bytes: u64,
+    /// Average round-trip time in microseconds, zero when no connection on this
+    /// edge closed inside the window (a long-lived connection reports nothing
+    /// rather than a stale number).
+    #[serde(default)]
+    pub rtt_us: u64,
 }
 
 /// `GET /api/v1/servicemap` response.
@@ -335,6 +366,10 @@ mod tests {
                 protocol: "http".into(),
                 connections: 2,
                 retransmits: 0,
+                tx_bytes: 100,
+                rx_bytes: 400,
+                rtt_us_sum: 900,
+                rtt_samples: 1,
             }],
             ..Default::default()
         };
@@ -346,6 +381,10 @@ mod tests {
                 protocol: "http".into(),
                 connections: 3,
                 retransmits: 1,
+                tx_bytes: 250,
+                rx_bytes: 600,
+                rtt_us_sum: 2100,
+                rtt_samples: 2,
             }],
             ..Default::default()
         };
@@ -354,6 +393,12 @@ mod tests {
         assert_eq!(a.edges.len(), 1);
         assert_eq!(a.edges[0].connections, 5);
         assert_eq!(a.edges[0].retransmits, 1);
+        // Bytes and RTT are counters too: a merged window must carry the sum,
+        // not the last observation.
+        assert_eq!(a.edges[0].tx_bytes, 350);
+        assert_eq!(a.edges[0].rx_bytes, 1000);
+        assert_eq!(a.edges[0].rtt_us_sum, 3000);
+        assert_eq!(a.edges[0].rtt_samples, 3);
     }
 
     #[test]

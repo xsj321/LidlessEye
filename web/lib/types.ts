@@ -107,6 +107,12 @@ export interface ServiceMapEdge {
   protocol: string;
   connections: number;
   retransmits?: number;
+  /** Bytes the client sent to the server over the window. */
+  tx_bytes?: number;
+  /** Bytes the server sent back. */
+  rx_bytes?: number;
+  /** Average round-trip time in microseconds; 0 when nothing closed. */
+  rtt_us?: number;
 }
 
 export interface ServiceMapPayload {

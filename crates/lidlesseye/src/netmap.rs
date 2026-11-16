@@ -1,35 +1,28 @@
 //! The service map collector.
 //!
-//! ## What it reads, and why not eBPF
+//! ## Two sources, one rule set
 //!
-//! A pod's TCP table is available in `/proc/<pid>/net/tcp` *of any process in
-//! its network namespace*, and the kernel resolves that path in that
-//! namespace — no `setns`, no `CAP_SYS_ADMIN` beyond the `hostPID` the agent
-//! already has. Reading it for one pid per pod yields the complete set of
-//! sockets the pod owns, including the ones opened by a sidecar.
+//! The map is built from connections, and there are two ways to see them:
 //!
-//! The alternative — kprobes on `tcp_connect`/`tcp_close` — would give byte
-//! counters and RTT, but it also means matching kernel struct layouts with
-//! CO-RE and reading `struct sock` fields whose offsets move between releases.
-//! The map has to name *both* endpoints of a connection, and `/proc/net/tcp`
-//! already has them, so the collector takes the path with no kernel ABI in it.
-//! Byte counters come from `/proc/<pid>/net/dev`, which is per namespace and
-//! therefore per pod.
+//!   * **eBPF** (preferred) — `bpf/net.bpf.c` hooks `tcp_set_state`, so every
+//!     completed handshake is seen no matter how briefly the socket lives, and
+//!     the addresses are the ones the application wrote, before kube-proxy
+//!     rewrites them. It also counts bytes and retransmits per connection and
+//!     samples the round-trip time. The direction is read off the handshake
+//!     itself (`SYN_SENT` -> established is a client, `SYN_RECV` ->
+//!     established is a server), so no listen-set guessing is needed.
+//!   * **`/proc/<pid>/net/tcp`** (fallback) — a pod's TCP table is available
+//!     in that process's network namespace, so one `hostPID` agent can read
+//!     every pod's table without `setns`. Nothing needs to be loaded into the
+//!     kernel, which is what makes this work on a kernel without BTF or when
+//!     the agent is not allowed to load programs.
 //!
-//! ## What the map is
-//!
-//! Every established connection is attributed to a client and a server:
-//!
-//!   * the side whose local port is in its own listen set is the server,
-//!   * the other side is the client.
-//!
-//! A connection between two pods is counted **once**, by the client's agent.
-//! The server side deliberately skips it: both ends are visible on a node, and
-//! summing both would double every edge. Connections from outside the cluster
-//! are counted by the server side, as `external -> service`.
-//!
-//! ClusterIP addresses are resolved through the Service index, so
-//! `10.96.0.10:443` becomes `default/kubernetes` instead of "external".
+//! Both feed the same attribution. Direction comes from the source: the eBPF
+//! probe knows it from the handshake, `/proc` infers it because the side whose
+//! local port is in its own listen set is the server. A connection between two
+//! pods is counted **once**, by the client's agent. ClusterIP addresses resolve
+//! through the Service index, so `10.96.0.10:443` becomes `default/kubernetes`
+//! instead of "external".
 //!
 //! ## What it deliberately does not do
 //!
@@ -37,8 +30,8 @@
 //! port (`https`, `postgres`, ...), not from the payload: telling gRPC from
 //! HTTP needs either plaintext traffic or a TLS uprobe, and a wrong label is
 //! worse than a coarse one. "Requests" would need the same inspection, so edges
-//! report new connections and retransmits — the numbers the kernel actually
-//! exposes.
+//! report connections, bytes, retransmits and RTT — the numbers the kernel
+//! actually exposes.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -47,8 +40,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use lidlesseye_core::servicemap::{
-    NodeKind, ServiceEdge, ServiceMapBatch, ServiceNode, protocol_for_port,
+    EXTERNAL_ID, NodeKind, ServiceEdge, ServiceMapBatch, ServiceNode, protocol_for_port,
 };
+use lidlesseye_ebpf::conntrack::{self, ConntrackConfig, ConntrackHandle, Flow, Role};
 use lidlesseye_ebpf::k8s::{PodIndex, PodMeta};
 use tracing::{debug, warn};
 
@@ -104,13 +98,15 @@ fn counted_state(state: u8) -> bool {
 /// Tunables for the collector.
 #[derive(Debug, Clone)]
 pub struct NetMapConfig {
-    /// How often the network namespaces are scanned. The dashboard sums the
-    /// resulting windows, so this only trades freshness for `/proc` reads.
+    /// How often the connection tables are read. The dashboard sums the
+    /// resulting windows, so this only trades freshness for work.
     pub interval: Duration,
     /// Cluster-wide pod index, used to turn a peer address into a service.
     pub pods: Arc<PodIndex>,
     /// ClusterIP -> Service, when the API allowed listing Services.
     pub services: Option<Arc<ServiceIndex>>,
+    /// Prefer the eBPF source, falling back to `/proc` when it cannot attach.
+    pub ebpf: bool,
 }
 
 impl NetMapConfig {
@@ -119,6 +115,7 @@ impl NetMapConfig {
             interval: Duration::from_secs(10),
             pods,
             services: None,
+            ebpf: true,
         }
     }
 }
@@ -127,6 +124,9 @@ impl NetMapConfig {
 pub struct NetMapHandle {
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
+    /// Set when the eBPF source is in use; stopping the scanner thread would
+    /// not reach it.
+    conntrack: Option<ConntrackHandle>,
 }
 
 impl NetMapHandle {
@@ -135,15 +135,15 @@ impl NetMapHandle {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+        if let Some(mut conntrack) = self.conntrack.take() {
+            conntrack.stop();
+        }
     }
 }
 
 impl Drop for NetMapHandle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        self.stop();
     }
 }
 
@@ -151,7 +151,62 @@ impl Drop for NetMapHandle {
 /// block on anything that needs the caller's runtime.
 pub fn start<F>(config: NetMapConfig, sink: F) -> NetMapHandle
 where
-    F: Fn(ServiceMapBatch) + Send + 'static,
+    F: Fn(ServiceMapBatch) + Send + Sync + 'static,
+{
+    let sink = Arc::new(sink);
+    if config.ebpf {
+        match start_ebpf(&config, Arc::clone(&sink)) {
+            Ok(conntrack) => {
+                return NetMapHandle {
+                    stop: Arc::new(AtomicBool::new(false)),
+                    join: None,
+                    conntrack: Some(conntrack),
+                };
+            }
+            Err(err) => warn!(
+                error = %err,
+                "eBPF connection accounting unavailable; falling back to /proc scanning"
+            ),
+        }
+    }
+    let (handle_stop, join) = start_scan(config, sink);
+    NetMapHandle {
+        stop: handle_stop,
+        join,
+        conntrack: None,
+    }
+}
+
+/// Drain the eBPF counters and turn them into map windows.
+fn start_ebpf<F>(config: &NetMapConfig, sink: Arc<F>) -> Result<ConntrackHandle, String>
+where
+    F: Fn(ServiceMapBatch) + Send + Sync + 'static,
+{
+    let mapper = FlowMapper {
+        pods: Arc::clone(&config.pods),
+        services: config.services.clone(),
+        node: lidlesseye_ebpf::procfs::hostname(),
+    };
+    conntrack::start(
+        ConntrackConfig {
+            flush_interval: config.interval,
+        },
+        move |flows| {
+            let batch = mapper.batch(flows, lidlesseye_core::now_ns());
+            if !batch.is_empty() {
+                sink(batch);
+            }
+        },
+    )
+}
+
+/// Scan every pod's network namespace for open sockets.
+fn start_scan<F>(
+    config: NetMapConfig,
+    sink: Arc<F>,
+) -> (Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>)
+where
+    F: Fn(ServiceMapBatch) + Send + Sync + 'static,
 {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -185,14 +240,176 @@ where
             }
         });
     match join {
-        Ok(join) => NetMapHandle {
-            stop,
-            join: Some(join),
-        },
+        Ok(join) => (stop, Some(join)),
         Err(err) => {
             warn!(error = %err, "could not start the service map collector");
-            NetMapHandle { stop, join: None }
+            (stop, None)
         }
+    }
+}
+
+/// Turns drained eBPF flows into one map window.
+///
+/// The observer of a flow is a pod, so the pod's own address is enough to
+/// identify it — no pid lookups, and therefore no race with a process exiting
+/// between the event and the drain.
+struct FlowMapper {
+    pods: Arc<PodIndex>,
+    services: Option<Arc<ServiceIndex>>,
+    node: String,
+}
+
+impl FlowMapper {
+    fn batch(&self, flows: Vec<Flow>, start_ns: u64) -> ServiceMapBatch {
+        let mut batch = ServiceMapBatch {
+            start_ns,
+            end_ns: lidlesseye_core::now_ns(),
+            node: self.node.clone(),
+            ..Default::default()
+        };
+        let mut nodes: HashMap<String, ServiceNode> = HashMap::new();
+        let mut edges: HashMap<(String, String, String), ServiceEdge> = HashMap::new();
+        let mut skipped = 0usize;
+        let mut hairpin = 0usize;
+        let mut ambiguous = 0usize;
+
+        for flow in flows {
+            if flow.opens == 0 && flow.tx_bytes == 0 && flow.rx_bytes == 0 && flow.retransmits == 0
+            {
+                continue;
+            }
+            // A socket that belongs to no pod is the node's own traffic (the
+            // kubelet, the agent itself). It has no place in a service map.
+            let Some(meta) = self.pods.lookup_ip(flow.local.0, flow.local.1) else {
+                skipped += 1;
+                continue;
+            };
+            let local_node = pod_node(&meta);
+            let peer = resolve_peer(
+                &self.pods,
+                self.services.as_deref(),
+                flow.remote.0,
+                flow.remote.1,
+            );
+
+            let role = match flow.role {
+                Role::Client | Role::Server => flow.role,
+                Role::Unknown => match infer_role(&flow, &meta, &peer) {
+                    Some(role) => role,
+                    None => {
+                        ambiguous += 1;
+                        continue;
+                    }
+                },
+            };
+
+            let (client, server, server_port, swapped) = match (role, &peer) {
+                (Role::Client, Peer::Pod(other)) => {
+                    let node = pod_node(other);
+                    if node.id == local_node.id {
+                        // A pod talking to itself is not an edge.
+                        continue;
+                    }
+                    (local_node.id.clone(), node.id.clone(), flow.remote.1, false)
+                }
+                (Role::Client, Peer::Service(service)) => {
+                    (local_node.id.clone(), service.id(), flow.remote.1, false)
+                }
+                (Role::Client, Peer::External) => (
+                    local_node.id.clone(),
+                    EXTERNAL_ID.to_string(),
+                    flow.remote.1,
+                    false,
+                ),
+                // The client's own agent records a pod-to-pod edge, so the
+                // server side only contributes the inbound-from-outside case
+                // — otherwise every internal edge would be counted twice.
+                (Role::Server, Peer::External) => {
+                    if is_cluster_private(flow.remote.0) {
+                        // kube-proxy rewrites the source of a same-node
+                        // pod-to-ClusterIP connection to the node's bridge
+                        // address (hairpin SNAT), so the server's socket
+                        // reports a private peer that belongs to no pod. The
+                        // client's agent names that connection; drawing this
+                        // view too would count the traffic twice and blame an
+                        // outside client that does not exist.
+                        hairpin += 1;
+                        continue;
+                    }
+                    (
+                        EXTERNAL_ID.to_string(),
+                        local_node.id.clone(),
+                        flow.local.1,
+                        true,
+                    )
+                }
+                (Role::Server, _) | (Role::Unknown, _) => continue,
+            };
+
+            let protocol = protocol_for_port(server_port).to_string();
+            let (tx, rx) = if swapped {
+                (flow.rx_bytes, flow.tx_bytes)
+            } else {
+                (flow.tx_bytes, flow.rx_bytes)
+            };
+
+            let this = nodes
+                .entry(local_node.id.clone())
+                .or_insert_with(|| local_node.clone());
+            this.tx_bytes += flow.tx_bytes;
+            this.rx_bytes += flow.rx_bytes;
+            this.retransmits += flow.retransmits;
+            this.connections += flow.opens;
+
+            let peer_node = match &peer {
+                Peer::Pod(other) => Some(pod_node(other)),
+                Peer::Service(service) => Some(service_node(service)),
+                Peer::External => Some(external_node()),
+            };
+            if let Some(peer_node) = peer_node.filter(|node| node.id != local_node.id) {
+                let slot = nodes.entry(peer_node.id.clone()).or_insert(peer_node);
+                slot.tx_bytes += tx;
+                slot.rx_bytes += rx;
+                slot.connections += flow.opens;
+            }
+
+            let key = (client.clone(), server.clone(), protocol.clone());
+            let edge = edges.entry(key).or_insert_with(|| ServiceEdge {
+                client,
+                server,
+                protocol,
+                ..Default::default()
+            });
+            edge.connections += flow.opens;
+            edge.retransmits += flow.retransmits;
+            edge.tx_bytes += tx;
+            edge.rx_bytes += rx;
+            edge.rtt_us_sum += flow.rtt_us_sum;
+            edge.rtt_samples += flow.rtt_samples;
+        }
+
+        if skipped > 0 {
+            debug!(
+                skipped,
+                "connections of processes that belong to no pod were left out"
+            );
+        }
+        if ambiguous > 0 {
+            debug!(
+                ambiguous,
+                "connections whose handshake predates the agent and whose direction cannot be read from the pod specs were left out"
+            );
+        }
+        if hairpin > 0 {
+            debug!(
+                hairpin,
+                "inbound connections whose client was rewritten by kube-proxy were left to the client's agent"
+            );
+        }
+        batch.nodes = nodes.into_values().collect();
+        batch.edges = edges.into_values().collect();
+        batch.end_ns = lidlesseye_core::now_ns();
+        batch
     }
 }
 
@@ -422,7 +639,12 @@ impl Scanner {
         }
 
         let local_is_server = pod.listen.contains(&socket.key.local.1);
-        let peer = resolve_peer(config, socket.key.remote.0, socket.key.remote.1);
+        let peer = resolve_peer(
+            config.pods.as_ref(),
+            config.services.as_deref(),
+            socket.key.remote.0,
+            socket.key.remote.1,
+        );
         let this = pod_node(&pod.meta);
 
         let (client_node, server_node, server_port) = match peer {
@@ -467,6 +689,7 @@ impl Scanner {
             protocol: protocol_for_port(server_port).to_string(),
             connections: u64::from(counted),
             retransmits: u64::from(retrans),
+            ..Default::default()
         })
     }
 
@@ -488,6 +711,48 @@ impl Scanner {
         match before {
             Some(previous) => (false, socket.retrans.saturating_sub(previous)),
             None => (true, 0),
+        }
+    }
+}
+
+/// The direction of a connection whose handshake happened before this agent
+/// was running.
+///
+/// The socket state alone does not say which end opened it, but the pod specs
+/// do: a pod that listens on its local port is the server, and a peer that
+/// listens on the remote port means this pod is the client. Anything else —
+/// both sides on undeclared ports — is unknowable, and guessing would draw
+/// half the edges backwards.
+fn infer_role(flow: &Flow, meta: &PodMeta, peer: &Peer) -> Option<Role> {
+    if meta.ports.contains(&flow.local.1) {
+        return Some(Role::Server);
+    }
+    match peer {
+        Peer::Pod(other) if other.ports.contains(&flow.remote.1) => Some(Role::Client),
+        Peer::Pod(_) => None,
+        // A virtual address has no listening socket of its own, so the pod is
+        // the one that dialled it.
+        Peer::Service(_) | Peer::External => Some(Role::Client),
+    }
+}
+
+/// Whether an address is inside a range a cluster uses for itself.
+///
+/// A peer in one of these ranges that resolves to no pod and no Service is not
+/// an outside client: it is the node's own bridge, after kube-proxy rewrote the
+/// source of a hairpin connection. Public addresses are the ones that can only
+/// come from outside.
+fn is_cluster_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]) // CGNAT
+        }
+        IpAddr::V6(v6) => {
+            v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_private())
         }
     }
 }
@@ -529,18 +794,14 @@ fn pod_node(meta: &PodMeta) -> ServiceNode {
     node
 }
 
-fn resolve_peer(config: &NetMapConfig, ip: IpAddr, port: u16) -> Peer {
+fn resolve_peer(pods: &PodIndex, services: Option<&ServiceIndex>, ip: IpAddr, port: u16) -> Peer {
     if ip.is_loopback() {
         return Peer::External;
     }
-    if let Some(meta) = config.pods.lookup_ip(ip, port) {
+    if let Some(meta) = pods.lookup_ip(ip, port) {
         return Peer::Pod(meta);
     }
-    if let Some(service) = config
-        .services
-        .as_ref()
-        .and_then(|index| index.lookup(ip, port))
-    {
+    if let Some(service) = services.and_then(|index| index.lookup(ip, port)) {
         return Peer::Service(service);
     }
     Peer::External
@@ -686,6 +947,263 @@ fn read_netdev(pid: u32) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lidlesseye_ebpf::k8s::PodIndex;
+    use std::collections::BTreeMap;
+
+    /// A pod index with `(uid, namespace, name, ip)` entries and no labels, so
+    /// the node id falls back to the pod name.
+    fn pod_index(entries: &[(&str, &str, &str, &str)]) -> Arc<PodIndex> {
+        let mut pods = HashMap::new();
+        for &(uid, namespace, name, ip) in entries {
+            let meta = PodMeta::new(uid, namespace, name, &BTreeMap::new(), None, None)
+                .with_ips(vec![ip.parse().unwrap()]);
+            pods.insert(uid.to_string(), meta);
+        }
+        let index = PodIndex::new();
+        index.replace(pods);
+        Arc::new(index)
+    }
+
+    fn mapper(entries: &[(&str, &str, &str, &str)]) -> FlowMapper {
+        FlowMapper {
+            pods: pod_index(entries),
+            services: None,
+            node: "test-node".to_string(),
+        }
+    }
+
+    /// A pod index whose pods declare the given container ports.
+    fn mapper_with_ports(entries: &[(&str, &str, &str, &str, &[u16])]) -> FlowMapper {
+        let mut pods = HashMap::new();
+        for &(uid, namespace, name, ip, ports) in entries {
+            let meta = PodMeta::new(uid, namespace, name, &BTreeMap::new(), None, None)
+                .with_ips(vec![ip.parse().unwrap()])
+                .with_ports(ports.to_vec());
+            pods.insert(uid.to_string(), meta);
+        }
+        let index = PodIndex::new();
+        index.replace(pods);
+        FlowMapper {
+            pods: Arc::new(index),
+            services: None,
+            node: "test-node".to_string(),
+        }
+    }
+
+    fn flow(local: (&str, u16), remote: (&str, u16), role: Role, tx: u64, rx: u64) -> Flow {
+        Flow {
+            local: (local.0.parse().unwrap(), local.1),
+            remote: (remote.0.parse().unwrap(), remote.1),
+            role,
+            opens: 1,
+            tx_bytes: tx,
+            rx_bytes: rx,
+            retransmits: 0,
+            rtt_us_sum: 0,
+            rtt_samples: 0,
+        }
+    }
+
+    #[test]
+    fn a_client_flow_becomes_one_edge_with_both_directions() {
+        let mapper = mapper(&[
+            ("u1", "shop", "checkout", "10.0.0.2"),
+            ("u2", "shop", "cart", "10.0.0.7"),
+        ]);
+        let batch = mapper.batch(
+            vec![flow(
+                ("10.0.0.2", 43210),
+                ("10.0.0.7", 8080),
+                Role::Client,
+                900,
+                2000,
+            )],
+            1,
+        );
+        assert_eq!(batch.edges.len(), 1);
+        let edge = &batch.edges[0];
+        assert_eq!(edge.client, "shop/checkout");
+        assert_eq!(edge.server, "shop/cart");
+        assert_eq!(edge.protocol, "http");
+        assert_eq!(edge.connections, 1);
+        assert_eq!(edge.tx_bytes, 900);
+        assert_eq!(edge.rx_bytes, 2000);
+
+        let checkout = batch
+            .nodes
+            .iter()
+            .find(|n| n.id == "shop/checkout")
+            .unwrap();
+        assert_eq!(checkout.tx_bytes, 900);
+        assert_eq!(checkout.rx_bytes, 2000);
+        let cart = batch.nodes.iter().find(|n| n.id == "shop/cart").unwrap();
+        // The server's counters come from the client's view of the same
+        // connection, which is why the server-side flow is dropped.
+        assert_eq!(cart.rx_bytes, 2000);
+        assert_eq!(cart.tx_bytes, 900);
+    }
+
+    #[test]
+    fn the_server_side_of_an_internal_connection_is_not_counted_again() {
+        let mapper = mapper(&[
+            ("u1", "shop", "checkout", "10.0.0.2"),
+            ("u2", "shop", "cart", "10.0.0.7"),
+        ]);
+        let batch = mapper.batch(
+            vec![flow(
+                ("10.0.0.7", 8080),
+                ("10.0.0.2", 43210),
+                Role::Server,
+                2000,
+                900,
+            )],
+            1,
+        );
+        assert!(batch.edges.is_empty(), "the client's agent owns this edge");
+        assert!(batch.nodes.is_empty(), "and no counter is recorded twice");
+    }
+
+    #[test]
+    fn an_inbound_connection_from_outside_is_attributed_to_external() {
+        let mapper = mapper(&[("u1", "shop", "checkout", "10.0.0.2")]);
+        let batch = mapper.batch(
+            vec![flow(
+                ("10.0.0.2", 8080),
+                ("203.0.113.9", 51515),
+                Role::Server,
+                700,
+                120,
+            )],
+            1,
+        );
+        assert_eq!(batch.edges.len(), 1);
+        let edge = &batch.edges[0];
+        assert_eq!(edge.client, EXTERNAL_ID);
+        assert_eq!(edge.server, "shop/checkout");
+        // The observer is the server: what it received is the client's tx.
+        assert_eq!(edge.tx_bytes, 120);
+        assert_eq!(edge.rx_bytes, 700);
+    }
+
+    #[test]
+    fn a_hairpin_rewritten_client_is_not_an_outside_client() {
+        // kube-proxy masquerades a same-node pod-to-ClusterIP connection to the
+        // node's bridge address, so the server's socket sees a private peer
+        // that is not a pod. The client's agent already names this connection.
+        let mapper = mapper(&[("u1", "shop", "checkout", "10.0.0.2")]);
+        let batch = mapper.batch(
+            vec![flow(
+                ("10.0.0.2", 8080),
+                ("10.244.0.1", 51515),
+                Role::Server,
+                700,
+                120,
+            )],
+            1,
+        );
+        assert!(batch.edges.is_empty());
+        assert!(batch.nodes.is_empty());
+    }
+
+    #[test]
+    fn outbound_to_an_unknown_address_is_kept_as_a_client_edge() {
+        let mapper = mapper(&[("u1", "shop", "checkout", "10.0.0.2")]);
+        let batch = mapper.batch(
+            vec![flow(
+                ("10.0.0.2", 43210),
+                ("203.0.113.9", 443),
+                Role::Client,
+                120,
+                700,
+            )],
+            1,
+        );
+        assert_eq!(batch.edges.len(), 1);
+        assert_eq!(batch.edges[0].client, "shop/checkout");
+        assert_eq!(batch.edges[0].server, EXTERNAL_ID);
+        assert_eq!(batch.edges[0].protocol, "https");
+    }
+
+    #[test]
+    fn traffic_of_a_process_outside_any_pod_is_dropped() {
+        let mapper = mapper(&[("u1", "shop", "checkout", "10.0.0.2")]);
+        // 127.0.0.1 and the node's own address belong to no pod.
+        let batch = mapper.batch(
+            vec![
+                flow(("127.0.0.1", 43210), ("10.0.0.7", 80), Role::Client, 10, 10),
+                flow(
+                    ("172.18.0.2", 43210),
+                    ("10.0.0.7", 80),
+                    Role::Client,
+                    10,
+                    10,
+                ),
+            ],
+            1,
+        );
+        assert!(batch.edges.is_empty());
+        assert!(batch.nodes.is_empty());
+    }
+
+    #[test]
+    fn a_connection_whose_direction_cannot_be_read_is_skipped() {
+        // Its handshake predates the agent and neither pod declares a port, so
+        // which end opened it is unknowable; guessing would draw half the
+        // edges backwards.
+        let mapper = mapper(&[
+            ("u1", "shop", "checkout", "10.0.0.2"),
+            ("u2", "shop", "cart", "10.0.0.7"),
+        ]);
+        let batch = mapper.batch(
+            vec![flow(
+                ("10.0.0.2", 43210),
+                ("10.0.0.7", 8080),
+                Role::Unknown,
+                10,
+                10,
+            )],
+            1,
+        );
+        assert!(batch.edges.is_empty());
+    }
+
+    #[test]
+    fn a_connection_that_predates_the_agent_is_directed_by_the_pod_specs() {
+        // Long-lived keep-alive connections never re-handshake: without this,
+        // the busiest edges of a cluster would be invisible until the client
+        // reconnects. The declared ports say who is the server.
+        let mapper = mapper_with_ports(&[
+            ("u1", "monitoring", "prometheus", "10.0.0.2", &[9090]),
+            ("u2", "monitoring", "node-exporter", "10.0.0.7", &[9100]),
+        ]);
+        let batch = mapper.batch(
+            vec![
+                // The scrape, from prometheus's side.
+                flow(
+                    ("10.0.0.2", 43210),
+                    ("10.0.0.7", 9100),
+                    Role::Unknown,
+                    900,
+                    2000,
+                ),
+                // The same connection from node-exporter's side: it listens on
+                // 9100, so it is the server and must not be counted again.
+                flow(
+                    ("10.0.0.7", 9100),
+                    ("10.0.0.2", 43210),
+                    Role::Unknown,
+                    2000,
+                    900,
+                ),
+            ],
+            1,
+        );
+        assert_eq!(batch.edges.len(), 1);
+        assert_eq!(batch.edges[0].client, "monitoring/prometheus");
+        assert_eq!(batch.edges[0].server, "monitoring/node-exporter");
+        assert_eq!(batch.edges[0].tx_bytes, 900);
+        assert_eq!(batch.edges[0].rx_bytes, 2000);
+    }
 
     #[test]
     fn parses_ipv4_endpoints_in_kernel_byte_order() {

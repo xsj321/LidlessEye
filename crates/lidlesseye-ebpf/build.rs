@@ -1,76 +1,128 @@
-//! Compiles the eBPF object, falling back to the checked-in prebuilt object
+//! Compiles the eBPF objects, falling back to the checked-in prebuilt ones
 //! when clang is not available.
 //!
-//! A prebuilt `bpf/profile.bpf.o` is committed so that `cargo install
+//! Prebuilt `bpf/*.bpf.o` files are committed so that `cargo install
 //! lidlesseye` and downstream crates work without a BPF toolchain. Set
-//! `LIDLESSEYE_BUILD_BPF=1` to force a rebuild (needed when editing the C
-//! source), or `LIDLESSEYE_PREBUILT_BPF=1` to always use the prebuilt object.
+//! `LIDLESSEYE_BUILD_BPF=1` to force a rebuild (needed when editing a `.c`
+//! source), or `LIDLESSEYE_PREBUILT_BPF=1` to always use the prebuilt objects.
+//!
+//! Two objects are built, and they are loaded separately on purpose:
+//! `profile.bpf.o` (sampling) and `net.bpf.o` (connection accounting). A kernel
+//! that rejects one must not take the other down with it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// `(source, prebuilt, defines)` for each object.
+const OBJECTS: &[(&str, &str)] = &[
+    ("bpf/profile.bpf.c", "bpf/profile.bpf.o"),
+    ("bpf/net.bpf.c", "bpf/net.bpf.o"),
+];
+
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let src = manifest_dir.join("bpf/profile.bpf.c");
-    let prebuilt = manifest_dir.join("bpf/profile.bpf.o");
-    let target = out_dir.join("profile.bpf.o");
 
-    println!("cargo:rerun-if-changed=bpf/profile.bpf.c");
+    for (source, _) in OBJECTS {
+        println!("cargo:rerun-if-changed={source}");
+    }
     println!("cargo:rerun-if-env-changed=LIDLESSEYE_BUILD_BPF");
     println!("cargo:rerun-if-env-changed=LIDLESSEYE_PREBUILT_BPF");
     println!("cargo:rerun-if-env-changed=CC");
 
-    // eBPF only exists on Linux; other targets never compile the collector.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
-        std::fs::write(&target, []).unwrap();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_endian = std::env::var("CARGO_CFG_TARGET_ENDIAN").unwrap_or_default();
+
+    for (source, prebuilt) in OBJECTS {
+        // The output keeps the prebuilt's name: `include_bytes!` in the crate
+        // refers to `net.bpf.o`, not to the `.c` it was compiled from.
+        let name = Path::new(prebuilt)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(prebuilt);
+        let out = out_dir.join(name);
+
+        // eBPF only exists on Linux; other targets never compile the collector.
+        if target_os != "linux" {
+            std::fs::write(&out, []).unwrap();
+            continue;
+        }
+
+        let mut defines: Vec<String> = Vec::new();
+        if target_endian == "little" {
+            defines.push("-DLIDLESSEYE_LE=1".to_string());
+        }
+        defines.push(format!("-DLIDLESSEYE_ARCH_{}", target_arch.to_uppercase()));
+
+        build_object(
+            &manifest_dir,
+            source,
+            prebuilt,
+            &out,
+            &defines,
+            &std::env::var("CC").unwrap_or_else(|_| "clang".to_string()),
+        );
+    }
+}
+
+fn build_object(
+    manifest_dir: &Path,
+    source: &str,
+    prebuilt: &str,
+    out: &Path,
+    defines: &[String],
+    clang: &str,
+) {
+    let src = manifest_dir.join(source);
+    let prebuilt = manifest_dir.join(prebuilt);
+
+    if std::env::var("LIDLESSEYE_PREBUILT_BPF").as_deref() == Ok("1") {
+        copy_prebuilt(&prebuilt, out);
         return;
     }
 
-    let force_prebuilt = std::env::var("LIDLESSEYE_PREBUILT_BPF").as_deref() == Ok("1");
-    let clang = std::env::var("CC").unwrap_or_else(|_| "clang".to_string());
+    let status = Command::new(clang)
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Werror",
+            "-target",
+            "bpf",
+            "-fno-omit-frame-pointer",
+            "-c",
+        ])
+        .args(defines)
+        .arg(&src)
+        .arg("-o")
+        .arg(out)
+        .status();
 
-    if !force_prebuilt {
-        let status = Command::new(&clang)
-            .args([
-                "-O2",
-                "-g",
-                "-Wall",
-                "-Werror",
-                "-target",
-                "bpf",
-                "-fno-omit-frame-pointer",
-                "-c",
-            ])
-            .arg(&src)
-            .arg("-o")
-            .arg(&target)
-            .status();
-
-        match status {
-            Ok(status) if status.success() => {
-                // Keep the checked-in object in sync so that users without
-                // clang get an up to date binary.
-                if let Err(err) = std::fs::copy(&target, &prebuilt) {
-                    println!("cargo:warning=could not refresh bpf/profile.bpf.o: {err}");
-                }
-                println!("cargo:warning=compiled eBPF program from source");
-                return;
-            }
-            Ok(status) => panic!(
-                "clang failed to compile {} ({status}). Fix the eBPF source or build with \
-                 LIDLESSEYE_PREBUILT_BPF=1.",
-                src.display()
-            ),
-            Err(err) => {
+    match status {
+        Ok(status) if status.success() => {
+            // Keep the checked-in object in sync so that users without clang
+            // get an up to date binary.
+            if let Err(err) = std::fs::copy(out, &prebuilt) {
                 println!(
-                    "cargo:warning=clang not usable ({err}); falling back to the prebuilt eBPF object"
+                    "cargo:warning=could not refresh {}: {err}",
+                    prebuilt.display()
                 );
             }
+            println!("cargo:warning=compiled {source} from source");
+        }
+        Ok(status) => panic!(
+            "clang failed to compile {} ({status}). Fix the eBPF source or build with \
+             LIDLESSEYE_PREBUILT_BPF=1.",
+            src.display()
+        ),
+        Err(err) => {
+            println!(
+                "cargo:warning=clang not usable ({err}); falling back to the prebuilt object for {source}"
+            );
+            copy_prebuilt(&prebuilt, out);
         }
     }
-
-    copy_prebuilt(&prebuilt, &target);
 }
 
 fn copy_prebuilt(prebuilt: &Path, target: &Path) {

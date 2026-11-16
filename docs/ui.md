@@ -187,19 +187,32 @@ The network graph of the selected window: nodes are workloads, ClusterIP
 Services and the outside world; edges are TCP connections between them. Node
 size grows with new connections, node colour is the on-CPU time of that
 workload's profiles (blue = idle, orange = hot), and an orange edge carries
-retransmits. Drag to move a node, scroll to zoom, drag the background to pan.
+retransmits.
 
-Selecting a node opens its panel — CPU, connections, bytes in/out, retransmits —
-and *Profile this service* replaces the filter bar with `k8s_namespace` +
+The graph is laid out in columns, one per dependency depth: an entry point sits
+in the leftmost column and everything it calls sits to its right, with the
+arrow on each edge pointing at the caller. Cycles are condensed first, so a pair
+of services that call each other share a column instead of stacking up. Within a
+column, nodes are ordered to reduce crossings against the column before them,
+and the busiest node is highest. Scroll to zoom, drag the background to pan.
+
+Selecting a node dims everything that is not its neighbour and fills the panel
+on the right: CPU, connections, bytes in/out, retransmits and the mean latency
+over the edges that closed a connection in this window. Below that are the two
+lists that make the node navigable — *Inbound*, everything that calls it, and
+*Outbound*, everything it calls — each row showing the peer, protocol,
+connections and round-trip time. Clicking a row selects that peer, so following
+a dependency is two clicks rather than a drag.
+
+*Profile this service* replaces the filter bar with `k8s_namespace` +
 `k8s_workload` (or `service_name` for a ClusterIP) and switches to the
 flamegraph. The time range is the one chosen above: dragging the bracket
 re-queries the map exactly as it re-queries a flamegraph.
 
-The protocol label on an edge comes from the server port; the map does not parse
-payloads, so it reports connections rather than requests. *External* collects
-everything the map cannot name: traffic that really does come from outside the
-cluster, and same-node traffic to a ClusterIP, which the kernel masquerades to
-the node's bridge address before it reaches the server. See
+The protocol label in the lists comes from the server port; the map does not
+parse payloads, so it reports connections rather than requests. *External*
+collects everything the map cannot name — traffic that really does come from
+outside the cluster — so an edge to it is worth a second look. See
 [architecture.md](architecture.md#service-map) for what the agent reads and why.
 
 ## URL reference
