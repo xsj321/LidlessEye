@@ -216,9 +216,9 @@ export function edgePath(a: Box, b: Box): EdgePath {
 
   if (forward) {
     const x1 = a.x + a.w;
-    // The arrowhead is drawn behind the target card and would be cut in half
-    // where it meets the edge, so the curve stops a few pixels short.
-    const x2 = b.x - 4;
+    // The arrowhead would otherwise touch the card it points at, so the curve
+    // stops three pixels short and the marker fills the gap.
+    const x2 = b.x - 3;
     const pull = Math.max(28, (x2 - x1) * 0.5);
     return {
       d: `M${x1},${ay} C${x1 + pull},${ay} ${x2 - pull},${by} ${x2},${by}`,
@@ -232,7 +232,7 @@ export function edgePath(a: Box, b: Box): EdgePath {
 
   const down = by >= ay;
   const y1 = down ? a.y + a.h : a.y;
-  const y2 = down ? b.y - 4 : b.y + b.h + 4;
+  const y2 = down ? b.y - 3 : b.y + b.h + 3;
   const x1 = a.x + a.w / 2;
   const x2 = b.x + b.w / 2;
   // Bow away from the cards, not into them: the loop runs on the right, where

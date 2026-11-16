@@ -155,8 +155,8 @@ export function EdgeLayer({
           viewBox="0 0 8 8"
           refX="7"
           refY="4"
-          markerWidth="5"
-          markerHeight="5"
+          markerWidth="3.4"
+          markerHeight="3.4"
           orient="auto"
         >
           <path d="M0 0.8 L7 4 L0 7.2 z" fill="#5b6679" />
@@ -166,8 +166,8 @@ export function EdgeLayer({
           viewBox="0 0 8 8"
           refX="7"
           refY="4"
-          markerWidth="5"
-          markerHeight="5"
+          markerWidth="3.4"
+          markerHeight="3.4"
           orient="auto"
         >
           <path d="M0 0.8 L7 4 L0 7.2 z" fill={LINE.warn} />
@@ -184,8 +184,10 @@ export function EdgeLayer({
             fill="none"
             opacity={touched ? 1 : 0.16}
             stroke={warn ? LINE.warn : touched && selected ? LINE.focused : LINE.idle}
-            strokeWidth={1 + Math.min(3.2, Math.log10(1 + rate * 20 + (edge.tx_bytes ?? 0) / 8192 + 1) * 1.4)}
-            strokeOpacity={touched ? 0.9 : 0.5}
+            // 0.55 to 1.6: an edge is a hint at the shape of the traffic, and a
+            // fat line competes with the card it points at.
+            strokeWidth={0.55 + Math.min(1.05, Math.log10(1 + rate * 20 + (edge.tx_bytes ?? 0) / 8192 + 1) * 0.7)}
+            strokeOpacity={touched ? 0.85 : 0.4}
             strokeLinecap="round"
             markerEnd={warn ? "url(#se-arrow-warn)" : "url(#se-arrow)"}
             strokeDasharray={warn ? "5 4" : undefined}
