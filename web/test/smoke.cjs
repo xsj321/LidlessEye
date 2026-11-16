@@ -457,6 +457,18 @@ async function main() {
 
   const brush = await page.locator("canvas.time-brush").boundingBox();
   check(brush !== null && brush.width > 200, "the histogram brush has a size", JSON.stringify(brush));
+  // The canvas must span its host, not sit at a fraction of the width. This
+  // regressed when draw() pinned inline `style.width` to a stale measurement
+  // and the ResizeObserver watched the canvas instead of its container.
+  const brushHost = await page.locator("canvas.time-brush").evaluate((el) => {
+    const host = el.parentElement;
+    return host ? host.getBoundingClientRect().width : 0;
+  });
+  check(
+    brush !== null && brushHost > 0 && brush.width >= brushHost - 2,
+    "the histogram brush fills its container width",
+    `canvas=${brush?.width} host=${brushHost}`,
+  );
   // The window covers the whole domain, so dragging inside brackets a new one.
   await page.mouse.move(brush.x + brush.width * 0.02, brush.y + brush.height / 2);
   await page.mouse.down();
@@ -809,7 +821,10 @@ async function main() {
   // The node drawer spans the full window height and overlaps the time bar;
   // close it before reaching for the range control behind it.
   await mapPage.click('[data-testid="map-panel-close"]');
-  await choose(mapPage, "#relative-range", "Last 15 minutes");
+  // The relative range is now a purpose-built time picker: a popover with a
+  // grid of shortcuts rather than a generic Select with role=option items.
+  await mapPage.click("#relative-range");
+  await mapPage.locator('[data-range="15m"]').click();
   check(
     (await mapPage.evaluate(() => window.lidlesseye.state.range)) === "15m",
     "the relative range picker changes the time window",

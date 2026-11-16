@@ -218,6 +218,62 @@ them. There is no converter, because the old format and the new schema carry the
 same information and the sampler can simply re-ingest. A deployment that must
 keep old history should export it with the version that wrote it.
 
+## Storage: Parquet + S3
+
+A second backend trades the single DuckDB file for a tiered layout of Parquet
+objects. Select it with `--storage-mode=parquet` (or `server.storage.mode:
+parquet` in Helm; see [deployment.md](deployment.md)). DuckDB 2.0 is still the
+query engine — this mode changes only where the durable rows live.
+
+```text
+<data-dir>/tenants/<tenant>/
+  parquet/
+    <table>/h<epoch-hour>-<rows>.parquet   # small local files (staging)
+    manifest.json                          # cache of archived S3 object keys
+  # no lidlesseye.duckdb file: the hot tier is in memory
+s3://<bucket>/<prefix>/<tenant>/<table>/hour=<epoch-hour>.parquet
+```
+
+The lifecycle has three steps, run by a background task roughly every 10 s:
+
+1. **Hot** — writes land in an in-memory DuckDB `<table>_hot` table. Recent
+   windows are served straight from memory.
+2. **Flush** — `flush_hot` copies the hot rows into one small ZSTD-compressed
+   Parquet file per table, named with the current epoch hour, and empties the
+   hot table. Queries still see everything because the canonical table names
+   are VIEWs over `hot UNION read_parquet(<explicit local files>)`.
+3. **Archive** — once a local file is older than `--parquet-local-ttl`
+   (default `1h`, so whole hours are archived), `archive_local` merges that
+   hour's files into one large object, `COPY`s it to S3, records the key in
+   `manifest.json`, then deletes the local copies. Reads for older windows now
+   stream from S3.
+
+The design goal is near-zero-copy: DuckDB scans Parquet directly, pushing
+filters and projections into the scan and skipping row groups with zonemaps.
+A query over S3 uses HTTP range reads (the object store returns `206 Partial
+Content`); nothing is downloaded into the database first. All six tables are
+stored this way, including the service-map `net_nodes` / `net_edges` rows.
+
+Two details make this robust:
+
+- **No LIST on the query path.** VIEWs are built from an explicit list of file
+  paths (local files from `read_dir`, S3 objects from the manifest), not a glob.
+  Binding a query therefore never contacts S3, and an empty or temporarily
+  unreachable bucket is a non-event. The manifest is written atomically before
+  local files are removed, so a crash can leave a harmless extra file but never
+  lose an object.
+- **S3 is the source of truth.** On open, a best-effort `glob()` of each S3
+  prefix rebuilds the manifest from the bucket. Losing `manifest.json` (PVC
+  rebuild, replacement node, first start against an existing bucket) therefore
+  cannot hide archived data. Discovery failure is non-fatal so a misconfigured
+  or offline S3 never blocks startup.
+
+Both modes keep the same schema and the same read SQL, and both are selected at
+install time — an existing DuckDB deployment is unaffected. Parquet mode needs
+an S3-compatible endpoint; AWS S3, MinIO and other S3 API implementations work,
+with path-style URLs by default. See [deployment.md](deployment.md) for the
+Helm values and credentials.
+
 ## Query engine
 
 `flamegraph`, `top` and `timeseries` share one pipeline:

@@ -5,14 +5,15 @@
 // but it is its own Radix dialog so Escape and focus return behave like any
 // other modal surface.
 
+import { useEffect, useState } from "react";
 import { RotateCcw, Settings2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogClose,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -32,9 +33,10 @@ import { useT } from "@/lib/i18n";
 import { RANGES } from "@/lib/time";
 import { dashboardStore } from "@/lib/store";
 import {
-  AUTO_REFRESH_OPTIONS,
   BUCKET_OPTIONS,
+  MAX_AUTO_REFRESH_MS,
   MAX_NODES_OPTIONS,
+  MIN_AUTO_REFRESH_MS,
   settingsStore,
   useSettings,
 } from "@/lib/settings";
@@ -104,6 +106,50 @@ function NumberSelect({
   );
 }
 
+/**
+ * Refresh cadence: preset chips for common values plus a free-form seconds
+ * input so an operator can dial in exactly 5s / 10s / 15s / … without a menu.
+ */
+function RefreshInput({
+  value,
+  onChange,
+  t,
+}: {
+  value: number;
+  onChange: (ms: number) => void;
+  t: (key: string) => string;
+}) {
+  const [text, setText] = useState(String(value / 1000));
+  useEffect(() => setText(String(value / 1000)), [value]);
+
+  const commit = () => {
+    const seconds = Number(text);
+    if (Number.isFinite(seconds) && seconds > 0) onChange(seconds * 1000);
+    else setText(String(value / 1000));
+  };
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <Input
+        id="settings-refresh"
+        type="number"
+        min={MIN_AUTO_REFRESH_MS / 1000}
+        max={MAX_AUTO_REFRESH_MS / 1000}
+        step={1}
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commit();
+        }}
+        className="h-7 w-20 text-xs"
+        aria-label={t("Auto-refresh interval")}
+      />
+      <span className="text-xs text-muted-foreground">s</span>
+    </div>
+  );
+}
+
 export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
   const settings = useSettings();
   const t = useT();
@@ -135,16 +181,13 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
             <Settings2 className="size-4 text-primary" />
             {t("Settings")}
           </DialogTitle>
-          <DialogDescription>
-            {t("Preferences are stored in this browser. They do not travel with a shared link.")}
-          </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-1 py-1">
           <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
             {t("General")}
           </div>
-          <Row label={t("Language")} hint={t("Interface language")} htmlFor="settings-language">
+          <Row label={t("Language")} htmlFor="settings-language">
             <Select
               value={settings.language}
               onValueChange={(value) => update({ language: value as Settings["language"] })}
@@ -166,7 +209,7 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
           <div className="mt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
             {t("Start-up")}
           </div>
-          <Row label={t("Default view")} hint={t("Used only when the URL does not name a view.")}>
+          <Row label={t("Default view")}>
             <Select
               value={settings.defaultView}
               onValueChange={(value) => update({ defaultView: value as Settings["defaultView"] })}
@@ -183,7 +226,7 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
               </SelectContent>
             </Select>
           </Row>
-          <Row label={t("Default range")} hint={t("The relative window on a fresh load.")}>
+          <Row label={t("Default range")}>
             <Select
               value={settings.defaultRange}
               onValueChange={(value) => update({ defaultRange: value })}
@@ -205,16 +248,11 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
           <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
             {t("Refresh")}
           </div>
-          <Row
-            label={t("Auto-refresh interval")}
-            hint={t("How often the current view reloads when auto-refresh is on.")}
-          >
-            <NumberSelect
-              id="settings-refresh"
+          <Row label={t("Auto-refresh interval")}>
+            <RefreshInput
               value={settings.autoRefreshMs}
-              options={AUTO_REFRESH_OPTIONS}
-              format={(value) => (value < 60_000 ? `${value / 1000} s` : `${value / 60_000} min`)}
               onChange={(value) => update({ autoRefreshMs: value })}
+              t={t}
             />
           </Row>
 
@@ -222,7 +260,7 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
           <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
             {t("Service map")}
           </div>
-          <Row label={t("Edge labels")} hint={t("Show connections/s and mean RTT on each edge.")}>
+          <Row label={t("Edge labels")}>
             <Switch
               id="settings-edge-labels"
               checked={settings.edgeLabels}
@@ -230,10 +268,7 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
               aria-label={t("Edge labels")}
             />
           </Row>
-          <Row
-            label={t("Label zoom threshold")}
-            hint={t("Labels appear once the map is zoomed past this point.")}
-          >
+          <Row label={t("Label zoom threshold")}>
             <div className="flex w-36 items-center gap-2">
               <input
                 id="settings-label-zoom"
@@ -256,10 +291,7 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
           <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
             {t("Charts")}
           </div>
-          <Row
-            label={t("Flamegraph frame cap")}
-            hint={t("Higher caps draw more frames but cost memory.")}
-          >
+          <Row label={t("Flamegraph frame cap")}>
             <NumberSelect
               id="settings-max-nodes"
               value={settings.flamegraphMaxNodes}
@@ -268,10 +300,7 @@ export function SettingsDialog({ collapsed = false }: { collapsed?: boolean }) {
               onChange={(value) => update({ flamegraphMaxNodes: value })}
             />
           </Row>
-          <Row
-            label={t("Histogram buckets")}
-            hint={t("Resolution of the time brush above the views.")}
-          >
+          <Row label={t("Histogram buckets")}>
             <NumberSelect
               id="settings-buckets"
               value={settings.histogramBuckets}

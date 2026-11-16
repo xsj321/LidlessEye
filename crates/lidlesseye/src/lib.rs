@@ -105,6 +105,9 @@ pub struct Builder {
     retention: Option<Duration>,
     max_disk_bytes: Option<u64>,
     duckdb_threads: Option<usize>,
+    storage_mode: Option<lidlesseye_core::StorageMode>,
+    s3: Option<lidlesseye_core::S3Config>,
+    parquet_local_ttl: Option<Duration>,
     auth_token: Option<String>,
     read_only: bool,
     cors: Option<String>,
@@ -142,6 +145,9 @@ impl Default for Builder {
             retention: Some(Duration::from_secs(7 * 24 * 3600)),
             max_disk_bytes: Some(50 * 1024 * 1024 * 1024),
             duckdb_threads: None,
+            storage_mode: None,
+            s3: None,
+            parquet_local_ttl: None,
             auth_token: None,
             read_only: false,
             cors: None,
@@ -199,6 +205,24 @@ impl Builder {
     /// `None` (the default) lets DuckDB use every core.
     pub fn duckdb_threads(mut self, threads: Option<usize>) -> Self {
         self.duckdb_threads = threads;
+        self
+    }
+
+    /// Select the physical storage backend.
+    pub fn storage_mode(mut self, mode: lidlesseye_core::StorageMode) -> Self {
+        self.storage_mode = Some(mode);
+        self
+    }
+
+    /// Configure the S3-compatible store used by Parquet mode.
+    pub fn s3(mut self, s3: lidlesseye_core::S3Config) -> Self {
+        self.s3 = Some(s3);
+        self
+    }
+
+    /// How long archived Parquet stays on local disk before removal.
+    pub fn parquet_local_ttl(mut self, ttl: Duration) -> Self {
+        self.parquet_local_ttl = Some(ttl);
         self
     }
 
@@ -352,6 +376,9 @@ impl Builder {
             retention: self.retention,
             max_disk_bytes: self.max_disk_bytes,
             duckdb_threads: self.duckdb_threads,
+            storage_mode: self.storage_mode,
+            s3: self.s3.clone(),
+            parquet_local_ttl_ns: self.parquet_local_ttl.map(|d| d.as_nanos() as u64),
             auth_token: self.auth_token.clone(),
             tenant_tokens,
             allowed_tenants: self.allowed_tenants.clone(),

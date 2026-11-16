@@ -11,7 +11,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
 import { RANGES } from "@/lib/time";
@@ -121,19 +120,14 @@ export function Toolbar() {
         <Switch
           checked={auto}
           onCheckedChange={(checked) => dashboardStore.setAuto(checked)}
-          aria-label={t("Auto-refresh (interval set in Settings)")}
+          aria-label={t("Auto")}
         />
       </Field>
 
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button size="sm" id="apply" onClick={() => void dashboardStore.reload()}>
-            <Play className="size-3.5" />
-            {t("Apply")}
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>{t("Re-run the query with the current filters")}</TooltipContent>
-      </Tooltip>
+      <Button size="sm" id="apply" onClick={() => void dashboardStore.reload()}>
+        <Play className="size-3.5" />
+        {t("Apply")}
+      </Button>
     </div>
   );
 }

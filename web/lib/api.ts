@@ -86,6 +86,8 @@ async function request<T>(
   params?: QueryParams,
   init?: RequestInit,
 ): Promise<T> {
+  // An aborted fetch throws an AbortError; callers treat that as a superseded
+  // query, not a failure. Let it propagate verbatim.
   const headers = new Headers(init?.headers);
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
@@ -98,6 +100,10 @@ async function request<T>(
   try {
     response = await fetch(path + buildQuery(params), { ...init, headers });
   } catch (err) {
+    // A deliberate abort (a superseded query) must stay distinguishable from a
+    // real network failure, so callers can ignore it instead of showing an
+    // error banner.
+    if (err instanceof Error && err.name === "AbortError") throw err;
     throw new ApiError(`network error: ${(err as Error).message}`, 0);
   }
   if (!response.ok) {
@@ -120,38 +126,43 @@ async function request<T>(
   return (await response.json()) as T;
 }
 
+// Every query accepts an optional AbortSignal. When the user switches view or
+// moves the time window, the store aborts the previous controller so the
+// browser drops the in-flight request and the server can interrupt its query.
 export const api = {
-  health: () => request<unknown>("/api/v1/health"),
-  version: () => request<VersionPayload>("/api/v1/version"),
-  stats: () => request<StatsPayload>("/api/v1/stats"),
-  tenants: () => request<TenantsPayload>("/api/v1/tenants"),
+  health: (signal?: AbortSignal) => request<unknown>("/api/v1/health", undefined, { signal }),
+  version: (signal?: AbortSignal) => request<VersionPayload>("/api/v1/version", undefined, { signal }),
+  stats: (signal?: AbortSignal) => request<StatsPayload>("/api/v1/stats", undefined, { signal }),
+  tenants: (signal?: AbortSignal) => request<TenantsPayload>("/api/v1/tenants", undefined, { signal }),
 
-  profileTypes: (params?: QueryParams) =>
-    request<ProfileTypesPayload>("/api/v1/profile_types", params),
-  series: (params?: QueryParams) => request<SeriesPayload>("/api/v1/series", params),
-  labelNames: (params?: QueryParams) =>
-    request<LabelNamesPayload>("/api/v1/label-names", params),
-  labelValues: (name: string, params?: QueryParams) =>
-    request<LabelValuesPayload>(`/api/v1/label/${encodeURIComponent(name)}/values`, params),
+  profileTypes: (params?: QueryParams, signal?: AbortSignal) =>
+    request<ProfileTypesPayload>("/api/v1/profile_types", params, { signal }),
+  series: (params?: QueryParams, signal?: AbortSignal) =>
+    request<SeriesPayload>("/api/v1/series", params, { signal }),
+  labelNames: (params?: QueryParams, signal?: AbortSignal) =>
+    request<LabelNamesPayload>("/api/v1/label-names", params, { signal }),
+  labelValues: (name: string, params?: QueryParams, signal?: AbortSignal) =>
+    request<LabelValuesPayload>(`/api/v1/label/${encodeURIComponent(name)}/values`, params, { signal }),
 
   // 50k nodes is the server-side ceiling (`QueryOptions::with_max_nodes`); the
   // canvas is happy with that, and it keeps the response in the low megabytes.
-  flamegraph: (params: QueryParams) =>
-    request<FlamegraphPayload>("/api/v1/flamegraph", { max_nodes: 50000, ...params }),
-  diff: (params: QueryParams) =>
-    request<DiffPayload>("/api/v1/diff", { max_nodes: 50000, ...params }),
-  top: (params: QueryParams) => request<TopPayload>("/api/v1/top", { limit: 100, ...params }),
-  timeseries: (params: QueryParams) =>
-    request<TimeseriesPayload>("/api/v1/timeseries", { buckets: 90, ...params }),
+  flamegraph: (params: QueryParams, signal?: AbortSignal) =>
+    request<FlamegraphPayload>("/api/v1/flamegraph", { max_nodes: 50000, ...params }, { signal }),
+  diff: (params: QueryParams, signal?: AbortSignal) =>
+    request<DiffPayload>("/api/v1/diff", { max_nodes: 50000, ...params }, { signal }),
+  top: (params: QueryParams, signal?: AbortSignal) =>
+    request<TopPayload>("/api/v1/top", { limit: 100, ...params }, { signal }),
+  timeseries: (params: QueryParams, signal?: AbortSignal) =>
+    request<TimeseriesPayload>("/api/v1/timeseries", { buckets: 90, ...params }, { signal }),
 
   // The map follows the same from/until window as the flamegraph; profile_type
   // and selector are deliberately not sent, it is a network view.
-  serviceMap: (params: QueryParams) =>
-    request<ServiceMapPayload>("/api/v1/servicemap", params),
+  serviceMap: (params: QueryParams, signal?: AbortSignal) =>
+    request<ServiceMapPayload>("/api/v1/servicemap", params, { signal }),
   // One node's own buckets, for the panel behind a click.
-  serviceMapHistory: (params: QueryParams) =>
-    request<MapHistoryPayload>("/api/v1/servicemap/history", params),
+  serviceMapHistory: (params: QueryParams, signal?: AbortSignal) =>
+    request<MapHistoryPayload>("/api/v1/servicemap/history", params, { signal }),
   // Whole-map request counts for the histogram brush above the map.
-  serviceMapHistogram: (params: QueryParams) =>
-    request<MapHistogramPayload>("/api/v1/servicemap/histogram", params),
+  serviceMapHistogram: (params: QueryParams, signal?: AbortSignal) =>
+    request<MapHistogramPayload>("/api/v1/servicemap/histogram", params, { signal }),
 };

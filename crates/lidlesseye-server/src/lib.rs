@@ -35,7 +35,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use lidlesseye_core::model::Report;
 use lidlesseye_core::store::{StoreConfig, StoreStats};
@@ -237,7 +237,65 @@ impl AppState {
     }
 }
 
+/// Cancellation guard for one read query.
+///
+/// The handler holds this for the lifetime of the request. When the client
+/// goes away — the user switched view, dragged the time range, or closed the
+/// tab — Axum drops the handler future, this guard drops with it, and DuckDB
+/// is interrupted so the single connection is freed immediately instead of
+/// finishing a scan nobody will read. Normal completion flips `done` first,
+/// so a returned guard is inert.
+///
+/// Cancelling on "any newer query" would be wrong: several independent
+/// controls (map, histogram, stats) legitimately query the same tenant at
+/// once, and they must not cancel each other.
+pub struct QueryGuard {
+    store: Arc<Store>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl QueryGuard {
+    /// Run a blocking query, interrupting it if this guard is dropped first
+    /// or if it exceeds the safety timeout.
+    pub async fn run<T, F>(&self, query: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+        let watchdog_store = self.store.clone();
+        let watchdog = tokio::spawn(async move {
+            tokio::time::sleep(QUERY_TIMEOUT).await;
+            debug!("query exceeded timeout; interrupting DuckDB");
+            watchdog_store.interrupt();
+        });
+        let result = tokio::task::spawn_blocking(query).await;
+        watchdog.abort();
+        self.done.store(true, Ordering::Relaxed);
+        result.unwrap_or_else(|err| std::panic::resume_unwind(err.into_panic()))
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        if !self.done.load(Ordering::Relaxed) {
+            debug!("client gone; interrupting DuckDB query");
+            self.store.interrupt();
+        }
+    }
+}
+
 impl AppState {
+    /// Create a cancellation guard tied to one store connection. Hold it in
+    /// the handler until the query result has been produced.
+    pub fn query_guard(&self, store: Arc<Store>) -> QueryGuard {
+        QueryGuard {
+            store,
+            done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
     /// Persist several reports of one tenant in a single blocking task.
     pub async fn ingest_many(
         &self,
@@ -390,6 +448,10 @@ impl LidlessEye {
             retention_ns: cfg.retention.map(|d| d.as_nanos() as u64),
             max_disk_bytes: cfg.max_disk_bytes,
             threads: cfg.duckdb_threads,
+            duckdb_memory_limit: cfg.duckdb_memory_limit.clone(),
+            storage_mode: cfg.storage_mode.unwrap_or_default(),
+            s3: cfg.s3.clone(),
+            parquet_local_ttl_ns: cfg.parquet_local_ttl_ns,
         };
         let registry = TenantStore::open_with_limits(
             &cfg.data_dir,
@@ -518,6 +580,32 @@ impl LidlessEye {
         let cfg = self.state.inner.cfg.clone();
         let metrics = self.state.inner.metrics.clone();
 
+        // Parquet mode needs a second loop that moves the in-memory hot tier
+        // to local Parquet and, past the local TTL, on to S3. In DuckDB mode
+        // `compaction_tick` is a cheap no-op, so this task is harmless there.
+        let compact_registry = registry.clone();
+        let compact_interval = cfg.prune_interval.min(Duration::from_secs(10));
+        let compact = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(compact_interval.max(Duration::from_secs(1)));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let registry = compact_registry.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let now = lidlesseye_core::now_ns();
+                    for (tenant, flushed, uploaded) in registry.compaction_tick(now) {
+                        info!(
+                            tenant = %tenant,
+                            flushed,
+                            uploaded,
+                            "parquet compaction"
+                        );
+                    }
+                })
+                .await;
+            }
+        });
+
         let prune = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(cfg.prune_interval.max(Duration::from_secs(1)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -553,6 +641,7 @@ impl LidlessEye {
             .with_graceful_shutdown(shutdown)
             .await;
         prune.abort();
+        compact.abort();
         result.map_err(|err| format!("server error: {err}"))
     }
 

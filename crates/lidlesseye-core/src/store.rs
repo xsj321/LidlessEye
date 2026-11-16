@@ -34,13 +34,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use duckdb::{Connection, params};
+use duckdb::{Connection, InterruptHandle, params};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 use crate::model::{Frame, ProfileType, Report, SERVICE_NAME_LABEL};
+use crate::parquet::{self, ParquetState};
 use crate::selector::{MatchOp, Selector};
 use crate::servicemap::{MapEdge, MapHistoryPoint, MapNode, NodeKind, ServiceMapBatch, node_id};
 use crate::time::now_ns;
@@ -54,6 +55,54 @@ pub const DB_FILE: &str = "lidlesseye.duckdb";
 /// Hard ceiling on rows returned by one [`Store::scan`], so a query over a
 /// month of data fails as a truncated answer instead of as an OOM kill.
 pub const MAX_SCAN_ROWS: usize = 2_000_000;
+
+/// How rows are physically stored.
+///
+/// * [`StorageMode::DuckDb`] keeps everything in one `lidlesseye.duckdb` file.
+///   This is the original, self-contained mode.
+/// * [`StorageMode::Parquet`] keeps a small in-memory "hot" DuckDB for recent
+///   writes, continuously flushes it to Parquet files on local disk, merges
+///   each completed hour into one large Parquet object in S3, and removes the
+///   local copy once the upload succeeds. Reads scan the hot tables and all
+///   Parquet files (local + S3) through canonical-name VIEWs, so DuckDB pushes
+///   filters/projections into the Parquet scans and never copies remote data
+///   into the database ("zero-copy" reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageMode {
+    #[default]
+    DuckDb,
+    Parquet,
+}
+
+/// Connection details for the S3-compatible object store used by
+/// [`StorageMode::Parquet`]. Any S3-compatible service (AWS S3, MinIO, ...)
+/// works; DuckDB's `httpfs` extension performs the actual uploads/reads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct S3Config {
+    /// Bucket that holds the Parquet archive.
+    pub bucket: String,
+    /// Key prefix inside the bucket. The tenant id is appended by
+    /// `TenantStore`, so tenants never share objects.
+    #[serde(default)]
+    pub prefix: String,
+    /// Endpoint host:port for S3-compatible stores such as MinIO. `None`
+    /// means AWS S3's default endpoint.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    /// Whether to use HTTPS for the endpoint. MinIO test setups use `false`.
+    #[serde(default)]
+    pub use_ssl: Option<bool>,
+    /// `path` for MinIO, `host` for AWS virtual-hosted buckets.
+    #[serde(default)]
+    pub url_style: Option<String>,
+}
 
 /// Tunables for the storage engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +118,22 @@ pub struct StoreConfig {
     pub max_disk_bytes: Option<u64>,
     /// Worker threads DuckDB may use. `None` lets it pick.
     pub threads: Option<usize>,
+    /// DuckDB `memory_limit` for query hash tables. Spills to
+    /// `temp_directory` beyond this instead of growing until the container
+    /// OOM-kills the process. `None` uses a conservative 1 GiB default that
+    /// fits alongside the server in a small pod.
+    pub duckdb_memory_limit: Option<String>,
+    /// Physical storage backend. Defaults to the original DuckDB file mode.
+    #[serde(default)]
+    pub storage_mode: StorageMode,
+    /// S3 connection used only in [`StorageMode::Parquet`] mode.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+    /// How long compacted Parquet stays on local disk before being uploaded
+    /// to S3 and removed. `None` uses one hour. This is the "hot on disk"
+    /// window: queries inside it read local files, older ranges read S3.
+    #[serde(default)]
+    pub parquet_local_ttl_ns: Option<u64>,
 }
 
 impl StoreConfig {
@@ -78,7 +143,22 @@ impl StoreConfig {
             retention_ns: None,
             max_disk_bytes: None,
             threads: None,
+            duckdb_memory_limit: None,
+            storage_mode: StorageMode::DuckDb,
+            s3: None,
+            parquet_local_ttl_ns: None,
         }
+    }
+
+    /// Effective local Parquet TTL: one hour unless overridden.
+    pub fn parquet_local_ttl_ns(&self) -> u64 {
+        self.parquet_local_ttl_ns.unwrap_or(3_600_000_000_000)
+    }
+
+    /// Effective DuckDB memory limit: the configured value or a conservative
+    /// default sized for a container with a ~2 GiB ceiling.
+    pub fn duckdb_memory_limit(&self) -> &str {
+        self.duckdb_memory_limit.as_deref().unwrap_or("1GB")
     }
 }
 
@@ -228,9 +308,32 @@ struct Ids {
 pub struct Store {
     cfg: StoreConfig,
     conn: Mutex<Connection>,
+    /// Cloneable handle that interrupts whatever query is currently running on
+    /// `conn` from another thread. Lets the HTTP layer cancel a long scan as
+    /// soon as the client goes away or a newer query supersedes it, instead of
+    /// holding the single connection hostage until it finishes.
+    interrupt: Arc<InterruptHandle>,
     /// `(module, symbol, file, line)` -> frame id, for the write path only.
     frame_cache: Mutex<HashMap<FrameKey, u32>>,
     ids: Mutex<Ids>,
+    /// Present only in Parquet mode: layout + lifecycle of the local/S3 files.
+    parquet: Option<ParquetState>,
+}
+
+impl Store {
+    /// Whether this store keeps rows in a DuckDB file or in Parquet/S3.
+    pub fn storage_mode(&self) -> StorageMode {
+        self.cfg.storage_mode
+    }
+
+    /// Name of the table writes must go to. In Parquet mode the canonical
+    /// names are VIEWs (hot ∪ local ∪ S3), so writes target the hot table.
+    fn wtable(&self, name: &str) -> String {
+        match self.parquet {
+            Some(_) => format!("{name}_hot"),
+            None => name.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Store {
@@ -243,22 +346,58 @@ impl std::fmt::Debug for Store {
 }
 
 impl Store {
-    /// Open (and create if needed) the database under `cfg.root`.
+    /// Open (and create if needed) the store under `cfg.root`.
     pub fn open(cfg: StoreConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.root)?;
-        let path = cfg.root.join(DB_FILE);
 
-        let mut config = duckdb::Config::default();
+        let parquet_state = if cfg.storage_mode == StorageMode::Parquet {
+            let s3 = cfg.s3.as_ref().ok_or_else(|| {
+                Error::InvalidArgument("parquet storage mode requires S3 configuration".into())
+            })?;
+            Some(ParquetState::new(&cfg.root, s3, cfg.parquet_local_ttl_ns()))
+        } else {
+            None
+        };
+
+        let mut duckdb_config = duckdb::Config::default();
         if let Some(threads) = cfg.threads {
-            config = config
+            duckdb_config = duckdb_config
                 .threads(threads as i64)
                 .map_err(|err| Error::Db(format!("setting DuckDB threads: {err}")))?;
         }
-        let conn = Connection::open_with_flags(&path, config)
-            .map_err(|err| Error::Db(format!("opening {}: {err}", path.display())))?;
-        create_schema(&conn)?;
+
+        let (conn, path) = if let Some(state) = &parquet_state {
+            // Hot tier only needs an in-memory database; durable rows live in
+            // Parquet files. This is the key to "no .duckdb file on disk".
+            let conn = Connection::open_in_memory()
+                .map_err(|err| Error::Db(format!("opening in-memory DuckDB: {err}")))?;
+            let s3 = cfg.s3.as_ref().expect("checked above");
+            parquet::configure_s3(&conn, s3)?;
+            tune_connection(&conn, &cfg.root.join("parquet.meta.duckdb"), &cfg)?;
+            parquet::create_schema(&conn, state)?;
+            // S3 is the source of truth; the local manifest is only a cache.
+            // Re-discover archived objects so a lost manifest (new node / PVC
+            // rebuild / first start against an existing bucket) never hides
+            // data. Best-effort: an unreachable S3 must not block startup.
+            match parquet::discover_s3_objects(&conn, state, s3) {
+                Ok(0) | Err(_) => {} // nothing archived yet, or S3 unreachable: both fine
+                Ok(n) => eprintln!("lidlesseye: discovered {n} archived S3 object(s)"),
+            }
+            (conn, cfg.root.join(DB_FILE))
+        } else {
+            let path = cfg.root.join(DB_FILE);
+            let conn = Connection::open_with_flags(&path, duckdb_config)
+                .map_err(|err| Error::Db(format!("opening {}: {err}", path.display())))?;
+            tune_connection(&conn, &path, &cfg)?;
+            create_schema(&conn)?;
+            (conn, path)
+        };
+        let _ = &path; // path kept for the DuckDB `disk_bytes` helper
+        let interrupt = conn.interrupt_handle();
 
         let ids = {
+            // These SELECTs hit canonical names: real tables in DuckDB mode,
+            // VIEWs over (hot ∪ local ∪ S3) in Parquet mode.
             let max_frame: i64 = conn
                 .query_row("SELECT COALESCE(MAX(frame_id), 0) FROM frames", [], |row| {
                     row.get(0)
@@ -289,10 +428,19 @@ impl Store {
         let store = Store {
             cfg,
             conn: Mutex::new(conn),
+            interrupt,
             frame_cache: Mutex::new(HashMap::new()),
             ids: Mutex::new(ids),
+            parquet: parquet_state,
         };
         Ok(store)
+    }
+
+    /// Interrupt the query currently running on this store's connection.
+    /// Safe to call from any thread; a no-op when nothing is in flight. This is
+    /// what lets the HTTP layer stop a long scan the moment it is superseded.
+    pub fn interrupt(&self) {
+        self.interrupt.interrupt();
     }
 
     pub fn config(&self) -> &StoreConfig {
@@ -422,16 +570,20 @@ impl Store {
         let created_ns = now_ns();
         let total_value: u64 = report.stacks.iter().map(|s| s.value).sum();
 
+        let frames_t = self.wtable("frames");
+        let stacks_t = self.wtable("stacks");
+        let samples_t = self.wtable("samples");
+        let batches_t = self.wtable("batches");
         {
             let conn = self.conn.lock();
             conn.execute_batch("BEGIN TRANSACTION").map_err(db_err)?;
             let result = (|| -> Result<()> {
                 if !pending.frames.is_empty() {
                     let mut stmt = conn
-                        .prepare(
-                            "INSERT INTO frames (frame_id, module, symbol, file, line) \
-                             VALUES (?, ?, ?, ?, ?)",
-                        )
+                        .prepare(&format!(
+                            "INSERT INTO {frames_t} (frame_id, module, symbol, file, line) \
+                             VALUES (?, ?, ?, ?, ?)"
+                        ))
                         .map_err(db_err)?;
                     for (id, frame) in &pending.frames {
                         stmt.execute(params![
@@ -446,7 +598,9 @@ impl Store {
                 }
                 if !pending.stacks.is_empty() {
                     let mut stmt = conn
-                        .prepare("INSERT INTO stacks (stack_id, frames) VALUES (?, ?)")
+                        .prepare(&format!(
+                            "INSERT INTO {stacks_t} (stack_id, frames) VALUES (?, ?)"
+                        ))
                         .map_err(db_err)?;
                     for (id, frames) in &pending.stacks {
                         stmt.execute(params![*id as i64, pack_frames(frames)])
@@ -454,10 +608,10 @@ impl Store {
                     }
                 }
                 let mut stmt = conn
-                    .prepare(
-                        "INSERT INTO samples (batch_id, profile_type, service_name, labels, \
-                         start_ns, end_ns, stack_id, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
+                    .prepare(&format!(
+                        "INSERT INTO {samples_t} (batch_id, profile_type, service_name, labels, \
+                         start_ns, end_ns, stack_id, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                    ))
                     .map_err(db_err)?;
                 for (stack_id, value) in &pending.samples {
                     stmt.execute(params![
@@ -473,9 +627,11 @@ impl Store {
                     .map_err(db_err)?;
                 }
                 conn.execute(
-                    "INSERT INTO batches (batch_id, profile_type, service_name, labels, start_ns, \
-                     end_ns, total_value, sample_count, bytes, created_ns) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    &format!(
+                        "INSERT INTO {batches_t} (batch_id, profile_type, service_name, labels, start_ns, \
+                         end_ns, total_value, sample_count, bytes, created_ns) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    ),
                     params![
                         batch_id as i64,
                         report.profile_type.as_str(),
@@ -646,6 +802,12 @@ impl Store {
 
         let mut rows: Vec<SampleRow> = Vec::new();
         let mut truncated = false;
+        // A wide scan returns one row per (stack, series) — over a million
+        // rows in practice — but those rows share only a handful of distinct
+        // label sets. Decoding each one was measured at ~8s of a ~9s scan;
+        // memoising by the encoded string turns that into a few hundred
+        // decodes. Matchers and grouping below are pure reads of this value.
+        let mut label_cache: HashMap<String, BTreeMap<String, String>> = HashMap::new();
         while let Some(row) = raw.next().map_err(db_err)? {
             if rows.len() >= MAX_SCAN_ROWS {
                 truncated = true;
@@ -656,16 +818,18 @@ impl Store {
             let labels_text: String = row.get(2).map_err(db_err)?;
             let value = row.get::<_, i64>(3).map_err(db_err)?.max(0) as u64;
 
-            let mut labels = decode_labels(&labels_text);
-            // `all_labels` puts the service name into the label set before
-            // encoding, but a report written by an older version may not have.
-            if !labels.contains_key(SERVICE_NAME_LABEL) {
-                labels.insert(SERVICE_NAME_LABEL.to_string(), service_name.clone());
+            // Only the encoded payload is the cache key: `matches_meta` and
+            // `group_by` both take service_name separately, so the decoded
+            // view never needs it injected. `String: Borrow<str>` lets us look
+            // up with `&str` and only allocate on a cache miss.
+            if !label_cache.contains_key(labels_text.as_str()) {
+                label_cache.insert(labels_text.clone(), decode_labels(&labels_text));
             }
+            let labels = &label_cache[labels_text.as_str()];
             // The label matchers (glob included) run here; SQL only pruned on
             // `service_name`. Dropping a whole (stack, series) group is safe
             // because the group is atomic: every row in it shares the series.
-            if !query.selector.matches_meta(&service_name, &labels) {
+            if !query.selector.matches_meta(&service_name, labels) {
                 continue;
             }
 
@@ -710,50 +874,83 @@ impl Store {
         })
     }
 
+    /// Load stack frames for many ids in ONE query.
+    ///
+    /// The old implementation issued `ids.len()/1000` separate `IN (...)`
+    /// queries; with a wide time range that is well over a thousand statement
+    /// prepares and dominated total query time (16s of an 17s scan). Loading
+    /// the ids into a temp table with DuckDB's `Appender` and joining once
+    /// brings the same work down to well under a second.
     fn load_stacks(&self, conn: &Connection, ids: &[u64]) -> Result<HashMap<u64, Vec<u32>>> {
-        let mut out = HashMap::with_capacity(ids.len());
-        for chunk in ids.chunks(1000) {
-            let placeholders = vec!["?"; chunk.len()].join(", ");
-            let sql =
-                format!("SELECT stack_id, frames FROM stacks WHERE stack_id IN ({placeholders})");
-            let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-            let args: Vec<i64> = chunk.iter().map(|&id| id as i64).collect();
-            let param_refs = params_from(&args);
-            let mut rows = stmt.query(param_refs.as_slice()).map_err(db_err)?;
-            while let Some(row) = rows.next().map_err(db_err)? {
-                let id = row.get::<_, i64>(0).map_err(db_err)?.max(0) as u64;
-                let blob: Vec<u8> = row.get(1).map_err(db_err)?;
-                out.insert(id, unpack_frames(&blob));
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS lidlesseye_query_ids(id BIGINT); \
+             DELETE FROM lidlesseye_query_ids;",
+        )
+        .map_err(db_err)?;
+        {
+            let mut appender = conn.appender("lidlesseye_query_ids").map_err(db_err)?;
+            for &id in ids {
+                appender.append_row([id as i64]).map_err(db_err)?;
             }
+            appender.flush().map_err(db_err)?;
+        }
+        let mut out = HashMap::with_capacity(ids.len());
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.stack_id, s.frames FROM stacks s \
+                 JOIN lidlesseye_query_ids q ON s.stack_id = q.id",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt.query([]).map_err(db_err)?;
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let id = row.get::<_, i64>(0).map_err(db_err)?.max(0) as u64;
+            let blob: Vec<u8> = row.get(1).map_err(db_err)?;
+            out.insert(id, unpack_frames(&blob));
         }
         Ok(out)
     }
 
+    /// Same bulk-join strategy as [`Store::load_stacks`]: one statement instead
+    /// of thousands of `IN (...)` prepares on the hot path of every query.
     fn load_frames(&self, conn: &Connection, ids: &[u32]) -> Result<HashMap<u32, Frame>> {
-        let mut out = HashMap::with_capacity(ids.len());
-        for chunk in ids.chunks(4000) {
-            let placeholders = vec!["?"; chunk.len()].join(", ");
-            let sql = format!(
-                "SELECT frame_id, module, symbol, file, line FROM frames \
-                 WHERE frame_id IN ({placeholders})"
-            );
-            let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-            let args: Vec<i64> = chunk.iter().map(|&id| id as i64).collect();
-            let param_refs = params_from(&args);
-            let mut rows = stmt.query(param_refs.as_slice()).map_err(db_err)?;
-            while let Some(row) = rows.next().map_err(db_err)? {
-                let id = row.get::<_, i64>(0).map_err(db_err)?.max(0) as u32;
-                out.insert(
-                    id,
-                    Frame {
-                        module: row.get(1).map_err(db_err)?,
-                        symbol: row.get(2).map_err(db_err)?,
-                        file: row.get(3).map_err(db_err)?,
-                        line: row.get::<_, i64>(4).map_err(db_err)?.max(0) as u32,
-                        addr: 0,
-                    },
-                );
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS lidlesseye_query_ids(id BIGINT); \
+             DELETE FROM lidlesseye_query_ids;",
+        )
+        .map_err(db_err)?;
+        {
+            let mut appender = conn.appender("lidlesseye_query_ids").map_err(db_err)?;
+            for &id in ids {
+                appender.append_row([id as i64]).map_err(db_err)?;
             }
+            appender.flush().map_err(db_err)?;
+        }
+        let mut out = HashMap::with_capacity(ids.len());
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.frame_id, f.module, f.symbol, f.file, f.line FROM frames f \
+                 JOIN lidlesseye_query_ids q ON f.frame_id = q.id",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt.query([]).map_err(db_err)?;
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let id = row.get::<_, i64>(0).map_err(db_err)?.max(0) as u32;
+            out.insert(
+                id,
+                Frame {
+                    module: row.get(1).map_err(db_err)?,
+                    symbol: row.get(2).map_err(db_err)?,
+                    file: row.get(3).map_err(db_err)?,
+                    line: row.get::<_, i64>(4).map_err(db_err)?.max(0) as u32,
+                    addr: 0,
+                },
+            );
         }
         Ok(out)
     }
@@ -801,6 +998,11 @@ impl Store {
     /// number shown next to `logical_bytes` would look broken. The filesystem
     /// does not guess, and it matches what an operator sees with `du`.
     fn disk_bytes(&self) -> u64 {
+        if let Some(state) = &self.parquet {
+            // Local staged Parquet is the physical footprint we control; the
+            // hot tier is in-memory and the archive lives in S3.
+            return parquet::staged_bytes(state);
+        }
         let path = self.path();
         let main = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let mut wal = path.into_os_string();
@@ -809,6 +1011,38 @@ impl Store {
             .map(|m| m.len())
             .unwrap_or(0);
         main.saturating_add(wal)
+    }
+
+    /// Flush the in-memory hot tier to a local Parquet file and return the
+    /// number of rows moved. No-op in DuckDB mode. Safe to call periodically.
+    pub fn flush_hot(&self) -> Result<usize> {
+        let Some(state) = &self.parquet else {
+            return Ok(0);
+        };
+        let conn = self.conn.lock();
+        parquet::flush_hot(&conn, state)
+    }
+
+    /// Merge local Parquet files older than the local TTL into one object per
+    /// table/hour, upload it to S3, and remove the local copies. No-op in
+    /// DuckDB mode. `now_ns` is supplied by the caller for deterministic TTL.
+    pub fn archive_local(&self, now_ns: u64) -> Result<parquet::ArchiveStats> {
+        let Some(state) = &self.parquet else {
+            return Ok(parquet::ArchiveStats::default());
+        };
+        let Some(s3) = &self.cfg.s3 else {
+            return Ok(parquet::ArchiveStats::default());
+        };
+        let conn = self.conn.lock();
+        parquet::archive_local(&conn, state, now_ns, s3)
+    }
+
+    /// Total bytes staged locally in Parquet mode (0 in DuckDB mode).
+    pub fn staged_bytes(&self) -> u64 {
+        self.parquet
+            .as_ref()
+            .map(parquet::staged_bytes)
+            .unwrap_or(0)
     }
 
     pub fn series(&self, from_ns: u64, until_ns: u64, selector: &Selector) -> Vec<SeriesInfo> {
@@ -925,30 +1159,40 @@ impl Store {
         let mut stats = PruneStats::default();
         let before = self.stats();
 
+        let samples_t = self.wtable("samples");
+        let batches_t = self.wtable("batches");
+        let nodes_t = self.wtable("net_nodes");
+        let edges_t = self.wtable("net_edges");
         {
             let conn = self.conn.lock();
             if let Some(retention) = self.cfg.retention_ns {
                 let cutoff = now_ns.saturating_sub(retention);
                 let removed: i64 = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM batches WHERE end_ns < ?",
+                        &format!("SELECT COUNT(*) FROM {batches_t} WHERE end_ns < ?"),
                         params![ts(cutoff)],
                         |row| row.get(0),
                     )
                     .unwrap_or(0);
-                conn.execute("DELETE FROM samples WHERE end_ns < ?", params![ts(cutoff)])
-                    .map_err(db_err)?;
-                conn.execute("DELETE FROM batches WHERE end_ns < ?", params![ts(cutoff)])
-                    .map_err(db_err)?;
-                // The map is a second, independent table family: it has no
-                // batches, so it needs its own cutoff.
                 conn.execute(
-                    "DELETE FROM net_nodes WHERE bucket_ns < ?",
+                    &format!("DELETE FROM {samples_t} WHERE end_ns < ?"),
                     params![ts(cutoff)],
                 )
                 .map_err(db_err)?;
                 conn.execute(
-                    "DELETE FROM net_edges WHERE bucket_ns < ?",
+                    &format!("DELETE FROM {batches_t} WHERE end_ns < ?"),
+                    params![ts(cutoff)],
+                )
+                .map_err(db_err)?;
+                // The map is a second, independent table family: it has no
+                // batches, so it needs its own cutoff.
+                conn.execute(
+                    &format!("DELETE FROM {nodes_t} WHERE bucket_ns < ?"),
+                    params![ts(cutoff)],
+                )
+                .map_err(db_err)?;
+                conn.execute(
+                    &format!("DELETE FROM {edges_t} WHERE bucket_ns < ?"),
                     params![ts(cutoff)],
                 )
                 .map_err(db_err)?;
@@ -980,10 +1224,16 @@ impl Store {
                         )
                         .ok();
                     let Some(batch_id) = oldest else { break };
-                    conn.execute("DELETE FROM samples WHERE batch_id = ?", params![batch_id])
-                        .map_err(db_err)?;
-                    conn.execute("DELETE FROM batches WHERE batch_id = ?", params![batch_id])
-                        .map_err(db_err)?;
+                    conn.execute(
+                        &format!("DELETE FROM {samples_t} WHERE batch_id = ?"),
+                        params![batch_id],
+                    )
+                    .map_err(db_err)?;
+                    conn.execute(
+                        &format!("DELETE FROM {batches_t} WHERE batch_id = ?"),
+                        params![batch_id],
+                    )
+                    .map_err(db_err)?;
                     stats.removed_batches += 1;
                 }
             }
@@ -1000,13 +1250,40 @@ impl Store {
 
     /// Delete every row (used by tests and `fsck --fix`).
     pub fn clear(&self) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute_batch(
-            "DELETE FROM samples; DELETE FROM stacks; DELETE FROM frames; DELETE FROM batches; \
-             DELETE FROM net_nodes; DELETE FROM net_edges;",
-        )
-        .map_err(db_err)?;
-        conn.execute_batch("CHECKPOINT").map_err(db_err)?;
+        let samples_t = self.wtable("samples");
+        let stacks_t = self.wtable("stacks");
+        let frames_t = self.wtable("frames");
+        let batches_t = self.wtable("batches");
+        let nodes_t = self.wtable("net_nodes");
+        let edges_t = self.wtable("net_edges");
+        {
+            let conn = self.conn.lock();
+            conn.execute_batch(&format!(
+                "DELETE FROM {samples_t}; DELETE FROM {stacks_t}; DELETE FROM {frames_t}; \
+                 DELETE FROM {batches_t}; DELETE FROM {nodes_t}; DELETE FROM {edges_t};"
+            ))
+            .map_err(db_err)?;
+            conn.execute_batch("CHECKPOINT").map_err(db_err)?;
+        }
+        // In Parquet mode the canonical tables are VIEWs; also drop the local
+        // files they read so a clear really empties the store. Archived S3
+        // objects are left for bucket lifecycle policies; queries still see
+        // nothing here because the view over this tenant's prefix is empty
+        // after its local files are removed. For a full purge the operator
+        // clears the S3 prefix.
+        if let Some(state) = &self.parquet {
+            for def in parquet::TABLES {
+                let dir = state.table_dir(def.name);
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+            state.clear_manifest()?;
+            let conn = self.conn.lock();
+            parquet::refresh_views(&conn, state)?;
+        }
         self.frame_cache.lock().clear();
         let mut ids = self.ids.lock();
         ids.next_frame = 0;
@@ -1158,17 +1435,19 @@ impl Store {
             return Ok(());
         }
         let bucket = ts(batch.start_ns);
+        let nodes_t = self.wtable("net_nodes");
+        let edges_t = self.wtable("net_edges");
         let conn = self.conn.lock();
         conn.execute_batch("BEGIN TRANSACTION").map_err(db_err)?;
         let result = (|| -> Result<()> {
             if !batch.nodes.is_empty() {
                 let mut stmt = conn
-                    .prepare(
-                        "INSERT INTO net_nodes (bucket_ns, node_id, namespace, workload, service, \
+                    .prepare(&format!(
+                        "INSERT INTO {nodes_t} (bucket_ns, node_id, namespace, workload, service, \
                          kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready, \
                          instances) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    ))
                     .map_err(db_err)?;
                 for node in &batch.nodes {
                     stmt.execute(params![
@@ -1192,11 +1471,11 @@ impl Store {
             }
             if !batch.edges.is_empty() {
                 let mut stmt = conn
-                    .prepare(
-                        "INSERT INTO net_edges (bucket_ns, client_id, server_id, protocol, \
+                    .prepare(&format!(
+                        "INSERT INTO {edges_t} (bucket_ns, client_id, server_id, protocol, \
                          connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    ))
                     .map_err(db_err)?;
                 for edge in &batch.edges {
                     stmt.execute(params![
@@ -1507,6 +1786,43 @@ impl Store {
     }
 }
 
+/// Apply connection-level settings that make large scans faster and bounded.
+///
+/// Each statement is applied independently: an unavailable PRAGMA on a
+/// particular DuckDB build is logged and skipped rather than failing to open
+/// the database. The settings that matter most here:
+///
+/// * `preserve_insertion_order=false` lets DuckDB reorder grouped aggregates
+///   and drop the final sort — a large win for the scan/GROUP BY queries that
+///   back flamegraphs and the service map.
+/// * `memory_limit` caps the hash tables behind long GROUP BYs so a wide range
+///   spills to disk instead of growing until the process is OOM-killed.
+/// * `temp_directory` gives those spills a known scratch location.
+fn tune_connection(conn: &Connection, path: &Path, cfg: &StoreConfig) -> Result<()> {
+    let settings: Vec<String> = vec![
+        "SET preserve_insertion_order=false".to_string(),
+        // DuckDB defaults to 80% of host RAM, which is dangerous in a 2 GiB
+        // pod. Cap the hash tables behind long GROUP BYs so wide ranges spill
+        // to the temp directory instead of getting the process OOM-killed.
+        format!("SET memory_limit='{}'", cfg.duckdb_memory_limit()),
+        format!(
+            "SET temp_directory='{}'",
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(".duckdb-tmp")
+                .display()
+        ),
+    ];
+    // Thread count is pinned through duckdb::Config at open time (see
+    // Store::open); no need to issue a redundant SET here.
+    for sql in settings {
+        if let Err(err) = conn.execute_batch(&sql) {
+            warn!("skipping DuckDB setting `{sql}`: {err}");
+        }
+    }
+    Ok(())
+}
+
 fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS batches (
@@ -1579,7 +1895,30 @@ fn create_schema(conn: &Connection) -> Result<()> {
         INSERT OR REPLACE INTO meta VALUES ('schema_version', '{SCHEMA_VERSION}');"
     ))
     .map_err(db_err)?;
-    add_missing_columns(conn)
+    add_missing_columns(conn)?;
+    create_indexes(conn)
+}
+
+/// Indexes the columns every read path filters or groups on. DuckDB keeps
+/// min/max zone maps per row group, but analyst queries that repeatedly pin a
+/// bucket or a node still benefit from an ART index — especially on the wide
+/// time ranges that were slow before. Created defensively so an older database
+/// or a build without ART support still opens.
+fn create_indexes(conn: &Connection) -> Result<()> {
+    let indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_net_edges_bucket ON net_edges(bucket_ns)",
+        "CREATE INDEX IF NOT EXISTS idx_net_edges_node ON net_edges(client_id, server_id)",
+        "CREATE INDEX IF NOT EXISTS idx_net_nodes_bucket ON net_nodes(bucket_ns)",
+        "CREATE INDEX IF NOT EXISTS idx_net_nodes_node ON net_nodes(node_id)",
+        "CREATE INDEX IF NOT EXISTS idx_samples_time ON samples(profile_type, start_ns, end_ns)",
+        "CREATE INDEX IF NOT EXISTS idx_batches_time ON batches(profile_type, start_ns, end_ns)",
+    ];
+    for sql in indexes {
+        if let Err(err) = conn.execute_batch(sql) {
+            warn!("skipping index `{sql}`: {err}");
+        }
+    }
+    Ok(())
 }
 
 /// Add the columns a store written by an older release does not have yet.
@@ -1688,10 +2027,6 @@ fn glob_to_like(pattern: &str) -> String {
         }
     }
     out
-}
-
-fn params_from(values: &[i64]) -> Vec<&dyn duckdb::ToSql> {
-    values.iter().map(|v| v as &dyn duckdb::ToSql).collect()
 }
 
 fn db_err(err: duckdb::Error) -> Error {
@@ -2284,6 +2619,89 @@ mod tests {
         assert_eq!(histogram[1], edges[1].connections);
 
         drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The performance settings and indexes must actually take effect — a
+    /// silently skipped PRAGMA would leave long scans slow without any signal.
+    #[test]
+    fn performance_settings_and_indexes_are_applied() {
+        let (store, dir) = temp_store("tuning");
+        let conn = store.conn.lock();
+
+        // DuckDB exposes this setting as a BOOLEAN, not a string.
+        let insertion_order: bool = conn
+            .query_row(
+                "SELECT current_setting('preserve_insertion_order')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!insertion_order, "reordering must be enabled");
+
+        let memory_limit: String = conn
+            .query_row("SELECT current_setting('memory_limit')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        // DuckDB normalises "1GB" to ~953.6 MiB (10^9 bytes). Parse the number
+        // and assert it is a small absolute cap, not the 80%-of-host default.
+        let mib: f64 = memory_limit
+            .split_whitespace()
+            .next()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0.0);
+        assert!(
+            mib > 0.0 && mib < 1500.0,
+            "a conservative memory cap must be set, got {memory_limit}"
+        );
+
+        let mut stmt = conn
+            .prepare("SELECT index_name FROM duckdb_indexes() WHERE index_name LIKE 'idx_%'")
+            .unwrap();
+        let indexes: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|name| name.unwrap())
+            .collect();
+        for expected in [
+            "idx_net_edges_bucket",
+            "idx_net_nodes_bucket",
+            "idx_samples_time",
+        ] {
+            assert!(
+                indexes.iter().any(|name| name == expected),
+                "missing {expected}"
+            );
+        }
+
+        drop(conn);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The interrupt handle must be able to stop a running query from another
+    /// thread — this is what frees the single connection when a newer query
+    /// supersedes an old long scan.
+    #[test]
+    fn interrupt_stops_a_running_query_from_another_thread() {
+        let (store, dir) = temp_store("interrupt");
+        let caller = store.interrupt.clone();
+        let thread = std::thread::spawn(move || {
+            let conn = store.conn.lock();
+            // A deliberately long scan (20 billion rows to count) that cannot
+            // finish before the interrupt below, but uses O(1) memory.
+            conn.execute_batch(
+                "SELECT count(*) FROM range(1000000000) t(x) CROSS JOIN range(20) u(y);",
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        caller.interrupt();
+        let result = thread.join().unwrap();
+        assert!(result.is_err(), "the query should be interrupted");
+
+        // `store` was moved into the thread and dropped when it finished.
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

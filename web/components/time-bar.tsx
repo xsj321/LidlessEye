@@ -3,15 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import { ChartNoAxesCombined, ChevronDown, ChevronUp } from "lucide-react";
 
+import { TimeRangePicker } from "@/components/time-range-picker";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { domainText, selectionText, TimeBrush } from "@/lib/canvas/timebrush";
 import { formatClock } from "@/lib/format";
@@ -20,7 +14,6 @@ import { dashboardStore } from "@/lib/store";
 import {
   fromLocalInput,
   nowNs,
-  RANGES,
   resolveBaseline,
   resolveDomain,
   resolveWindow,
@@ -243,11 +236,6 @@ export function TimeBar() {
   const win = resolveWindow(state);
   const baseline = resolveBaseline(state);
 
-  const context =
-    state.mode === "absolute"
-      ? `${t("absolute")} · ${dashboardStore.domainSpanText()}`
-      : `${t(dashboardStore.rangeLabel()).toLowerCase()} · ${t("ends now")}`;
-
   const hint =
     state.histEmpty && state.dataRange
       ? `${t("No samples here; data spans")} ${formatClock(state.dataRange.from)} → ${formatClock(
@@ -277,7 +265,9 @@ export function TimeBar() {
           </ToggleGroupItem>
         </ToggleGroup>
 
-        <span className="text-[11px] text-muted-foreground">{context}</span>
+        {/* The relative picker sits right next to the mode switch; both answer
+            "which window?", so they belong together. */}
+        {state.mode === "relative" ? <TimeRangePicker /> : null}
 
         {state.mode === "absolute" ? <AbsoluteRangeInputs domain={domain} t={t} /> : null}
 
@@ -293,32 +283,6 @@ export function TimeBar() {
           >
             {t("Use data range")}
           </Button>
-        ) : null}
-
-        {/* A relative window still needs a range picker; on the service map it
-            is the only one, since the profile toolbar is deliberately hidden. */}
-        {state.mode === "relative" ? (
-          <Select
-            value={state.range}
-            onValueChange={(value) => dashboardStore.setRelativeRange(value)}
-          >
-            <SelectTrigger
-              size="sm"
-              id="relative-range"
-              data-testid="relative-range"
-              className="w-36"
-              aria-label={t("Range")}
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {RANGES.map(([value, label]) => (
-                <SelectItem key={value} value={value}>
-                  {t(label)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
         ) : null}
 
         <Button

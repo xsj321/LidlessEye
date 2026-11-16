@@ -80,14 +80,15 @@ function CollapseButton({
           id="sidebar-toggle"
           data-testid="sidebar-toggle"
           variant="ghost"
-          size="icon-xs"
+          size="icon-sm"
           className="shrink-0"
           aria-label={label}
           aria-expanded={!collapsed}
           aria-controls="tabs"
           onClick={toggle}
         >
-          {collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+          {/* Match the size-4 nav icons so the rail looks uniform. */}
+          {collapsed ? <PanelLeftOpen className="size-4" /> : <PanelLeftClose className="size-4" />}
         </Button>
       </TooltipTrigger>
       <TooltipContent side="right">{label}</TooltipContent>

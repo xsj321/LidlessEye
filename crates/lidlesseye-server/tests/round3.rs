@@ -317,8 +317,7 @@ async fn pruning_while_ingesting_keeps_the_index_consistent() {
             StoreConfig {
                 root: dir.path().to_path_buf(),
                 retention_ns: Some(3_600_000_000_000),
-                max_disk_bytes: None,
-                threads: None,
+                ..StoreConfig::new(dir.path())
             },
         )
         .unwrap(),
@@ -387,8 +386,7 @@ async fn retention_removes_only_expired_segments() {
         StoreConfig {
             root: dir.path().to_path_buf(),
             retention_ns: Some(7 * day),
-            max_disk_bytes: None,
-            threads: None,
+            ..StoreConfig::new(dir.path())
         },
     )
     .unwrap();

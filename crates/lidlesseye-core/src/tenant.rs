@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
-use crate::store::{PruneStats, Store, StoreConfig, StoreStats};
+use crate::store::{PruneStats, S3Config, Store, StoreConfig, StoreStats};
 
 /// Maximum accepted tenant id length.
 pub const MAX_TENANT_LEN: usize = 64;
@@ -232,6 +232,13 @@ impl TenantStore {
             });
         }
         let limits = self.limits(tenant);
+        // The S3 prefix is namespaced per tenant so archives never mix. The
+        // storage mode and connection details come from the process-wide base
+        // config; only the on-disk root and retention are tenant-specific.
+        let s3 = self.base.s3.as_ref().map(|base| S3Config {
+            prefix: format!("{}/{}", base.prefix.trim_end_matches('/'), tenant.as_str()),
+            ..base.clone()
+        });
         let cfg = StoreConfig {
             root: self.tenant_dir(tenant),
             retention_ns: limits.retention_ns,
@@ -240,6 +247,10 @@ impl TenantStore {
             // pool is per connection, and letting one tenant size its own
             // would let a noisy tenant starve the others.
             threads: self.base.threads,
+            duckdb_memory_limit: self.base.duckdb_memory_limit.clone(),
+            storage_mode: self.base.storage_mode,
+            s3,
+            parquet_local_ttl_ns: self.base.parquet_local_ttl_ns,
         };
         let store = Arc::new(Store::open(cfg)?);
         stores.insert(tenant.clone(), store.clone());
@@ -320,6 +331,39 @@ impl TenantStore {
             }
         }
         total
+    }
+
+    /// Run one Parquet compaction pass across all tenants: flush each hot tier
+    /// to local Parquet, then archive files past the local TTL to S3. Returns
+    /// `(tenant, rows_flushed, files_uploaded)`. No-op when not in Parquet mode.
+    pub fn compaction_tick(&self, now_ns: u64) -> Vec<(TenantId, usize, usize)> {
+        let mut out = Vec::new();
+        if self.base.storage_mode != crate::store::StorageMode::Parquet {
+            return out;
+        }
+        for id in self.tenant_ids() {
+            let Some(store) = self.tenant(&id) else {
+                continue;
+            };
+            let flushed = match store.flush_hot() {
+                Ok(n) => n,
+                Err(err) => {
+                    warn!(tenant = %id, error = %err, "parquet hot flush failed");
+                    continue;
+                }
+            };
+            let uploaded = match store.archive_local(now_ns) {
+                Ok(stats) => stats.files_uploaded,
+                Err(err) => {
+                    warn!(tenant = %id, error = %err, "parquet S3 archive failed");
+                    0
+                }
+            };
+            if flushed > 0 || uploaded > 0 {
+                out.push((id, flushed, uploaded));
+            }
+        }
+        out
     }
 
     /// Prune every tenant; returns what was removed, per tenant.

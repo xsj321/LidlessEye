@@ -28,7 +28,9 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the HTTP server (and optionally the eBPF collector).
-    Serve(ServeArgs),
+    /// Boxed: the serve args carry the whole storage/S3 configuration and are
+    /// much larger than the other subcommands' arguments.
+    Serve(Box<ServeArgs>),
     /// Run only the eBPF collector and push profiles to a server.
     Collect(CollectArgs),
     /// Import reports from files or stdin.
@@ -56,6 +58,38 @@ struct ServeArgs {
     /// Worker threads DuckDB may use per tenant (default: all cores).
     #[arg(long)]
     duckdb_threads: Option<usize>,
+    /// Physical storage backend: `duckdb` (single file, default) or `parquet`
+    /// (hot memory tier + local Parquet + hourly S3 archive).
+    #[arg(long, env = "LIDLESSEYE_STORAGE_MODE", default_value = "duckdb")]
+    storage_mode: String,
+    /// S3 bucket for Parquet mode.
+    #[arg(long, env = "LIDLESSEYE_S3_BUCKET")]
+    s3_bucket: Option<String>,
+    /// S3 key prefix for Parquet mode.
+    #[arg(long, env = "LIDLESSEYE_S3_PREFIX", default_value = "lidlesseye")]
+    s3_prefix: String,
+    /// S3 endpoint host:port for S3-compatible stores (e.g. MinIO).
+    #[arg(long, env = "LIDLESSEYE_S3_ENDPOINT")]
+    s3_endpoint: Option<String>,
+    /// S3 region.
+    #[arg(long, env = "LIDLESSEYE_S3_REGION")]
+    s3_region: Option<String>,
+    /// S3 access key id.
+    #[arg(long, env = "LIDLESSEYE_S3_ACCESS_KEY")]
+    s3_access_key: Option<String>,
+    /// S3 secret access key.
+    #[arg(long, env = "LIDLESSEYE_S3_SECRET_KEY")]
+    s3_secret_key: Option<String>,
+    /// Use HTTPS for the S3 endpoint (MinIO test setups use false).
+    #[arg(long, env = "LIDLESSEYE_S3_USE_SSL")]
+    s3_use_ssl: Option<bool>,
+    /// S3 URL style: `path` (MinIO) or `host` (AWS).
+    #[arg(long, env = "LIDLESSEYE_S3_URL_STYLE")]
+    s3_url_style: Option<String>,
+    /// How long compacted Parquet stays local before S3 upload/removal
+    /// (`1h` by default; shorter values are useful for testing).
+    #[arg(long, env = "LIDLESSEYE_PARQUET_LOCAL_TTL")]
+    parquet_local_ttl: Option<String>,
     #[arg(long, env = "LIDLESSEYE_AUTH_TOKEN")]
     auth_token: Option<String>,
     /// Bind a bearer token to a tenant: `--tenant-token <token>=<tenant>`
@@ -263,7 +297,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Serve(args) => serve(args).await,
+        Command::Serve(args) => serve(*args).await,
         Command::Collect(args) => collect(args).await,
         Command::Ingest(args) => ingest(args).await,
         Command::Query(args) => query(args),
@@ -298,12 +332,43 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let retention = parse_optional_duration(&args.retention)?;
     let max_disk = parse_optional_bytes(&args.max_disk)?;
 
+    let storage_mode = match args.storage_mode.to_ascii_lowercase().as_str() {
+        "parquet" | "parquet-s3" | "s3" => lidlesseye_core::StorageMode::Parquet,
+        "duckdb" | "" => lidlesseye_core::StorageMode::DuckDb,
+        other => anyhow::bail!("unknown --storage-mode `{other}` (use duckdb or parquet)"),
+    };
+    let s3 = args
+        .s3_bucket
+        .as_ref()
+        .map(|bucket| lidlesseye_core::S3Config {
+            bucket: bucket.clone(),
+            prefix: args.s3_prefix.clone(),
+            endpoint: args.s3_endpoint.clone(),
+            region: args.s3_region.clone(),
+            access_key_id: args.s3_access_key.clone(),
+            secret_access_key: args.s3_secret_key.clone(),
+            use_ssl: args.s3_use_ssl,
+            url_style: args.s3_url_style.clone(),
+        });
+    let parquet_local_ttl = match &args.parquet_local_ttl {
+        Some(value) => Some(parse_duration(value)?),
+        None => None,
+    };
+
     let mut builder = Builder::new()
         .data_dir(&args.data_dir)
         .listen(&args.listen)
         .retention(retention)
         .max_disk_bytes(max_disk)
         .duckdb_threads(args.duckdb_threads)
+        .storage_mode(storage_mode);
+    if let Some(s3) = s3 {
+        builder = builder.s3(s3);
+    }
+    if let Some(ttl) = parquet_local_ttl {
+        builder = builder.parquet_local_ttl(ttl);
+    }
+    builder = builder
         .auth_token(args.auth_token.clone())
         .cors(args.cors.clone())
         .read_only(args.read_only)

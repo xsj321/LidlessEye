@@ -111,6 +111,8 @@ helm install lidlesseye deploy/helm/lidlesseye \
   --set server.auth.enabled=true
 ```
 
+存储默认为每个租户一个 DuckDB 文件。对于数据量大或留存期长的场景，`--set server.storage.mode=parquet` 可切换到分层 Parquet + S3 存储（内存热层 → 本地 Parquet → 每小时归档到 S3，查询通过 DuckDB 零拷贝扫描读回）；凭证和端点在 `server.storage.s3` 下配置。两种模式与完整参数见 [deployment.md](docs/deployment.md)。
+
 ## 嵌入自己的程序
 
 ```toml

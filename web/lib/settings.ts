@@ -51,12 +51,31 @@ export const DEFAULT_SETTINGS: Settings = {
 
 const STORAGE_KEY = "lidlesseye.settings";
 
-const AUTO_REFRESH_OPTIONS = [10_000, 30_000, 60_000, 300_000] as const;
+// Seconds-first cadences: operators watching a live incident want a fast
+// heartbeat (5s), while idle dashboards should not hammer the server.
+export const MIN_AUTO_REFRESH_MS = 5_000;
+export const MAX_AUTO_REFRESH_MS = 3_600_000;
+const AUTO_REFRESH_OPTIONS = [
+  5_000,
+  10_000,
+  15_000,
+  30_000,
+  60_000,
+  120_000,
+  300_000,
+] as const;
 const MAX_NODES_OPTIONS = [10_000, 50_000, 100_000] as const;
 const BUCKET_OPTIONS = [60, 120, 240] as const;
 
 function pick<T>(value: unknown, options: readonly T[], fallback: T): T {
   return options.includes(value as T) ? (value as T) : fallback;
+}
+
+/** Auto-refresh period in ms, clamped to a [5s, 1h] safe window. */
+function clampMs(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_SETTINGS.autoRefreshMs;
+  return Math.min(MAX_AUTO_REFRESH_MS, Math.max(MIN_AUTO_REFRESH_MS, Math.round(n)));
 }
 
 /** Validate every field: localStorage is user-editable and survives upgrades. */
@@ -71,7 +90,9 @@ export function sanitiseSettings(raw: unknown): Settings {
       RANGES.map(([name]) => name),
       DEFAULT_SETTINGS.defaultRange,
     ),
-    autoRefreshMs: pick(value.autoRefreshMs, AUTO_REFRESH_OPTIONS, DEFAULT_SETTINGS.autoRefreshMs),
+    // A range clamp (not a whitelist) so the dialog can offer presets and a
+    // free-form seconds input without the value being silently reset.
+    autoRefreshMs: clampMs(value.autoRefreshMs),
     edgeLabels: typeof value.edgeLabels === "boolean" ? value.edgeLabels : DEFAULT_SETTINGS.edgeLabels,
     labelZoom: Number.isFinite(zoom)
       ? Math.min(1, Math.max(0, zoom))

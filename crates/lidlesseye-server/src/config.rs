@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use lidlesseye_core::{TenantId, TenantLimits};
+use lidlesseye_core::{S3Config, StorageMode, TenantId, TenantLimits};
 
 /// HTTP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,10 +46,31 @@ pub struct ServerConfig {
     /// How often retention/eviction runs.
     pub prune_interval: Duration,
     /// Worker threads DuckDB may use per connection (i.e. per tenant).
-    /// `None` lets it use every core, which is right for a single-tenant
-    /// deployment and generous for a busy multi-tenant one.
-    #[serde(default)]
+    /// Defaults to 4: on hosts with many cores DuckDB's thread coordination
+    /// costs more than it saves on the GROUP BY scans behind flamegraphs and
+    /// the service map, and 4 threads kept the same query ~6x faster. Set to
+    /// `null` in config to let DuckDB pick every core.
+    #[serde(default = "default_duckdb_threads")]
     pub duckdb_threads: Option<usize>,
+    /// DuckDB memory limit per tenant connection, e.g. "1GB", "512MB".
+    /// Caps the hash tables behind long scans so wide ranges spill to disk
+    /// instead of OOM-killing the pod. `None` uses a conservative 1 GiB.
+    #[serde(default)]
+    pub duckdb_memory_limit: Option<String>,
+    /// Physical storage backend: the original DuckDB file, or Parquet with
+    /// hourly S3 archival. `None` means DuckDB (the default).
+    #[serde(default)]
+    pub storage_mode: Option<StorageMode>,
+    /// S3-compatible object store configuration for Parquet mode.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+    /// How long compacted Parquet stays on local disk before S3 upload/removal.
+    #[serde(default)]
+    pub parquet_local_ttl_ns: Option<u64>,
+}
+
+fn default_duckdb_threads() -> Option<usize> {
+    Some(4)
 }
 
 impl Default for ServerConfig {
@@ -69,7 +90,11 @@ impl Default for ServerConfig {
             read_only: false,
             cors_allow_origin: None,
             prune_interval: Duration::from_secs(60),
-            duckdb_threads: None,
+            duckdb_threads: default_duckdb_threads(),
+            duckdb_memory_limit: None,
+            storage_mode: None,
+            s3: None,
+            parquet_local_ttl_ns: None,
         }
     }
 }

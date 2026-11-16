@@ -44,6 +44,32 @@ server:
   retention: 7d
   maxDisk: 40GB
 
+  # Physical storage backend.
+  #   duckdb  - single lidlesseye.duckdb file per tenant (original, default)
+  #   parquet - in-memory hot tier + local Parquet, merged hourly to S3.
+  #             Reads scan Parquet directly (filter/projection pushdown,
+  #             HTTP range reads from S3) with no intermediate database copy.
+  storage:
+    mode: duckdb
+    # How long merged Parquet stays on local disk before the S3 upload removes
+    # it. Queries inside this window read local files, older ones read S3.
+    localTTL: 1h
+    # S3-compatible object store, used only when mode=parquet. Works with AWS
+    # S3 and with MinIO-style servers. For AWS, leave endpoint empty and set
+    # urlStyle to "host"; for MinIO use endpoint + urlStyle=path + useSSL=false.
+    s3:
+      bucket: ""
+      prefix: lidlesseye
+      endpoint: ""        # e.g. minio.lidlesseye.svc:9000
+      region: us-east-1
+      accessKey: ""
+      secretKey: ""
+      useSSL: true
+      urlStyle: path
+      # If set, read credentials from this existing Secret instead of the keys
+      # above. Expected keys: access-key, secret-key.
+      existingSecret: ""
+
   # Bearer token required by every API call when set. The agent picks it up
   # from the same secret, so agents and server stay in sync.
   auth:

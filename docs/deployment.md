@@ -147,6 +147,55 @@ Two sizing caveats come from DuckDB rather than from the sampler:
   `serve` process and a CLI `fsck`, at the same data directory. Use a read-only
   replica with its own copy instead.
 
+### Alternative: Parquet + S3 storage
+
+For larger or longer-lived datasets, switch the server from the single DuckDB
+file to tiered Parquet objects in S3. The hot tier stays in memory, small
+Parquet files are flushed to the data volume, and whole hours are merged and
+uploaded to S3 after `--parquet-local-ttl` (default `1h`), with the local copies
+deleted after a successful upload. Queries read hot + local + S3 through one
+VIEW; see [architecture.md](architecture.md#storage-parquet--s3) for the design.
+
+```bash
+# binary / bare metal
+lidlesseye serve --storage-mode=parquet \
+  --s3-bucket=profiles --s3-prefix=lidlesseye \
+  --s3-endpoint=s3.example.com:9000 --s3-use-ssl=false \
+  --s3-url-style=path \
+  --parquet-local-ttl=1h
+# credentials come from env: LIDLESSEYE_S3_ACCESS_KEY / LIDLESSEYE_S3_SECRET_KEY
+```
+
+```bash
+# Helm
+helm install lidlesseye deploy/helm/lidlesseye \
+  --namespace observability --create-namespace \
+  --set server.storage.mode=parquet \
+  --set server.storage.s3.bucket=profiles \
+  --set server.storage.s3.endpoint=s3.example.com:9000 \
+  --set server.storage.s3.useSSL=false \
+  --set server.storage.s3.existingSecret=lidlesseye-s3
+# the secret must contain keys `access-key` and `secret-key`; if
+# existingSecret is empty the chart creates one from s3.accessKey/s3.secretKey
+```
+
+Relevant values under `server.storage`:
+
+| Value | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `duckdb` | `duckdb` (original file) or `parquet` (tiered S3) |
+| `localTTL` | `1h` | how long a local Parquet file stays before S3 upload/removal |
+| `s3.bucket` | `""` | bucket name (required in `parquet` mode) |
+| `s3.prefix` | `lidlesseye` | key prefix; the tenant id is appended per tenant |
+| `s3.endpoint` | `""` | `host:port`; empty uses the AWS default endpoint |
+| `s3.region` / `s3.useSSL` / `s3.urlStyle` | `us-east-1` / `true` / `path` | httpfs connection settings |
+| `s3.existingSecret` | `""` | pre-created secret with `access-key` / `secret-key` |
+
+The S3 bucket is the source of truth: on startup the server re-discovers
+archived objects from the bucket, so losing the local `manifest.json` or moving
+to a new node does not hide data. Any S3-compatible endpoint (AWS S3, MinIO,
+etc.) works. The original DuckDB file mode remains the default and is unchanged.
+
 ## 3. Kubernetes
 
 ```bash

@@ -37,6 +37,8 @@ interface Histogram {
 export interface TimeBrushOptions {
   onChange?: (from: number, until: number) => void;
   onPreview?: (from: number | null, until: number | null) => void;
+  /** Element whose width drives the canvas. Defaults to the canvas parent. */
+  host?: HTMLElement;
 }
 
 type DragMode = "move" | "resizeL" | "resizeR" | "create";
@@ -52,6 +54,7 @@ interface Drag {
 export class TimeBrush {
   private readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
+  private readonly host: HTMLElement;
   private readonly onChange: (from: number, until: number) => void;
   private readonly onPreview: (from: number | null, until: number | null) => void;
 
@@ -63,6 +66,13 @@ export class TimeBrush {
 
   constructor(canvas: HTMLCanvasElement, options: TimeBrushOptions = {}) {
     this.canvas = canvas;
+    // Measure and observe the host, never the canvas itself: draw() sets the
+    // canvas backing width, and writing its inline `style.width` used to pin
+    // it to a fixed px value. Observing a self-pinned canvas means the observer
+    // never fires again once the parent grows, leaving the histogram stuck at
+    // a fraction of the available width. The host is a plain block element
+    // whose width always tracks the layout, so it is the correct source.
+    this.host = options.host ?? canvas.parentElement ?? canvas;
     this.onChange = options.onChange ?? (() => {});
     this.onPreview = options.onPreview ?? (() => {});
     const ctx = canvas.getContext("2d");
@@ -77,7 +87,7 @@ export class TimeBrush {
     });
 
     this.resizeObserver = new ResizeObserver(() => this.draw());
-    this.resizeObserver.observe(canvas);
+    this.resizeObserver.observe(this.host);
   }
 
   destroy() {
@@ -125,7 +135,9 @@ export class TimeBrush {
   // ---- geometry ---------------------------------------------------------
 
   private plotWidth() {
-    return Math.max(10, this.canvas.clientWidth);
+    // The canvas fills its host via CSS `width:100%`; the backing store is
+    // sized from the host so the drawing always spans the full available width.
+    return Math.max(10, this.host.clientWidth);
   }
 
   private xFor(ns: number) {
@@ -260,8 +272,11 @@ export class TimeBrush {
     const dpr = window.devicePixelRatio || 1;
     if (this.canvas.width !== Math.round(width * dpr)) {
       this.canvas.width = Math.round(width * dpr);
-      this.canvas.style.width = `${width}px`;
     }
+    // Keep the CSS width fluid. Never pin it to a px value: the canvas must
+    // keep filling its host at every width (drawer resize, view switch,
+    // window resize). Only the backing store is sized in device pixels.
+    this.canvas.style.width = "100%";
     this.canvas.height = Math.round(HEIGHT * dpr);
     this.canvas.style.height = `${HEIGHT}px`;
     const ctx = this.ctx;

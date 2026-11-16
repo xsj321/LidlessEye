@@ -111,6 +111,13 @@ helm install lidlesseye deploy/helm/lidlesseye \
   --set server.auth.enabled=true
 ```
 
+Storage defaults to one DuckDB file per tenant. For large or long-lived
+datasets, `--set server.storage.mode=parquet` switches the server to tiered
+Parquet objects in S3 (memory hot tier → local Parquet → hourly S3 archive,
+read back through zero-copy DuckDB scans); credentials and endpoint are set
+under `server.storage.s3`. Both modes and the full option list are documented
+in [deployment.md](docs/deployment.md).
+
 ## Embed it
 
 ```toml

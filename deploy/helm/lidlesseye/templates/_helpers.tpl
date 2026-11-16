@@ -88,3 +88,12 @@ app.kubernetes.io/component: agent
 {{- printf "%s-tenants" (include "lidlesseye.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Secret holding S3 credentials for Parquet storage mode. */}}
+{{- define "lidlesseye.s3SecretName" -}}
+{{- if .Values.server.storage.s3.existingSecret -}}
+{{- .Values.server.storage.s3.existingSecret -}}
+{{- else -}}
+{{- printf "%s-s3" (include "lidlesseye.fullname" .) -}}
+{{- end -}}
+{{- end -}}

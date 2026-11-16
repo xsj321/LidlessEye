@@ -162,6 +162,10 @@ export class DashboardStore {
 
   private requestId = 0;
   private histToken = 0;
+  /** Aborts the in-flight main query when the view or window changes. */
+  private queryAbort: AbortController | null = null;
+  /** Aborts the in-flight histogram query independently. */
+  private histAbort: AbortController | null = null;
   private autoTimer: ReturnType<typeof setInterval> | null = null;
   private lastDomain: Window | null = null;
   private readonly valueCache = new Map<string, Promise<FilterValues>>();
@@ -593,7 +597,24 @@ export class DashboardStore {
     this.commit({ banner });
   }
 
+  /** Cancel the previous query before starting a new one. */
+  private abortPrevious(signal: "query" | "hist"): AbortSignal {
+    if (signal === "query") {
+      this.queryAbort?.abort();
+      this.queryAbort = new AbortController();
+      return this.queryAbort.signal;
+    }
+    this.histAbort?.abort();
+    this.histAbort = new AbortController();
+    return this.histAbort.signal;
+  }
+
+  private static isAbort(err: unknown): boolean {
+    return err instanceof Error && err.name === "AbortError";
+  }
+
   private handleError(err: unknown) {
+    if (DashboardStore.isAbort(err)) return;
     if (err instanceof ApiError && err.status === 401) {
       this.setBanner({
         tone: "warning",
@@ -650,6 +671,9 @@ export class DashboardStore {
 
   async reload() {
     const id = ++this.requestId;
+    // A new query supersedes the previous one: cancel it in the browser so the
+    // connection is freed and the server can interrupt its DuckDB scan.
+    const signal = this.abortPrevious("query");
     const params = this.queryParams();
     this.commit({ banner: null, loading: true, empty: null });
 
@@ -658,9 +682,9 @@ export class DashboardStore {
 
       if (view === "overview") {
         const [stats, types, series] = await Promise.all([
-          api.stats(),
-          api.profileTypes(params),
-          api.series(params),
+          api.stats(signal),
+          api.profileTypes(params, signal),
+          api.series(params, signal),
         ]);
         if (id !== this.requestId) return;
         this.commit({
@@ -673,7 +697,7 @@ export class DashboardStore {
         const result = await api.flamegraph({
           ...params,
           max_nodes: settingsStore.getSnapshot().flamegraphMaxNodes,
-        });
+        }, signal);
         if (id !== this.requestId) return;
         if (!result.total) {
           this.commit({ flamegraph: null, empty: this.emptyFlamegraph() });
@@ -687,7 +711,7 @@ export class DashboardStore {
         const result = await api.diff({
           ...this.diffParams(),
           max_nodes: settingsStore.getSnapshot().flamegraphMaxNodes,
-        });
+        }, signal);
         if (id !== this.requestId) return;
         if (!result.total_left && !result.total_right) {
           this.commit({
@@ -704,7 +728,7 @@ export class DashboardStore {
       }
 
       if (view === "top") {
-        const result = await api.top(params);
+        const result = await api.top(params, signal);
         if (id !== this.requestId) return;
         if (!result.items.length) {
           this.commit({
@@ -721,16 +745,16 @@ export class DashboardStore {
       }
 
       if (view === "timeseries") {
-        const unit = await this.unitFor(this.state.type, params);
+        const unit = await this.unitFor(this.state.type, params, signal);
         if (id !== this.requestId) return;
-        const result = await api.timeseries(params);
+        const result = await api.timeseries(params, signal);
         if (id !== this.requestId) return;
         this.commit({ series: result, unit });
         return;
       }
 
       if (view === "labels") {
-        await this.loadLabels(id, params);
+        await this.loadLabels(id, params, signal);
         return;
       }
 
@@ -739,7 +763,7 @@ export class DashboardStore {
         // server, and the selector would only make the map lie about its
         // completeness. Only the window is sent.
         const win = this.resolveWindow();
-        const result = await api.serviceMap({ from: iso(win.from), until: iso(win.until) });
+        const result = await api.serviceMap({ from: iso(win.from), until: iso(win.until) }, signal);
         if (id !== this.requestId) return;
         if (!result.nodes?.length && !result.edges?.length) {
           this.commit({
@@ -772,9 +796,9 @@ export class DashboardStore {
     };
   }
 
-  private async unitFor(type: string, params: Record<string, string>) {
+  private async unitFor(type: string, params: Record<string, string>, signal?: AbortSignal) {
     try {
-      const types = await api.profileTypes(params);
+      const types = await api.profileTypes(params, signal);
       const match = (types.profile_types ?? []).find((row) => row.name === type);
       return match?.unit ?? "nanoseconds";
     } catch {
@@ -782,8 +806,8 @@ export class DashboardStore {
     }
   }
 
-  private async loadLabels(id: number, params: Record<string, string>) {
-    const names = await api.labelNames(params);
+  private async loadLabels(id: number, params: Record<string, string>, signal?: AbortSignal) {
+    const names = await api.labelNames(params, signal);
     if (id !== this.requestId) return;
     const list = names.label_names ?? [];
     const active =
@@ -792,7 +816,7 @@ export class DashboardStore {
         : (list.find((name) => name !== "service_name") ?? list[0] ?? null);
     this.commit({ explorerNames: list, activeLabel: active, explorerValues: [] });
     if (!active) return;
-    const values = await api.labelValues(active, params);
+    const values = await api.labelValues(active, params, signal);
     if (id !== this.requestId) return;
     this.commit({ explorerValues: values.values ?? [] });
   }
@@ -817,6 +841,7 @@ export class DashboardStore {
   /** Refresh the histogram over the domain; single-flighted. */
   async loadHistogram() {
     const token = ++this.histToken;
+    const signal = this.abortPrevious("hist");
     const domain = this.resolveDomain();
     const buckets = settingsStore.getSnapshot().histogramBuckets;
 
@@ -830,7 +855,7 @@ export class DashboardStore {
           from: iso(domain.from),
           until: iso(domain.until),
           buckets,
-        });
+        }, signal);
         if (token !== this.histToken) return;
         const points = payload.connections ?? [];
         const data: TimeseriesPayload = {
@@ -856,7 +881,7 @@ export class DashboardStore {
     };
     if (selector) params.selector = selector;
     try {
-      const payload = await api.timeseries(params);
+      const payload = await api.timeseries(params, signal);
       if (token !== this.histToken) return;
       const empty = (payload.series ?? []).every((series) =>
         (series.points ?? []).every((point) => !point),

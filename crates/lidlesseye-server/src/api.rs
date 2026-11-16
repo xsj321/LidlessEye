@@ -220,9 +220,10 @@ pub async fn flamegraph(
         return Ok(Json(Flamegraph::empty(profile_type.unit())).into_response());
     };
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || lidlesseye_core::flamegraph(&store, &opts))
+    let result = state
+        .query_guard(store.clone())
+        .run(move || lidlesseye_core::flamegraph(&store, &opts))
         .await
-        .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
 
@@ -283,9 +284,10 @@ pub async fn diff(
         .into_response());
     };
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || lidlesseye_core::diff(&store, &opts))
+    let result = state
+        .query_guard(store.clone())
+        .run(move || lidlesseye_core::diff(&store, &opts))
         .await
-        .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
     Ok(Json(result).into_response())
@@ -316,9 +318,10 @@ pub async fn top(
         .into_response());
     };
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || lidlesseye_core::top(&store, &opts, limit))
+    let result = state
+        .query_guard(store.clone())
+        .run(move || lidlesseye_core::top(&store, &opts, limit))
         .await
-        .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
     let TopResult { items, total_value } = result;
@@ -368,9 +371,10 @@ pub async fn timeseries(
         .into_response());
     };
     let started = Instant::now();
-    let series = tokio::task::spawn_blocking(move || lidlesseye_core::timeseries(&store, &opts))
+    let series = state
+        .query_guard(store.clone())
+        .run(move || lidlesseye_core::timeseries(&store, &opts))
         .await
-        .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
     Ok(Json(series).into_response())
@@ -663,9 +667,10 @@ pub async fn servicemap(
         }));
     };
     let started = Instant::now();
-    let map = tokio::task::spawn_blocking(move || lidlesseye_core::servicemap(&store, from, until))
+    let map = state
+        .query_guard(store.clone())
+        .run(move || lidlesseye_core::servicemap(&store, from, until))
         .await
-        .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
         .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
     Ok(Json(map))
@@ -701,12 +706,11 @@ pub async fn servicemap_history(
         }));
     };
     let started = Instant::now();
-    let history = tokio::task::spawn_blocking(move || {
-        lidlesseye_core::servicemap_history(&store, &node, from, until, step_ns)
-    })
-    .await
-    .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
-    .map_err(ApiError::from)?;
+    let history = state
+        .query_guard(store.clone())
+        .run(move || lidlesseye_core::servicemap_history(&store, &node, from, until, step_ns))
+        .await
+        .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
     Ok(Json(history))
 }
@@ -736,12 +740,11 @@ pub async fn servicemap_histogram(
         }));
     };
     let started = Instant::now();
-    let histogram = tokio::task::spawn_blocking(move || {
-        lidlesseye_core::servicemap_histogram(&store, from, until, buckets)
-    })
-    .await
-    .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
-    .map_err(ApiError::from)?;
+    let histogram = state
+        .query_guard(store.clone())
+        .run(move || lidlesseye_core::servicemap_histogram(&store, from, until, buckets))
+        .await
+        .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
     Ok(Json(histogram))
 }

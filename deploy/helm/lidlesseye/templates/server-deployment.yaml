@@ -49,6 +49,16 @@ spec:
             {{- end }}
             - --tenant-header={{ .Values.server.tenants.header }}
             - --max-tenants={{ .Values.server.tenants.maxTenants }}
+            - --storage-mode={{ .Values.server.storage.mode }}
+            {{- if eq .Values.server.storage.mode "parquet" }}
+            - --s3-bucket={{ .Values.server.storage.s3.bucket }}
+            - --s3-prefix={{ .Values.server.storage.s3.prefix }}
+            - --s3-endpoint={{ .Values.server.storage.s3.endpoint }}
+            - --s3-region={{ .Values.server.storage.s3.region }}
+            - --s3-url-style={{ .Values.server.storage.s3.urlStyle }}
+            - --s3-use-ssl={{ .Values.server.storage.s3.useSSL }}
+            - --parquet-local-ttl={{ .Values.server.storage.localTTL }}
+            {{- end }}
             {{- range .Values.server.tenants.allowed }}
             - --allowed-tenant={{ . }}
             {{- end }}
@@ -70,6 +80,18 @@ spec:
               value: /var/lib/lidlesseye
             - name: LIDLESSEYE_LISTEN
               value: 0.0.0.0:{{ .Values.server.service.port }}
+            {{- if eq .Values.server.storage.mode "parquet" }}
+            - name: LIDLESSEYE_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lidlesseye.s3SecretName" . }}
+                  key: access-key
+            - name: LIDLESSEYE_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lidlesseye.s3SecretName" . }}
+                  key: secret-key
+            {{- end }}
             {{- if .Values.server.profiling.enabled }}
             - name: LIDLESSEYE_NODE_NAME
               valueFrom:
