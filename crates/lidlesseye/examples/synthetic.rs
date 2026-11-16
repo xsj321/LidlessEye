@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "stored {} batches in {}",
-        store.stats().segment_count,
+        store.stats().batch_count,
         dir.display()
     );
 

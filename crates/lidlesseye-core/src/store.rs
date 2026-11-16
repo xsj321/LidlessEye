@@ -1,10 +1,9 @@
 //! Storage backed by DuckDB 2.0.
 //!
-//! The earlier implementation wrote immutable `.leseg` files and maintained its
-//! own header layout, frame dictionary, CRC32 checksums and crash-safe rename.
-//! That is a storage engine, and it had to be re-verified whenever any of it
-//! changed. DuckDB now owns that job: transactional writes, compression, zone
-//! maps, checkpointing and recovery are its problem.
+//! There is no storage engine of our own here, on purpose: transactional
+//! writes, compression, zone maps, checkpointing and recovery are DuckDB's
+//! problem, and each one of them was a thing that had to be re-proved whenever
+//! it changed.
 //!
 //! What is left on our side is the part that is actually specific to
 //! profiling — a small schema:
@@ -85,9 +84,8 @@ impl StoreConfig {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct StoreStats {
-    /// Number of ingested batches. Named `segment_count` for the `/metrics`
-    /// contract; one batch is what used to be one segment file.
-    pub segment_count: usize,
+    /// Number of ingested batches, i.e. rows in `batches`.
+    pub batch_count: usize,
     /// Physical size of the database file.
     pub total_bytes: u64,
     /// Size the retained batches are estimated to occupy. This is what the
@@ -102,11 +100,11 @@ pub struct StoreStats {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PruneStats {
-    pub removed_segments: usize,
+    pub removed_batches: usize,
     pub removed_bytes: u64,
 }
 
-/// One ingested batch: the unit that used to be a segment file.
+/// One ingested batch: one accepted report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchMeta {
     pub batch_id: u64,
@@ -143,7 +141,7 @@ pub struct SeriesInfo {
     pub profile_type: String,
     pub labels: BTreeMap<String, String>,
     pub total_value: u64,
-    pub segment_count: usize,
+    pub batch_count: usize,
     pub start_ns: u64,
     pub end_ns: u64,
 }
@@ -294,39 +292,7 @@ impl Store {
             frame_cache: Mutex::new(HashMap::new()),
             ids: Mutex::new(ids),
         };
-        store.warn_about_legacy_segments();
         Ok(store)
-    }
-
-    /// `.leseg` files from a pre-DuckDB deployment cannot be read any more.
-    /// Saying so once is better than silently reporting an empty dashboard.
-    fn warn_about_legacy_segments(&self) {
-        let mut found = 0usize;
-        if let Ok(types) = std::fs::read_dir(&self.cfg.root) {
-            for entry in types.flatten() {
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                if let Ok(services) = std::fs::read_dir(entry.path()) {
-                    for service in services.flatten() {
-                        if let Ok(files) = std::fs::read_dir(service.path()) {
-                            found += files
-                                .flatten()
-                                .filter(|f| f.path().to_string_lossy().ends_with(".leseg"))
-                                .count();
-                        }
-                    }
-                }
-            }
-        }
-        if found > 0 {
-            warn!(
-                count = found,
-                root = %self.cfg.root.display(),
-                "found `.leseg` segments from an older version; they are not read by the \
-                 DuckDB store — re-ingest the data or keep the old binary for it"
-            );
-        }
     }
 
     pub fn config(&self) -> &StoreConfig {
@@ -344,8 +310,7 @@ impl Store {
 
     /// Kept for API compatibility; the schema is created on open.
     pub fn reload(&self) -> Result<usize> {
-        self.warn_about_legacy_segments();
-        Ok(self.stats().segment_count)
+        Ok(self.stats().batch_count)
     }
 
     /// Every batch, oldest first.
@@ -818,7 +783,7 @@ impl Store {
             }
         };
         StoreStats {
-            segment_count: count.max(0) as usize,
+            batch_count: count.max(0) as usize,
             total_bytes: self.disk_bytes(),
             logical_bytes: logical.max(0) as u64,
             total_value: value.max(0) as u64,
@@ -878,7 +843,7 @@ impl Store {
             out.push(SeriesInfo {
                 profile_type: row.get(1).map_err(db_err)?,
                 total_value: row.get::<_, i64>(3).map_err(db_err)?.max(0) as u64,
-                segment_count: row.get::<_, i64>(4).map_err(db_err)?.max(0) as usize,
+                batch_count: row.get::<_, i64>(4).map_err(db_err)?.max(0) as usize,
                 start_ns: row.get::<_, i64>(5).map_err(db_err)?.max(0) as u64,
                 end_ns: row.get::<_, i64>(6).map_err(db_err)?.max(0) as u64,
                 service_name,
@@ -987,7 +952,7 @@ impl Store {
                     params![ts(cutoff)],
                 )
                 .map_err(db_err)?;
-                stats.removed_segments += removed.max(0) as usize;
+                stats.removed_batches += removed.max(0) as usize;
             }
 
             if let Some(limit) = self.cfg.max_disk_bytes {
@@ -1019,7 +984,7 @@ impl Store {
                         .map_err(db_err)?;
                     conn.execute("DELETE FROM batches WHERE batch_id = ?", params![batch_id])
                         .map_err(db_err)?;
-                    stats.removed_segments += 1;
+                    stats.removed_batches += 1;
                 }
             }
 
@@ -1096,10 +1061,9 @@ impl Store {
 
     /// Remove rows that break the schema's referential invariants.
     ///
-    /// The file-backed store could fix corruption by deleting one bad segment
-    /// file. A tenant is a *single* database here, so deleting the file would
-    /// destroy the whole tenant — `--fix` has to be surgical instead. Returns
-    /// the number of rows removed.
+    /// A tenant is a *single* database, so a repair cannot throw the file away
+    /// the way a per-file store could: it would destroy the whole tenant.
+    /// Returns the number of rows removed.
     pub fn repair(&self) -> Result<usize> {
         let conn = self.conn.lock();
         let (broken, _) = self.dangling_stacks(&conn)?;
@@ -1877,7 +1841,7 @@ mod tests {
 
         // Reopening reads the same rows out of the database file.
         let store2 = Store::open(StoreConfig::new(&dir)).unwrap();
-        assert_eq!(store2.stats().segment_count, 3);
+        assert_eq!(store2.stats().batch_count, 3);
         assert_eq!(store2.stats().total_value, 3_000);
 
         std::fs::remove_dir_all(dir).unwrap();
@@ -2005,8 +1969,8 @@ mod tests {
         cfg.retention_ns = Some(hour + hour / 2);
         let store = Store::open(cfg).unwrap();
         let stats = store.prune(2 * hour).unwrap();
-        assert_eq!(stats.removed_segments, 1);
-        assert_eq!(store.stats().segment_count, 1);
+        assert_eq!(stats.removed_batches, 1);
+        assert_eq!(store.stats().batch_count, 1);
         drop(store);
 
         // The cap is measured on retained data, not on the file, which DuckDB
@@ -2017,10 +1981,10 @@ mod tests {
         store
             .append(&report("web", 3 * hour, "b", &["hot"], 10))
             .unwrap();
-        assert!(store.stats().segment_count >= 1);
+        assert!(store.stats().batch_count >= 1);
         store.prune(3 * hour).unwrap();
         assert_eq!(
-            store.stats().segment_count,
+            store.stats().batch_count,
             0,
             "everything exceeds a 1 byte cap"
         );
@@ -2045,7 +2009,7 @@ mod tests {
         let series = store.series(0, 10_000, &Selector::default());
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].service_name, "api");
-        assert_eq!(series[0].segment_count, 2);
+        assert_eq!(series[0].batch_count, 2);
         assert_eq!(series[0].total_value, 200);
 
         let pods = store.label_values("pod", 0, 10_000, &Selector::default());
@@ -2087,7 +2051,7 @@ mod tests {
             .unwrap();
         store.clear().unwrap();
         let stats = store.stats();
-        assert_eq!(stats.segment_count, 0);
+        assert_eq!(stats.batch_count, 0);
         assert_eq!(stats.total_value, 0);
         assert!(
             store
@@ -2106,15 +2070,15 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// `--fix` used to delete a corrupt segment file. With one database per
-    /// tenant that would delete everything, so it must drop only the bad rows.
+    /// `--fix` must drop the bad rows, not the file: there is one database per
+    /// tenant, and deleting it would delete everything.
     #[test]
     fn repair_removes_dangling_rows_and_keeps_good_batches() {
         let (store, dir) = temp_store("repair");
         store
             .append(&report("api", 1_000, "a", &["hot"], 10))
             .unwrap();
-        let before = store.stats().segment_count;
+        let before = store.stats().batch_count;
 
         {
             let conn = store.conn.lock();
@@ -2141,7 +2105,7 @@ mod tests {
             "expected at least two rows, removed {removed}"
         );
         assert!(store.fsck().iter().all(|(_, r)| r.is_ok()));
-        assert_eq!(store.stats().segment_count, before, "good batch survives");
+        assert_eq!(store.stats().batch_count, before, "good batch survives");
         assert!(store.path().is_file(), "database file survives");
 
         std::fs::remove_dir_all(dir).unwrap();

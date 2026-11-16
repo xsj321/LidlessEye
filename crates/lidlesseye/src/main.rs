@@ -674,9 +674,8 @@ fn fsck(args: FsckArgs) -> anyhow::Result<()> {
                 failures += 1;
                 eprintln!("FAIL [{tenant}] {}: {err}", path.display());
                 if args.fix {
-                    // A tenant is one database file. Deleting it — what the old
-                    // file-backed store did with a corrupt segment — would drop
-                    // all of the tenant's good data, so repair by removing the
+                    // A tenant is one database file. Deleting it would drop all
+                    // of the tenant's good data, so repair by removing the
                     // dangling rows instead.
                     match registry.tenant(tenant).map(|store| store.repair()) {
                         Some(Ok(rows)) => eprintln!("  removed {rows} dangling rows"),

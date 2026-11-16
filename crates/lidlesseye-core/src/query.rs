@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn flamegraph_merges_segments_and_filters_labels() {
+    fn flamegraph_merges_batches_and_filters_labels() {
         let (store, dir) = store_with_data("merge");
         let mut b = ReportBuilder::new("checkout", "cpu", 3_000, 4_000).label("pod", "p2");
         b.add_stack(
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn timeseries_distributes_segments() {
+    fn timeseries_distributes_batches() {
         let (store, dir) = store_with_data("ts");
         let ts = timeseries(
             &store,

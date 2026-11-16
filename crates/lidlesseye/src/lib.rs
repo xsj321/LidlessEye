@@ -4,10 +4,10 @@
 //!
 //! LidlessEye is the profiling backend you embed, not a service you deploy:
 //! it starts an HTTP server, ingests profiles over HTTP **or** through a plain
-//! Rust call, stores them in an immutable columnar format and serves
-//! flamegraphs. The eBPF collector ships in the same crate, so a single
-//! `LidlessEye::builder()` gives you "profile this process and show me the
-//! flamegraph" with no external infrastructure.
+//! Rust call, stores them in DuckDB and serves flamegraphs. The eBPF collector
+//! ships in the same crate, so a single `LidlessEye::builder()` gives you
+//! "profile this process and show me the flamegraph" with no external
+//! infrastructure.
 //!
 //! ## Embedded: profile yourself
 //!
@@ -533,7 +533,7 @@ impl LidlessEye {
     }
 
     /// Ingest a report directly, without an HTTP round trip.
-    pub async fn ingest(&self, report: Report) -> Result<Arc<SegmentMeta>> {
+    pub async fn ingest(&self, report: Report) -> Result<Arc<BatchMeta>> {
         self.http
             .ingest_for(&self.tenant, report)
             .await
@@ -541,7 +541,7 @@ impl LidlessEye {
     }
 
     /// Ingest a batch of reports.
-    pub async fn ingest_many(&self, reports: Vec<Report>) -> Result<Vec<Arc<SegmentMeta>>> {
+    pub async fn ingest_many(&self, reports: Vec<Report>) -> Result<Vec<Arc<BatchMeta>>> {
         self.http
             .ingest_many(&self.tenant, reports)
             .await
@@ -569,7 +569,7 @@ impl LidlessEye {
     }
 }
 
-pub use lidlesseye_core::SegmentMeta;
+pub use lidlesseye_core::BatchMeta;
 
 /// A spawned instance. Dropping it stops the HTTP server and the collector.
 pub struct RunningInstance {

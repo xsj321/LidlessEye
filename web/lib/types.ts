@@ -168,7 +168,7 @@ export interface MapHistoryPayload {
 export interface ProfileType {  name: string;
   unit: string;
   total_value: number;
-  segment_count: number;
+  batch_count: number;
   virtual?: boolean;
 }
 
@@ -181,7 +181,7 @@ export interface SeriesRow {
   profile_type: string;
   labels?: Record<string, string>;
   total_value: number;
-  segment_count: number;
+  batch_count: number;
   start_ns: number;
   end_ns: number;
 }
@@ -198,7 +198,7 @@ export interface StatsPayload {
   ingest_reports?: number;
   queries?: number;
   store?: {
-    segment_count?: number;
+    batch_count?: number;
     total_bytes?: number;
     earliest_ns?: number;
     latest_ns?: number;

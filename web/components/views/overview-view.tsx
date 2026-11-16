@@ -42,7 +42,7 @@ export function OverviewView() {
       v: formatUptime(stats.uptime_seconds ?? 0),
       s: `version ${stats.version ?? "?"}`,
     },
-    { k: "Batches", v: formatCount(store.segment_count ?? 0), s: formatBytes(store.total_bytes ?? 0) },
+    { k: "Batches", v: formatCount(store.batch_count ?? 0), s: formatBytes(store.total_bytes ?? 0) },
     {
       k: "Series",
       v: formatCount(stats.series ?? 0),
@@ -97,7 +97,7 @@ export function OverviewView() {
                   {formatValue(type.total_value, type.unit)}
                 </div>
                 <div className="mt-0.5 text-[11px] text-muted-foreground">
-                  {type.segment_count} batches · {type.unit}
+                  {type.batch_count} batches · {type.unit}
                 </div>
               </CardContent>
             </Card>
@@ -136,7 +136,7 @@ export function OverviewView() {
                   {formatCount(row.total_value)}
                 </TableCell>
                 <TableCell className="text-right font-mono text-xs">
-                  {formatCount(row.segment_count)}
+                  {formatCount(row.batch_count)}
                 </TableCell>
                 <TableCell className="text-[11px] whitespace-nowrap text-muted-foreground">
                   {formatTimestamp(row.start_ns)} → {formatTimestamp(row.end_ns)}

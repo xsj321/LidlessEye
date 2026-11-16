@@ -146,7 +146,7 @@ async fn ingest_then_query_roundtrip() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["accepted"], 1);
-    assert_eq!(body["segments"], 1);
+    assert_eq!(body["batches"], 1);
     assert_eq!(body["samples"], 2);
     assert_eq!(body["tenant"], "default");
 
@@ -457,7 +457,7 @@ async fn metrics_use_the_prometheus_exposition_format() {
         "# TYPE lidlesseye_ingest_reports_total counter",
         "lidlesseye_ingest_reports_total 1",
         "lidlesseye_queries_total 1",
-        "lidlesseye_segments 1",
+        "lidlesseye_batches 1",
         "lidlesseye_tenants 1",
         "lidlesseye_query_duration_seconds_total",
     ] {
@@ -466,7 +466,7 @@ async fn metrics_use_the_prometheus_exposition_format() {
 }
 
 #[tokio::test]
-async fn time_series_buckets_a_segment_across_its_window() {
+async fn time_series_buckets_a_batch_across_its_window() {
     let dir = tempfile::tempdir().unwrap();
     let app = router(dir.path()).await;
 
@@ -557,10 +557,10 @@ async fn ingest_accepts_a_batch_and_reports_counts() {
     let (status, body) = call(&app, "POST", "/ingest", Some(payload), &[]).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["accepted"], 2);
-    assert_eq!(body["segments"], 2);
+    assert_eq!(body["batches"], 2);
 
     let (_, stats) = call(&app, "GET", "/api/v1/stats", None, &[]).await;
-    assert_eq!(stats["store"]["segment_count"], 2);
+    assert_eq!(stats["store"]["batch_count"], 2);
     assert_eq!(stats["series"], 2);
     assert_eq!(stats["ingest_reports"], 2);
 
@@ -611,7 +611,7 @@ async fn tenants_are_isolated_over_http() {
     assert_eq!(series["series"].as_array().unwrap().len(), 1);
     let (_, stats) = call_as(&app, "GET", "/api/v1/stats", None, "acme").await;
     assert_eq!(stats["tenant"], "acme");
-    assert_eq!(stats["store"]["segment_count"], 1);
+    assert_eq!(stats["store"]["batch_count"], 1);
     assert_eq!(stats["tenants"], 2);
 }
 
@@ -1096,5 +1096,5 @@ async fn tenants_endpoint_lists_every_tenant() {
     assert_eq!(list.len(), 2);
     let ids: Vec<&str> = list.iter().map(|t| t["id"].as_str().unwrap()).collect();
     assert_eq!(ids, vec!["acme", "beta"]);
-    assert_eq!(list[1]["stats"]["segment_count"], 1);
+    assert_eq!(list[1]["stats"]["batch_count"], 1);
 }

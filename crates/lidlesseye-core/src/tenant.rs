@@ -243,7 +243,7 @@ impl TenantStore {
         };
         let store = Arc::new(Store::open(cfg)?);
         stores.insert(tenant.clone(), store.clone());
-        debug!(tenant = %tenant, batches = store.stats().segment_count, "tenant opened");
+        debug!(tenant = %tenant, batches = store.stats().batch_count, "tenant opened");
         Ok(store)
     }
 
@@ -305,7 +305,7 @@ impl TenantStore {
         for id in self.tenant_ids() {
             if let Some(store) = self.tenant(&id) {
                 let stats = store.stats();
-                total.segment_count += stats.segment_count;
+                total.batch_count += stats.batch_count;
                 total.total_bytes += stats.total_bytes;
                 total.logical_bytes += stats.logical_bytes;
                 total.total_value += stats.total_value;
@@ -330,7 +330,7 @@ impl TenantStore {
                 continue;
             };
             match store.prune(now_ns) {
-                Ok(stats) if stats.removed_segments > 0 => {
+                Ok(stats) if stats.removed_batches > 0 => {
                     out.insert(id, stats);
                 }
                 Ok(_) => {}
@@ -511,8 +511,8 @@ mod tests {
             .append(&report("api", 2_000))
             .unwrap();
 
-        assert_eq!(registry.tenant(&acme).unwrap().stats().segment_count, 1);
-        assert_eq!(registry.tenant(&beta).unwrap().stats().segment_count, 2);
+        assert_eq!(registry.tenant(&acme).unwrap().stats().batch_count, 1);
+        assert_eq!(registry.tenant(&beta).unwrap().stats().batch_count, 2);
 
         let fg = crate::flamegraph(
             &registry.tenant(&acme).unwrap(),
@@ -553,7 +553,7 @@ mod tests {
         let registry = TenantStore::open(&dir, StoreConfig::new(&dir)).unwrap();
         let default = TenantId::default_tenant();
         let store = registry.tenant(&default).unwrap();
-        assert_eq!(store.stats().segment_count, 1);
+        assert_eq!(store.stats().batch_count, 1);
         assert_eq!(
             store
                 .select(&ProfileType::cpu(), 0, 10_000, &Selector::default())
@@ -566,7 +566,7 @@ mod tests {
         // Re-opening is idempotent.
         drop(registry);
         let registry = TenantStore::open(&dir, StoreConfig::new(&dir)).unwrap();
-        assert_eq!(registry.tenant(&default).unwrap().stats().segment_count, 1);
+        assert_eq!(registry.tenant(&default).unwrap().stats().batch_count, 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

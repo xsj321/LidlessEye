@@ -16,8 +16,8 @@ pub struct Metrics {
     pub queries: AtomicU64,
     pub query_nanos: AtomicU64,
     pub query_errors: AtomicU64,
-    pub segments_written: AtomicU64,
-    pub pruned_segments: AtomicU64,
+    pub batches_written: AtomicU64,
+    pub batches_pruned: AtomicU64,
 }
 
 impl Metrics {
@@ -70,14 +70,14 @@ impl Metrics {
                 self.query_errors.load(Ordering::Relaxed),
             ),
             counter(
-                "lidlesseye_segments_written_total",
+                "lidlesseye_batches_written_total",
                 "Ingest batches persisted (metric name kept for compatibility).",
-                self.segments_written.load(Ordering::Relaxed),
+                self.batches_written.load(Ordering::Relaxed),
             ),
             counter(
-                "lidlesseye_segments_pruned_total",
+                "lidlesseye_batches_pruned_total",
                 "Ingest batches dropped by retention or eviction.",
-                self.pruned_segments.load(Ordering::Relaxed),
+                self.batches_pruned.load(Ordering::Relaxed),
             ),
         ];
         for (name, help, value) in counters {

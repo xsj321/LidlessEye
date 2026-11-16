@@ -151,19 +151,18 @@ pub async fn ingest(
         .ingest_bytes
         .fetch_add(body.len() as u64, Ordering::Relaxed);
 
-    // One accepted batch used to be one file; the id is what identifies it now.
-    let segments: Vec<String> = metas
+    let batch_ids: Vec<String> = metas
         .iter()
         .map(|m| format!("batch-{}", m.batch_id))
         .collect();
     Ok(Json(json!({
         "accepted": count,
-        "segments": segments.len(),
+        "batches": batch_ids.len(),
         "samples": samples,
         "bytes": body.len(),
         "format": format,
         "tenant": caller.tenant.to_string(),
-        "files": segments,
+        "ids": batch_ids,
     }))
     .into_response())
 }
@@ -452,18 +451,18 @@ pub async fn profile_types(
         for row in store.series(from, until, &selector) {
             let entry = totals.entry(row.profile_type.clone()).or_insert((0, 0));
             entry.0 += row.total_value;
-            entry.1 += row.segment_count;
+            entry.1 += row.batch_count;
         }
     }
     let mut out: Vec<Value> = totals
         .iter()
-        .map(|(name, (total, segments))| {
+        .map(|(name, (total, batches))| {
             let profile_type = ProfileType::new(name.clone());
             json!({
                 "name": name,
                 "unit": profile_type.unit().as_str(),
                 "total_value": total,
-                "segment_count": segments,
+                "batch_count": batches,
             })
         })
         .collect();
@@ -477,7 +476,7 @@ pub async fn profile_types(
             "name": ProfileType::WALL,
             "unit": Unit::Nanoseconds.as_str(),
             "total_value": sum(ProfileType::CPU) + sum(ProfileType::OFF_CPU) + sum(ProfileType::WALL),
-            "segment_count": totals.values().map(|value| value.1).sum::<usize>(),
+            "batch_count": totals.values().map(|value| value.1).sum::<usize>(),
             "virtual": true,
         }));
     }
@@ -579,7 +578,7 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     let ids = registry.tenant_ids();
     let store = registry.total_stats();
     let extra = vec![
-        ("lidlesseye_segments", store.segment_count.to_string()),
+        ("lidlesseye_batches", store.batch_count.to_string()),
         ("lidlesseye_storage_bytes", store.total_bytes.to_string()),
         ("lidlesseye_stored_value", store.total_value.to_string()),
         ("lidlesseye_tenants", ids.len().to_string()),

@@ -55,6 +55,3 @@ pub use store::{
 };
 pub use tenant::{MAX_TENANT_LEN, TenantId, TenantInfo, TenantLimits, TenantStore};
 pub use time::{now_ns, parse_duration_ns};
-
-/// Compatibility alias: one batch is what used to be one `.leseg` segment.
-pub type SegmentMeta = BatchMeta;

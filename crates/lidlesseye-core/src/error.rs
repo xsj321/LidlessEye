@@ -15,19 +15,11 @@ pub enum Error {
     InvalidReport(String),
 
     /// A database whose rows violate the schema's own invariants.
-    /// The variant name is kept for source compatibility with the file-backed
-    /// store; the message describes what is actually wrong now.
     #[error("inconsistent database {path}: {reason}")]
-    CorruptSegment { path: PathBuf, reason: String },
+    CorruptDatabase { path: PathBuf, reason: String },
 
     #[error("database error: {0}")]
     Db(String),
-
-    #[error("unsupported segment version {version} in {path}")]
-    UnsupportedVersion { version: u32, path: PathBuf },
-
-    #[error("segment is too large ({size} bytes, limit is {limit})")]
-    SegmentTooLarge { size: u64, limit: u64 },
 
     #[error("selector parse error: {0}")]
     Selector(String),
@@ -53,7 +45,7 @@ pub enum Error {
 
 impl Error {
     pub(crate) fn corrupt(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
-        Error::CorruptSegment {
+        Error::CorruptDatabase {
             path: path.into(),
             reason: reason.into(),
         }

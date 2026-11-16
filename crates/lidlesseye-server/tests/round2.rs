@@ -318,7 +318,7 @@ async fn hostile_service_names_cannot_escape_the_directory() {
             }
         }
     }
-    assert!(!std::path::Path::new("/etc/passwd.leseg").exists());
+    assert!(!std::path::Path::new("/etc/passwd.duckdb").exists());
 }
 
 #[tokio::test]

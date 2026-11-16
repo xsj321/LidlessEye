@@ -144,16 +144,15 @@ Repeated `match[]=` parameters are ANDed, and `service_name=` /
 Response:
 
 ```json
-{ "accepted": 1, "segments": 1, "samples": 2, "bytes": 812, "format": "json",
+{ "accepted": 1, "batches": 1, "samples": 2, "bytes": 812, "format": "json",
   "tenant": "acme",
-  "files": ["batch-7"] }
+  "ids": ["batch-7"] }
 ```
 
-`segments` and `files` are kept for compatibility with the previous file-backed
-store: one accepted report is one row in `batches`, so `files` now contains the
-batch ids (`batch-<id>`) rather than filenames. The ids are also the primary key
-of the `batches` table and can be looked up with any DuckDB client. `bytes` is
-the size of the request body, not the space the batch occupies in the database.
+`batches` is how many rows were written to the `batches` table and `ids` names
+them (`batch-<id>`); the ids are also the primary key of that table and can be
+looked up with any DuckDB client. `bytes` is the size of the request body, not
+the space the batch occupies in the database.
 
 A batch is all-or-nothing: if any report is invalid, or a per-tenant limit would
 be exceeded, nothing is written and the response is `400` / `429`. That keeps a
@@ -280,7 +279,7 @@ Known `(service, profile_type, labels)` combinations in the range:
       "profile_type": "cpu",
       "labels": { "env": "prod" },
       "total_value": 2850000000,
-      "segment_count": 42,
+      "batch_count": 42,
       "start_ns": 1700000000000000000,
       "end_ns": 1700003600000000000
     }
@@ -304,9 +303,9 @@ there).
 ```json
 {
   "profile_types": [
-    { "name": "cpu", "unit": "nanoseconds", "total_value": 527638125, "segment_count": 34 },
-    { "name": "off_cpu", "unit": "nanoseconds", "total_value": 171054958510, "segment_count": 68 },
-    { "name": "wall", "unit": "nanoseconds", "total_value": 171582596635, "segment_count": 102, "virtual": true }
+    { "name": "cpu", "unit": "nanoseconds", "total_value": 527638125, "batch_count": 34 },
+    { "name": "off_cpu", "unit": "nanoseconds", "total_value": 171054958510, "batch_count": 68 },
+    { "name": "wall", "unit": "nanoseconds", "total_value": 171582596635, "batch_count": 102, "virtual": true }
   ]
 }
 ```
@@ -314,10 +313,9 @@ there).
 `wall` is offered whenever `cpu` or `off_cpu` data exists, and is flagged
 `"virtual": true`.
 
-`segment_count` appears in `/series`, `/profile_types`, `/stats`, `/tenants`
-and the `lidlesseye_segments*` metrics. The name is kept for compatibility with
-clients written against the earlier file-backed store; it now counts rows in
-`batches`, i.e. ingest batches, one per accepted report.
+`batch_count` appears in `/series`, `/profile_types`, `/stats`, `/tenants` and
+the `lidlesseye_batches*` metrics. It counts rows in `batches`, i.e. ingest
+batches, one per accepted report.
 
 ## `GET /api/v1/diff`
 
@@ -375,7 +373,7 @@ Administration endpoint. A tenant-scoped token only ever sees its own tenant.
     {
       "id": "acme",
       "series": 12,
-      "stats": { "segment_count": 480, "total_bytes": 8416712,
+      "stats": { "batch_count": 480, "total_bytes": 8416712,
                  "logical_bytes": 6093120, "total_value": 991233,
                  "earliest_ns": 1700000000000000000, "latest_ns": 1700003600000000000 },
       "limits": { "retention_ns": 604800000000000, "max_disk_bytes": null, "max_series": 5000 }
@@ -396,7 +394,7 @@ has been written to it.
   "version": "0.1.0",
   "tenant": "acme",
   "uptime_seconds": 812,
-  "store": { "segment_count": 480, "total_bytes": 8416712,
+  "store": { "batch_count": 480, "total_bytes": 8416712,
              "logical_bytes": 6093120, "total_value": 991233,
              "earliest_ns": 1700000000000000000, "latest_ns": 1700003600000000000 },
   "series": 12,
@@ -443,21 +441,21 @@ lidlesseye_ingest_errors_total
 lidlesseye_queries_total
 lidlesseye_query_duration_seconds_total
 lidlesseye_query_errors_total
-lidlesseye_segments_written_total
-lidlesseye_segments_pruned_total
+lidlesseye_batches_written_total
+lidlesseye_batches_pruned_total
 lidlesseye_uptime_seconds
-lidlesseye_segments            (gauge)
+lidlesseye_batches             (gauge)
 lidlesseye_storage_bytes       (gauge)
 lidlesseye_stored_value        (gauge)
 lidlesseye_tenants             (gauge)
 ```
 
-The `lidlesseye_segments*` series are named for the previous file-backed store;
-they count ingest batches (rows in `batches`). `lidlesseye_storage_bytes` is the
-physical size of all tenant database files combined. There is deliberately no
-`segment`-per-tenant label: metrics are tenant-agnostic, a label carrying
-`X-Scope-OrgID` would let any scraper enumerate customers. Per-tenant numbers
-are available from `/api/v1/tenants` to an operator holding the right token.
+The `lidlesseye_batches*` series count ingest batches (rows in `batches`).
+`lidlesseye_storage_bytes` is the physical size of all tenant database files
+combined. There is deliberately no per-tenant label: metrics are
+tenant-agnostic, a label carrying `X-Scope-OrgID` would let any scraper
+enumerate customers. Per-tenant numbers are available from `/api/v1/tenants` to
+an operator holding the right token.
 
 ## Compression and limits
 

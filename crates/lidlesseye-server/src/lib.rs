@@ -39,7 +39,7 @@ use tracing::{info, warn};
 
 use lidlesseye_core::model::Report;
 use lidlesseye_core::store::{StoreConfig, StoreStats};
-use lidlesseye_core::{SegmentMeta, Store, TenantId, TenantStore};
+use lidlesseye_core::{BatchMeta, Store, TenantId, TenantStore};
 
 pub use config::ServerConfig;
 pub use error::ApiError;
@@ -243,7 +243,7 @@ impl AppState {
         &self,
         tenant: &TenantId,
         reports: Vec<Report>,
-    ) -> Result<Vec<Arc<SegmentMeta>>, ApiError> {
+    ) -> Result<Vec<Arc<BatchMeta>>, ApiError> {
         if self.inner.cfg.read_only {
             return Err(ApiError::forbidden("server is read-only"));
         }
@@ -295,7 +295,7 @@ impl AppState {
             .fetch_add(samples, Ordering::Relaxed);
         self.inner
             .metrics
-            .segments_written
+            .batches_written
             .fetch_add(metas.len() as u64, Ordering::Relaxed);
         if !errors.is_empty() {
             self.inner
@@ -406,7 +406,7 @@ impl LidlessEye {
             addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             data_dir = %cfg.data_dir.display(),
             tenants = registry.tenant_ids().len(),
-            batches = stats.segment_count,
+            batches = stats.batch_count,
             bytes = stats.total_bytes,
             "store opened"
         );
@@ -476,7 +476,7 @@ impl LidlessEye {
     }
 
     /// Persist a report for the default tenant, bypassing HTTP.
-    pub async fn ingest(&self, report: Report) -> Result<Arc<SegmentMeta>, ApiError> {
+    pub async fn ingest(&self, report: Report) -> Result<Arc<BatchMeta>, ApiError> {
         self.ingest_for(&TenantId::default_tenant(), report).await
     }
 
@@ -485,7 +485,7 @@ impl LidlessEye {
         &self,
         tenant: &TenantId,
         report: Report,
-    ) -> Result<Arc<SegmentMeta>, ApiError> {
+    ) -> Result<Arc<BatchMeta>, ApiError> {
         self.ingest_many(tenant, vec![report])
             .await?
             .into_iter()
@@ -498,7 +498,7 @@ impl LidlessEye {
         &self,
         tenant: &TenantId,
         reports: Vec<Report>,
-    ) -> Result<Vec<Arc<SegmentMeta>>, ApiError> {
+    ) -> Result<Vec<Arc<BatchMeta>>, ApiError> {
         self.state.ingest_many(tenant, reports).await
     }
 
@@ -530,11 +530,11 @@ impl LidlessEye {
                         Ok(per_tenant) if !per_tenant.is_empty() => {
                             for (tenant, stats) in per_tenant {
                                 metrics
-                                    .pruned_segments
-                                    .fetch_add(stats.removed_segments as u64, Ordering::Relaxed);
+                                    .batches_pruned
+                                    .fetch_add(stats.removed_batches as u64, Ordering::Relaxed);
                                 info!(
                                     tenant = %tenant,
-                                    batches = stats.removed_segments,
+                                    batches = stats.removed_batches,
                                     bytes = stats.removed_bytes,
                                     "pruned old batches"
                                 );

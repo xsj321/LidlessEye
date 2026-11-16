@@ -50,8 +50,7 @@ impl From<CoreError> for ApiError {
             | CoreError::Selector(_)
             | CoreError::InvalidRange { .. }
             | CoreError::InvalidTenant(_)
-            | CoreError::Malformed(_)
-            | CoreError::SegmentTooLarge { .. } => StatusCode::BAD_REQUEST,
+            | CoreError::Malformed(_) => StatusCode::BAD_REQUEST,
             // A limit is a temporary state the caller can fix by dropping data
             // or asking an operator to raise it: 429, not 500.
             CoreError::LimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,

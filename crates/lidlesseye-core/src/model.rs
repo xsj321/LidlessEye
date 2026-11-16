@@ -196,7 +196,7 @@ impl Frame {
     }
 
     /// Stable key used to merge identical frames coming from different
-    /// segments. `addr` is deliberately excluded: with ASLR the same function
+    /// batches. `addr` is deliberately excluded: with ASLR the same function
     /// has a different address in every process.
     pub fn key(&self) -> (&str, &str, &str, u32) {
         (&self.module, &self.symbol, &self.file, self.line)

@@ -82,7 +82,7 @@ async fn ingest_throughput_holds_up() {
     )
     .await;
     let query = started.elapsed();
-    println!("flamegraph over 2000 segments: {query:?}");
+    println!("flamegraph over 2000 batches: {query:?}");
     assert_eq!(status, StatusCode::OK, "{fg}");
     assert!(fg["total"].as_u64().unwrap() > 0);
     assert!(
@@ -357,9 +357,9 @@ async fn pruning_while_ingesting_keeps_the_index_consistent() {
     // Nothing is older than the retention window, so pruning must not have
     // removed anything, and the index must still match the files on disk.
     assert_eq!(
-        store.stats().segment_count,
+        store.stats().batch_count,
         300,
-        "pruning dropped live segments"
+        "pruning dropped live batches"
     );
     assert!(store.fsck().iter().all(|(_, result)| result.is_ok()));
 
@@ -401,19 +401,19 @@ async fn retention_removes_only_expired_segments() {
         builder.add_stack(vec![Frame::new("/app", "work")], value);
         store.append(&builder.finish()).unwrap();
     }
-    assert_eq!(store.stats().segment_count, 4);
+    assert_eq!(store.stats().batch_count, 4);
 
     let pruned = registry.prune(now).unwrap();
-    let removed: usize = pruned.values().map(|stats| stats.removed_segments).sum();
+    let removed: usize = pruned.values().map(|stats| stats.removed_batches).sum();
     assert_eq!(removed, 2, "8 and 10 day old data must go");
-    assert_eq!(store.stats().segment_count, 2);
+    assert_eq!(store.stats().batch_count, 2);
 
     let fg = flamegraph(
         &store,
         &QueryOptions::new("cpu", 0, u64::MAX, Selector::default()),
     )
     .unwrap();
-    assert_eq!(fg.total, 3_000 + 4_000, "the wrong segments survived");
+    assert_eq!(fg.total, 3_000 + 4_000, "the wrong batches survived");
 
     // Pruning again is a no-op.
     assert!(
@@ -431,7 +431,7 @@ async fn the_disk_cap_evicts_oldest_first() {
         let registry = TenantStore::open(dir.path(), StoreConfig::new(dir.path())).unwrap();
         let tenant = TenantId::parse("acme").unwrap();
         let store = registry.open_tenant(&tenant).unwrap();
-        // 20 segments, one per minute, growing in size.
+        // 20 batches, one per minute, growing in size.
         for i in 0..20u64 {
             let end = now - (20 - i) * 60_000_000_000;
             let mut builder = ReportBuilder::new("svc", ProfileType::cpu(), end - 1_000_000, end);
@@ -446,7 +446,7 @@ async fn the_disk_cap_evicts_oldest_first() {
             }
             store.append(&builder.finish()).unwrap();
         }
-        assert_eq!(store.stats().segment_count, 20);
+        assert_eq!(store.stats().batch_count, 20);
         // The cap is applied by the store that opens the directory, so record
         // what a fresh process would see.
         let before = store.stats();
@@ -484,7 +484,7 @@ async fn the_disk_cap_evicts_oldest_first() {
     let store = registry.open_tenant(&tenant).unwrap();
 
     let pruned = registry.prune(now).unwrap();
-    let removed: usize = pruned.values().map(|stats| stats.removed_segments).sum();
+    let removed: usize = pruned.values().map(|stats| stats.removed_batches).sum();
     assert!(removed > 0, "the cap evicted nothing");
     let after = store.stats();
     assert!(
@@ -493,16 +493,16 @@ async fn the_disk_cap_evicts_oldest_first() {
         after.logical_bytes
     );
 
-    // Eviction removes the oldest segments, so the newest one survives.
+    // Eviction removes the oldest batches, so the newest one survives.
     let rows = store.series(0, u64::MAX, &Selector::default());
     let earliest = rows.iter().map(|r| r.start_ns).min().unwrap();
     assert!(
         earliest >= now - 20 * 60_000_000_000,
-        "the earliest surviving segment is older than the newest one written"
+        "the earliest surviving batch is older than the newest one written"
     );
     assert_eq!(
-        rows.iter().map(|r| r.segment_count).sum::<usize>(),
-        after.segment_count,
+        rows.iter().map(|r| r.batch_count).sum::<usize>(),
+        after.batch_count,
         "the index and the series view disagree after eviction"
     );
 }
@@ -559,7 +559,7 @@ async fn unrelated_files_in_the_data_dir_are_ignored() {
     // once ran the old binary, a backup, a stray note.
     std::fs::write(dir.path().join("notes.txt"), b"hello").unwrap();
     std::fs::create_dir_all(dir.path().join("scratch")).unwrap();
-    std::fs::write(dir.path().join("scratch/half-written.leseg.tmp"), b"junk").unwrap();
+    std::fs::write(dir.path().join("scratch/half-written.db.tmp"), b"junk").unwrap();
 
     let registry = TenantStore::open(dir.path(), StoreConfig::new(dir.path())).unwrap();
     let tenant = TenantId::parse("acme").unwrap();
@@ -579,7 +579,7 @@ async fn unrelated_files_in_the_data_dir_are_ignored() {
 
     let reopened = TenantStore::open(dir.path(), StoreConfig::new(dir.path())).unwrap();
     let store = reopened.open_tenant(&tenant).unwrap();
-    assert_eq!(store.stats().segment_count, 1);
+    assert_eq!(store.stats().batch_count, 1);
     assert!(store.fsck().iter().all(|(_, r)| r.is_ok()));
 }
 
