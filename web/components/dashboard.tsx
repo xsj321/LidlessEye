@@ -8,7 +8,6 @@ import { TimeBar } from "@/components/time-bar";
 import { Toolbar } from "@/components/toolbar";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { FlamegraphView } from "@/components/views/flamegraph-view";
 import { LabelsView } from "@/components/views/labels-view";
@@ -76,24 +75,28 @@ export function Dashboard() {
       <header className="flex h-12 shrink-0 items-center gap-5 border-b bg-card px-3">
         <Brand />
 
-        <Tabs
-          id="tabs"
-          value={state.view}
-          onValueChange={(value) => dashboardStore.setView(value as View)}
-        >
-          <TabsList className="h-8 gap-0.5 bg-transparent p-0">
-            {NAV.map((item) => (
-              <TabsTrigger
+        {/* These switch the whole page, not a panel of sibling tabs. A nav
+            landmark with `aria-current` is what the view really is: it is
+            addressable in the hash, so a screen reader should announce "current
+            page", not "tab 3 of 7" with no tabpanel to go with it. */}
+        <nav id="tabs" aria-label="Dashboard views" className="flex items-center gap-0.5">
+          {NAV.map((item) => {
+            const active = state.view === item.value;
+            return (
+              <button
                 key={item.value}
-                value={item.value}
+                type="button"
                 data-view={item.value}
-                className="h-7 rounded-md px-2.5 text-xs data-[state=active]:bg-secondary data-[state=active]:shadow-none"
+                data-state={active ? "active" : "inactive"}
+                aria-current={active ? "page" : undefined}
+                onClick={() => dashboardStore.setView(item.value)}
+                className="h-7 rounded-md px-2.5 text-xs text-muted-foreground outline-none transition-colors hover:bg-secondary/70 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/70 data-[state=active]:bg-secondary data-[state=active]:text-foreground"
               >
                 {item.label}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-        </Tabs>
+              </button>
+            );
+          })}
+        </nav>
 
         <div className="ml-auto flex items-center gap-2">
           <span className="font-mono text-[11px] text-muted-foreground" data-testid="build-info">

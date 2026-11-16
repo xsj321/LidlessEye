@@ -13,6 +13,12 @@
 .dark {
   --radius: 0.5rem;
 
+  /* The dashboard is dark by design. Saying so turns the browser's own UI —
+     scrollbars, the date/time pickers behind the range inputs, the select
+     popups, autofill highlight — dark too, instead of leaving white boxes in a
+     dark page. One declaration replaces styling each of them by hand. */
+  color-scheme: dark;
+
   --background: #0e1014;
   --foreground: #e7eaf0;
 
@@ -40,7 +46,7 @@
 
   --success: #4fbf8b;
   --link: #6ba7f7;
-  --faint: #6b7585;
+  --faint: #7b8598;
 
   --border: #232b36;
   --input: #303a48;
@@ -147,8 +153,21 @@
   }
 }
 
-/* Respect the OS preference for reduced motion in the canvas animations. */
+/* Respect the OS preference for reduced motion everywhere, not only in the
+   canvas: the drawer, the card hovers and the tab indicator all animate, and a
+   user who asked for less motion meant all of them. Durations go to zero rather
+   than the transitions being removed, so nothing that fires on `transitionend`
+   is left waiting. */
 @media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
   [data-loading="1"] {
     transition: none;
   }

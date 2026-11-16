@@ -81,7 +81,10 @@ export const NodeCard = memo(function NodeCard({
     <Card
       role="button"
       tabIndex={0}
-      aria-pressed={selected}
+      // A card is a disclosure, not a toggle: it opens the panel below it, and
+      // `aria-expanded` is the state assistive tech already knows how to report.
+      aria-expanded={selected}
+      aria-controls="map-panel"
       data-testid={testId}
       title={`${label}\n${node.id}${meta ? `\n${meta}` : ""}`}
       onClick={(event) => {

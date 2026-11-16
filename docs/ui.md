@@ -292,6 +292,21 @@ usually takes.
 Shortcuts are ignored while a text field has focus, so typing `r` into the
 search box does not reload the page.
 
+The view switcher is a `<nav>` of buttons with `aria-current="page"`, not a
+`tablist`: it switches the whole page and has no sibling panels for the tab
+pattern to describe. Its buttons keep `data-view` and `data-state` so the URL
+model and the smoke test read the same source of truth.
+
+The service map's cards are disclosures — `aria-expanded` plus
+`aria-controls="map-panel"` — and the drawer is a non-modal `role="dialog"`
+named by the node title. Non-modal on purpose: the map behind it stays live so
+the next card can be clicked without dismissing the current one. Opening moves
+focus into the drawer, closing returns it to the card that opened it, and a
+closed drawer is `inert`, so its off-screen buttons are not silent tab stops.
+The page declares `color-scheme: dark`, which keeps browser-drawn surfaces —
+scrollbars, the date/time pickers behind the range inputs, select popups — in
+the same palette as the dashboard instead of styling each one by hand.
+
 ## Motion
 
 The flamegraph animates on purpose and sparingly: bars grow in on load, zoom
