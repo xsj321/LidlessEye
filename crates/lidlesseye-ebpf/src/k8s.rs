@@ -55,6 +55,9 @@ pub struct PodMeta {
     /// looks exactly like that), so the map needs both numbers: how many pods
     /// exist and how many of them are serving.
     pub ready: bool,
+    /// Node the pod is scheduled on (`spec.nodeName`). Empty when the cluster
+    /// did not report it, which is what a bare `PodMeta::new` leaves behind.
+    pub host: String,
 }
 
 impl PodMeta {
@@ -91,6 +94,7 @@ impl PodMeta {
             ports: Vec::new(),
             phase: String::new(),
             ready: false,
+            host: String::new(),
         }
     }
 
@@ -111,6 +115,12 @@ impl PodMeta {
     pub fn with_health(mut self, phase: impl Into<String>, ready: bool) -> Self {
         self.phase = phase.into();
         self.ready = ready;
+        self
+    }
+
+    /// Attach where the pod runs, as `spec.nodeName` reports it.
+    pub fn on_host(mut self, host: impl Into<String>) -> Self {
+        self.host = host.into();
         self
     }
 

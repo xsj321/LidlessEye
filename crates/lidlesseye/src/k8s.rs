@@ -544,6 +544,9 @@ struct PodItem {
 struct PodSpec {
     #[serde(default)]
     containers: Vec<PodContainer>,
+    /// Where the scheduler placed the pod; the instance list shows it.
+    #[serde(default, rename = "nodeName")]
+    node_name: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -646,6 +649,7 @@ impl PodItem {
             .iter()
             .any(|condition| condition.kind == "Ready" && condition.status == "True");
         let phase = self.status.phase.clone();
+        let host = self.spec.node_name.clone();
         let pod = PodMeta::new(
             meta.uid.as_str(),
             meta.namespace.as_str(),
@@ -656,7 +660,8 @@ impl PodItem {
         )
         .with_ips(ips)
         .with_ports(ports)
-        .with_health(phase, ready);
+        .with_health(phase, ready)
+        .on_host(host);
         Some((meta.uid, pod))
     }
 }

@@ -40,7 +40,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use lidlesseye_core::servicemap::{
-    EXTERNAL_ID, NodeKind, ServiceEdge, ServiceMapBatch, ServiceNode, protocol_for_port,
+    EXTERNAL_ID, InstanceInfo, NodeKind, ServiceEdge, ServiceMapBatch, ServiceNode,
+    protocol_for_port,
 };
 use lidlesseye_ebpf::conntrack::{self, ConntrackConfig, ConntrackHandle, Flow, Role};
 use lidlesseye_ebpf::k8s::{PodIndex, PodMeta};
@@ -805,35 +806,63 @@ fn pod_node(meta: &PodMeta) -> ServiceNode {
     node
 }
 
-/// Replica count and ready count per map node, from the cluster-wide pod
-/// snapshot the peer lookup already walks.
+/// Replica count, ready count and the replicas themselves, per map node.
 ///
-/// The map needs both: a workload with three pods and one ready is serving
-/// errors, and connections alone cannot say that. Every agent reads the same
-/// list, so the numbers agree across nodes.
-fn health_by_node(pods: &PodIndex) -> HashMap<String, (u32, u32)> {
-    let mut out: HashMap<String, (u32, u32)> = HashMap::new();
+/// The counts say whether the workload is healthy; the list says which pod is
+/// the sick one, and on which node it sits. Every agent reads the same
+/// cluster-wide list, so the numbers agree across nodes.
+fn health_by_node(pods: &PodIndex) -> HashMap<String, NodeHealth> {
+    let mut out: HashMap<String, NodeHealth> = HashMap::new();
     for meta in pods.snapshot().values() {
         let id = lidlesseye_core::servicemap::node_id(&meta.namespace, &map_name_of(meta));
-        let slot = out.entry(id).or_insert((0, 0));
-        slot.0 += 1;
+        let slot = out.entry(id).or_default();
+        slot.pods += 1;
         if meta.ready {
-            slot.1 += 1;
+            slot.ready += 1;
         }
+        // A bounded list: the panel that shows it scrolls, and a 500-replica
+        // deployment must not turn every map payload into megabytes.
+        if slot.instances.len() < MAX_INSTANCES {
+            slot.instances.push(InstanceInfo {
+                name: meta.name.clone(),
+                node: meta.host.clone(),
+                ready: meta.ready,
+                phase: meta.phase.clone(),
+            });
+        }
+    }
+    for health in out.values_mut() {
+        // Not-ready first, then by name: the exception belongs at the top of
+        // the list, and a stable order keeps the panel from reshuffling.
+        health
+            .instances
+            .sort_by(|a, b| a.ready.cmp(&b.ready).then_with(|| a.name.cmp(&b.name)));
     }
     out
 }
+
+/// Replica gauges for one map node.
+#[derive(Default)]
+struct NodeHealth {
+    pods: u32,
+    ready: u32,
+    instances: Vec<InstanceInfo>,
+}
+
+/// How many replicas of one workload a map payload carries.
+const MAX_INSTANCES: usize = 24;
 
 /// Stamp the replica gauges onto the nodes of a window.
 ///
 /// Nodes the pod list does not know (a ClusterIP service, the outside world, a
 /// workload whose pods all went away mid-window) keep zero, which the UI reads
 /// as "no replicas to report" rather than "all replicas are down".
-fn attach_health(nodes: &mut HashMap<String, ServiceNode>, health: &HashMap<String, (u32, u32)>) {
+fn attach_health(nodes: &mut HashMap<String, ServiceNode>, health: &HashMap<String, NodeHealth>) {
     for node in nodes.values_mut() {
-        if let Some(&(pods, ready)) = health.get(&node.id) {
-            node.pods = pods;
-            node.ready = ready;
+        if let Some(known) = health.get(&node.id) {
+            node.pods = known.pods;
+            node.ready = known.ready;
+            node.instances = known.instances.clone();
         }
     }
 }

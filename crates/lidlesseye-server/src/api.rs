@@ -18,8 +18,8 @@ use lidlesseye_core::model::{Report, Unit};
 use lidlesseye_core::pprof::PprofOptions;
 use lidlesseye_core::servicemap::ServiceMapBatch;
 use lidlesseye_core::{
-    DiffFlamegraph, DiffOptions, Flamegraph, ProfileType, QueryOptions, Selector, ServiceMap,
-    Store, TimeSeries, TimeSeriesOptions, TopResult, now_ns,
+    DiffFlamegraph, DiffOptions, Flamegraph, MapHistory, ProfileType, QueryOptions, Selector,
+    ServiceMap, Store, TimeSeries, TimeSeriesOptions, TopResult, now_ns,
 };
 
 use crate::error::ApiError;
@@ -670,6 +670,46 @@ pub async fn servicemap(
         .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
     Ok(Json(map))
+}
+
+/// `GET /api/v1/servicemap/history`
+///
+/// One node's own counters and its incident edges, bucketed over the same
+/// window as the map. The panel behind a click needs a shape to draw, not a
+/// single total, and this is the only query that produces one without asking
+/// the browser to fetch every bucket of `net_nodes`.
+pub async fn servicemap_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Params,
+) -> Result<Json<MapHistory>, ApiError> {
+    let caller = state.authorize(&headers)?;
+    let node = match params.get("node").map(str::trim) {
+        Some(node) if !node.is_empty() => node.to_string(),
+        _ => return Err(ApiError::bad_request("`node` is required")),
+    };
+    let now = now_ns();
+    let (from, until) = params.range(now)?;
+    let buckets = params.usize_param("buckets", 60).clamp(1, 600) as u64;
+    let step_ns = ((until - from) / buckets).max(1);
+    let Some(store) = maybe_store(&state, &caller) else {
+        return Ok(Json(MapHistory {
+            node,
+            from_ns: from,
+            until_ns: until,
+            step_ns,
+            ..Default::default()
+        }));
+    };
+    let started = Instant::now();
+    let history = tokio::task::spawn_blocking(move || {
+        lidlesseye_core::servicemap_history(&store, &node, from, until, step_ns)
+    })
+    .await
+    .map_err(|err| ApiError::internal(format!("query task failed: {err}")))?
+    .map_err(ApiError::from)?;
+    state.record_query(&caller.tenant, started);
+    Ok(Json(history))
 }
 
 impl AppState {

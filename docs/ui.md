@@ -185,42 +185,70 @@ range. This is the view that answers "is anything arriving at all?".
 
 The network graph of the selected window: nodes are workloads, ClusterIP
 Services and the outside world; edges are TCP connections between them. A node
-is a rounded card with two lines inside it — the service name, then its
-namespace and, for a workload, how many of its replicas are ready (`3/3` in
-green, `2/3` in orange when a replica is failing). The card's fill warms with
-the on-CPU time of that workload's profiles, so a busy service is visibly
-warmer than an idle one without the text becoming unreadable; an orange edge
-carries retransmits, and a dashed edge calls back upstream — against the
-column flow — which is the case worth spotting.
+is a real `Card` — a small rounded rectangle, not a dot — with two lines inside
+it: the service name, then its namespace and, for a workload, how many replicas
+are ready. Three signals share the card without competing:
 
-Two lines of text set the card's size, and the card's size sets the column and
-row gaps, so the map is drawn at 1:1: the layout works in pixels and the chart
-is inset by the content's margin instead of being scaled to fit the canvas.
-Text longer than the card is clipped with an ellipsis; the tooltip and the
-panel carry the full name.
+- **colour** — a bar on the left edge, and a faint tint, say what the node is:
+  blue for a workload, purple for a ClusterIP, grey for the outside world;
+- **shape** — a glyph on the right says how it is doing: a filled circle when
+  every replica is ready, a triangle when one is not, a hollow ring when the
+  cluster reported no replicas at all;
+- **a hairline at the bottom** — the share of on-CPU time of the busiest node on
+  the map, so cost is a bar rather than a fourth colour.
+
+Every edge is labelled with its own numbers: new connections per second and the
+mean round-trip time of the connections that closed in the window
+(`0.31/s · 149µs`). Labels are *placed*, not dropped at the geometric midpoint —
+each is tried at seven points along its curve and five offsets from each, and
+takes the first spot that hits neither a card nor another label. An edge whose
+label has nowhere to go keeps its curve but loses its text, which is the better
+failure: overlapping digits are not information. Retransmits turn an edge red
+and dashed; an edge that runs against the column flow (a callback, a retry)
+bends out and arrives on the far side.
 
 The graph is laid out in columns, one per dependency depth: an entry point sits
 in the leftmost column and everything it calls sits to its right. Cycles are
 condensed first, so a pair of services that call each other share a column
 instead of stacking up. Within a column, cards are ordered to reduce crossings
-against the column before them, and the busiest node is highest. Scroll to
-zoom, drag the background to pan.
+against the column before them, and the busiest node is highest. Cards in one
+column share a width, which is what makes a column read as a stack. Scroll to
+zoom, drag the background to pan, double the button group at the top right to
+fit the graph back.
 
-Selecting a node dims everything that is not its neighbour and fills the panel
-on the right: CPU, connections, replicas, bytes in/out, retransmits and the
-mean latency over the edges that closed a connection in this window. Below that
-are the two lists that make the node navigable — *Inbound*, everything that
-calls it, and *Outbound*, everything it calls — each row showing the peer,
-protocol, connections and round-trip time. Clicking a row selects that peer, so
-following a dependency is two clicks rather than a drag.
+Clicking a card slides a panel in from the right — the map stays visible behind
+it, because the numbers are about the topology that is still on screen. The
+panel opens with the node's **neighbourhood**: callers in a column on the left,
+the node in the middle, callees on the right, every edge labelled like the map's
+and every card clickable, so walking the graph is one hop per click. A column
+with nothing in it is dropped and its space given to the others.
 
-*Profile this service* replaces the filter bar with `k8s_namespace` +
-`k8s_workload` (or `service_name` for a ClusterIP) and switches to the
-flamegraph. The time range is the one chosen above: dragging the bracket
-re-queries the map exactly as it re-queries a flamegraph.
+Below the neighbourhood are seven tabs:
 
-The protocol label in the lists comes from the server port; the map does not
-parse payloads, so it reports connections rather than requests. *External*
+| tab | what it answers | where the numbers come from |
+| --- | --- | --- |
+| SLO | how much of the traffic failed, against a 99.9% objective | retransmits as the error signal (no L7 status codes are collected) |
+| Instances | which replicas exist, whether they are ready, where they run | the cluster's pod list, per bucket |
+| CPU | how much on-CPU time, in cores, over the window | the `cpu` profiles behind the node's labels |
+| Memory | the same shape for a heap profile type | whatever memory type the emitters ship, if any |
+| Net | bytes per second in and out, RTT, per-peer rates | the node's counters and its edges |
+| DNS | lookup latency per nameserver | edges on TCP/53 |
+| Profiling | the hottest functions, and the jump to the flamegraph | `/api/v1/top` for the same selector |
+
+Charts follow what the data means rather than one house style: a line with an
+area fill for anything that moves over time, a step line where the value is a
+gauge (replicas), a sorted bar for a ranking, and an error rate — not an
+availability percentage — where the interesting variation is in the last
+fraction of a percent. When a tab has no data it says which measurement is
+missing and what would produce it, instead of drawing an empty chart.
+
+*Open in the flamegraph* replaces the filter bar with `k8s_namespace` +
+`k8s_workload` (or `service_name` for a ClusterIP) and switches views. The time
+range is the one chosen above: dragging the bracket re-queries the map exactly
+as it re-queries a flamegraph.
+
+The protocol on an edge comes from the server port; the map does not parse
+payloads, so the rate is *new connections* per second, not requests. *External*
 collects everything the map cannot name — traffic that really does come from
 outside the cluster — so an edge to it is worth a second look. See
 [architecture.md](architecture.md#service-map) for what the agent reads and why.

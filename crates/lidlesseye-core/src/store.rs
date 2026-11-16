@@ -43,7 +43,7 @@ use tracing::{debug, warn};
 use crate::error::{Error, Result};
 use crate::model::{Frame, ProfileType, Report, SERVICE_NAME_LABEL};
 use crate::selector::{MatchOp, Selector};
-use crate::servicemap::{MapEdge, MapNode, NodeKind, ServiceMapBatch, node_id};
+use crate::servicemap::{MapEdge, MapHistoryPoint, MapNode, NodeKind, ServiceMapBatch, node_id};
 use crate::time::now_ns;
 
 /// Version of the table layout. Bumped when a change needs a migration.
@@ -1201,8 +1201,9 @@ impl Store {
                 let mut stmt = conn
                     .prepare(
                         "INSERT INTO net_nodes (bucket_ns, node_id, namespace, workload, service, \
-                         kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready, \
+                         instances) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
                     .map_err(db_err)?;
                 for node in &batch.nodes {
@@ -1220,6 +1221,7 @@ impl Store {
                         node.retransmits as i64,
                         node.pods as i64,
                         node.ready as i64,
+                        serde_json::to_string(&node.instances).unwrap_or_else(|_| "[]".into()),
                     ])
                     .map_err(db_err)?;
                 }
@@ -1271,7 +1273,8 @@ impl Store {
                 "SELECT node_id, any_value(namespace), any_value(workload), any_value(service), \
                         any_value(kind), sum(rx_bytes), sum(tx_bytes), sum(connections), \
                         sum(retransmits), \
-                        arg_max(pods, (bucket_ns, pods)), arg_max(ready, (bucket_ns, pods)) \
+                        arg_max(pods, (bucket_ns, pods)), arg_max(ready, (bucket_ns, pods)), \
+                        arg_max(instances, (bucket_ns, pods)) \
                  FROM net_nodes WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY node_id \
                  ORDER BY sum(connections) + (sum(rx_bytes) + sum(tx_bytes)) / 1024 DESC LIMIT ?",
@@ -1300,6 +1303,11 @@ impl Store {
                 // always consistent.
                 pods: row.get::<_, i64>(9).unwrap_or(0).max(0) as u32,
                 ready: row.get::<_, i64>(10).unwrap_or(0).max(0) as u32,
+                instances: row
+                    .get::<_, String>(11)
+                    .ok()
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
             });
         }
         Ok(out)
@@ -1341,6 +1349,116 @@ impl Store {
                 // Mean round-trip time over the connections that closed inside
                 // the window; zero when none did.
                 rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
+    /// One row per bucket of a single node's own counters.
+    ///
+    /// Slots are computed relative to `from_ns`, not as absolute epoch
+    /// multiples: `bucket_ns` is ~1.7e18, which is past the exact integer range
+    /// of a double, and DuckDB's `/` returns one. Subtracting `from_ns` first
+    /// keeps the numerator inside the window (hours, not decades) so the
+    /// division is exact.
+    ///
+    /// Replicas are a gauge shared by every agent, so a bucket reports the
+    /// largest count seen rather than the sum — the same rule [`ServiceNode`]
+    /// merging uses.
+    pub fn net_node_history(
+        &self,
+        node: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>> {
+        let step = ts(step_ns.max(1));
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST((bucket_ns - ?) / ? AS BIGINT) AS slot, \
+                        sum(rx_bytes), sum(tx_bytes), sum(connections), sum(retransmits), \
+                        max(pods), max(ready) \
+                 FROM net_nodes WHERE node_id = ? AND bucket_ns >= ? AND bucket_ns < ? \
+                 GROUP BY slot ORDER BY slot",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt
+            .query(params![ts(from_ns), step, node, ts(from_ns), ts(until_ns)])
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let slot: i64 = row.get(0).map_err(db_err)?;
+            out.push(MapHistoryPoint {
+                bucket_ns: from_ns
+                    .saturating_add((slot.max(0) as u64).saturating_mul(step_ns.max(1))),
+                rx_bytes: row.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+                tx_bytes: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                connections: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                retransmits: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                rtt_us: 0,
+                pods: row.get::<_, i64>(5).unwrap_or(0).max(0) as u32,
+                ready: row.get::<_, i64>(6).unwrap_or(0).max(0) as u32,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The same buckets as [`Store::net_node_history`], but seen through the
+    /// edges incident to the node.
+    ///
+    /// `rtt_us` is the sample-weighted mean of the bucket rather than the mean
+    /// of the per-edge means: a busy edge and an idle one would otherwise
+    /// count the same. Bytes are split by who sent them, which is what makes
+    /// "in" and "out" of a node mean the same thing on both sides of an edge.
+    pub fn net_edge_history(
+        &self,
+        node: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>> {
+        let step = ts(step_ns.max(1));
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST((bucket_ns - ?) / ? AS BIGINT) AS slot, \
+                        sum(connections), sum(retransmits), \
+                        sum(CASE WHEN client_id = ? THEN tx_bytes ELSE rx_bytes END), \
+                        sum(CASE WHEN client_id = ? THEN rx_bytes ELSE tx_bytes END), \
+                        sum(rtt_us_sum), sum(rtt_samples) \
+                 FROM net_edges \
+                 WHERE (client_id = ? OR server_id = ?) AND bucket_ns >= ? AND bucket_ns < ? \
+                 GROUP BY slot ORDER BY slot",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt
+            .query(params![
+                ts(from_ns),
+                step,
+                node,
+                node,
+                node,
+                node,
+                ts(from_ns),
+                ts(until_ns)
+            ])
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let slot: i64 = row.get(0).map_err(db_err)?;
+            let rtt_us_sum = row.get::<_, i64>(5).unwrap_or(0).max(0) as u64;
+            let rtt_samples = row.get::<_, i64>(6).unwrap_or(0).max(0) as u64;
+            out.push(MapHistoryPoint {
+                bucket_ns: from_ns
+                    .saturating_add((slot.max(0) as u64).saturating_mul(step_ns.max(1))),
+                rx_bytes: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                tx_bytes: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                connections: row.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+                retransmits: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
+                pods: 0,
+                ready: 0,
             });
         }
         Ok(out)
@@ -1435,7 +1553,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
             connections BIGINT NOT NULL,
             retransmits BIGINT NOT NULL,
             pods BIGINT DEFAULT 0 NOT NULL,
-            ready BIGINT DEFAULT 0 NOT NULL
+            ready BIGINT DEFAULT 0 NOT NULL,
+            /* The replicas themselves, as a JSON array of name / node / ready /
+             * phase objects. Bounded by the agent; the map only needs it for
+             * the panel behind a click. */
+            instances VARCHAR DEFAULT '[]' NOT NULL
         );
         CREATE TABLE IF NOT EXISTS net_edges (
             bucket_ns BIGINT NOT NULL,
@@ -1479,6 +1601,7 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         &[
             ("pods", "BIGINT DEFAULT 0 NOT NULL"),
             ("ready", "BIGINT DEFAULT 0 NOT NULL"),
+            ("instances", "VARCHAR DEFAULT '[]' NOT NULL"),
         ],
     )
 }
@@ -2059,6 +2182,93 @@ mod tests {
         let nodes = store.net_nodes(start, start + 60_000_000_000, 10).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!((nodes[0].pods, nodes[0].ready), (1, 1));
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A panel that draws a shape needs buckets, and the two series it draws
+    /// come from different tables: counters from `net_nodes`, latency from
+    /// `net_edges`. This pins down both the bucketing and the two aggregation
+    /// rules that are easy to get wrong — counters add, a gauge does not, and
+    /// latency is weighted by sample count rather than averaged per edge.
+    #[test]
+    fn node_history_buckets_counters_and_weights_latency_by_samples() {
+        use crate::servicemap::{ServiceEdge, ServiceNode};
+
+        let (store, dir) = temp_store("net-history");
+        let start = 1_700_000_000_000_000_000u64;
+        let step = 10_000_000_000u64;
+        let batch = |offset: u64, pods: u32, ready: u32, connections: u64, rtt: (u64, u64)| {
+            ServiceMapBatch {
+                start_ns: start + offset,
+                end_ns: start + offset + step,
+                nodes: vec![ServiceNode {
+                    connections,
+                    pods,
+                    ready,
+                    ..ServiceNode::new("shop/a", NodeKind::Workload)
+                }],
+                edges: vec![ServiceEdge {
+                    client: "shop/a".to_string(),
+                    server: "shop/b".to_string(),
+                    protocol: "http".to_string(),
+                    connections,
+                    tx_bytes: 1000 * connections,
+                    rx_bytes: 2000 * connections,
+                    rtt_us_sum: rtt.0,
+                    rtt_samples: rtt.1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        };
+        // Two agents report the same window: counters double, replicas do not.
+        for _ in 0..2 {
+            store
+                .append_servicemap(&batch(0, 3, 3, 5, (100, 2)))
+                .unwrap();
+        }
+        // A later bucket, after a scale-down.
+        store
+            .append_servicemap(&batch(step, 1, 0, 1, (900, 2)))
+            .unwrap();
+
+        let points = store
+            .net_node_history("shop/a", start, start + 2 * step, step)
+            .unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].bucket_ns, start);
+        assert_eq!(points[0].connections, 10, "counters add across agents");
+        assert_eq!(
+            (points[0].pods, points[0].ready),
+            (3, 3),
+            "a gauge must not be summed per agent"
+        );
+        assert_eq!(points[1].bucket_ns, start + step);
+        assert_eq!((points[1].pods, points[1].ready), (1, 0));
+
+        let edges = store
+            .net_edge_history("shop/a", start, start + 2 * step, step)
+            .unwrap();
+        assert_eq!(edges.len(), 2);
+        // 50us over two samples, doubled because two agents reported it.
+        assert_eq!(edges[0].rtt_us, 50);
+        assert_eq!(edges[0].tx_bytes, 2 * 5000);
+        assert_eq!(edges[0].rx_bytes, 2 * 10000);
+        assert_eq!(edges[1].rtt_us, 450);
+
+        // Asking for a narrower step re-buckets the same rows.
+        let coarse = store
+            .net_node_history("shop/a", start, start + 2 * step, 2 * step)
+            .unwrap();
+        assert_eq!(coarse.len(), 1);
+        assert_eq!(coarse[0].connections, 11);
+        assert_eq!(
+            (coarse[0].pods, coarse[0].ready),
+            (3, 3),
+            "a gauge inside a bucket reports its peak, not its sum"
+        );
 
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

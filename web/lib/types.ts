@@ -88,6 +88,16 @@ export interface TimeseriesPayload {
 
 export type NodeKind = "workload" | "service" | "external";
 
+/** One replica behind a workload, as the cluster reports it. */
+export interface ServiceInstance {
+  name: string;
+  /** Kubernetes node the pod runs on; empty when the API did not say. */
+  node?: string;
+  ready?: boolean;
+  /** `Running`, `Pending`, ... */
+  phase?: string;
+}
+
 export interface ServiceMapNode {
   id: string;
   namespace?: string;
@@ -102,6 +112,8 @@ export interface ServiceMapNode {
   /** Replicas of this workload at the end of the window, and how many are ready. */
   pods?: number;
   ready?: number;
+  /** The replicas themselves, newest observation, bounded by the agent. */
+  instances?: ServiceInstance[];
 }
 
 export interface ServiceMapEdge {
@@ -124,6 +136,33 @@ export interface ServiceMapPayload {
   nodes: ServiceMapNode[];
   edges: ServiceMapEdge[];
   truncated?: boolean;
+}
+
+/**
+ * One bucket of a single node's history.
+ *
+ * `points` come from the node's own counters (and carry the replica gauge),
+ * `edges` from the connections around it (and carry the round-trip time).
+ * Buckets with no traffic are simply absent.
+ */
+export interface MapHistoryPoint {
+  bucket_ns: number;
+  rx_bytes?: number;
+  tx_bytes?: number;
+  connections?: number;
+  retransmits?: number;
+  rtt_us?: number;
+  pods?: number;
+  ready?: number;
+}
+
+export interface MapHistoryPayload {
+  node: string;
+  from_ns: number;
+  until_ns: number;
+  step_ns: number;
+  points: MapHistoryPoint[];
+  edges: MapHistoryPoint[];
 }
 
 export interface ProfileType {  name: string;

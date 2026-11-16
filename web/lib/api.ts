@@ -9,6 +9,7 @@ import type {
   FlamegraphPayload,
   LabelNamesPayload,
   LabelValuesPayload,
+  MapHistoryPayload,
   ProfileTypesPayload,
   SeriesPayload,
   ServiceMapPayload,
@@ -146,4 +147,7 @@ export const api = {
   // and selector are deliberately not sent, it is a network view.
   serviceMap: (params: QueryParams) =>
     request<ServiceMapPayload>("/api/v1/servicemap", params),
+  // One node's own buckets, for the panel behind a click.
+  serviceMapHistory: (params: QueryParams) =>
+    request<MapHistoryPayload>("/api/v1/servicemap/history", params),
 };

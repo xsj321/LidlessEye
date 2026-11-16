@@ -53,8 +53,15 @@ export interface LayoutOptions {
   height?: number;
   columnGap?: number;
   rowGap?: number;
+  /** Floor for the derived column gap: a node card has a width of its own, and
+   *  the edge label between two columns needs room to sit in. */
+  minColumnGap?: number;
   /** Floor for the derived row gap: a node has a height of its own. */
   minRowGap?: number;
+  /** Ceiling for the derived row gap. A graph of three nodes on a tall canvas
+   *  would otherwise spread them a screen apart; the drawing code zooms to fit
+   *  instead, which keeps the density readable. */
+  maxRowGap?: number;
 }
 
 /** Bounds the derived gaps: too tight and labels collide, too wide and the
@@ -173,9 +180,18 @@ export function layeredLayout(
   // whole graph up, columns included.
   const columnGap =
     fixedColumnGap ??
-    clamp(width / Math.max(columns.length - 1, 1), LIMITS.columnGap[0], LIMITS.columnGap[1]);
+    clamp(
+      width / Math.max(columns.length - 1, 1),
+      Math.max(options.minColumnGap ?? 0, LIMITS.columnGap[0]),
+      Math.max(options.minColumnGap ?? 0, LIMITS.columnGap[1]),
+    );
   const rowGap =
-    fixedRowGap ?? Math.max(minRowGap ?? LIMITS.rowGap, height / Math.max(tallest - 1, 1));
+    fixedRowGap ??
+    clamp(
+      height / Math.max(tallest - 1, 1),
+      minRowGap ?? LIMITS.rowGap,
+      Math.max(minRowGap ?? 0, options.maxRowGap ?? Number.POSITIVE_INFINITY),
+    );
 
   const positions = new Map<string, Point>();
   columns.forEach((column, columnIndex) => {

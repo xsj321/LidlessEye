@@ -455,11 +455,61 @@ still accepts and refuses connections identically.
 Two aggregation rules follow from them being gauges. Merging two agents'
 batches takes the larger value, because every agent reads the same list and
 summing would multiply the replicas by the number of nodes. Reading a window
-takes `arg_max(pods, bucket_ns)` — the newest sample in the range — rather than
-the maximum, so a workload that scaled down does not keep reporting its peak;
-both columns come from the same row, so the pair is always consistent.
+takes `arg_max(pods, (bucket_ns, pods))` — the newest sample in the range, with
+the count itself breaking a same-bucket tie so two agents' rows resolve to one
+consistently — rather than the maximum, so a workload that scaled down does not
+keep reporting its peak; every column comes from the same row, so the count and
+the instance list always describe the same moment.
 
-Known limits, stated rather than hidden: there is no L7 parsing, so an edge's
+### Instances
+
+The count says a workload is short a pod; the list says which one. Each node
+carries up to 24 pods — name, the node running it, readiness and phase — sorted
+not-ready first and then by name, so a panel's table opens on the row that is
+worth reading instead of alphabetically 24 mostly-identical lines. The host
+comes from `spec.nodeName`: the `/proc` collector already walks the cluster pod
+list for peer resolution, and the eBPF collector keeps the same index, so the
+field costs one more assignment on a path that already exists.
+
+The list is a gauge too, stored as a JSON column rather than a join table so a
+window read stays a single scan. Merging two agents' batches takes the longer
+list rather than the union — the union of two identical reads is the same list
+twice. On read it is parsed back per row; a row written before the column
+existed carries the `'[]'` default and the panel degrades to a count.
+
+### History for the panel
+
+The map shows one window; the panel that opens on a node draws that window's
+*shape*, which needs buckets rather than totals:
+`GET /api/v1/servicemap/history?node=&from=&until=&buckets=` returns up to 600
+buckets of `rx_bytes`, `tx_bytes`, `connections`, `retransmits`, `rtt_us`,
+`pods` and `ready`, twice — `points` for the node's own counters and `edges` for
+the same buckets seen through every edge touching it.
+
+The bucketing happens inside DuckDB, `CAST((bucket_ns - from) / step AS BIGINT)
+AS slot`, because `bucket_ns` at today's epoch is ~1.7e18 and past a double's
+exact integer range; subtracting the range start first keeps the numerator at
+hours, not decades. Doing the division in Rust would misalign buckets by
+hundreds of microseconds at the window's start, and doing it in the browser
+would round the timestamps themselves.
+
+What each column means follows from how the map is built. Counters sum across
+agents, because two agents genuinely saw different halves of the traffic.
+Gauges take `max`, because the same replica count reported twice is still one
+count. `rtt_us` is `sum(rtt_us_sum) / sum(rtt_samples)` — weighted by how many
+samples produced it, not the mean of per-edge means, or an edge that closed two
+connections would weigh as much as one that closed two thousand. Egress and
+ingress are split with `client_id = ?`, so "out" means the same thing when the
+node sits on the server end of an edge as when it sits on the client end.
+
+`buckets` defaults to 60 and the step is derived as `(until - from) / buckets`,
+so a caller never has to compute a step that lines up with the window it asked
+for.
+
+### Known limits
+
+Stated rather than hidden, because each one changes how a number on screen
+should be read: there is no L7 parsing, so an edge's
 protocol is inferred from the server port and an edge reports connections, not
 requests; traffic in a pod's own namespace (`localhost`) is ignored; a
 long-lived idle connection is counted when it appears, not re-counted per

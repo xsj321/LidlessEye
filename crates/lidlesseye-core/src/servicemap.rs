@@ -107,6 +107,25 @@ pub struct ServiceNode {
     pub pods: u32,
     #[serde(default)]
     pub ready: u32,
+    /// The replicas themselves, capped by the agent: the panel that lists
+    /// instances needs names and placements, and the counts alone cannot
+    /// answer "which replica is the one that is not ready".
+    #[serde(default)]
+    pub instances: Vec<InstanceInfo>,
+}
+
+/// One replica of a workload, as the cluster reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceInfo {
+    pub name: String,
+    /// Kubernetes node the pod is scheduled on.
+    #[serde(default)]
+    pub node: String,
+    #[serde(default)]
+    pub ready: bool,
+    /// `Running`, `Pending`, ... Empty when the cluster did not report one.
+    #[serde(default)]
+    pub phase: String,
 }
 
 impl ServiceNode {
@@ -197,6 +216,12 @@ impl ServiceMapBatch {
                     // replica once per node that noticed the workload.
                     slot.pods = slot.pods.max(node.pods);
                     slot.ready = slot.ready.max(node.ready);
+                    // The instance list is the same gauge: every agent reads
+                    // the same cluster-wide pod list, so the longer of the two
+                    // is the more complete observation, not a union.
+                    if node.instances.len() > slot.instances.len() {
+                        slot.instances = node.instances.clone();
+                    }
                     if slot.namespace.is_empty() {
                         slot.namespace = node.namespace;
                     }
@@ -273,6 +298,9 @@ pub struct MapNode {
     pub pods: u32,
     #[serde(default)]
     pub ready: u32,
+    /// The replicas themselves, newest observation.
+    #[serde(default)]
+    pub instances: Vec<InstanceInfo>,
 }
 
 /// An aggregated edge in a query response.
@@ -336,6 +364,70 @@ pub fn servicemap(store: &Store, from_ns: u64, until_ns: u64) -> Result<ServiceM
         nodes,
         edges,
         truncated,
+    })
+}
+
+/// One bucket of a single node's history.
+///
+/// The same shape covers two different observations, which is why the fields
+/// are all plain counters: `pods`/`ready` are a gauge and are only filled in on
+/// the node's own series, `rtt_us` only exists where an edge does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapHistoryPoint {
+    pub bucket_ns: u64,
+    #[serde(default)]
+    pub rx_bytes: u64,
+    #[serde(default)]
+    pub tx_bytes: u64,
+    #[serde(default)]
+    pub connections: u64,
+    #[serde(default)]
+    pub retransmits: u64,
+    /// Sample-weighted mean round-trip time over the bucket.
+    #[serde(default)]
+    pub rtt_us: u64,
+    #[serde(default)]
+    pub pods: u32,
+    #[serde(default)]
+    pub ready: u32,
+}
+
+/// `GET /api/v1/servicemap/history` response.
+///
+/// Buckets with no traffic are absent rather than zero-filled: a gap in the
+/// agent's reporting is not the same thing as a quiet minute, and the drawing
+/// code knows how to leave the former empty.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MapHistory {
+    pub node: String,
+    pub from_ns: u64,
+    pub until_ns: u64,
+    pub step_ns: u64,
+    /// What the node itself sent and received, plus its replica gauge.
+    #[serde(default)]
+    pub points: Vec<MapHistoryPoint>,
+    /// The same buckets seen through the node's edges, which is the only place
+    /// a round-trip time exists.
+    #[serde(default)]
+    pub edges: Vec<MapHistoryPoint>,
+}
+
+/// Per-bucket history of one node over `[from_ns, until_ns)`.
+pub fn servicemap_history(
+    store: &Store,
+    node: &str,
+    from_ns: u64,
+    until_ns: u64,
+    step_ns: u64,
+) -> Result<MapHistory> {
+    let step_ns = step_ns.max(1);
+    Ok(MapHistory {
+        node: node.to_string(),
+        from_ns,
+        until_ns,
+        step_ns,
+        points: store.net_node_history(node, from_ns, until_ns, step_ns)?,
+        edges: store.net_edge_history(node, from_ns, until_ns, step_ns)?,
     })
 }
 
