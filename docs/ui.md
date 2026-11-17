@@ -258,8 +258,10 @@ with nothing in it is dropped and its space given to the others.
 
 The hop uses its own layout and its own card, not the big map's. A workload is
 **one card that owns its containers**: the header names the workload, and below
-it a short spine brackets one row per container, indented and inside the same
-border. The rows are a real `<ul>` of `<li>` children and the card is an
+it one translucent pane per container rests on the card — no spine, no border
+and no connector hairline, because the lift and the gaps already say the panes
+belong to the card above them. The rows are a real `<ul>` of `<li>` children
+and the card is an
 `<article>` whose whole area is one native `<button>`, so "workload owns
 container" is expressed in the markup, not just in the pixels; Enter/Space walk
 the graph without a hand-rolled key handler, and selection only recolours the
@@ -281,8 +283,8 @@ rather than leaving an empty column.
 
 **Edges run container to container.** Each container row draws a small port on
 the border it faces — `out` on the right of a caller, `in` on the left of a
-callee, both on the selected workload — and the row's stub joins that port to
-its name. The curve leaves the caller container's `out` port and lands on the
+callee, both on the selected workload. The row is inset by only a few pixels,
+so the port sits against its own row and needs no stub to claim it. The curve leaves the caller container's `out` port and lands on the
 callee container's `in` port, at the row's own height, so a sidecar's traffic
 visibly starts and ends at the sidecars rather than at the workload boxes. Ports
 are strict: a row that only receives draws no `out` port, so a callee's dead end
@@ -432,6 +434,10 @@ ones this code has already been measured against:
   group the header and the rows inside it, so there is no rule under the
   header, no border on a container row, and never two hairlines a pixel apart
   for one boundary.
+- Nesting is carried by depth, not linework. A layer inside a card is a
+  translucent pane on a translucent card: lighter surface, cast shadow, and
+  visible gap. No spine, no connector hairline — the gap and the value
+  difference already say which layer the child belongs to.
 - The shell has one `<main>` (focusable, `tabIndex={-1}`), a skip link ahead of
   the navigation drawer, and exactly one `<h1>` naming the current view.
 

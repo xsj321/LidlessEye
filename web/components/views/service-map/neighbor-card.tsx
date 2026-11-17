@@ -4,10 +4,13 @@
 //
 // The big map draws a workload and a peer as separate things; the
 // neighbourhood answers a different question — "which part of this workload
-// holds the connection" — so a container is a row *inside* its workload card,
-// under a short spine, never a second free-floating box. One DOM subtree per
-// workload means a long name or a third container cannot push a row onto its
-// neighbour: the browser stacks them.
+// holds the connection" — so a container is a pane *resting on* its workload
+// card, never a second free-floating box. The belonging is carried by depth
+// and translucency rather than by linework: the card is a translucent tint,
+// each row a lighter translucent pane with a cast shadow, and the gaps between
+// them do the grouping a spine and connector hairlines used to do. One DOM
+// subtree per workload means a long name or a third container cannot push a
+// row onto its neighbour: the browser stacks them.
 //
 // Two things come from the browser rather than from JavaScript, following the
 // Modern Web Guidance card guide:
@@ -43,24 +46,34 @@ import { cn } from "@/lib/utils";
 
 /** All sizes in world pixels at scale 1; the view scales the layer, not the card. */
 export const NEIGHBOR_CARD = {
+  /** Border width. `box-sizing: border-box` makes the card's own border eat
+   *  content height, so every offset below adds it back rather than letting
+   *  the last container row sit on the bottom border. */
+  border: 1,
   header: 48,
   rowHeight: 28,
-  rowGap: 6,
+  rowGap: 8,
   /** Space between the header and the first container row. */
-  padTop: 10,
-  padBottom: 11,
-  /** How far a container row is indented from the card's left edge. */
-  indent: 24,
-  rightPad: 10,
+  padTop: 14,
+  padBottom: 14,
+  /**
+   * How far a container row is inset from the card's side edges — and the
+   * header's own padding, so the title and the rows share one left edge. Kept
+   * small on purpose: the row runs nearly to the border, so a port on the
+   * border reads as that row's terminal without a connector line.
+   */
+  indent: 8,
+  rightPad: 8,
   /** Radius of the port circles that sit on the card's left/right borders. */
   portRadius: 4,
 } as const;
 
 /** Height a card needs for a given number of container rows. */
 export function neighborCardHeight(containerCount: number): number {
-  if (containerCount <= 0) return NEIGHBOR_CARD.header;
+  const chrome = NEIGHBOR_CARD.border * 2 + NEIGHBOR_CARD.header;
+  if (containerCount <= 0) return chrome;
   return (
-    NEIGHBOR_CARD.header +
+    chrome +
     NEIGHBOR_CARD.padTop +
     containerCount * NEIGHBOR_CARD.rowHeight +
     (containerCount - 1) * NEIGHBOR_CARD.rowGap +
@@ -71,6 +84,7 @@ export function neighborCardHeight(containerCount: number): number {
 /** Y of a container row, relative to the top of its card. */
 export function neighborRowOffset(index: number): number {
   return (
+    NEIGHBOR_CARD.border +
     NEIGHBOR_CARD.header +
     NEIGHBOR_CARD.padTop +
     index * (NEIGHBOR_CARD.rowHeight + NEIGHBOR_CARD.rowGap)
@@ -147,9 +161,11 @@ export const NeighborCard = memo(function NeighborCard({
   // A workload with no namespace would title its second line with a bare
   // dash; the kind is the more useful thing to say there.
   const meta = rawMeta === "—" || rawMeta === "-" ? kind : rawMeta;
-  const headerCenter = NEIGHBOR_CARD.header / 2;
+  const headerCenter = NEIGHBOR_CARD.border + NEIGHBOR_CARD.header / 2;
   const portStyle = { borderColor: palette.bar, backgroundColor: palette.tint };
-  const stubStyle = { backgroundColor: `${palette.bar}73` };
+  // A translucent card, so the canvas reads faintly through it and the rows
+  // above it have something to sit on. The tint still carries the kind.
+  const cardFill = `color-mix(in srgb, ${palette.tint} 60%, transparent)`;
 
   return (
     <article
@@ -174,7 +190,7 @@ export const NeighborCard = memo(function NeighborCard({
         top: box.y,
         width: box.w,
         height: box.h,
-        backgroundColor: palette.tint,
+        backgroundColor: cardFill,
       }}
     >
       <span
@@ -198,7 +214,7 @@ export const NeighborCard = memo(function NeighborCard({
           tinted, which already says "these belong to the title". A hairline
           there only drew a second frame inside the card's own frame. */}
       <header
-        className="flex items-center gap-2 px-3"
+        className="flex items-center gap-2 px-2"
         style={{ height: NEIGHBOR_CARD.header }}
       >
         <hgroup className="min-w-0 flex-1 leading-none">
@@ -257,6 +273,9 @@ export const NeighborCard = memo(function NeighborCard({
               const hasIn = container.ports?.in === true;
               const hasOut = container.ports?.out === true;
               if (!hasIn && !hasOut) return null;
+              // No stub joins the port to its row: the row is inset by only
+              // 8px, so the dot already sits against its own row. A hairline
+              // there was a line saying what the gap already said.
               return (
                 <Fragment key={container.name}>
                   {hasIn ? (
@@ -289,25 +308,6 @@ export const NeighborCard = memo(function NeighborCard({
                       }}
                     />
                   ) : null}
-                  {/* A stub joins each live port to its row, so the port reads
-                      as this row's terminal rather than a floating dot. */}
-                  {hasIn ? (
-                    <span
-                      className="absolute h-px"
-                      style={{ left: 0, top: center, width: NEIGHBOR_CARD.indent, ...stubStyle }}
-                    />
-                  ) : null}
-                  {hasOut ? (
-                    <span
-                      className="absolute h-px"
-                      style={{
-                        right: 0,
-                        top: center,
-                        width: NEIGHBOR_CARD.rightPad,
-                        ...stubStyle,
-                      }}
-                    />
-                  ) : null}
                 </Fragment>
               );
             })}
@@ -321,24 +321,12 @@ export const NeighborCard = memo(function NeighborCard({
               paddingRight: NEIGHBOR_CARD.rightPad,
             }}
           >
-          {/* The spine is inside the card: container rows read as parts of
-              the workload, not as neighbours that happen to sit below it. */}
-          <span
-            aria-hidden="true"
-            className="absolute w-px"
-            style={{
-              left: 13,
-              top: NEIGHBOR_CARD.padTop,
-              bottom: NEIGHBOR_CARD.padBottom,
-              backgroundColor: `${palette.bar}59`,
-            }}
-          />
           {containers.map((container, index) => {
             if (container.more) {
               return (
                 <li
                   key={container.name}
-                  className="relative flex items-center rounded-[5px] bg-white/[0.03] px-2 italic text-muted-foreground/80"
+                  className="relative flex items-center rounded-[7px] bg-white/[0.04] px-2 italic text-muted-foreground/80"
                   style={{
                     height: NEIGHBOR_CARD.rowHeight,
                     marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
@@ -355,23 +343,25 @@ export const NeighborCard = memo(function NeighborCard({
                 data-testid="map-container-row"
                 data-node={node.id}
                 data-container={container.name}
-                className="relative flex items-center gap-1.5 rounded-[5px] bg-white/[0.045] px-2"
+                // A pane of glass resting on the card, not a box drawn in it:
+                // a translucent white gradient, a lit top edge and a shadow
+                // underneath. The lift says "part of the workload above",
+                // which is more than the old border and spine managed.
+                className={cn(
+                  "relative flex items-center gap-1.5 rounded-[7px] px-2",
+                  "bg-white/[0.10] backdrop-blur-[3px]",
+                  // The lift is a cast shadow, not a lit edge: a hairline along
+                  // the top of every row would be the same divider this change
+                  // is removing, in disguise.
+                  "shadow-[0_9px_18px_-10px_rgba(0,0,0,1)]",
+                )}
                 style={{
                   height: NEIGHBOR_CARD.rowHeight,
                   marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
                 }}
                 title={`${label} · ${container.name}`}
               >
-                <span
-                  aria-hidden="true"
-                  className="absolute h-px w-[11px]"
-                  style={{
-                    left: -11,
-                    top: "50%",
-                    backgroundColor: `${palette.bar}59`,
-                  }}
-                />
-                <span className="neighbor-trim min-w-0 flex-1 truncate font-mono text-[10px] text-foreground/85">
+                <span className="neighbor-trim min-w-0 flex-1 truncate font-mono text-[10px] text-foreground/90">
                   {container.name}
                 </span>
                 <span className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground">
