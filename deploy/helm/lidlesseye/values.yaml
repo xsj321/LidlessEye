@@ -6,9 +6,10 @@
 #     with eBPF and pushes the profiles to that server.
 
 image:
-  repository: ghcr.io/lidlesseye/lidlesseye
+  # Published on Docker Hub; see docker push in the release notes / deployment docs.
+  repository: docker.io/xsj321/lidlesseye
   # Defaults to the chart's appVersion when empty.
-  tag: ""
+  tag: "0.10.22-parquet"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
