@@ -57,6 +57,8 @@ const SIZE = {
 const ZOOM = { min: 0.5, max: 2.4, step: 1.22 };
 const MAX_VIEW_HEIGHT = 440;
 const MIN_VIEW_HEIGHT = 260;
+/** Breathing room kept around the fitted graph, in viewport pixels. */
+const FIT_MARGIN = 22;
 
 export interface NeighborhoodProps {
   node: ServiceMapNode;
@@ -515,8 +517,14 @@ export function Neighborhood({
   const viewHeight = clamp(Math.round(layout.height), MIN_VIEW_HEIGHT, MAX_VIEW_HEIGHT);
   const fit = useCallback(() => {
     if (available <= 0) return;
+    // Keep a margin on all four sides. At 10px a card's border and an edge
+    // label sat exactly on the clipping edge and read as cut off; the graph
+    // has to look like it fits, not like it was cropped.
     const k = clamp(
-      Math.min((available - 20) / layout.width, (viewHeight - 20) / layout.height),
+      Math.min(
+        (available - FIT_MARGIN * 2) / layout.width,
+        (viewHeight - FIT_MARGIN * 2) / layout.height,
+      ),
       ZOOM.min,
       1,
     );

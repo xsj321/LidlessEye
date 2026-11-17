@@ -346,7 +346,10 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
             </Button>
           </header>
 
-          <div className="border-b px-3 py-2">
+          {/* No rule under the map: the tab rail directly below already draws
+              the boundary, and two rules one hairline apart read as a box
+              inside a box rather than as two regions. */}
+          <div className="px-3 py-2">
             <Neighborhood
               node={current}
               nodes={nodes}

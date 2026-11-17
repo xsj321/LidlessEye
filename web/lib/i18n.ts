@@ -16,6 +16,7 @@ export type { Language } from "./settings";
 const ZH: Record<string, string> = {
   // Shell / navigation
   Refresh: "刷新",
+  "Skip to main content": "跳到主内容",
   "Reload (R)": "重新加载 (R)",
   Tenant: "租户",
   default: "默认",

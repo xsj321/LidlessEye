@@ -413,6 +413,31 @@ The page declares `color-scheme: dark`, which keeps browser-drawn surfaces —
 scrollbars, the date/time pickers behind the range inputs, select popups — in
 the same palette as the dashboard instead of styling each one by hand.
 
+## Visual rules
+
+The dashboard follows Google Chrome's [Modern Web Guidance](https://github.com/GoogleChrome/modern-web-guidance-src).
+It is a working checklist rather than a mood board, and the rules below are the
+ones this code has already been measured against:
+
+- A card is an `<article>`. A card with a title and a subtitle groups them in
+  `<header>` + `<hgroup>`; repeated items inside a card are a `<ul>`/`<li>`.
+- When the whole card is one action, the action is a single native `<button>`
+  stretched over the card (`absolute inset-0`) and the focus ring is drawn on
+  the card with `has-[>button:focus-visible]`. No `div role="button"` and no
+  hand-written Enter/Space handlers — the browser already implements both.
+- Selection changes colour only (border-color, box-shadow). Border width,
+  padding and font weight never change, so a card does not jump when it is
+  selected.
+- A card draws one frame, not two. The card's own border and its tint already
+  group the header and the rows inside it, so there is no rule under the
+  header, no border on a container row, and never two hairlines a pixel apart
+  for one boundary.
+- The shell has one `<main>` (focusable, `tabIndex={-1}`), a skip link ahead of
+  the navigation drawer, and exactly one `<h1>` naming the current view.
+
+Read a guide before changing a component: `npx -y modern-web-guidance@latest
+retrieve card` (or `list` for the full set).
+
 ## Motion
 
 The flamegraph animates on purpose and sparingly: bars grow in on load, zoom

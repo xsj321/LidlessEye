@@ -194,18 +194,21 @@ export const NeighborCard = memo(function NeighborCard({
         onClick={() => onSelect?.(node.id)}
       />
 
-      <div
-        className="flex items-center gap-2 border-b border-white/[0.06] px-3"
+      {/* No rule under the header: the container rows below are indented and
+          tinted, which already says "these belong to the title". A hairline
+          there only drew a second frame inside the card's own frame. */}
+      <header
+        className="flex items-center gap-2 px-3"
         style={{ height: NEIGHBOR_CARD.header }}
       >
-        <div className="min-w-0 flex-1 leading-none">
+        <hgroup className="min-w-0 flex-1 leading-none">
           <h3 className="neighbor-trim truncate text-[11px] font-semibold text-card-foreground">
             {label}
           </h3>
           <p className="neighbor-trim mt-1.5 truncate font-mono text-[9px] text-muted-foreground">
             {meta}
           </p>
-        </div>
+        </hgroup>
         <StatusGlyph tone={tone} />
         {/* Traffic with no container attribution ends on the header edge, so
             the curve still terminates on a visible port. */}
@@ -237,7 +240,7 @@ export const NeighborCard = memo(function NeighborCard({
             }}
           />
         ) : null}
-      </div>
+      </header>
 
       {containers.length > 0 ? (
         <>
@@ -335,7 +338,7 @@ export const NeighborCard = memo(function NeighborCard({
               return (
                 <li
                   key={container.name}
-                  className="relative flex items-center rounded-[5px] border border-white/[0.05] bg-white/[0.03] px-2 italic text-muted-foreground/80"
+                  className="relative flex items-center rounded-[5px] bg-white/[0.03] px-2 italic text-muted-foreground/80"
                   style={{
                     height: NEIGHBOR_CARD.rowHeight,
                     marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
@@ -352,7 +355,7 @@ export const NeighborCard = memo(function NeighborCard({
                 data-testid="map-container-row"
                 data-node={node.id}
                 data-container={container.name}
-                className="relative flex items-center gap-1.5 rounded-[5px] border border-white/[0.06] bg-white/[0.045] px-2"
+                className="relative flex items-center gap-1.5 rounded-[5px] bg-white/[0.045] px-2"
                 style={{
                   height: NEIGHBOR_CARD.rowHeight,
                   marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,

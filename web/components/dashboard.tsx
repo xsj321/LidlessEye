@@ -4,7 +4,7 @@ import { RefreshCw } from "lucide-react";
 
 import { Banner } from "@/components/banner";
 import { FilterBar } from "@/components/filter-bar";
-import { Sidebar } from "@/components/sidebar";
+import { NAV, Sidebar } from "@/components/sidebar";
 import { TimeBar } from "@/components/time-bar";
 import { Toolbar } from "@/components/toolbar";
 import { Button } from "@/components/ui/button";
@@ -27,6 +27,11 @@ import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
 import type { View } from "@/lib/types";
 import { useDashboard } from "@/lib/use-dashboard";
+
+/** The visible name of a view, reusing the drawer's own labels. */
+function viewLabel(view: View): string {
+  return NAV.find((item) => item.value === view)?.label ?? "Service map";
+}
 
 function ViewSwitch({ view }: { view: View }) {
   switch (view) {
@@ -59,6 +64,15 @@ export function Dashboard() {
 
   return (
     <div id="app-shell">
+      {/* Keyboard users land here first: the drawer holds seven buttons before
+          the content starts, and tabbing through them on every view switch is
+          the tax this link refunds. It is off-screen until focused. */}
+      <a
+        href="#main"
+        className="sr-only focus:not-sr-only focus:absolute focus:top-3 focus:left-3 focus:z-50 focus:rounded-md focus:bg-card focus:px-3 focus:py-2 focus:text-xs focus:shadow-lg focus:ring-2 focus:ring-ring"
+      >
+        {t("Skip to main content")}
+      </a>
       <Sidebar />
 
       <div id="app-content" className="flex min-w-0 flex-1 flex-col">
@@ -119,9 +133,16 @@ export function Dashboard() {
 
         <main
           id="main"
-          className="min-h-0 flex-1 overflow-auto px-3 py-2"
+          // The skip link points here, so the target has to be focusable; -1
+          // keeps it out of the tab order while still letting focus land.
+          tabIndex={-1}
+          className="min-h-0 flex-1 overflow-auto px-3 py-2 outline-none"
           data-loading={state.loading ? "1" : undefined}
         >
+          {/* One h1 per page, naming the view that is on screen. The drawer
+              already says which view is active visually, so this heading is
+              for the document outline rather than for the eye. */}
+          <h1 className="sr-only">{t(viewLabel(state.view))}</h1>
           {state.ready ? (
             <ViewSwitch view={state.view} />
           ) : (

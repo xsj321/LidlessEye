@@ -79,12 +79,6 @@ export const NodeCard = memo(function NodeCard({
 
   return (
     <Card
-      role="button"
-      tabIndex={0}
-      // A card is a disclosure, not a toggle: it opens the panel below it, and
-      // `aria-expanded` is the state assistive tech already knows how to report.
-      aria-expanded={selected}
-      aria-controls="map-panel"
       data-testid={testId}
       // Every clickable card carries this marker, on the big map and in the
       // neighbourhood alike. A pan surface must not capture the pointer on a
@@ -92,20 +86,12 @@ export const NodeCard = memo(function NodeCard({
       // big map's test id for this check and silently lost its node jumps.
       data-map-card=""
       title={`${label}\n${node.id}${meta ? `\n${meta}` : ""}`}
-      onClick={(event) => {
-        event.stopPropagation();
-        onSelect?.(node.id);
-      }}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onSelect?.(node.id);
-        }
-      }}
       className={cn(
         "absolute select-none flex-row items-center gap-0 overflow-hidden rounded-md border py-0 px-0",
         "shadow-sm transition-[border-color,box-shadow,opacity] duration-150",
-        "cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-ring/70",
+        // Focus is drawn on the card, not on the invisible button: the ring
+        // must trace the card a sighted keyboard user is actually looking at.
+        "has-[>button:focus-visible]:ring-2 has-[>button:focus-visible]:ring-ring/70",
         selected
           ? "border-primary/80 shadow-[0_0_0_1px_var(--primary),0_6px_20px_-8px_rgba(0,0,0,0.9)]"
           : "border-white/10 hover:border-white/25",
@@ -119,6 +105,22 @@ export const NodeCard = memo(function NodeCard({
         backgroundColor: palette.tint,
       }}
     >
+      {/* A native button stretched over the card, exactly as the neighbour
+          card does it. `div role="button"` would mean re-implementing Enter,
+          Space-on-keyup, and the accessible name by hand; the browser already
+          does all three, and the card is a disclosure rather than a toggle —
+          it opens the panel, so `aria-expanded` is the state to report. */}
+      <button
+        type="button"
+        className="absolute inset-0 z-10 cursor-pointer rounded-md focus-visible:outline-none"
+        aria-label={`Open the neighbourhood of ${label}`}
+        aria-expanded={selected}
+        aria-controls="map-panel"
+        onClick={(event) => {
+          event.stopPropagation();
+          onSelect?.(node.id);
+        }}
+      />
       {/* The kind bar: the one colour on the card that never changes with
           state, so "what is this" is answerable before "how is it". */}
       <span
