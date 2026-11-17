@@ -204,6 +204,8 @@ export function EdgeLayer({
             key={edgeKey(edge)}
             d={path.d}
             data-protocol={protocol || edge.protocol || "tcp"}
+            data-from={edge.client}
+            data-to={edge.server}
             fill="none"
             opacity={touched ? 1 : 0.16}
             stroke={warn ? LINE.warn : touched && selected ? LINE.focused : LINE.idle}

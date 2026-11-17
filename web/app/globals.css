@@ -145,6 +145,24 @@
  * behaviour — everything inside is painted by the 2D context.
  */
 @layer components {
+  /* Neighbourhood workload cards. The text labels trim the font's ghost
+     leading so an 8.5px mono line and its 10px heading sit centred in their
+     fixed-height rows instead of drifting a pixel low (Modern Web Guidance,
+     precise-text-alignment). `text-box` does not inherit, so it is applied to
+     each label directly. Unsupported browsers ignore it and keep the old box. */
+  .neighbor-trim {
+    text-box: trim-both cap alphabetic;
+  }
+
+  /* The card is its own inline-size container: when a peer list makes it too
+     narrow to show a rate beside the container name, the rate folds away
+     rather than truncating the name the operator needs to identify the hop. */
+  @container (max-width: 208px) {
+    .neighbor-rate {
+      display: none;
+    }
+  }
+
   .fg-scroll {
     overflow-x: hidden;
     overflow-y: auto;

@@ -30,9 +30,9 @@ import { Button } from "@/components/ui/button";
 
 import { EdgeLayer } from "./edge-layer";
 import {
-  NEIGHBOR_CARD,
   NeighborCard,
   neighborCardHeight,
+  neighborRowCenter,
   neighborRowOffset,
 } from "./neighbor-card";
 import type { NeighborContainer } from "./neighbor-card";
@@ -86,7 +86,14 @@ interface NeighborRow {
 interface Layout {
   /** Workload cards — the only things a label must avoid. */
   cards: Map<string, Box>;
-  /** Cards plus one full-width band per container row, for edge endpoints. */
+  /**
+   * Edge endpoints. Every container row has two point-sized anchors: `<key>@out`
+   * on the card's right border and `<key>@in` on its left, matching the two
+   * ports drawn on the card. A curve leaves a source's `@out` and lands on a
+   * target's `@in`, so it runs container-to-container at the row's own height.
+   * Workloads whose edge could not be attributed to a container get `<id>@out`
+   * / `<id>@in` at the card's vertical centre.
+   */
   anchors: Map<string, Box>;
   rows: NeighborRow[];
   rowNames: Map<string, string>;
@@ -94,6 +101,16 @@ interface Layout {
   height: number;
   width: number;
   selfBox: Box;
+}
+
+/** A point-sized box whose centre is (x, y): edgePath reads its edges. */
+function port(x: number, y: number): Box {
+  return { x: x - 0.5, y: y - 0.5, w: 1, h: 1 };
+}
+
+/** Strip the `@in` / `@out` suffix back to a row or workload key. */
+function anchorBase(key: string): string {
+  return key.replace(/@(in|out)$/, "");
 }
 
 function groupPeers(edges: ServiceMapEdge[], peerOf: (edge: ServiceMapEdge) => string): PeerGroup[] {
@@ -284,18 +301,19 @@ export function Neighborhood({
         const cardHeight = neighborCardHeight(rowCountOf(id));
         const card = { x: xs[columnIndex], y, w: cardWidth, h: cardHeight };
         cards.set(id, card);
-        // An edge ending on a container leaves the card at that row's height,
-        // at the card's own left/right border — never in the middle of a card.
-        anchors.set(id, card);
+        // Fallback for traffic the agent could not attribute to a container:
+        // the two sides of the card, at its vertical centre.
+        anchors.set(`${id}@out`, port(card.x + card.w, y + card.h / 2));
+        anchors.set(`${id}@in`, port(card.x, y + card.h / 2));
         (containers.get(id)?.names ?? []).forEach((name, index) => {
           const key = rowId(id, name);
           const offset = neighborRowOffset(index);
-          anchors.set(key, {
-            x: card.x,
-            y: y + offset,
-            w: cardWidth,
-            h: NEIGHBOR_CARD.rowHeight,
-          });
+          const centre = y + neighborRowCenter(index);
+          // The out port is the circle on the card's right border, the in port
+          // the one on its left — the exact points NeighborCard draws. An edge
+          // leaves one and lands on the other at the row's own height.
+          anchors.set(`${key}@out`, port(card.x + card.w, centre));
+          anchors.set(`${key}@in`, port(card.x, centre));
           rowNames.set(key, name);
           rows.push({ id: key, ownerId: id, name, offset });
         });
@@ -311,25 +329,32 @@ export function Neighborhood({
       columns,
       height,
       width,
-      selfBox: cards.get(node.id) ?? { x: 0, y: 0, w: cardWidth, h: NEIGHBOR_CARD.header },
+      selfBox: cards.get(node.id) ?? { x: 0, y: 0, w: cardWidth, h: neighborCardHeight(0) },
     };
   }, [upGroups, downGroups, node.id, nodes, containers, shownIds, rowId]);
 
-  // One line per pair of container rows, anchored on the containers the edge
-  // actually names. An edge with no container stays on its workload's card.
+  // One line per pair of container rows. A client leaves its row's right port
+  // (`@out`) and a server is entered at its row's left port (`@in`), so the
+  // curve is drawn from one container to the other rather than from card to
+  // card. An edge with no container stays on its workload's card centre.
   const shown = useMemo(() => {
     const out: ServiceMapEdge[] = [];
-    const endpoint = (owner: string, container: string | undefined) => {
+    const endpoint = (
+      owner: string,
+      container: string | undefined,
+      side: "out" | "in",
+    ) => {
       const candidate = container ? rowId(owner, container) : "";
       // An edge the agent could not attribute down to a container stays on the
       // workload card instead of disappearing from the drawing.
-      return candidate && layout.anchors.has(candidate) ? candidate : owner;
+      const base = candidate && layout.anchors.has(`${candidate}@${side}`) ? candidate : owner;
+      return `${base}@${side}`;
     };
     const emit = (group: PeerGroup, fromPeer: boolean) => {
       const pairs = new Map<string, ServiceMapEdge[]>();
       for (const edge of group.edges) {
-        const client = endpoint(fromPeer ? group.id : node.id, edge.client_container);
-        const server = endpoint(fromPeer ? node.id : group.id, edge.server_container);
+        const client = endpoint(fromPeer ? group.id : node.id, edge.client_container, "out");
+        const server = endpoint(fromPeer ? node.id : group.id, edge.server_container, "in");
         if (!layout.anchors.has(client) || !layout.anchors.has(server)) continue;
         const key = `${client}|${server}`;
         const slot = pairs.get(key) ?? [];
@@ -343,8 +368,8 @@ export function Neighborhood({
             matching,
             client,
             server,
-            layout.rowNames.get(client) ?? "",
-            layout.rowNames.get(server) ?? "",
+            layout.rowNames.get(anchorBase(client)) ?? "",
+            layout.rowNames.get(anchorBase(server)) ?? "",
           ),
         );
       }
@@ -354,15 +379,29 @@ export function Neighborhood({
     return out;
   }, [upGroups, downGroups, layout.anchors, layout.rowNames, node.id, rowId]);
 
-  /** Connections each container row carries, for the row's own number. */
-  const perRow = useMemo(() => {
+  /** Connections per row, and which of its two ports actually carry an edge. */
+  const { perRow, usedPorts } = useMemo(() => {
     const totals = new Map<string, number>();
+    const ports = new Map<string, { in?: boolean; out?: boolean }>();
+    const mark = (anchor: string) => {
+      const side = anchor.endsWith("@out") ? "out" : anchor.endsWith("@in") ? "in" : null;
+      if (!side) return;
+      const row = anchorBase(anchor);
+      if (!layout.rowNames.has(row)) return;
+      const state = ports.get(row) ?? {};
+      state[side] = true;
+      ports.set(row, state);
+    };
     for (const edge of shown) {
-      totals.set(edge.client, (totals.get(edge.client) ?? 0) + (edge.connections ?? 0));
-      totals.set(edge.server, (totals.get(edge.server) ?? 0) + (edge.connections ?? 0));
+      const client = anchorBase(edge.client);
+      const server = anchorBase(edge.server);
+      totals.set(client, (totals.get(client) ?? 0) + (edge.connections ?? 0));
+      totals.set(server, (totals.get(server) ?? 0) + (edge.connections ?? 0));
+      mark(edge.client);
+      mark(edge.server);
     }
-    return totals;
-  }, [shown]);
+    return { perRow: totals, usedPorts: ports };
+  }, [shown, layout.rowNames]);
 
   const reportWidth = useCallback(
     (width: number) => onPreferredWidth?.(width),
@@ -540,6 +579,7 @@ export function Neighborhood({
               const rows: NeighborContainer[] = (info?.names ?? []).map((name) => ({
                 name,
                 rate: rate(perRow.get(rowId(id, name)) ?? 0),
+                ports: usedPorts.get(rowId(id, name)),
               }));
               if (info?.extra) {
                 rows.push({ name: `+${info.extra} more containers`, rate: 0, more: true });

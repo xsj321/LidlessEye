@@ -259,17 +259,28 @@ with nothing in it is dropped and its space given to the others.
 The hop uses its own layout and its own card, not the big map's. A workload is
 **one card that owns its containers**: the header names the workload, and below
 it a short spine brackets one row per container, indented and inside the same
-border. The rows are children of the card in the DOM, so a long workload name
-or a third sidecar cannot push one over another — the browser stacks them, and
-card height is computed from the same shared geometry the card renders with.
-Containers that carried traffic in the window come first, heaviest at the top;
-a long tail collapses into `+n more containers`. An edge is anchored to the
-band at its container's row height, on the card's own border, so the line
-leaves the card exactly where the row sits — a sidecar's traffic reads as the
-sidecar's. Labels clear the workload cards, not the rows inside them, and stay
-in the channel between columns. The hop has its own scroll-to-zoom,
-drag-to-pan and zoom buttons, with a *fit* action that returns to a readable
-whole-hop view.
+border. The rows are a real `<ul>` of `<li>` children and the card is an
+`<article>` whose whole area is one native `<button>`, so "workload owns
+container" is expressed in the markup, not just in the pixels; Enter/Space walk
+the graph without a hand-rolled key handler, and selection only recolours the
+border rather than resizing it. A long workload name or a third sidecar cannot
+push one over another — the browser stacks them, and card height is computed
+from the same shared geometry the card renders with. Containers that carried
+traffic in the window come first, heaviest at the top; a long tail collapses
+into `+n more containers`. The card is its own `inline-size` container: when a
+crowded hop squeezes it, the rate beside a container name folds away before the
+name is truncated.
+
+**Edges run container to container.** Each container row draws a small port on
+the card's left (`in`) and right (`out`) border, and the row's stub joins that
+port to its name. A curve leaves the caller container's `out` port and lands on
+the callee container's `in` port at that row's own height — so a sidecar's
+traffic visibly starts and ends at the sidecars, not at the workload boxes.
+Only traffic the agent could not attribute to a container falls back to the
+card's centre; unused ports are not drawn, so no circle floats without an edge.
+Labels clear the workload cards, not the rows inside them, and stay in the
+channel between columns. The hop has its own scroll-to-zoom, drag-to-pan and
+zoom buttons, with a *fit* action that returns to a readable whole-hop view.
 
 The panel is portalled to `document.body` and positioned `fixed`, so it spans
 the **full window height** rather than stopping at the map card. It opens at

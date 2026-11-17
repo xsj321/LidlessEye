@@ -869,30 +869,34 @@ async function main() {
   );
   // A container is a row *inside* its workload card: nested, indented, and
   // below the header. The two must never be separate boxes that can overlap.
-  const selfCard = mapPage.locator('[data-testid="map-neighborhood-self"]');
-  const selfBox = await selfCard.boundingBox();
-  const firstRowBox = await mapPage
-    .locator('[data-testid="map-container-row"][data-node="shop/cart"]')
-    .first()
-    .boundingBox();
-  const layoutZoom = Number(
-    await mapPage
-      .locator('[data-testid="map-neighborhood"] > div[data-zoom]')
-      .getAttribute("data-zoom"),
-  );
+  // Measure the card and its first row in one evaluation: the drawer widens to
+  // fit the map on open, and two separate boundingBox() calls can straddle
+  // that transform and read positions from different frames.
+  const nesting = await mapPage.evaluate(() => {
+    const card = document.querySelector('[data-testid="map-neighborhood-self"]');
+    const row = document.querySelector(
+      '[data-testid="map-container-row"][data-node="shop/cart"]',
+    );
+    if (!card || !row) return null;
+    const c = card.getBoundingClientRect();
+    const r = row.getBoundingClientRect();
+    const zoomEl = document.querySelector('[data-testid="map-neighborhood"] > div[data-zoom]');
+    return {
+      c: { x: c.x, y: c.y, w: c.width, h: c.height },
+      r: { x: r.x, y: r.y, h: r.height },
+      zoom: Number(zoomEl?.getAttribute("data-zoom") ?? 1),
+    };
+  });
   check(
-    selfBox != null &&
-      firstRowBox != null &&
-      firstRowBox.x > selfBox.x + 4 &&
-      firstRowBox.y > selfBox.y + 12 &&
+    nesting != null &&
+      nesting.r.x > nesting.c.x + 4 &&
+      nesting.r.y > nesting.c.y + 12 &&
       // The row sits just under the header. `Card`'s default py-6/gap-6 used
       // to push it down by a third of the card and clip the last row.
-      firstRowBox.y - selfBox.y < 70 * layoutZoom &&
-      firstRowBox.y + firstRowBox.height < selfBox.y + selfBox.height + 1,
+      nesting.r.y - nesting.c.y < 70 * nesting.zoom &&
+      nesting.r.y + nesting.r.h < nesting.c.y + nesting.c.h + 1,
     "container rows are nested and indented inside their workload card",
-    selfBox && firstRowBox
-      ? `card ${JSON.stringify(selfBox)} / row ${JSON.stringify(firstRowBox)}`
-      : "missing box",
+    nesting ? `card ${JSON.stringify(nesting.c)} / row ${JSON.stringify(nesting.r)}` : "missing box",
   );
   // The whole point of the dedicated layout: no two workload cards overlap,
   // however long their names or however many containers they own.
@@ -921,6 +925,28 @@ async function main() {
     (await mapPage.locator('[data-testid="map-neighborhood-edges"] path[marker-end]').count()) >= 2,
     "container rows carry their own edges",
   );
+  // Every hop leaves a source port (`@out`) and lands on a target port
+  // (`@in`); when both ends name a container (the `::` separator) the line is
+  // container-to-container, not workload-to-workload.
+  const hops = await mapPage
+    .locator('[data-testid="map-neighborhood-edges"] path[data-from]')
+    .evaluateAll((paths) =>
+      paths.map((path) => ({ from: path.dataset.from, to: path.dataset.to })),
+    );
+  check(
+    hops.length > 0 && hops.every((h) => h.from?.endsWith("@out") && h.to?.endsWith("@in")),
+    "every hop is anchored on ports, not card centres",
+    JSON.stringify(hops),
+  );
+  check(
+    hops.some((h) => h.from?.includes("::") && h.to?.includes("::")),
+    "at least one hop runs container-to-container",
+    JSON.stringify(hops),
+  );
+  const ports = await mapPage
+    .locator('[data-testid="map-neighborhood-self"] [data-container-port]')
+    .count();
+  check(ports > 0, "container rows draw connection ports", String(ports));
   const protocols = await mapPage
     .locator('[data-testid="map-neighborhood-edges"] path[data-protocol]')
     .evaluateAll((paths) => paths.map((path) => path.dataset.protocol));

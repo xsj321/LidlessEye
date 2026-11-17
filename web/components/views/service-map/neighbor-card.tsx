@@ -1,22 +1,31 @@
 "use client";
 
-// A workload as it appears in the one-hop map: one card that owns its
-// containers.
+// A workload in the one-hop map: one card that owns its container rows.
 //
 // The big map draws a workload and a peer as separate things; the
-// neighbourhood has a different job. There the question is "which part of
-// this workload holds the connection", so a container is a row *inside* the
-// workload card, under a short spine, not a second free-floating box next to
-// it. Keeping the row in the card's own DOM subtree is what makes overlap
-// impossible by construction: the browser stacks them, there is no second
-// set of absolute coordinates that can drift out of sync with the layout.
+// neighbourhood answers a different question — "which part of this workload
+// holds the connection" — so a container is a row *inside* its workload card,
+// under a short spine, never a second free-floating box. One DOM subtree per
+// workload means a long name or a third container cannot push a row onto its
+// neighbour: the browser stacks them.
 //
-// The geometry below is shared with the layout in neighborhood.tsx. Both
-// import it: if a padding changes here, the edge anchors move with it.
+// Two things come from the browser rather than from JavaScript, following the
+// Modern Web Guidance card guide:
+//   * semantics and interaction are chosen separately — `<article>` carries
+//     the content (`<h3>` + `<ul>`), a single stretched native `<button>` is
+//     the whole-card action. Enter/Space and the accessible name are native.
+//   * selection only recolours the border and the shadow. Border width,
+//     padding and font weight never change, so a card does not jump when it
+//     becomes the selected node.
+//
+// Each container row carries two ports on the card's left and right borders.
+// The edge layer anchors lines at those exact points, so a curve visibly runs
+// from one container's port to another's — container to container, not card to
+// card. The geometry below is shared with neighborhood.tsx: change a constant
+// here and both the ports and the edge anchors move with it.
 
-import { memo } from "react";
+import { Fragment, memo } from "react";
 
-import { Card } from "@/components/ui/card";
 import {
   KIND,
   formatRate,
@@ -30,15 +39,17 @@ import { cn } from "@/lib/utils";
 
 /** All sizes in world pixels at scale 1; the view scales the layer, not the card. */
 export const NEIGHBOR_CARD = {
-  header: 44,
+  header: 46,
   rowHeight: 26,
-  rowGap: 5,
+  rowGap: 6,
   /** Space between the header and the first container row. */
-  padTop: 8,
-  padBottom: 9,
+  padTop: 9,
+  padBottom: 10,
   /** How far a container row is indented from the card's left edge. */
   indent: 22,
   rightPad: 8,
+  /** Radius of the port circles that sit on the card's left/right borders. */
+  portRadius: 3.25,
 } as const;
 
 /** Height a card needs for a given number of container rows. */
@@ -62,10 +73,17 @@ export function neighborRowOffset(index: number): number {
   );
 }
 
+/** Y of the centre of a container row — the height an edge port sits at. */
+export function neighborRowCenter(index: number): number {
+  return neighborRowOffset(index) + NEIGHBOR_CARD.rowHeight / 2;
+}
+
 export interface NeighborContainer {
   name: string;
   /** Connections per second on all edges that touch this container. */
   rate: number;
+  /** Which sides actually carry an edge in this hop. Hides unused ports. */
+  ports?: { in?: boolean; out?: boolean };
   /** Set when more containers exist than the card can draw. */
   more?: boolean;
 }
@@ -116,35 +134,22 @@ export const NeighborCard = memo(function NeighborCard({
   const heat = cpuMax > 0 ? Math.min(1, Math.sqrt(cpu / cpuMax)) : 0;
   const label = nodeLabel(node);
   const meta = nodeMeta(node);
+  const portStyle = { borderColor: palette.bar, backgroundColor: palette.tint };
+  const stubStyle = { backgroundColor: `${palette.bar}80` };
 
   return (
-    <Card
-      role="button"
-      tabIndex={0}
-      aria-expanded={selected}
-      aria-controls="map-panel"
+    <article
       data-testid={testId}
       // The pan surface checks this marker before capturing the pointer:
-      // without it a press on a card never reaches this onClick.
+      // without it a press on a card never reaches its button.
       data-map-card=""
-      title={`${label}\n${node.id}${meta ? `\n${meta}` : ""}`}
-      onClick={(event) => {
-        event.stopPropagation();
-        onSelect?.(node.id);
-      }}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onSelect?.(node.id);
-        }
-      }}
+      aria-label={`${label} · ${meta}`}
       className={cn(
-        // `Card` brings py-6 and gap-6. Both would push the rows past the
-        // height the layout reserved for them and get clipped, so zero them
-        // out: this card's geometry is the shared constants above.
-        "absolute flex-col gap-0 select-none overflow-hidden rounded-md border px-0 py-0 shadow-sm",
-        "cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-ring/70",
+        "absolute isolate flex-col rounded-md border border-solid bg-card text-card-foreground",
+        // Selection is colour only: no border-width, padding or font-weight
+        // change, so the card and its neighbours never jump.
         "transition-[border-color,box-shadow] duration-150",
+        "has-[>button:focus-visible]:ring-2 has-[>button:focus-visible]:ring-ring/70",
         selected
           ? "border-primary/80 shadow-[0_0_0_1px_var(--primary),0_6px_20px_-8px_rgba(0,0,0,0.9)]"
           : "border-white/10 hover:border-white/25",
@@ -155,28 +160,43 @@ export const NeighborCard = memo(function NeighborCard({
         width: box.w,
         height: box.h,
         backgroundColor: palette.tint,
+        // The card's own width drives the rate label, not the drawer's width.
+        containerType: "inline-size",
       }}
     >
       <span
         aria-hidden="true"
-        className="absolute left-0 top-0 h-full w-[3px]"
+        className="absolute inset-y-0 left-0 w-[3px] rounded-l-md"
         style={{ backgroundColor: palette.bar }}
       />
 
-      <div
-        className="flex items-center gap-1.5 px-2"
-        style={{ height: NEIGHBOR_CARD.header }}
-      >
+      {/* The whole card is one action: a native button stretched over the
+          article. Container rows are not interactive, so there is nothing for
+          a second control to compete with. Enter/Space come for free. */}
+      <button
+        type="button"
+        className="absolute inset-0 z-10 cursor-pointer rounded-md focus-visible:outline-none"
+        aria-label={`Open the neighbourhood of ${label}`}
+        aria-expanded={selected}
+        aria-controls="map-panel"
+        onClick={() => onSelect?.(node.id)}
+      />
+
+      <div className="flex items-center gap-1.5 px-2" style={{ height: NEIGHBOR_CARD.header }}>
         <div className="min-w-0 flex-1 leading-none">
-          <div className="truncate text-[10px] font-medium text-card-foreground">{label}</div>
-          <div className="mt-1 truncate font-mono text-[8.5px] text-muted-foreground">{meta}</div>
+          <h3 className="neighbor-trim truncate text-[10px] font-medium text-card-foreground">
+            {label}
+          </h3>
+          <p className="neighbor-trim mt-1 truncate font-mono text-[8.5px] text-muted-foreground">
+            {meta}
+          </p>
         </div>
         <StatusGlyph tone={tone} />
       </div>
 
       {containers.length > 0 ? (
-        <div
-          className="relative"
+        <ul
+          className="relative m-0 list-none p-0"
           style={{
             paddingTop: NEIGHBOR_CARD.padTop,
             paddingBottom: NEIGHBOR_CARD.padBottom,
@@ -184,11 +204,11 @@ export const NeighborCard = memo(function NeighborCard({
             paddingRight: NEIGHBOR_CARD.rightPad,
           }}
         >
-          {/* The spine is inside the card: container rows read as parts of the
-              workload, not as neighbours that happen to sit underneath. */}
+          {/* The spine is inside the card: container rows read as parts of
+              the workload, not as neighbours that happen to sit below it. */}
           <span
             aria-hidden="true"
-            className="absolute top-0 w-px"
+            className="absolute w-px"
             style={{
               left: 11,
               top: NEIGHBOR_CARD.padTop,
@@ -196,42 +216,109 @@ export const NeighborCard = memo(function NeighborCard({
               backgroundColor: `${palette.bar}66`,
             }}
           />
-          {containers.map((container, index) => (
-            <div
-              key={container.name}
-              data-testid={container.more ? undefined : "map-container-row"}
-              data-node={container.more ? undefined : node.id}
-              data-container={container.more ? undefined : container.name}
-              className="relative flex items-center gap-1 rounded border border-white/5 bg-white/[0.05] px-1.5"
-              style={{
-                height: NEIGHBOR_CARD.rowHeight,
-                marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
-              }}
-              title={container.more ? undefined : `${label} · ${container.name}`}
-            >
-              <span
-                aria-hidden="true"
-                className="absolute h-px w-[10px]"
-                style={{ left: -11, top: "50%", backgroundColor: `${palette.bar}66` }}
-              />
-          <span
-            className={cn(
-              "min-w-0 flex-1 truncate font-mono",
-              container.more
-                ? "text-[8.5px] italic text-muted-foreground/80"
-                : "text-[9px] text-foreground/80",
-            )}
-          >
-            {container.name}
-          </span>
-          {!container.more && container.rate > 0 ? (
-            <span className="shrink-0 font-mono text-[8px] text-muted-foreground">
-              {formatRate(container.rate)}
-            </span>
-          ) : null}
-            </div>
-          ))}
-        </div>
+          {containers.map((container, index) => {
+            if (container.more) {
+              return (
+                <li
+                  key={container.name}
+                  className="relative flex items-center rounded border border-white/5 bg-white/[0.05] px-1.5 italic text-muted-foreground/80"
+                  style={{
+                    height: NEIGHBOR_CARD.rowHeight,
+                    marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
+                    fontSize: 8.5,
+                  }}
+                >
+                  {container.name}
+                </li>
+              );
+            }
+            const center = neighborRowCenter(index);
+            const hasIn = container.ports?.in ?? true;
+            const hasOut = container.ports?.out ?? true;
+            return (
+              <Fragment key={container.name}>
+                {/* Ports on the card's borders, only on sides that carry an
+                    edge in this hop. Each curve ends on one of these circles,
+                    so the line visibly belongs to this container row. */}
+                {hasIn ? (
+                  <span
+                    aria-hidden="true"
+                    data-container-port="in"
+                    data-node={node.id}
+                    data-container={container.name}
+                    className="absolute z-0 rounded-full border-2"
+                    style={{
+                      left: -NEIGHBOR_CARD.portRadius,
+                      top: center - NEIGHBOR_CARD.portRadius,
+                      width: NEIGHBOR_CARD.portRadius * 2,
+                      height: NEIGHBOR_CARD.portRadius * 2,
+                      ...portStyle,
+                    }}
+                  />
+                ) : null}
+                {hasOut ? (
+                  <span
+                    aria-hidden="true"
+                    data-container-port="out"
+                    data-node={node.id}
+                    data-container={container.name}
+                    className="absolute z-0 rounded-full border-2"
+                    style={{
+                      right: -NEIGHBOR_CARD.portRadius,
+                      top: center - NEIGHBOR_CARD.portRadius,
+                      width: NEIGHBOR_CARD.portRadius * 2,
+                      height: NEIGHBOR_CARD.portRadius * 2,
+                      ...portStyle,
+                    }}
+                  />
+                ) : null}
+                {/* A short stub ties each live port to its row's label. */}
+                {hasIn ? (
+                  <span
+                    aria-hidden="true"
+                    className="absolute h-px"
+                    style={{ left: 0, top: center, width: NEIGHBOR_CARD.indent, ...stubStyle }}
+                  />
+                ) : null}
+                {hasOut ? (
+                  <span
+                    aria-hidden="true"
+                    className="absolute h-px"
+                    style={{
+                      right: 0,
+                      top: center,
+                      width: NEIGHBOR_CARD.rightPad,
+                      ...stubStyle,
+                    }}
+                  />
+                ) : null}
+                <li
+                  data-testid="map-container-row"
+                  data-node={node.id}
+                  data-container={container.name}
+                  className="relative flex items-center gap-1 rounded border border-white/5 bg-white/[0.05] px-1.5"
+                  style={{
+                    height: NEIGHBOR_CARD.rowHeight,
+                    marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
+                  }}
+                  title={`${label} · ${container.name}`}
+                >
+                  <span
+                    aria-hidden="true"
+                    className="absolute h-px w-[10px]"
+                    style={{ left: -11, top: "50%", backgroundColor: `${palette.bar}66` }}
+                  />
+                  <span className="neighbor-trim min-w-0 flex-1 truncate font-mono text-[9px] text-foreground/80">
+                    {container.name}
+                  </span>
+                  <span className="neighbor-rate shrink-0 font-mono text-[8px] text-muted-foreground">
+                    {container.rate > 0 ? formatRate(container.rate) : ""}
+                  </span>
+                </li>
+              </Fragment>
+            );
+          })}
+        </ul>
       ) : null}
 
       <span
@@ -244,6 +331,6 @@ export const NeighborCard = memo(function NeighborCard({
           style={{ width: `${Math.round(heat * 100)}%`, backgroundColor: "#f2a65a" }}
         />
       </span>
-    </Card>
+    </article>
   );
 });
