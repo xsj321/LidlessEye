@@ -154,6 +154,9 @@ struct Module {
     loads: Vec<LoadSegment>,
     syms: Vec<Sym>,
     go: Option<GoTable>,
+    /// `go1.x.y` from the binary's build info, when it carries one. Purely
+    /// diagnostic: it is the answer to "is this the Go release we tested".
+    go_version: Option<String>,
 }
 
 /// Where a name came from, so the collector can report coverage per source.
@@ -180,6 +183,22 @@ impl Module {
         let text = file
             .section_by_name(".text")
             .map(|section| section.address())
+            // A binary whose section headers were removed still has program
+            // headers, and its code lives in the executable `PT_LOAD`. Without
+            // this, a section-stripped PIE has no `text` at all: the header's
+            // `textStart` is a relocation placeholder there, so the Go table
+            // would parse and then answer nothing.
+            .or_else(|| {
+                file.segments()
+                    .find(|segment| {
+                        matches!(
+                            segment.flags(),
+                            object::SegmentFlags::Elf { p_flags, .. }
+                                if p_flags.contains(object::elf::PF_X)
+                        )
+                    })
+                    .map(|segment| segment.address())
+            })
             .unwrap_or(0);
         let loads = file
             .segments()
@@ -205,6 +224,12 @@ impl Module {
             .and_then(|section| section.data().ok())
             .and_then(|blob| GoTable::parse(blob, text))
             .or_else(|| GoTable::scan(data, text));
+        let go_version = go.as_ref().and_then(|_| {
+            file.section_by_name(".go.buildinfo")
+                .and_then(|section| section.data().ok())
+                .and_then(go_version_of)
+                .or_else(|| go_version_of(data))
+        });
         if syms.is_empty() && go.is_none() {
             tracing::debug!(
                 path = %path.display(),
@@ -218,7 +243,12 @@ impl Module {
                 return None;
             }
         }
-        Some(Module { loads, syms, go })
+        Some(Module {
+            loads,
+            syms,
+            go,
+            go_version,
+        })
     }
 
     /// Offset to subtract from a runtime address to land in the file's own
@@ -306,6 +336,46 @@ fn collect_symbols(file: &object::File<'_>) -> Vec<Sym> {
         });
     }
     syms
+}
+
+/// `go1.x.y` from a Go binary's build info.
+///
+/// The `.go.buildinfo` section stores either inline length-prefixed strings or
+/// two pointers into the image; a PIE relocates the pointers and a packer
+/// renames the section, so neither shape is something to rely on. The version
+/// string is what answers "is this the Go release the symbolizer was tested
+/// with", and scanning for the token finds it in both shapes.
+fn go_version_of(data: &[u8]) -> Option<String> {
+    const NEEDLE: &[u8] = b"go1.";
+    let mut offset = 0usize;
+    while offset + NEEDLE.len() <= data.len() {
+        let found = data[offset..]
+            .windows(NEEDLE.len())
+            .position(|window| window == NEEDLE)?;
+        let start = offset + found;
+        let end = data[start..start + 24.min(data.len() - start)]
+            .iter()
+            .position(|byte| !(byte.is_ascii_digit() || *byte == b'.' || byte.is_ascii_lowercase()))
+            .map(|len| start + len)
+            .unwrap_or(data.len());
+        let token = &data[start..end];
+        if let Ok(text) = std::str::from_utf8(token)
+            && text.len() >= 6
+            && text.len() <= 24
+            && text.as_bytes()[4].is_ascii_digit()
+            && !text.ends_with('.')
+        {
+            return Some(text.to_string());
+        }
+        offset = start + NEEDLE.len();
+    }
+    None
+}
+
+/// [`go_version_of`], for tests in other modules of this crate.
+#[cfg(test)]
+pub(crate) fn go_version_of_for_test(data: &[u8]) -> Option<String> {
+    go_version_of(data)
 }
 
 fn read_maps(tgid: u32) -> Option<Vec<Mapping>> {
@@ -439,7 +509,39 @@ struct CachedModule {
     module: Option<Arc<Module>>,
     /// Monotonic use counter, for eviction.
     used: u64,
+    /// Which route opened the file, for diagnostics.
+    route: &'static str,
 }
+
+/// Why frames from one binary stay unnamed.
+///
+/// A wall of hex on a dashboard is not a rendering bug: either the file could
+/// not be opened at all, or it was read and simply has nothing to say about
+/// those addresses (stripped, no Go table, or a stale build). The two need
+/// different fixes, and on a cluster the user cannot shell into, the agent has
+/// to name the binary and the reason for them.
+#[derive(Clone)]
+pub(crate) struct ModuleIssue {
+    pub path: String,
+    /// `go1.x.x` when the binary carries build info: the first thing to check
+    /// when a Go service still shows addresses.
+    pub go_version: Option<String>,
+    /// ELF symbols the file offers, and whether it had a Go function table.
+    pub symbols: usize,
+    pub has_go: bool,
+    /// Addresses that landed in this binary and named nothing.
+    pub count: u64,
+    /// The file was never readable, so `symbols`/`has_go` say nothing.
+    pub unreadable: bool,
+    /// Route that opened the file, for the readable case.
+    pub route: &'static str,
+    /// Whether this binary was already named in the log.
+    pub reported: bool,
+}
+
+/// How many binaries get an issue entry. A node runs a few hundred binaries and
+/// the log has to stay readable.
+const MAX_ISSUES: usize = 32;
 
 /// Per-pid map snapshots plus one parsed [`Module`] per binary.
 #[derive(Default)]
@@ -447,6 +549,8 @@ pub(crate) struct ModuleCache {
     maps: HashMap<u32, MapsCache>,
     /// `(dev, inode)` → module.
     modules: HashMap<(u64, u64), CachedModule>,
+    /// Binaries that produced unnamed frames, keyed by path.
+    issues: HashMap<String, ModuleIssue>,
     /// Last value handed out by the use counter.
     tick: u64,
     /// Modules whose lookups already produced a diagnostic, so the message
@@ -484,15 +588,32 @@ impl ModuleCache {
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         if !self.modules.contains_key(&key) {
-            let module = self.load(tgid, &mapping).map(Arc::new);
-            self.insert(key, module, tick);
+            let (module, route) = self.load(tgid, &mapping);
+            self.insert(key, module.map(Arc::new), tick, route);
         }
         let entry = self.modules.get_mut(&key)?;
         entry.used = tick;
+        let route = entry.route;
         let module = entry.module.as_ref()?;
         let bias = module.bias(mapping.start, mapping.offset)?;
         let vaddr = addr.checked_sub(bias)?;
         let Some((name, source)) = module.lookup(vaddr) else {
+            if self.issues.len() < MAX_ISSUES || self.issues.contains_key(&mapping.path) {
+                let issue =
+                    self.issues
+                        .entry(mapping.path.clone())
+                        .or_insert_with(|| ModuleIssue {
+                            path: mapping.path.clone(),
+                            go_version: module.go_version.clone(),
+                            symbols: module.syms.len(),
+                            has_go: module.go.is_some(),
+                            count: 0,
+                            unreadable: false,
+                            route,
+                            reported: false,
+                        });
+                issue.count += 1;
+            }
             if tracing::enabled!(tracing::Level::DEBUG)
                 && self.misses.len() < MAX_REPORTED
                 && self.misses.insert(mapping.path.clone())
@@ -526,7 +647,13 @@ impl ModuleCache {
     }
 
     /// Cache `module`, evicting the least recently used entry when full.
-    fn insert(&mut self, key: (u64, u64), module: Option<Arc<Module>>, used: u64) {
+    fn insert(
+        &mut self,
+        key: (u64, u64),
+        module: Option<Arc<Module>>,
+        used: u64,
+        route: &'static str,
+    ) {
         if self.modules.len() >= MAX_MODULES {
             let oldest = self
                 .modules
@@ -537,15 +664,24 @@ impl ModuleCache {
                 self.modules.remove(&oldest);
             }
         }
-        self.modules.insert(key, CachedModule { module, used });
+        self.modules.insert(
+            key,
+            CachedModule {
+                module,
+                used,
+                route,
+            },
+        );
     }
 
-    fn load(&mut self, tgid: u32, mapping: &Mapping) -> Option<Module> {
+    fn load(&mut self, tgid: u32, mapping: &Mapping) -> (Option<Module>, &'static str) {
         let Some((file, how, identity)) = open_module(tgid, mapping) else {
             self.report(tgid, mapping);
-            return None;
+            return (None, "none");
         };
-        let data = read_file(file, how)?;
+        let Some(data) = read_file(file, how) else {
+            return (None, how);
+        };
         let module = Module::parse(&data, Path::new(&mapping.path));
         if identity == Identity::Different {
             tracing::debug!(
@@ -564,12 +700,54 @@ impl ModuleCache {
                 "module parsed"
             );
         }
-        module
+        (module, how)
+    }
+
+    /// Binaries that produced unnamed frames, worst first.
+    pub(crate) fn issues(&self) -> Vec<ModuleIssue> {
+        let mut out: Vec<ModuleIssue> = self.issues.values().cloned().collect();
+        out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
+        out
+    }
+
+    /// The issues that have not been logged yet, marked as reported.
+    ///
+    /// One line per binary is what makes a remote cluster diagnosable: the user
+    /// pastes the agent log and the message already says which file, which Go
+    /// release and which cause.
+    pub(crate) fn take_new_issues(&mut self, max: usize) -> Vec<ModuleIssue> {
+        let mut fresh: Vec<ModuleIssue> = self
+            .issues
+            .values_mut()
+            .filter(|issue| !issue.reported)
+            .map(|issue| {
+                issue.reported = true;
+                issue.clone()
+            })
+            .collect();
+        fresh.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
+        fresh.truncate(max);
+        fresh
     }
 
     /// Name the path and the routes that were tried, once per binary.
     fn report(&mut self, tgid: u32, mapping: &Mapping) {
         self.failed += 1;
+        if self.issues.len() < MAX_ISSUES
+            && let std::collections::hash_map::Entry::Vacant(slot) =
+                self.issues.entry(mapping.path.clone())
+        {
+            slot.insert(ModuleIssue {
+                path: mapping.path.clone(),
+                go_version: None,
+                symbols: 0,
+                has_go: false,
+                count: 0,
+                unreadable: true,
+                route: "none",
+                reported: false,
+            });
+        }
         if self.reported.len() >= MAX_REPORTED || !self.reported.insert(mapping.path.clone()) {
             return;
         }
@@ -629,6 +807,20 @@ mod tests {
     }
 
     #[test]
+    fn reads_a_go_version_token_from_build_info() {
+        // Pointer-shaped build info, plus the inline-string shape Go uses when
+        // the version is baked in; both contain the token, and that is all the
+        // diagnostic needs.
+        let mut data = b"\xff Go buildinf:".to_vec();
+        data.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        data.extend_from_slice(b"\x07go1.22.3\x00");
+        assert_eq!(go_version_of(&data).as_deref(), Some("go1.22.3"));
+        // A `go1.` that is not a version never matches.
+        assert_eq!(go_version_of(b"go1.txt"), None);
+        assert_eq!(go_version_of(b"nothing here"), None);
+    }
+
+    #[test]
     fn bias_handles_pie_and_flat_executables() {
         // Non-PIE: the first PT_LOAD maps file offset 0 to vaddr 0x400000 and
         // the kernel maps it at 0x400000, so nothing is relocated.
@@ -640,6 +832,7 @@ mod tests {
             }],
             syms: Vec::new(),
             go: None,
+            go_version: None,
         };
         assert_eq!(flat.bias(0x40_0000, 0), Some(0));
         assert_eq!(flat.bias(0x41_2000, 0x1_2000), Some(0));
@@ -654,6 +847,7 @@ mod tests {
             }],
             syms: Vec::new(),
             go: None,
+            go_version: None,
         };
         let base = 0x55f0_c000_0000;
         assert_eq!(pie.bias(base, 0), Some(base));
@@ -667,6 +861,7 @@ mod tests {
             loads: Vec::new(),
             syms: Vec::new(),
             go: None,
+            go_version: None,
         };
         assert_eq!(module.bias(0x1000_5000, 0x5000), Some(0x1000_0000));
     }
@@ -688,6 +883,7 @@ mod tests {
                 },
             ],
             go: None,
+            go_version: None,
         };
         assert_eq!(module.lookup(0x100).map(|(name, _)| name), Some("a"));
         assert_eq!(module.lookup(0x17f).map(|(name, _)| name), Some("a"));
@@ -705,6 +901,7 @@ mod tests {
             loads: Vec::new(),
             syms: Vec::new(),
             go: Some(GoTable::for_test(0x401000, 0, 0x2000, "main.hotA")),
+            go_version: None,
         };
         assert_eq!(
             module.lookup(0x401100),
@@ -725,6 +922,7 @@ mod tests {
                 name: "later".into(),
             }],
             go: Some(GoTable::for_test(0x401000, 0, 0x2000, "main.hotA")),
+            go_version: None,
         };
         assert_eq!(module.lookup(0x401100), Some(("main.hotA", Source::Go)));
         assert_eq!(module.lookup(0x5050), Some(("later", Source::Symbols)));

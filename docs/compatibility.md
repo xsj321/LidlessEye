@@ -124,6 +124,42 @@ What remains is `libc.so.6`: distributions strip it, so its internal helpers
 package. Installing `libc6-dbg` (or the matching `debuginfo` package) resolves
 them; nothing on the agent side can.
 
+### When a frame is still an address
+
+The agent explains itself once a minute, at info level, so a cluster nobody can
+shell into is still diagnosable from its logs:
+
+```text
+INFO symbol coverage named=2090 go=661 elfless=232 unnamed=3 binaries=1 parsed=21 unreadable=0
+WARN frames from this binary stay unnamed path=/usr/local/bin/lidlesseye go="-" route="proc-root" \
+     symbols=0 go_table=false frames=3 cause="no ELF symbol table and no Go function table"
+```
+
+The summary says how much was named and by which source (`go` is `.gopclntab`,
+`elfless` is the module fallback for files blazesym cannot reach), how many
+addresses stayed unnamed, how many binaries were parsed and how many could not
+be opened at all. Each offending binary then gets one line naming the file, its
+Go release when it has build info, and the cause — because the causes have
+different fixes:
+
+| Cause | What it means | Fix |
+| --- | --- | --- |
+| `the file could not be opened through any route` | the agent cannot see the binary: no `hostPID`, a too-narrow security context, or a runtime whose root filesystem it cannot traverse | give the DaemonSet `hostPID: true` and `privileged: true` (the chart's default) |
+| `no ELF symbol table and no Go function table` | the binary was stripped at build time and is not Go | build with `strip = "debuginfo"` (Rust), keep `.symtab`, or install the `-dbg`/`debuginfo` package |
+| `the address is outside the Go function table` | the Go table parsed but this PC is not in it: a stale cached build, or a `-buildmode=plugin` object | restart the agent to drop its module cache; report it if it persists |
+| `the address is outside every ELF symbol` | same, for native code | as above |
+
+Kernel stacks have their own line: when `/proc/kallsyms` is empty or reports
+zeroed addresses, the agent warns once — `kptr_restrict=2` or a dropped
+`CAP_SYSLOG` hides every kernel symbol, and no user-side work can recover them.
+
+**Go version is not one of the causes.** The pclntab reader is exercised against
+Go 1.18, 1.20, 1.22, 1.23, 1.24 and 1.25, each built plain, `-ldflags="-s -w"`
+and `-buildmode=pie -ldflags="-s -w"`, on amd64 and arm64
+(`LIDLESSEYE_GO_FIXTURES=<dir> cargo test -p lidlesseye-ebpf --lib real_go_binaries`).
+The header layout has been stable at magic `0xfffffff1` since Go 1.20, and the
+three older layouts (1.16–1.19) are handled as well.
+
 One limitation is worth stating plainly: samples from a process in **another
 PID namespace** (another container, when the agent runs with `hostPID: true`)
 are counted and dropped. `bpf_get_ns_current_pid_tgid` only answers for tasks

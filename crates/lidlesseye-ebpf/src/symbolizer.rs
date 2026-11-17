@@ -28,6 +28,8 @@
 
 use std::collections::HashMap;
 
+use std::time::Instant;
+
 use blazesym::Pid;
 use blazesym::symbolize::Reason;
 use blazesym::symbolize::source::{Kernel, Process, Source};
@@ -157,6 +159,17 @@ pub(crate) struct FrameResolver {
     /// [`crate::perf_map`].
     perf_map: PerfMapFallback,
     tally: Tally,
+    /// When the coverage summary was last written, so the agent explains
+    /// itself once a minute instead of once per stack.
+    last_report: Option<Instant>,
+    /// `/proc/kallsyms` is checked once: whether it is readable does not change
+    /// while the agent runs, and the answer explains every unnamed `[kernel]`
+    /// frame at once.
+    kernel_symbols_checked: bool,
+    /// `uname -r` of the node, read once for the coverage line. "Which kernel
+    /// is this" is the first question a symbol report from another cluster
+    /// raises, and the answer belongs in the same line as the numbers.
+    kernel_release: Option<String>,
     /// Whether to resolve user addresses through `/proc/<pid>/map_files`.
     ///
     /// Those entries are magic links that resolve inside the *target's* mount
@@ -180,7 +193,110 @@ impl FrameResolver {
             modules: ModuleCache::new(),
             perf_map: PerfMapFallback::new(),
             tally: Tally::default(),
+            last_report: None,
+            kernel_symbols_checked: false,
+            kernel_release: None,
             map_files: true,
+        }
+    }
+
+    /// Explain, at most once a minute, what could not be named and why.
+    ///
+    /// A dashboard full of `0x5f3c...` leaves the user guessing whether the
+    /// binary is stripped, the kernel is hiding its symbols, or the agent
+    /// cannot read the file at all. The three have different fixes, and on a
+    /// cluster nobody can shell into, the log is the only place they can be
+    /// told apart.
+    pub(crate) fn report_diagnostics(&mut self) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        const MAX_LINES: usize = 8;
+        if self.last_report.is_some_and(|at| at.elapsed() < INTERVAL) {
+            return;
+        }
+        self.last_report = Some(Instant::now());
+        self.check_kernel_symbols();
+
+        let kernel = self
+            .kernel_release
+            .get_or_insert_with(|| {
+                std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                    .map(|text| text.trim().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string())
+            })
+            .clone();
+        let (opened, failed) = self.modules.counts();
+        let issues = self.modules.issues();
+        let unnamed: u64 = issues.iter().map(|issue| issue.count).sum();
+        if !issues.is_empty() || failed > 0 {
+            tracing::info!(
+                arch = std::env::consts::ARCH,
+                kernel = %kernel,
+                named = self.tally.resolved,
+                go = self.tally.go,
+                elfless = self.tally.module,
+                unnamed,
+                binaries = issues.len(),
+                parsed = opened,
+                unreadable = failed,
+                "symbol coverage"
+            );
+        }
+        for issue in self.modules.take_new_issues(MAX_LINES) {
+            let cause = if issue.unreadable {
+                "the file could not be opened through any route"
+            } else if issue.symbols == 0 && !issue.has_go {
+                "no ELF symbol table and no Go function table"
+            } else if issue.has_go {
+                "the address is outside the Go function table"
+            } else {
+                "the address is outside every ELF symbol"
+            };
+            tracing::warn!(
+                path = %issue.path,
+                go = issue.go_version.as_deref().unwrap_or("-"),
+                route = issue.route,
+                symbols = issue.symbols,
+                go_table = issue.has_go,
+                frames = issue.count,
+                cause,
+                "frames from this binary stay unnamed"
+            );
+        }
+    }
+
+    /// Warn once when the kernel's own symbol table is not readable.
+    ///
+    /// `kptr_restrict=2`, a missing `CAP_SYSLOG` or a masked `/proc/kallsyms`
+    /// all leave the kernel half of every stack as an address, and nothing else
+    /// in the log would hint at it.
+    fn check_kernel_symbols(&mut self) {
+        if self.kernel_symbols_checked {
+            return;
+        }
+        self.kernel_symbols_checked = true;
+        use std::io::Read as _;
+        let mut head = vec![0u8; 4096];
+        let read = std::fs::File::open("/proc/kallsyms")
+            .and_then(|mut file| file.read(&mut head))
+            .unwrap_or(0);
+        let text = String::from_utf8_lossy(&head[..read]);
+        let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+        if lines.is_empty() {
+            tracing::warn!(
+                "`/proc/kallsyms` is empty or unreadable: kernel frames will show addresses \
+                 (check kptr_restrict and CAP_SYSLOG)"
+            );
+            return;
+        }
+        if lines
+            .iter()
+            .take(8)
+            .all(|line| line.starts_with("0000000000000000"))
+        {
+            tracing::warn!(
+                "`/proc/kallsyms` reports zeroed addresses: kernel symbols are hidden \
+                 (kptr_restrict=2 or a dropped CAP_SYSLOG), so kernel frames stay unnamed"
+            );
         }
     }
 

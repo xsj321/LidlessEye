@@ -508,6 +508,7 @@ fn flush<F>(
 where
     F: Fn(Report),
 {
+    resolver.report_diagnostics();
     let mut cpu_records = drain_map(ebpf, "cpu_counts")?;
     let mut offcpu_records = if offcpu_enabled {
         drain_map(ebpf, "offcpu_totals")?

@@ -258,6 +258,94 @@ fn u64_at(blob: &[u8], off: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object::{Object, ObjectSection};
+
+    /// Parse real Go binaries from `LIDLESSEYE_GO_FIXTURES` and check that the
+    /// table names the functions the program actually has.
+    ///
+    /// The synthetic table above pins the layout; this pins the *reader* against
+    /// whatever the installed toolchain emits — including the PIE and stripped
+    /// variants, which are the ones that show up as addresses in production.
+    #[test]
+    fn real_go_binaries_resolve_their_own_functions() {
+        let Ok(dir) = std::env::var("LIDLESSEYE_GO_FIXTURES") else {
+            return;
+        };
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("fixture dir") {
+            let path = entry.expect("dir entry").path();
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "bin") {
+                continue;
+            }
+            let data = std::fs::read(&path).expect("fixture");
+            let file = object::File::parse(&*data).expect("elf");
+            let text = file
+                .section_by_name(".text")
+                .map(|section| section.address())
+                .unwrap_or(0);
+            let table = file
+                .section_by_name(".gopclntab")
+                .or_else(|| {
+                    file.sections().find(|section| {
+                        section.name().is_ok_and(|name| name.ends_with("gopclntab"))
+                    })
+                })
+                .and_then(|section| section.data().ok())
+                .and_then(|blob| GoTable::parse(blob, text))
+                .or_else(|| GoTable::scan(&data, text))
+                .unwrap_or_else(|| panic!("{}: no Go table", path.display()));
+
+            let mut names = Vec::new();
+            for func in &table.funcs {
+                if let Some(name) = table.name_at(func.name) {
+                    names.push(name.to_string());
+                }
+            }
+            for expected in ["main.hotA", "main.hotB", "runtime.main"] {
+                assert!(
+                    names.iter().any(|name| name == expected),
+                    "{}: missing {expected} among {} names (text={:x})",
+                    path.display(),
+                    names.len(),
+                    table.text
+                );
+            }
+            // And the range lookup has to agree with the table's own entry.
+            let func = table
+                .funcs
+                .iter()
+                .find(|func| table.name_at(func.name) == Some("main.hotA"))
+                .expect("main.hotA");
+            assert_eq!(
+                table.lookup(table.text + u64::from(func.start)),
+                Some("main.hotA"),
+                "{}: lookup misses its own entry",
+                path.display()
+            );
+            // The build info the agent reports has to name the toolchain the
+            // file was built with, or the log cannot answer "is this the Go
+            // release we tested".
+            let version = crate::module::go_version_of_for_test(&data)
+                .unwrap_or_else(|| panic!("{}: no Go version token", path.display()));
+            let stem = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            // `strip-1.22` / `pie-strip-1.24` name the toolchain; the arm64
+            // fixtures name the architecture instead and are skipped here.
+            if let Some((_, expected)) = stem.rsplit_once('-')
+                && expected.starts_with('1')
+            {
+                assert!(
+                    version.contains(expected),
+                    "{}: reported {version}, fixture is {expected}",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no fixtures found in {dir}");
+    }
 
     /// Build a minimal Go 1.20 style `.gopclntab` with three functions.
     fn synthetic() -> Vec<u8> {

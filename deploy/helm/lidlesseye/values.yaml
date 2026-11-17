@@ -9,7 +9,7 @@ image:
   # Published on Docker Hub; see docker push in the release notes / deployment docs.
   repository: docker.io/xsj321/lidlesseye
   # Defaults to the chart's appVersion when empty.
-  tag: "0.10.40-containers"
+  tag: "0.10.43-symdiag"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
