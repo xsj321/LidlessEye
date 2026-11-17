@@ -38,11 +38,14 @@ jobs:
       - name: Extract release notes
         run: |
           tag="${GITHUB_REF_NAME#v}"
+          # The section runs until the next `## [` heading, and the file's
+          # trailing link-reference definitions (`[0.1.0]: https://…`) are not
+          # part of it — they belong to the changelog, not to the release page.
           awk -v heading="## [$tag]" '
             index($0, heading) == 1 { found = 1; next }
-            found && /^## \[/ { exit }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
             found { print }
-          ' CHANGELOG.md > release-notes.md
+          ' CHANGELOG.md | awk 'NF { blank = 0 } !NF { blank++ } blank < 2' > release-notes.md
           if [ ! -s release-notes.md ]; then
             echo "::error::CHANGELOG.md has no section for $tag"
             exit 1
