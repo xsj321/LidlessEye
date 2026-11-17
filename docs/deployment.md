@@ -235,6 +235,62 @@ Reach the dashboard with `kubectl -n lidlesseye port-forward svc/lidlesseye 4040
 `NodePort` and `LoadBalancer` services are not reliably exposed on the host by
 these distributions, so port-forward is the dependable option.
 
+### Clusters that cannot pull from a registry
+
+An air-gapped cluster, a node behind a proxy that only allows `GET`, or a tag
+whose push was rejected all end the same way: `ImagePullBackOff`. The image has
+to be moved as a file. `scripts/push-image.sh` is the check that catches this
+before the cluster does — it verifies the tag with a manifest lookup after
+pushing, because `docker push` exits 0 on some transport failures and a progress
+line is not a verdict:
+
+```bash
+scripts/push-image.sh xsj321/lidlesseye:0.1.0 --save /tmp/lidlesseye.tar
+```
+
+Then, on the node (or on a machine that can reach the nodes):
+
+```bash
+# containerd, the runtime of every distribution since 1.24
+ctr -n k8s.io images import /tmp/lidlesseye.tar
+
+# CRI-based node, no shell into containerd's namespace
+crictl pull docker.io/xsj321/lidlesseye:0.1.0   # only if a registry is reachable
+crictl images | grep lidlesseye
+
+# kind: the tar goes through the host daemon, kind copies it into every node
+kind load image-archive /tmp/lidlesseye.tar --name my-cluster
+
+# k3s: its own containerd namespace and its own importer
+k3s ctr images import /tmp/lidlesseye.tar
+
+# Docker Desktop shares its image store with the built-in cluster,
+# so `docker load` is enough there
+docker load -i /tmp/lidlesseye.tar
+```
+
+`ctr images import` and `kind load` keep the tag from the tar, so the chart's
+`image.tag` has to match the tag inside it — check with
+`ctr -n k8s.io images ls | grep lidlesseye` and pass the same value to Helm. A
+namespace mismatch is the usual reason an import "works" and the pod still
+fails: `ctr -n k8s.io` is what kubelet reads, `ctr -n default` is what a bare
+`ctr images import` writes.
+
+Pin the image in the cluster by digest when the registry is unreliable
+(`--set image.digest=sha256:...` is not supported yet, so the tag is the handle):
+`docker images --digests` on the importing machine and the pod's
+`status.containerStatuses[].imageID` both print it, and comparing the two is the
+quickest way to prove the node is running the build you think it is.
+
+For a private registry, the chart already supports both halves:
+
+```bash
+helm upgrade lidlesseye deploy/helm/lidlesseye -n lidlesseye --reuse-values \
+  --set image.repository=harbor.example.com/observability/lidlesseye \
+  --set image.tag=0.1.0 \
+  --set-json 'imagePullSecrets=[{"name":"harbor-creds"}]'
+```
+
 ### Privileges the agent needs
 
 The DaemonSet is privileged on purpose: `CAP_BPF`/`CAP_PERFMON` to load
