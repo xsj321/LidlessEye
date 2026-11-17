@@ -68,13 +68,22 @@ if [ "$pushed" -ne 1 ]; then
 fi
 
 # The manifest is the only proof kubelet will find the tag.
-if docker manifest inspect "${image#docker.io/}" >/dev/null 2>&1; then
+#
+# The check goes through the daemon, not the CLI. `docker manifest inspect`
+# resolves through `https_proxy`, while the daemon carries its own proxy
+# setting; on a machine where only the daemon's proxy can reach the registry the
+# CLI reports a false negative, and the honest reading of that is "unknown",
+# not "not published". A pull is also closer to what kubelet actually does.
+if docker pull "$image" >/dev/null 2>&1; then
     say "==> verified: ${image#docker.io/} resolves on the registry"
-    docker manifest inspect "${image#docker.io/}" 2>/dev/null \
-        | grep -oE '"digest": "sha256:[a-f0-9]+"' | head -1 || true
+    docker image inspect "$image" --format '    {{.Id}}' 2>/dev/null || true
+elif docker manifest inspect "${image#docker.io/}" >/dev/null 2>&1; then
+    say "==> verified: ${image#docker.io/} resolves on the registry"
 else
-    say "==> NOT verified: the registry has no manifest for ${image#docker.io/}"
+    say "==> NOT verified: no manifest for ${image#docker.io/}"
     say "    (offline, behind a proxy that is down, or the push was rejected)"
+    say "    the CLI proxy and the daemon proxy can differ: retry with"
+    say "    docker pull $image  to ask the daemon directly"
     exit 1
 fi
 

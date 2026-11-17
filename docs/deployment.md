@@ -276,6 +276,14 @@ namespace mismatch is the usual reason an import "works" and the pod still
 fails: `ctr -n k8s.io` is what kubelet reads, `ctr -n default` is what a bare
 `ctr images import` writes.
 
+One trap specific to publishing from Docker Desktop: the CLI and the daemon have
+**separate** proxy settings. `docker manifest inspect`, `docker login` and
+`docker search` run client-side and use `https_proxy`, while `docker push`,
+`docker pull` and kubelet use the daemon's own proxy. On a network where only
+one of the two reaches the registry, a push can succeed while `manifest inspect`
+insists the tag does not exist. `scripts/push-image.sh` therefore verifies with
+`docker pull`, which goes through the daemon — the same path a node takes.
+
 Pin the image in the cluster by digest when the registry is unreliable
 (`--set image.digest=sha256:...` is not supported yet, so the tag is the handle):
 `docker images --digests` on the importing machine and the pod's
