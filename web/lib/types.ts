@@ -114,12 +114,18 @@ export interface ServiceMapNode {
   ready?: number;
   /** The replicas themselves, newest observation, bounded by the agent. */
   instances?: ServiceInstance[];
+  /** Container names of the workload's pods, for the per-container rows. */
+  containers?: string[];
 }
 
 export interface ServiceMapEdge {
   client: string;
   server: string;
   protocol: string;
+  /** Container of the client pod that opened the connections, when known. */
+  client_container?: string;
+  /** Container of the server pod that accepted them, when known. */
+  server_container?: string;
   connections: number;
   retransmits?: number;
   /** Bytes the client sent to the server over the window. */

@@ -561,6 +561,44 @@ list rather than the union — the union of two identical reads is the same list
 twice. On read it is parsed back per row; a row written before the column
 existed carries the `'[]'` default and the panel degrades to a count.
 
+### Containers
+
+A pod is not one process. A sidecar opens its own connections, and folding them
+into the workload hides which of the two is talking. Every edge therefore names
+the container on each end when the agent can tell:
+
+* the **client** container comes from the *cgroup that dialled*. The handshake
+  completes in softirq, where `bpf_get_current_cgroup_id()` is whatever task the
+  CPU was running — so the probe takes it earlier, when the socket enters
+  `SYN_SENT`: `connect()` goes through `tcp_set_state` in the caller's context,
+  and that id is carried on the socket until the connection is established.
+  User space resolves it to a name in two steps: the cgroup directory's kernfs
+  inode *is* the id the helper returns, and the pod list maps the container id
+  in the cgroup path (`cri-containerd-<id>.scope`, `crio-<id>.scope`,
+  `docker-<id>.scope`, or a bare id on cgroup v1) to `status.containerStatuses`
+  and finally to a name;
+* when a connection predates the agent there is no handshake to record, so it
+  falls back to the socket itself: a pod's containers share one network
+  namespace, and the missing link between "a port exists" and "this container
+  owns it" is the socket inode in `/proc/<pid>/fd`, matched against the
+  namespace table and the same cgroup-derived name;
+* the **server** container is inferred from the port the peer declares in
+  `spec.containers[].ports`. A port no container claims is left empty rather
+  than guessed: with two containers the guess would put a sidecar's traffic on
+  the app.
+
+Containers also become an edge key, so two containers of one pod talking to the
+same peer are two rows in the store, not one. The node carries the container
+names it runs, as a gauge merged like the replica counts, and the panel under a
+clicked node draws one row per container with the edges anchored on the row that
+owns them; traffic the agent could not attribute stays on the workload card.
+
+Two limits are worth stating. A `hostNetwork` pod shares the node's address, so
+an outgoing socket on an ephemeral port can still be credited to the wrong *pod*
+— the container name, when the cgroup was recorded, is exact regardless. And a
+connection that both opened and closed between two drains, on a socket the
+handshake map no longer knows, arrives with no container at all.
+
 ### History for the panel
 
 The map shows one window; the panel that opens on a node draws that window's

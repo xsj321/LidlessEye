@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use lidlesseye_ebpf::k8s::{PodIndex, PodMeta};
+use lidlesseye_ebpf::k8s::{ContainerInfo, PodIndex, PodMeta};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -552,6 +552,8 @@ struct PodSpec {
 #[derive(Debug, Default, Deserialize)]
 struct PodContainer {
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     ports: Vec<PodContainerPort>,
 }
 
@@ -576,6 +578,19 @@ struct PodStatus {
     /// different thing from a pod that is fine.
     #[serde(default)]
     conditions: Vec<PodCondition>,
+    /// The runtime id of every container; with the spec's name it is what
+    /// turns a cgroup into `istio-proxy` or `app`.
+    #[serde(default, rename = "containerStatuses")]
+    container_statuses: Vec<PodContainerStatus>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PodContainerStatus {
+    #[serde(default)]
+    name: String,
+    /// `containerd://<id>`, `docker://<id>`, `cri-o://<id>`, ...
+    #[serde(default, rename = "containerID")]
+    container_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -650,6 +665,28 @@ impl PodItem {
             .any(|condition| condition.kind == "Ready" && condition.status == "True");
         let phase = self.status.phase.clone();
         let host = self.spec.node_name.clone();
+        let containers = self
+            .spec
+            .containers
+            .iter()
+            .map(|container| {
+                let mut ports: Vec<u16> =
+                    container.ports.iter().map(|p| p.container_port).collect();
+                ports.sort_unstable();
+                ports.dedup();
+                // A container without a started id (CrashLoopBackOff, an init
+                // container) still belongs in the pod's list: it has a name,
+                // and traffic from an old instance of it is still its traffic.
+                let id = self
+                    .status
+                    .container_statuses
+                    .iter()
+                    .find(|status| status.name == container.name)
+                    .map(|status| runtime_id(&status.container_id))
+                    .unwrap_or_default();
+                ContainerInfo::new(container.name.clone(), id, ports)
+            })
+            .collect();
         let pod = PodMeta::new(
             meta.uid.as_str(),
             meta.namespace.as_str(),
@@ -661,9 +698,24 @@ impl PodItem {
         .with_ips(ips)
         .with_ports(ports)
         .with_health(phase, ready)
+        .with_containers(containers)
         .on_host(host);
         Some((meta.uid, pod))
     }
+}
+
+/// The id part of a `containerd://<id>` reference.
+///
+/// The kubelet prefixes the runtime scheme and nothing else strips it; a
+/// cgroup carries the bare id, so leaving the prefix on would make every
+/// container lookup miss.
+fn runtime_id(reference: &str) -> String {
+    reference
+        .rsplit_once("://")
+        .map(|(_, id)| id)
+        .unwrap_or(reference)
+        .trim()
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -727,6 +779,55 @@ mod tests {
         let json = r#"{"items": [], "metadata": {"continue": "abc123"}}"#;
         let list: PodList = serde_json::from_str(json).expect("valid pod list");
         assert_eq!(list.metadata.continue_token.as_deref(), Some("abc123"));
+    }
+
+    /// The pod's containers, with the runtime id that ties a cgroup to a name.
+    /// Without the id the map can say "this pod talks to that one" but not
+    /// which container opened the connection, which is the whole point of the
+    /// per-container rows.
+    #[test]
+    fn reads_container_names_ids_and_ports() {
+        let id = "009d176d3433bad77f9ad74ffcc17d5f7b2bc15080e9dde28c5917d8270efcde";
+        let docker_id = "ab".repeat(32);
+        let json = format!(
+            r#"{{
+                "items": [{{
+                    "metadata": {{"uid": "u1", "name": "checkout-1", "namespace": "shop"}},
+                    "spec": {{
+                        "containers": [
+                            {{"name": "app", "ports": [{{"containerPort": 8080}}]}},
+                            {{"name": "istio-proxy", "ports": [{{"containerPort": 15006}}]}},
+                            {{"name": "not-started"}}
+                        ]
+                    }},
+                    "status": {{
+                        "phase": "Running",
+                        "containerStatuses": [
+                            {{"name": "app", "containerID": "containerd://{id}"}},
+                            {{"name": "istio-proxy", "containerID": "docker://{docker_id}"}}
+                        ]
+                    }}
+                }}],
+                "metadata": {{}}
+            }}"#
+        );
+        let list: PodList = serde_json::from_str(&json).expect("valid pod list");
+        let (_, pod) = list.items.into_iter().next().unwrap().into_meta().unwrap();
+        assert_eq!(
+            pod.containers
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["app", "istio-proxy", "not-started"]
+        );
+        // The runtime scheme is stripped: a cgroup carries the bare id.
+        assert_eq!(pod.containers[0].id, id);
+        assert_eq!(pod.containers[1].id, docker_id);
+        assert_eq!(pod.containers[0].ports, [8080]);
+        // A container that has not started has no id but keeps its row.
+        assert_eq!(pod.containers[2].id, "");
+        // The pod-wide port list is still the union, as before.
+        assert_eq!(pod.ports, [8080, 15006]);
     }
 
     /// The one property the whole feature rests on: outside a cluster nothing

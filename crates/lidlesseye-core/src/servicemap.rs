@@ -112,6 +112,15 @@ pub struct ServiceNode {
     /// answer "which replica is the one that is not ready".
     #[serde(default)]
     pub instances: Vec<InstanceInfo>,
+    /// Container names of the workload's pods, deduplicated.
+    ///
+    /// A pod is not one process: a sidecar (an Istio proxy, a log shipper)
+    /// opens its own connections, and a topic that folds them into the pod
+    /// hides which of the two is talking. The names are a gauge like the
+    /// replica counts — every agent reads the same pod list — and they are
+    /// what the panel uses to give each container its own row.
+    #[serde(default)]
+    pub containers: Vec<String>,
 }
 
 /// One replica of a workload, as the cluster reports it.
@@ -154,6 +163,14 @@ pub struct ServiceEdge {
     /// `http`, `grpc`, `postgres`, `redis`, `dns`, `tcp`, ...
     #[serde(default)]
     pub protocol: String,
+    /// Container inside the client pod that opened the sockets, and the one
+    /// inside the server pod that accepted them. Both are empty when the agent
+    /// could not attribute the traffic — a sidecar-less pod with no declared
+    /// ports, or a peer outside the cluster.
+    #[serde(default)]
+    pub client_container: String,
+    #[serde(default)]
+    pub server_container: String,
     #[serde(default)]
     pub connections: u64,
     #[serde(default)]
@@ -231,6 +248,12 @@ impl ServiceMapBatch {
                     if slot.workload.is_empty() {
                         slot.workload = node.workload;
                     }
+                    // Container names are a gauge too, and every agent reads the
+                    // same pod list: the longer list is the more complete
+                    // observation, not something to append to.
+                    if node.containers.len() > slot.containers.len() {
+                        slot.containers = node.containers.clone();
+                    }
                 }
                 None => {
                     index.insert(node.id.clone(), self.nodes.len());
@@ -238,17 +261,30 @@ impl ServiceMapBatch {
                 }
             }
         }
-        let mut edge_index: HashMap<(String, String, String), usize> = self
+        let mut edge_index: HashMap<(String, String, String, String, String), usize> = self
             .edges
             .iter()
             .enumerate()
-            .map(|(i, e)| ((e.client.clone(), e.server.clone(), e.protocol.clone()), i))
+            .map(|(i, e)| {
+                (
+                    (
+                        e.client.clone(),
+                        e.server.clone(),
+                        e.protocol.clone(),
+                        e.client_container.clone(),
+                        e.server_container.clone(),
+                    ),
+                    i,
+                )
+            })
             .collect();
         for edge in other.edges {
             let key = (
                 edge.client.clone(),
                 edge.server.clone(),
                 edge.protocol.clone(),
+                edge.client_container.clone(),
+                edge.server_container.clone(),
             );
             match edge_index.get(&key) {
                 Some(&i) => {
@@ -301,6 +337,10 @@ pub struct MapNode {
     /// The replicas themselves, newest observation.
     #[serde(default)]
     pub instances: Vec<InstanceInfo>,
+    /// Container names behind this node, for the per-container rows in the
+    /// panel. Empty for the outside world and for a ClusterIP service.
+    #[serde(default)]
+    pub containers: Vec<String>,
 }
 
 /// An aggregated edge in a query response.
@@ -309,6 +349,15 @@ pub struct MapEdge {
     pub client: String,
     pub server: String,
     pub protocol: String,
+    /// Container of the client pod that opened the connections, when the agent
+    /// could tell one from the socket's owner. Empty on data collected before
+    /// containers were tracked, and for a peer that is not a pod.
+    #[serde(default)]
+    pub client_container: String,
+    /// Container of the server pod that accepted them, inferred from the port
+    /// the peer declares. Empty when no container claims that port.
+    #[serde(default)]
+    pub server_container: String,
     pub connections: u64,
     pub retransmits: u64,
     /// Bytes the client sent to the server over the window.
@@ -511,6 +560,8 @@ mod tests {
                 client: "shop/a".into(),
                 server: "shop/b".into(),
                 protocol: "http".into(),
+                client_container: "app".into(),
+                server_container: "app".into(),
                 connections: 2,
                 retransmits: 0,
                 tx_bytes: 100,
@@ -531,6 +582,8 @@ mod tests {
                 client: "shop/a".into(),
                 server: "shop/b".into(),
                 protocol: "http".into(),
+                client_container: "app".into(),
+                server_container: "app".into(),
                 connections: 3,
                 retransmits: 1,
                 tx_bytes: 250,
@@ -556,6 +609,60 @@ mod tests {
         // The larger sample wins, because the newer pod list is the one that
         // noticed the last replica becoming ready.
         assert_eq!((a.nodes[0].pods, a.nodes[0].ready), (3, 3));
+    }
+
+    /// A pod's sidecar opens its own connections. They must not be folded into
+    /// the workload's row: the whole point of tracking containers is that the
+    /// panel can say "this traffic came from istio-proxy, not from app".
+    #[test]
+    fn containers_split_an_edge_instead_of_merging_it() {
+        let edge = |container: &str, connections: u64| ServiceEdge {
+            client: "shop/a".into(),
+            server: "shop/b".into(),
+            protocol: "http".into(),
+            client_container: container.into(),
+            server_container: "app".into(),
+            connections,
+            ..Default::default()
+        };
+        let mut batch = ServiceMapBatch {
+            edges: vec![edge("app", 3)],
+            ..Default::default()
+        };
+        batch.merge(ServiceMapBatch {
+            edges: vec![edge("app", 2), edge("istio-proxy", 7)],
+            ..Default::default()
+        });
+        batch
+            .edges
+            .sort_by(|a, b| a.client_container.cmp(&b.client_container));
+        assert_eq!(batch.edges.len(), 2);
+        assert_eq!(batch.edges[0].client_container, "app");
+        assert_eq!(batch.edges[0].connections, 5);
+        assert_eq!(batch.edges[1].client_container, "istio-proxy");
+        assert_eq!(batch.edges[1].connections, 7);
+    }
+
+    /// Container names are a gauge like the replica counts, and every agent
+    /// reads the same pod list: the merge takes the fuller list rather than
+    /// appending, which would multiply each name by the number of agents.
+    #[test]
+    fn container_lists_merge_as_a_gauge() {
+        let mut a = ServiceMapBatch {
+            nodes: vec![ServiceNode {
+                containers: vec!["app".into()],
+                ..ServiceNode::new("shop/a", NodeKind::Workload)
+            }],
+            ..Default::default()
+        };
+        a.merge(ServiceMapBatch {
+            nodes: vec![ServiceNode {
+                containers: vec!["app".into(), "istio-proxy".into()],
+                ..ServiceNode::new("shop/a", NodeKind::Workload)
+            }],
+            ..Default::default()
+        });
+        assert_eq!(a.nodes[0].containers, ["app", "istio-proxy"]);
     }
 
     #[test]

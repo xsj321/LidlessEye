@@ -81,6 +81,47 @@ fn is_uuid(value: &str) -> bool {
     groups.next().is_none()
 }
 
+/// Runtime id of the container a cgroup path belongs to, if it names one.
+///
+/// Every runtime spells the leaf differently, but all of them carry the id:
+///
+///   * containerd (systemd driver): `…/cri-containerd-<id>.scope`
+///   * CRI-O: `…/crio-<id>.scope`
+///   * Docker: `…/docker-<id>.scope`
+///   * cgroup v1 (no systemd): `/kubepods/burstable/pod<uid>/<id>`
+///
+/// The id is what ties a process to the container the kubelet reports in
+/// `status.containerStatuses[].containerID`, which is the only place a
+/// human-readable container *name* exists.
+pub fn parse_container_id(cgroup: &str) -> Option<String> {
+    // The pod's own slice carries a UID, not a container id, and it is the
+    // path prefix of every container below it — walking from the end means the
+    // leaf is examined first.
+    for segment in cgroup.rsplit('/') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        for prefix in ["cri-containerd-", "crio-", "docker-", "cri-dockerd-"] {
+            if let Some(rest) = segment.strip_prefix(prefix) {
+                return hex_id(rest.strip_suffix(".scope").unwrap_or(rest));
+            }
+        }
+        // A bare 64-character id, as cgroup v1 writes it.
+        if let Some(id) = hex_id(segment) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// A container id is at least 32 hex characters; shorter runs are slices.
+fn hex_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() >= 32 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_lowercase())
+}
+
 /// Derive a few low-cardinality Kubernetes labels from a cgroup path.
 pub fn kubernetes_labels(cgroup: &str) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
@@ -285,6 +326,43 @@ mod tests {
         assert!(!is_uuid("9d1b4a7c8c1e4f1d9a3e1b2c3d4e5f60"));
         assert!(!is_uuid("9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f60-extra"));
         assert!(!is_uuid("9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f6z"));
+    }
+
+    const CONTAINER: &str = "009d176d3433bad77f9ad74ffcc17d5f7b2bc15080e9dde28c5917d8270efcde";
+
+    #[test]
+    fn reads_the_container_id_from_every_runtime_layout() {
+        // containerd, systemd driver — the layout every kind node uses.
+        let cg = format!(
+            "/kubepods.slice/kubepods-burstable.slice/\
+             kubepods-burstable-pod9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f60.slice/\
+             cri-containerd-{CONTAINER}.scope"
+        );
+        assert_eq!(parse_container_id(&cg).as_deref(), Some(CONTAINER));
+        // CRI-O and Docker spell the same leaf differently.
+        let crio = format!("/kubepods.slice/pod9d1b4a7c.slice/crio-{CONTAINER}.scope");
+        assert_eq!(parse_container_id(&crio).as_deref(), Some(CONTAINER));
+        let docker =
+            format!("/kubepods/burstable/pod9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f60/{CONTAINER}");
+        assert_eq!(parse_container_id(&docker).as_deref(), Some(CONTAINER));
+    }
+
+    #[test]
+    fn does_not_mistake_a_pod_slice_for_a_container() {
+        // The pod's own slice sits above every container and carries a UID
+        // with dashes, which is not a runtime id.
+        let cg = "/kubepods.slice/kubepods-burstable.slice/\
+                  kubepods-burstable-pod9d1b4a7c-8c1e-4f1d-9a3e-1b2c3d4e5f60.slice";
+        assert_eq!(parse_container_id(cg), None);
+        assert_eq!(parse_container_id("/user.slice/user-1000.slice"), None);
+        // A 32-character static-pod hash is a pod, not a container: it has no
+        // container prefix and is too short to be a runtime id.
+        assert_eq!(
+            parse_container_id(
+                "/kubelet.slice/kubelet-kubepods-burstable-pod8d5bd4003a31dbe5a62437d1e90c172b.slice"
+            ),
+            None
+        );
     }
 
     #[test]

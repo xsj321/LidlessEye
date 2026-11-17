@@ -72,6 +72,12 @@ pub struct Flow {
     /// windows keeps the average exact.
     pub rtt_us_sum: u64,
     pub rtt_samples: u64,
+    /// Cgroup id of the task that opened the connection, when the probe saw
+    /// the handshake. Zero for a socket that predates the agent, and for a
+    /// server-side socket (its handshake runs in softirq, where "current" is
+    /// unrelated to the connection). It is what names the container that
+    /// dialled, down to the sidecar.
+    pub cgroup: u64,
 }
 
 impl Flow {
@@ -140,7 +146,7 @@ struct FlowKey {
 
 unsafe impl aya::Pod for FlowKey {}
 
-// SAFETY: as above; eight 64-bit and two 32-bit counters.
+// SAFETY: as above; nine 64-bit and two 32-bit counters.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct FlowStats {
@@ -150,6 +156,7 @@ struct FlowStats {
     retransmits: u64,
     rtt_us_sum: u64,
     rtt_samples: u64,
+    cgroup: u64,
     role: u32,
     pad: u32,
 }
@@ -334,6 +341,7 @@ fn to_flow(key: &FlowKey, stats: &FlowStats) -> Option<Flow> {
         retransmits: stats.retransmits,
         rtt_us_sum: stats.rtt_us_sum,
         rtt_samples: stats.rtt_samples,
+        cgroup: stats.cgroup,
     })
 }
 
@@ -342,7 +350,17 @@ fn address(bytes: &[u8; 16], family: u16) -> Option<IpAddr> {
         AF_INET => Some(IpAddr::V4(Ipv4Addr::new(
             bytes[0], bytes[1], bytes[2], bytes[3],
         ))),
-        AF_INET6 => Some(IpAddr::V6(Ipv6Addr::from(*bytes))),
+        AF_INET6 => {
+            let ip = Ipv6Addr::from(*bytes);
+            // A dual-stack socket reports an IPv4 peer as `::ffff:a.b.c.d`.
+            // The pod index, the Service index and `/proc/net/tcp` all know it
+            // by its IPv4 form, so leaving it mapped would make every lookup
+            // miss on a cluster that binds its sockets that way.
+            Some(match ip.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(ip),
+            })
+        }
         _ => None,
     }
 }
@@ -394,6 +412,36 @@ mod tests {
     fn loopback_traffic_is_dropped() {
         let stats = FlowStats::default();
         assert!(to_flow(&key([127, 0, 0, 1], [127, 0, 0, 1], 40000, 8080), &stats).is_none());
+    }
+
+    /// A dual-stack socket reports IPv4 as `::ffff:a.b.c.d`; keeping it mapped
+    /// makes every pod and Service lookup miss, and the map draws those
+    /// connections as "outside the cluster".
+    #[test]
+    fn an_ipv4_mapped_address_becomes_ipv4() {
+        let mut key = FlowKey {
+            sport: 9930,
+            dport: 6443,
+            family: AF_INET6,
+            ..Default::default()
+        };
+        // ::ffff:172.18.0.4, little-endian words as the kernel writes them.
+        key.saddr[10] = 0xff;
+        key.saddr[11] = 0xff;
+        key.saddr[12..16].copy_from_slice(&[172, 18, 0, 4]);
+        key.daddr[10] = 0xff;
+        key.daddr[11] = 0xff;
+        key.daddr[12..16].copy_from_slice(&[10, 244, 0, 1]);
+        let flow = to_flow(
+            &key,
+            &FlowStats {
+                role: ROLE_SERVER,
+                ..Default::default()
+            },
+        )
+        .expect("a dual-stack socket is a flow");
+        assert_eq!(flow.local, ("172.18.0.4".parse().unwrap(), 9930));
+        assert_eq!(flow.remote, ("10.244.0.1".parse().unwrap(), 6443));
     }
 
     #[test]

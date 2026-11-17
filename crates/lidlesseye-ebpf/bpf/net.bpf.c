@@ -78,6 +78,7 @@ static long (*bpf_map_update_elem)(void *map, const void *key, const void *value
                                    __u64 flags) = (void *)2;
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *src) = (void *)113;
+static __u64 (*bpf_get_current_cgroup_id)(void) = (void *)80;
 
 /* ---- kernel structs, by the kernel's own names ------------------------ */
 struct in6_addr {
@@ -168,6 +169,10 @@ struct flow_stats {
     __u64 retransmits;
     __u64 rtt_us_sum;
     __u64 rtt_samples;
+    /* Which container opened the connection. A 5-tuple only says "this pod",
+     * and a pod is not one process: a sidecar has its own sockets. Filled
+     * from `sock_owners`, which records it where the task is known. */
+    __u64 cgroup;
     __u32 role;
     __u32 pad;
 };
@@ -198,6 +203,21 @@ struct {
     __type(key, __u64);
     __type(value, struct sock_flow);
 } sock_flows SEC(".maps");
+
+/* sock pointer -> cgroup of the task that dialled it.
+ *
+ * The handshake completes in softirq, where `bpf_get_current_cgroup_id()` is
+ * whatever task the CPU happened to interrupt — not the one that called
+ * connect(). The dialler's identity is therefore taken where the socket enters
+ * SYN_SENT, which connect() does in the caller's context, and carried until
+ * the state machine reports the socket established. LRU as well, for the
+ * connections that never complete. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 131072);
+    __type(key, __u64);
+    __type(value, __u64);
+} sock_owners SEC(".maps");
 
 /* ---- helpers ---------------------------------------------------------- */
 #ifdef LIDLESSEYE_LE
@@ -281,6 +301,15 @@ int lidlesseye_tcp_state(struct pt_regs *ctx) {
     }
     entry.state = new_state;
 
+    /* Entering SYN_SENT is the one transition a client's own task performs:
+     * connect() calls tcp_connect(), which sets the state before sending the
+     * SYN. Recording the cgroup here is exact, and the completion of the
+     * handshake — which happens later, in softirq — can still read it. */
+    if (new_state == TCP_SYN_SENT) {
+        __u64 owner = bpf_get_current_cgroup_id();
+        bpf_map_update_elem((void *)&sock_owners, &addr, &owner, BPF_ANY);
+    }
+
     /* The client's handshake completes on SYN_SENT -> ESTABLISHED and the
      * server's on SYN_RECV -> ESTABLISHED. Counting the completed handshake
      * rather than the SYN keeps half-open sockets out of the map, and it is
@@ -292,6 +321,15 @@ int lidlesseye_tcp_state(struct pt_regs *ctx) {
         if (stats) {
             __sync_fetch_and_add(&stats->opens, 1);
             stats->role = old_state == TCP_SYN_SENT ? ROLE_CLIENT : ROLE_SERVER;
+            /* The client side has an owner worth recording: the task that
+             * called connect(). The server's socket was accepted in softirq,
+             * so its container comes from the port the pod declares instead. */
+            if (old_state == TCP_SYN_SENT) {
+                __u64 *owner = bpf_map_lookup_elem((void *)&sock_owners, &addr);
+                if (owner) {
+                    stats->cgroup = *owner;
+                }
+            }
         }
     }
 
@@ -312,6 +350,7 @@ int lidlesseye_tcp_state(struct pt_regs *ctx) {
 
     if (new_state == TCP_CLOSE) {
         bpf_map_delete_elem((void *)&sock_flows, &addr);
+        bpf_map_delete_elem((void *)&sock_owners, &addr);
     } else {
         bpf_map_update_elem((void *)&sock_flows, &addr, &entry, BPF_ANY);
     }

@@ -41,10 +41,17 @@ export interface Point {
   y: number;
 }
 
-/** What a card shows as its title. */
+/** What a card shows as its title.
+ *
+ * A workload is titled with its own name, not with an app label: the label is
+ * what a chart chose to call the whole release, and two Deployments of one
+ * release would read as the same thing. The namespace belongs on the second
+ * line, where it qualifies the name instead of replacing it.
+ */
 export function nodeLabel(node: ServiceMapNode | undefined): string {
   if (!node) return "—";
   if (node.kind === "external") return "external";
+  if (node.kind === "workload") return node.workload || node.service || node.id;
   return node.service || node.workload || node.id;
 }
 

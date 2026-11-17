@@ -78,13 +78,13 @@ pub(crate) const TABLES: &[TableDef] = &[
     },
     TableDef {
         name: "net_nodes",
-        columns: "bucket_ns, node_id, namespace, workload, service, kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready, instances",
-        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, node_id VARCHAR NOT NULL, namespace VARCHAR NOT NULL, workload VARCHAR NOT NULL, service VARCHAR NOT NULL, kind VARCHAR NOT NULL, k8s_node VARCHAR NOT NULL, rx_bytes BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, pods BIGINT DEFAULT 0 NOT NULL, ready BIGINT DEFAULT 0 NOT NULL, instances VARCHAR DEFAULT '[]' NOT NULL)",
+        columns: "bucket_ns, node_id, namespace, workload, service, kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready, instances, containers",
+        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, node_id VARCHAR NOT NULL, namespace VARCHAR NOT NULL, workload VARCHAR NOT NULL, service VARCHAR NOT NULL, kind VARCHAR NOT NULL, k8s_node VARCHAR NOT NULL, rx_bytes BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, pods BIGINT DEFAULT 0 NOT NULL, ready BIGINT DEFAULT 0 NOT NULL, instances VARCHAR DEFAULT '[]' NOT NULL, containers VARCHAR DEFAULT '[]' NOT NULL)",
     },
     TableDef {
         name: "net_edges",
-        columns: "bucket_ns, client_id, server_id, protocol, connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples",
-        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, client_id VARCHAR NOT NULL, server_id VARCHAR NOT NULL, protocol VARCHAR NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, rx_bytes BIGINT NOT NULL, rtt_us_sum BIGINT NOT NULL, rtt_samples BIGINT NOT NULL)",
+        columns: "bucket_ns, client_id, server_id, protocol, client_container, server_container, connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples",
+        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, client_id VARCHAR NOT NULL, server_id VARCHAR NOT NULL, protocol VARCHAR NOT NULL, client_container VARCHAR DEFAULT '' NOT NULL, server_container VARCHAR DEFAULT '' NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, rx_bytes BIGINT NOT NULL, rtt_us_sum BIGINT NOT NULL, rtt_samples BIGINT NOT NULL)",
     },
 ];
 
@@ -300,17 +300,22 @@ fn parquet_paths(state: &ParquetState, manifest: &Manifest, table: &str) -> Vec<
 /// manifest, so binding works even before any upload and when S3 is down.
 /// When there are no Parquet files the VIEW is just the hot table, which is
 /// always a valid, correctly-typed relation.
+///
+/// The two halves are joined `BY NAME`, not positionally. An upgrade adds
+/// columns (the container names on a service map edge, say), and the archive
+/// still holds files written before they existed: listing the columns
+/// explicitly makes the binder reject such a file, which turns every write into
+/// a 500 until the first new file appears — a deadlock the deployment cannot
+/// recover from on its own. With `BY NAME` the missing column reads as NULL,
+/// which the consumers already treat as "not recorded" (an empty container, an
+/// empty list).
 pub(crate) fn refresh_views(conn: &Connection, state: &ParquetState) -> Result<()> {
     let manifest = state.load_manifest();
     for def in TABLES {
         let hot = format!("{}_hot", def.name);
-        let cols = def.columns;
         let paths = parquet_paths(state, &manifest, def.name);
         let sql = if paths.is_empty() {
-            format!(
-                "CREATE OR REPLACE VIEW {} AS SELECT {cols} FROM {hot}",
-                def.name
-            )
+            format!("CREATE OR REPLACE VIEW {} AS SELECT * FROM {hot}", def.name)
         } else {
             let list = paths
                 .iter()
@@ -319,8 +324,9 @@ pub(crate) fn refresh_views(conn: &Connection, state: &ParquetState) -> Result<(
                 .join(", ");
             format!(
                 "CREATE OR REPLACE VIEW {name} AS \
-                 SELECT {cols} FROM {hot} \
-                 UNION ALL SELECT {cols} FROM read_parquet([{list}], hive_partitioning=false)",
+                 SELECT * FROM {hot} \
+                 UNION ALL BY NAME \
+                 SELECT * FROM read_parquet([{list}], hive_partitioning=false, union_by_name=true)",
                 name = def.name,
             )
         };
@@ -578,6 +584,51 @@ mod tests {
         assert_eq!(flame_total(&store), 0);
         // Flushing an empty hot tier is a no-op.
         assert_eq!(store.flush_hot().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_view_reads_an_archive_file_written_before_a_column_existed() {
+        // The upgrade that added container names to the map left files behind
+        // that predate the column. Listing the columns explicitly made the
+        // binder reject them, and because the views are rebuilt on every write
+        // the deployment could not get past it — every ingest returned 500.
+        let dir = std::env::temp_dir().join(format!("ldx-pq-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("parquet").join("net_nodes")).unwrap();
+        let file = dir.join("parquet").join("net_nodes").join("old.parquet");
+
+        let conn = Connection::open_in_memory().unwrap();
+        // `net_nodes` as the release before containers wrote it.
+        conn.execute_batch(&format!(
+            "COPY (SELECT 1::BIGINT AS bucket_ns, 'shop/a' AS node_id, 'shop' AS namespace, \
+             'a' AS workload, 'a' AS service, 'workload' AS kind, 'node' AS k8s_node, \
+             0::BIGINT AS rx_bytes, 0::BIGINT AS tx_bytes, 0::BIGINT AS connections, \
+             0::BIGINT AS retransmits, 1::BIGINT AS pods, 1::BIGINT AS ready, \
+             '[]' AS instances) TO '{}' (FORMAT PARQUET)",
+            file.to_string_lossy().replace('\\', "/")
+        ))
+        .unwrap();
+
+        let state = ParquetState {
+            dir: dir.join("parquet"),
+            bucket: "unused".into(),
+            prefix: "test".into(),
+            local_ttl_ns: u64::MAX,
+            manifest_path: dir.join("parquet").join("manifest.json"),
+        };
+        state.save_manifest(&Manifest::default()).unwrap();
+        create_schema(&conn, &state).unwrap();
+
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM net_nodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the archived row still reads");
+        let containers: Option<String> = conn
+            .query_row("SELECT containers FROM net_nodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(containers, None, "a column the file predates reads as NULL");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

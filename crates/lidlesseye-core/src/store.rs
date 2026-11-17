@@ -1445,8 +1445,8 @@ impl Store {
                     .prepare(&format!(
                         "INSERT INTO {nodes_t} (bucket_ns, node_id, namespace, workload, service, \
                          kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready, \
-                         instances) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                         instances, containers) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     ))
                     .map_err(db_err)?;
                 for node in &batch.nodes {
@@ -1465,6 +1465,7 @@ impl Store {
                         node.pods as i64,
                         node.ready as i64,
                         serde_json::to_string(&node.instances).unwrap_or_else(|_| "[]".into()),
+                        serde_json::to_string(&node.containers).unwrap_or_else(|_| "[]".into()),
                     ])
                     .map_err(db_err)?;
                 }
@@ -1473,8 +1474,9 @@ impl Store {
                 let mut stmt = conn
                     .prepare(&format!(
                         "INSERT INTO {edges_t} (bucket_ns, client_id, server_id, protocol, \
-                         connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                         client_container, server_container, connections, retransmits, \
+                         tx_bytes, rx_bytes, rtt_us_sum, rtt_samples) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     ))
                     .map_err(db_err)?;
                 for edge in &batch.edges {
@@ -1483,6 +1485,8 @@ impl Store {
                         edge.client,
                         edge.server,
                         edge.protocol,
+                        edge.client_container,
+                        edge.server_container,
                         edge.connections as i64,
                         edge.retransmits as i64,
                         edge.tx_bytes as i64,
@@ -1517,7 +1521,8 @@ impl Store {
                         any_value(kind), sum(rx_bytes), sum(tx_bytes), sum(connections), \
                         sum(retransmits), \
                         arg_max(pods, (bucket_ns, pods)), arg_max(ready, (bucket_ns, pods)), \
-                        arg_max(instances, (bucket_ns, pods)) \
+                        arg_max(instances, (bucket_ns, pods)), \
+                        arg_max(containers, (bucket_ns, pods)) \
                  FROM net_nodes WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY node_id \
                  ORDER BY sum(connections) + (sum(rx_bytes) + sum(tx_bytes)) / 1024 DESC LIMIT ?",
@@ -1551,6 +1556,11 @@ impl Store {
                     .ok()
                     .and_then(|json| serde_json::from_str(&json).ok())
                     .unwrap_or_default(),
+                containers: row
+                    .get::<_, String>(12)
+                    .ok()
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
             });
         }
         Ok(out)
@@ -1566,10 +1576,11 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT client_id, server_id, protocol, sum(connections), sum(retransmits), \
+                "SELECT client_id, server_id, protocol, client_container, server_container, \
+                        sum(connections), sum(retransmits), \
                         sum(tx_bytes), sum(rx_bytes), sum(rtt_us_sum), sum(rtt_samples) \
                  FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
-                 GROUP BY client_id, server_id, protocol \
+                 GROUP BY client_id, server_id, protocol, client_container, server_container \
                  HAVING sum(connections) + sum(tx_bytes) + sum(rx_bytes) > 0 \
                  ORDER BY sum(connections) + sum(tx_bytes) / 1024 DESC LIMIT 4000",
             )
@@ -1579,16 +1590,18 @@ impl Store {
             .map_err(db_err)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(db_err)? {
-            let rtt_us_sum = row.get::<_, i64>(7).unwrap_or(0).max(0) as u64;
-            let rtt_samples = row.get::<_, i64>(8).unwrap_or(0).max(0) as u64;
+            let rtt_us_sum = row.get::<_, i64>(9).unwrap_or(0).max(0) as u64;
+            let rtt_samples = row.get::<_, i64>(10).unwrap_or(0).max(0) as u64;
             out.push(MapEdge {
                 client: row.get(0).map_err(db_err)?,
                 server: row.get(1).map_err(db_err)?,
                 protocol: row.get(2).map_err(db_err)?,
-                connections: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
-                retransmits: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
-                tx_bytes: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
-                rx_bytes: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
+                client_container: row.get(3).unwrap_or_default(),
+                server_container: row.get(4).unwrap_or_default(),
+                connections: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
+                retransmits: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
+                tx_bytes: row.get::<_, i64>(7).unwrap_or(0).max(0) as u64,
+                rx_bytes: row.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
                 // Mean round-trip time over the connections that closed inside
                 // the window; zero when none did.
                 rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
@@ -1877,13 +1890,19 @@ fn create_schema(conn: &Connection) -> Result<()> {
             /* The replicas themselves, as a JSON array of name / node / ready /
              * phase objects. Bounded by the agent; the map only needs it for
              * the panel behind a click. */
-            instances VARCHAR DEFAULT '[]' NOT NULL
+            instances VARCHAR DEFAULT '[]' NOT NULL,
+            /* Container names of the workload's pods, as a JSON array. The
+             * panel gives each container its own row, so a sidecar's traffic
+             * does not disappear into the pod's total. */
+            containers VARCHAR DEFAULT '[]' NOT NULL
         );
         CREATE TABLE IF NOT EXISTS net_edges (
             bucket_ns BIGINT NOT NULL,
             client_id VARCHAR NOT NULL,
             server_id VARCHAR NOT NULL,
             protocol VARCHAR NOT NULL,
+            client_container VARCHAR DEFAULT '' NOT NULL,
+            server_container VARCHAR DEFAULT '' NOT NULL,
             connections BIGINT NOT NULL,
             retransmits BIGINT NOT NULL,
             tx_bytes BIGINT NOT NULL,
@@ -1936,6 +1955,8 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
             ("rx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
             ("rtt_us_sum", "BIGINT DEFAULT 0 NOT NULL"),
             ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
+            ("client_container", "VARCHAR DEFAULT '' NOT NULL"),
+            ("server_container", "VARCHAR DEFAULT '' NOT NULL"),
         ],
     )?;
     add_columns(
@@ -1945,6 +1966,7 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
             ("pods", "BIGINT DEFAULT 0 NOT NULL"),
             ("ready", "BIGINT DEFAULT 0 NOT NULL"),
             ("instances", "VARCHAR DEFAULT '[]' NOT NULL"),
+            ("containers", "VARCHAR DEFAULT '[]' NOT NULL"),
         ],
     )
 }
@@ -2521,6 +2543,56 @@ mod tests {
         let nodes = store.net_nodes(start, start + 60_000_000_000, 10).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!((nodes[0].pods, nodes[0].ready), (1, 1));
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Both container columns have to survive the store: the panel groups by
+    /// them, and a column that is written but never read back would silently
+    /// collapse a sidecar into its workload.
+    #[test]
+    fn map_containers_round_trip_through_the_store() {
+        use crate::servicemap::{ServiceEdge, ServiceNode};
+
+        let (store, dir) = temp_store("net-containers");
+        let start = 1_700_000_000_000_000_000u64;
+        store
+            .append_servicemap(&ServiceMapBatch {
+                start_ns: start,
+                end_ns: start + 10_000_000_000,
+                nodes: vec![
+                    ServiceNode {
+                        containers: vec!["app".into(), "istio-proxy".into()],
+                        ..ServiceNode::new("shop/a", NodeKind::Workload)
+                    },
+                    // An edge whose peer is not a node would be dropped by the
+                    // query, and this test is about the edge.
+                    ServiceNode::new("shop/b", NodeKind::Workload),
+                ],
+                edges: vec![ServiceEdge {
+                    client: "shop/a".into(),
+                    server: "shop/b".into(),
+                    protocol: "http".into(),
+                    client_container: "istio-proxy".into(),
+                    server_container: "app".into(),
+                    connections: 4,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let map = crate::servicemap(&store, start, start + 10_000_000_000).unwrap();
+        let a = map
+            .nodes
+            .iter()
+            .find(|node| node.id == "shop/a")
+            .expect("shop/a is on the map");
+        assert_eq!(a.containers, ["app", "istio-proxy"]);
+        assert_eq!(map.edges.len(), 1);
+        assert_eq!(map.edges[0].client_container, "istio-proxy");
+        assert_eq!(map.edges[0].server_container, "app");
 
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

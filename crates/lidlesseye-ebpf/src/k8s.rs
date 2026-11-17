@@ -58,6 +58,54 @@ pub struct PodMeta {
     /// Node the pod is scheduled on (`spec.nodeName`). Empty when the cluster
     /// did not report it, which is what a bare `PodMeta::new` leaves behind.
     pub host: String,
+    /// The pod's containers, newest status, in declaration order.
+    ///
+    /// Containers are the unit the map's panel draws: a pod's network
+    /// namespace is shared, so the kernel only says "this pod", and a sidecar
+    /// that opens its own connections would otherwise be indistinguishable
+    /// from the workload itself. The list is empty for a pod whose status the
+    /// API has not reported yet.
+    pub containers: Vec<ContainerInfo>,
+}
+
+/// One container of a pod: what to call it, which cgroup it owns, and the
+/// ports it declares.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerInfo {
+    /// `metadata.name` of the container inside the pod (`app`, `istio-proxy`).
+    pub name: String,
+    /// Runtime id without the `containerd://` prefix, as the kubelet reports
+    /// it in `status.containerStatuses[].containerID`. Empty when the
+    /// container has not started.
+    pub id: String,
+    /// `containerPort`s the container declares. The map uses them to tell
+    /// which container of the *server* pod accepted a connection.
+    pub ports: Vec<u16>,
+}
+
+impl ContainerInfo {
+    pub fn new(name: impl Into<String>, id: impl Into<String>, ports: Vec<u16>) -> Self {
+        ContainerInfo {
+            name: name.into(),
+            id: id.into(),
+            ports,
+        }
+    }
+
+    /// Whether a cgroup-derived container id belongs to this container.
+    ///
+    /// A runtime id is 64 hex characters; cgroups spell it out in full and the
+    /// kubelet's `containerID` does too, but a short id turns up in test data
+    /// and in older runtimes, so a prefix match in either direction is
+    /// accepted. An empty `id` never matches: a container that has not started
+    /// is not the owner of anything.
+    pub fn matches_id(&self, id: &str) -> bool {
+        let id = id.trim();
+        if id.is_empty() || self.id.is_empty() {
+            return false;
+        }
+        self.id == id || self.id.starts_with(id) || id.starts_with(self.id.as_str())
+    }
 }
 
 impl PodMeta {
@@ -95,6 +143,7 @@ impl PodMeta {
             phase: String::new(),
             ready: false,
             host: String::new(),
+            containers: Vec::new(),
         }
     }
 
@@ -122,6 +171,35 @@ impl PodMeta {
     pub fn on_host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
         self
+    }
+
+    /// Attach the pod's containers, as its spec and status describe them.
+    pub fn with_containers(mut self, containers: Vec<ContainerInfo>) -> Self {
+        self.containers = containers;
+        self
+    }
+
+    /// The container that owns `id`, if any.
+    pub fn container_by_id(&self, id: &str) -> Option<&ContainerInfo> {
+        self.containers
+            .iter()
+            .find(|container| container.matches_id(id))
+    }
+
+    /// The container that declares `port`, or — when it declares no ports at
+    /// all — the pod's only container.
+    ///
+    /// A sidecar usually listens on a port the spec does not mention (metrics,
+    /// health), so an unmatched port is not proof that nobody owns it. It is
+    /// still not a reason to guess between two containers.
+    pub fn container_by_port(&self, port: u16) -> Option<&ContainerInfo> {
+        self.containers
+            .iter()
+            .find(|container| container.ports.contains(&port))
+            .or_else(|| {
+                (self.containers.len() == 1 && self.containers[0].ports.is_empty())
+                    .then(|| &self.containers[0])
+            })
     }
 
     /// The name a series should use, if the pod offers a better one than the
@@ -366,6 +444,54 @@ mod tests {
         let meta = PodMeta::new("uid", "ns", "debug", &labels(&[]), None, None);
         assert_eq!(meta.workload, None);
         assert_eq!(meta.service_name(), None);
+    }
+
+    #[test]
+    fn names_the_container_a_cgroup_belongs_to() {
+        let id = "009d176d3433bad77f9ad74ffcc17d5f7b2bc15080e9dde28c5917d8270efcde";
+        let meta = PodMeta::new("uid", "ns", "checkout-1", &labels(&[]), None, None)
+            .with_containers(vec![
+                ContainerInfo::new("app", id, vec![8080]),
+                ContainerInfo::new("istio-proxy", "aa".repeat(32), vec![15006]),
+            ]);
+        assert_eq!(
+            meta.container_by_id(id).map(|c| c.name.as_str()),
+            Some("app")
+        );
+        // A short id in either direction still resolves, and an id that is not
+        // a prefix of anything resolves to nothing.
+        assert_eq!(
+            meta.container_by_id(&id[..12]).map(|c| c.name.as_str()),
+            Some("app")
+        );
+        assert_eq!(meta.container_by_id("ff"), None);
+        assert_eq!(meta.container_by_id(""), None);
+    }
+
+    #[test]
+    fn attributes_a_server_port_to_the_container_that_declares_it() {
+        let meta = PodMeta::new("uid", "ns", "p", &labels(&[]), None, None).with_containers(vec![
+            ContainerInfo::new("app", "a", vec![8080]),
+            ContainerInfo::new("istio-proxy", "b", vec![15006, 15090]),
+        ]);
+        assert_eq!(
+            meta.container_by_port(15006).map(|c| c.name.as_str()),
+            Some("istio-proxy")
+        );
+        assert_eq!(
+            meta.container_by_port(8080).map(|c| c.name.as_str()),
+            Some("app")
+        );
+        // An undeclared port is not attributed: guessing between two
+        // containers would put a sidecar's traffic on the workload.
+        assert_eq!(meta.container_by_port(9999), None);
+        // A single container with no declared ports is still the only owner.
+        let single = PodMeta::new("uid", "ns", "p", &labels(&[]), None, None)
+            .with_containers(vec![ContainerInfo::new("app", "a", Vec::new())]);
+        assert_eq!(
+            single.container_by_port(9999).map(|c| c.name.as_str()),
+            Some("app")
+        );
     }
 
     #[test]

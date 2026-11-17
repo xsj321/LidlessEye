@@ -50,8 +50,12 @@ use tracing::{debug, warn};
 use crate::k8s::ServiceIndex;
 
 /// Where a socket's peer ended up.
+///
+/// Boxed because a [`PodMeta`] is the big variant by an order of magnitude —
+/// it carries the pod's container and port lists — and every resolution would
+/// otherwise move that payload around by value.
 enum Peer {
-    Pod(PodMeta),
+    Pod(Box<PodMeta>),
     Service(crate::k8s::ServiceRef),
     External,
 }
@@ -269,7 +273,9 @@ impl FlowMapper {
             ..Default::default()
         };
         let mut nodes: HashMap<String, ServiceNode> = HashMap::new();
-        let mut edges: HashMap<(String, String, String), ServiceEdge> = HashMap::new();
+        let mut edges: HashMap<(String, String, String, String, String), ServiceEdge> =
+            HashMap::new();
+        let containers = ContainerMap::scan(&self.pods);
         let mut skipped = 0usize;
         let mut hairpin = 0usize;
         let mut ambiguous = 0usize;
@@ -354,6 +360,37 @@ impl FlowMapper {
                 (flow.tx_bytes, flow.rx_bytes)
             };
 
+            // The observing socket belongs to one container of the pod, and the
+            // peer may be a pod whose port names one on its side. Both are
+            // empty when the kernel and the specs cannot say.
+            let local_container = if role == Role::Client {
+                // The connecting task is the exact answer; the socket itself
+                // has usually closed by the time /proc is scanned.
+                containers
+                    .by_handshake(flow.cgroup)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| containers.container_of(flow.local))
+            } else {
+                // An accepted socket: its owner is the container that declared
+                // the port, because the accept ran in softirq, where the
+                // handshake's cgroup says nothing about the connection.
+                meta.container_by_port(flow.local.1)
+                    .map(|info| info.name.clone())
+                    .unwrap_or_else(|| containers.container_of(flow.local))
+            };
+            let (client_container, server_container) = if swapped {
+                (String::new(), local_container)
+            } else {
+                let peer_container = match &peer {
+                    Peer::Pod(other) => other
+                        .container_by_port(flow.remote.1)
+                        .map(|info| info.name.clone())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                (local_container, peer_container)
+            };
+
             let this = nodes
                 .entry(local_node.id.clone())
                 .or_insert_with(|| local_node.clone());
@@ -374,11 +411,19 @@ impl FlowMapper {
                 slot.connections += flow.opens;
             }
 
-            let key = (client.clone(), server.clone(), protocol.clone());
+            let key = (
+                client.clone(),
+                server.clone(),
+                protocol.clone(),
+                client_container.clone(),
+                server_container.clone(),
+            );
             let edge = edges.entry(key).or_insert_with(|| ServiceEdge {
                 client,
                 server,
                 protocol,
+                client_container,
+                server_container,
                 ..Default::default()
             });
             edge.connections += flow.opens;
@@ -417,6 +462,118 @@ impl FlowMapper {
     }
 }
 
+/// Which container owns which local socket, for the pods in one window of eBPF
+/// flows.
+///
+/// The probe sees a 5-tuple, not a cgroup: the local address is the pod and the
+/// local port is the socket. Tying that socket back to a container means
+/// walking `/proc`, so the walk runs once per batch — and it keys on the
+/// *address*, not on the pod identity, because a `hostNetwork` pod and the
+/// control plane share the node's address: resolving the flow to a pod first
+/// would pick whichever of them the pod list happens to return and then look
+/// for the socket in the wrong process list.
+#[derive(Default)]
+struct ContainerMap {
+    /// Cgroup id from the handshake -> container name. Exact, and it survives
+    /// a connection that closed before the scan ran — which is most of them.
+    by_cgroup: HashMap<u64, String>,
+    /// Local endpoint of every socket whose owner the pod list can name. The
+    /// fallback for a socket whose handshake predates the agent.
+    owned: HashMap<(IpAddr, u16), String>,
+}
+
+impl ContainerMap {
+    fn scan(pods: &PodIndex) -> Self {
+        // Container id -> name. The id is the only link between a cgroup and a
+        // human-readable container: a static pod's cgroup carries a kubelet
+        // hash instead of the object's UID, so the UID is not an option.
+        let snapshot = pods.snapshot();
+        let mut owners: HashMap<&str, &str> = HashMap::new();
+        for meta in snapshot.values() {
+            for container in &meta.containers {
+                if !container.id.is_empty() {
+                    owners
+                        .entry(container.id.as_str())
+                        .or_insert(container.name.as_str());
+                }
+            }
+        }
+
+        let mut by_cgroup = HashMap::new();
+        let mut owned = HashMap::new();
+        // The TCP table belongs to the network namespace, and a pod's
+        // containers share one: reading it per pod beats reading it per pid.
+        let mut tables: HashMap<Option<u64>, HashMap<u64, (IpAddr, u16)>> = HashMap::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Self::default();
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Some(cgroup) = lidlesseye_ebpf::procfs::read_cgroup(pid) else {
+                continue;
+            };
+            let Some(id) = lidlesseye_ebpf::procfs::parse_container_id(&cgroup) else {
+                continue;
+            };
+            let Some(name) = owners.get(id.as_str()) else {
+                continue;
+            };
+            if let Some(group) = cgroup_id(&cgroup) {
+                by_cgroup.insert(group, (*name).to_string());
+            }
+            let namespace = netns_of(pid);
+            let table = tables
+                .entry(namespace)
+                .or_insert_with(|| socket_endpoints(pid));
+            for inode in own_socket_inodes(pid) {
+                if let Some(local) = table.get(&inode) {
+                    owned.insert(*local, (*name).to_string());
+                }
+            }
+        }
+        ContainerMap { by_cgroup, owned }
+    }
+
+    /// Container that owns the socket at `local`, or an empty string.
+    fn container_of(&self, local: (IpAddr, u16)) -> String {
+        self.owned.get(&local).cloned().unwrap_or_default()
+    }
+
+    /// Container that ran the task which completed the handshake.
+    fn by_handshake(&self, cgroup: u64) -> Option<&str> {
+        if cgroup == 0 {
+            // No handshake in this window (a keep-alive that predates the
+            // agent), or a context that has no cgroup of its own.
+            return None;
+        }
+        self.by_cgroup.get(&cgroup).map(String::as_str)
+    }
+}
+
+/// Kernel cgroup id of a cgroup path — what `bpf_get_current_cgroup_id`
+/// returns for a task in it.
+///
+/// The id is the kernfs inode of the cgroup directory. The agent runs with
+/// `hostPID`, so pid 1 is the host's init and `/proc/1/root` is the host's root
+/// filesystem, which is where the full hierarchy lives; the agent's own
+/// `/sys/fs/cgroup` is only its container's subtree and is tried as a fallback
+/// for a host install.
+fn cgroup_id(path: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    for root in ["/proc/1/root/sys/fs/cgroup", "/sys/fs/cgroup"] {
+        if let Ok(meta) = std::fs::metadata(format!("{root}{path}")) {
+            return Some(meta.ino());
+        }
+    }
+    None
+}
+
 /// Reading another process's `/proc/<pid>/net` needs ptrace-level access; the
 /// agent runs privileged, this only makes a missing capability visible.
 fn guard_memlock() {
@@ -432,6 +589,9 @@ struct PodSockets {
     sockets: Vec<Socket>,
     rx_bytes: u64,
     tx_bytes: u64,
+    /// Local port -> container name, for the sockets the pod's processes own.
+    /// A port with no entry belongs to a process the scan could not attribute.
+    containers: HashMap<u16, String>,
 }
 
 #[derive(Default)]
@@ -486,7 +646,8 @@ impl Scanner {
             slot.rx_bytes += rx;
             slot.tx_bytes += tx;
 
-            let mut edges: HashMap<(String, String, String), ServiceEdge> = HashMap::new();
+            let mut edges: HashMap<(String, String, String, String, String), ServiceEdge> =
+                HashMap::new();
             for socket in &pod.sockets {
                 if !counted_state(socket.state) {
                     continue;
@@ -500,6 +661,8 @@ impl Scanner {
                     edge.client.clone(),
                     edge.server.clone(),
                     edge.protocol.clone(),
+                    edge.client_container.clone(),
+                    edge.server_container.clone(),
                 );
                 edges
                     .entry(key)
@@ -573,6 +736,9 @@ impl Scanner {
         // and only the sockets they actually hold open are kept.
         let host_netns = netns_of(1);
         let mut seen: HashSet<String> = HashSet::new();
+        // Pods already in `out`, so a second process of the same pod can still
+        // contribute its container attribution without a second socket table.
+        let mut placed: HashMap<String, usize> = HashMap::new();
         for entry in entries.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -587,6 +753,19 @@ impl Scanner {
             let Some(uid) = lidlesseye_ebpf::procfs::parse_pod_uid(&cgroup) else {
                 continue;
             };
+            if let Some(&index) = placed.get(&uid) {
+                // Every container of a pod shares its network namespace, so the
+                // sockets are the pod's either way; what the extra process adds
+                // is the link from a socket to the container that owns it.
+                if let Some(name) = container_name(config, &uid, &cgroup)
+                    && let Some(pod) = out.get_mut(index)
+                {
+                    for port in ports_of_process(pid) {
+                        pod.containers.insert(port, name.clone());
+                    }
+                }
+                continue;
+            }
             if !seen.insert(uid.clone()) {
                 continue;
             }
@@ -606,12 +785,20 @@ impl Scanner {
             // and there is no per-pod byte count to substitute: report none
             // rather than the node's totals under every host-network pod.
             let (rx_bytes, tx_bytes) = if shared { (0, 0) } else { read_netdev(pid) };
+            let mut containers = HashMap::new();
+            if let Some(name) = container_name(config, &uid, &cgroup) {
+                for port in ports_of_process(pid) {
+                    containers.insert(port, name.clone());
+                }
+            }
+            placed.insert(uid, out.len());
             out.push(PodSockets {
                 meta,
                 listen,
                 sockets,
                 rx_bytes,
                 tx_bytes,
+                containers,
             });
         }
         out
@@ -653,8 +840,13 @@ impl Scanner {
             socket.key.remote.1,
         );
         let this = pod_node(&pod.meta);
+        let local_container = pod
+            .containers
+            .get(&socket.key.local.1)
+            .cloned()
+            .unwrap_or_default();
 
-        let (client_node, server_node, server_port) = match peer {
+        let (client_node, server_node, server_port, server_container) = match peer {
             Peer::Pod(meta) => {
                 let node = pod_node(&meta);
                 if local_is_server {
@@ -665,8 +857,12 @@ impl Scanner {
                     return None;
                 }
                 let id = node.id.clone();
+                let container = meta
+                    .container_by_port(socket.key.remote.1)
+                    .map(|info| info.name.clone())
+                    .unwrap_or_default();
                 peers.entry(id.clone()).or_insert(node);
-                (this.id, id, socket.key.remote.1)
+                (this.id, id, socket.key.remote.1, container)
             }
             Peer::Service(service) => {
                 if local_is_server {
@@ -674,7 +870,7 @@ impl Scanner {
                 }
                 let node = service_node(&service);
                 peers.entry(node.id.clone()).or_insert(node);
-                (this.id, service.id(), socket.key.remote.1)
+                (this.id, service.id(), socket.key.remote.1, String::new())
             }
             Peer::External => {
                 unnamed.insert((socket.key.remote.0, socket.key.remote.1));
@@ -682,18 +878,28 @@ impl Scanner {
                 peers.entry(id.clone()).or_insert_with(external_node);
                 if local_is_server {
                     // Inbound from outside the cluster: the pod is the server.
-                    (id, this.id, socket.key.local.1)
+                    (id, this.id, socket.key.local.1, String::new())
                 } else {
                     // Outbound to something the map cannot name.
-                    (this.id, id, socket.key.remote.1)
+                    (this.id, id, socket.key.remote.1, String::new())
                 }
             }
+        };
+
+        // The edge's ends are known now: whichever side this pod is on gets
+        // the container the socket belongs to.
+        let (client_container, server_container) = if local_is_server {
+            (String::new(), local_container)
+        } else {
+            (local_container, server_container)
         };
 
         Some(ServiceEdge {
             client: client_node,
             server: server_node,
             protocol: protocol_for_port(server_port).to_string(),
+            client_container,
+            server_container,
             connections: u64::from(counted),
             retransmits: u64::from(retrans),
             ..Default::default()
@@ -803,6 +1009,11 @@ fn pod_node(meta: &PodMeta) -> ServiceNode {
     node.namespace = meta.namespace.clone();
     node.workload = meta.workload.clone().unwrap_or_default();
     node.service = meta.service_name().unwrap_or(&name).to_string();
+    node.containers = meta
+        .containers
+        .iter()
+        .map(|container| container.name.clone())
+        .collect();
     node
 }
 
@@ -817,6 +1028,11 @@ fn health_by_node(pods: &PodIndex) -> HashMap<String, NodeHealth> {
         let id = lidlesseye_core::servicemap::node_id(&meta.namespace, &map_name_of(meta));
         let slot = out.entry(id).or_default();
         slot.pods += 1;
+        for container in &meta.containers {
+            if !slot.containers.contains(&container.name) {
+                slot.containers.push(container.name.clone());
+            }
+        }
         if meta.ready {
             slot.ready += 1;
         }
@@ -837,6 +1053,9 @@ fn health_by_node(pods: &PodIndex) -> HashMap<String, NodeHealth> {
         health
             .instances
             .sort_by(|a, b| a.ready.cmp(&b.ready).then_with(|| a.name.cmp(&b.name)));
+        // Containers are a set, and their order is the spec's, which is the
+        // order every other tool shows them in.
+        health.containers.sort();
     }
     out
 }
@@ -847,6 +1066,7 @@ struct NodeHealth {
     pods: u32,
     ready: u32,
     instances: Vec<InstanceInfo>,
+    containers: Vec<String>,
 }
 
 /// How many replicas of one workload a map payload carries.
@@ -863,6 +1083,7 @@ fn attach_health(nodes: &mut HashMap<String, ServiceNode>, health: &HashMap<Stri
             node.pods = known.pods;
             node.ready = known.ready;
             node.instances = known.instances.clone();
+            node.containers = known.containers.clone();
         }
     }
 }
@@ -872,7 +1093,7 @@ fn resolve_peer(pods: &PodIndex, services: Option<&ServiceIndex>, ip: IpAddr, po
         return Peer::External;
     }
     if let Some(meta) = pods.lookup_ip(ip, port) {
-        return Peer::Pod(meta);
+        return Peer::Pod(Box::new(meta));
     }
     if let Some(service) = services.and_then(|index| index.lookup(ip, port)) {
         return Peer::Service(service);
@@ -962,6 +1183,66 @@ fn read_sockets(pid: u32, only: Option<&HashSet<u64>>) -> (Vec<Socket>, HashSet<
     (sockets, listen)
 }
 
+/// The container a process belongs to, named as the Kubernetes API names it.
+///
+/// The cgroup only carries the runtime id, which nobody can read; the pod
+/// index is what turns it into `app` or `istio-proxy`. `None` for a process
+/// the index does not describe — a stopped container whose id outlived the
+/// status entry, or a runtime whose cgroup layout is not recognised.
+fn container_name(config: &NetMapConfig, uid: &str, cgroup: &str) -> Option<String> {
+    let id = lidlesseye_ebpf::procfs::parse_container_id(cgroup)?;
+    let meta = config.pods.lookup(uid)?;
+    meta.container_by_id(&id).map(|info| info.name.clone())
+}
+
+/// Local ports of the sockets this process holds open.
+///
+/// `/proc/<pid>/net/tcp` belongs to the network *namespace*, which every
+/// container of a pod shares: it lists the pods' sockets, not this process's.
+/// The fd table is what makes the difference, so the inode of each open socket
+/// is looked up in the namespace's table and translated to its local port.
+fn ports_of_process(pid: u32) -> Vec<u16> {
+    let endpoints = socket_endpoints(pid);
+    let mut out: Vec<u16> = own_socket_inodes(pid)
+        .iter()
+        .filter_map(|inode| endpoints.get(inode).map(|(_, port)| *port))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Socket inode -> local endpoint, for every TCP socket in a namespace.
+///
+/// The local address is read as well as the port: a `hostNetwork` pod shares
+/// the node's address, so "the socket on port 41234" is only one socket if the
+/// address is part of the key.
+fn socket_endpoints(pid: u32) -> HashMap<u64, (IpAddr, u16)> {
+    let mut out = HashMap::new();
+    for (path, v6) in [
+        (format!("/proc/{pid}/net/tcp"), false),
+        (format!("/proc/{pid}/net/tcp6"), true),
+    ] {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 {
+                continue;
+            }
+            let Some(inode) = fields[9].parse::<u64>().ok() else {
+                continue;
+            };
+            let Some(local) = parse_endpoint(fields[1], v6) else {
+                continue;
+            };
+            out.insert(inode, local);
+        }
+    }
+    out
+}
+
 /// `0100007F:1F90` -> `127.0.0.1:8080`. The kernel prints each 32-bit word in
 /// host order, so a little-endian host needs the bytes reversed.
 fn parse_endpoint(field: &str, v6: bool) -> Option<(IpAddr, u16)> {
@@ -1020,7 +1301,7 @@ fn read_netdev(pid: u32) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lidlesseye_ebpf::k8s::PodIndex;
+    use lidlesseye_ebpf::k8s::{ContainerInfo, PodIndex};
     use std::collections::BTreeMap;
 
     /// A pod index with `(uid, namespace, name, ip)` entries and no labels, so
@@ -1040,6 +1321,33 @@ mod tests {
     fn mapper(entries: &[(&str, &str, &str, &str)]) -> FlowMapper {
         FlowMapper {
             pods: pod_index(entries),
+            services: None,
+            node: "test-node".to_string(),
+        }
+    }
+
+    /// `(container name, ports)` pairs of one stand-in pod.
+    type PodContainers<'a> = &'a [(&'a str, &'a [u16])];
+
+    /// A pod index whose pods carry named containers with their ports.
+    fn mapper_with_containers(
+        entries: &[(&str, &str, &str, &str, PodContainers<'_>)],
+    ) -> FlowMapper {
+        let mut pods = HashMap::new();
+        for &(uid, namespace, name, ip, containers) in entries {
+            let containers = containers
+                .iter()
+                .map(|(name, ports)| ContainerInfo::new(*name, "", ports.to_vec()))
+                .collect();
+            let meta = PodMeta::new(uid, namespace, name, &BTreeMap::new(), None, None)
+                .with_ips(vec![ip.parse().unwrap()])
+                .with_containers(containers);
+            pods.insert(uid.to_string(), meta);
+        }
+        let index = PodIndex::new();
+        index.replace(pods);
+        FlowMapper {
+            pods: Arc::new(index),
             services: None,
             node: "test-node".to_string(),
         }
@@ -1074,6 +1382,7 @@ mod tests {
             retransmits: 0,
             rtt_us_sum: 0,
             rtt_samples: 0,
+            cgroup: 0,
         }
     }
 
@@ -1114,6 +1423,78 @@ mod tests {
         // connection, which is why the server-side flow is dropped.
         assert_eq!(cart.rx_bytes, 2000);
         assert_eq!(cart.tx_bytes, 900);
+    }
+
+    /// The server's container is inferred from the port the peer declares; the
+    /// client's comes from `/proc`, which cannot see these stand-in pods, so it
+    /// stays empty rather than being guessed.
+    #[test]
+    fn an_edge_names_the_container_that_owns_the_server_port() {
+        let mapper = mapper_with_containers(&[
+            ("u1", "shop", "checkout", "10.0.0.2", &[("app", &[8080])]),
+            ("u2", "shop", "payments", "10.0.0.7", &[("app", &[5432])]),
+        ]);
+        let batch = mapper.batch(
+            vec![flow(
+                ("10.0.0.2", 43210),
+                ("10.0.0.7", 5432),
+                Role::Client,
+                900,
+                2000,
+            )],
+            1,
+        );
+        assert_eq!(batch.edges.len(), 1);
+        assert_eq!(batch.edges[0].server_container, "app");
+        assert_eq!(batch.edges[0].client_container, "");
+        // The container list travels with the node, so the panel can draw a row
+        // for a container that opened no connection in this window.
+        let payments = batch
+            .nodes
+            .iter()
+            .find(|node| node.id == "shop/payments")
+            .expect("the peer is on the map");
+        assert_eq!(payments.containers, ["app"]);
+    }
+
+    /// The same workload, two containers: the edges must not merge, or the
+    /// sidecar's traffic would be indistinguishable from the app's. The split
+    /// itself is covered by `containers_split_an_edge_instead_of_merging_it`
+    /// in the core crate; what this pins down is that both flows survive with
+    /// their own connection count.
+    #[test]
+    fn two_containers_of_one_pod_do_not_double_count() {
+        let mapper = mapper_with_containers(&[
+            ("u1", "shop", "checkout", "10.0.0.2", &[("app", &[8080])]),
+            ("u2", "shop", "payments", "10.0.0.7", &[("app", &[5432])]),
+        ]);
+        let batch = mapper.batch(
+            vec![
+                flow(
+                    ("10.0.0.2", 43210),
+                    ("10.0.0.7", 5432),
+                    Role::Client,
+                    900,
+                    2000,
+                ),
+                flow(
+                    ("10.0.0.2", 43211),
+                    ("10.0.0.7", 5432),
+                    Role::Client,
+                    100,
+                    300,
+                ),
+            ],
+            1,
+        );
+        let total: u64 = batch.edges.iter().map(|edge| edge.connections).sum();
+        assert_eq!(total, 2);
+        assert!(
+            batch
+                .edges
+                .iter()
+                .all(|edge| edge.server == "shop/payments")
+        );
     }
 
     #[test]

@@ -180,6 +180,28 @@ async function seed() {
         rx_bytes: 48_000,
         tx_bytes: 24_000,
       },
+      // A workload with a sidecar: the node's title must be the workload name,
+      // and the panel must give each container its own row.
+      {
+        id: "shop/cart",
+        namespace: "shop",
+        workload: "cart",
+        service: "cart",
+        kind: "workload",
+        pods: 1,
+        ready: 1,
+        containers: ["app", "istio-proxy"],
+      },
+      {
+        id: "shop/payments",
+        namespace: "shop",
+        workload: "payments",
+        service: "payments",
+        kind: "workload",
+        pods: 1,
+        ready: 1,
+        containers: ["app"],
+      },
       { id: "external", service: "external", kind: "external" },
     ],
     edges: [
@@ -193,6 +215,31 @@ async function seed() {
         tx_bytes: 24_000,
         rtt_us_sum: 36_000,
         rtt_samples: 12,
+      },
+      {
+        client: "shop/cart",
+        server: "checkout",
+        protocol: "http",
+        client_container: "istio-proxy",
+        connections: 120,
+        retransmits: 0,
+        rx_bytes: 12_000,
+        tx_bytes: 6_000,
+        rtt_us_sum: 24_000,
+        rtt_samples: 12,
+      },
+      {
+        client: "shop/cart",
+        server: "shop/payments",
+        protocol: "grpc",
+        client_container: "app",
+        server_container: "app",
+        connections: 60,
+        retransmits: 0,
+        rx_bytes: 9_000,
+        tx_bytes: 30_000,
+        rtt_us_sum: 6_000,
+        rtt_samples: 6,
       },
     ],
   });
@@ -771,6 +818,50 @@ async function main() {
     (await mapPage.locator('[data-testid="service-map-canvas"] svg text').count()) > 0,
     "the service map labels its seeded edge",
   );
+
+  // A workload card is titled with the workload, not with its namespace or an
+  // app label; the namespace belongs on the second line.
+  const cartCard = mapPage
+    .locator('[data-testid="map-node"]')
+    .filter({ hasText: "cart" })
+    .first();
+  check((await cartCard.count()) === 1, "the seeded workload is on the map");
+  const cartLines = (await cartCard.innerText())
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  check(cartLines[0] === "cart", "a workload card is titled with the workload name", cartLines[0]);
+  check(
+    cartLines[1] === "shop · 1/1",
+    "the namespace and replica count stay on the second line",
+    cartLines[1],
+  );
+
+  // Clicking it opens the panel, where the workload's containers get a row
+  // each and the edges are anchored on the container that owns them.
+  await cartCard.click();
+  await mapPage.waitForSelector('[data-testid="map-panel"][data-state="open"]', { timeout: 10000 });
+  await mapPage.waitForSelector('[data-testid="map-container-row"]', { timeout: 10000 });
+  const containerRows = await mapPage
+    .locator('[data-testid="map-container-row"]')
+    .allInnerTexts();
+  check(
+    containerRows.length === 2 &&
+      containerRows.some((row) => row.includes("istio-proxy")) &&
+      containerRows.some((row) => row.includes("app")),
+    "the panel draws one row per container",
+    JSON.stringify(containerRows),
+  );
+  check(
+    (await mapPage.locator('[data-testid="map-neighborhood"] svg path[marker-end]').count()) >= 2,
+    "container rows carry their own edges",
+  );
+  // The drawer slides in over 300ms; a screenshot taken mid-flight looks like
+  // a clipped layout, so let the transition finish first.
+  await mapPage.waitForTimeout(400);
+  await shot(mapPage, "8-map-containers");
+  await mapPage.click('[data-testid="map-panel-close"]');
+
   await mapPage
     .locator('[data-testid="map-node"]')
     .filter({ hasText: "checkout" })
