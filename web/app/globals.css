@@ -154,15 +154,6 @@
     text-box: trim-both cap alphabetic;
   }
 
-  /* The card is its own inline-size container: when a peer list makes it too
-     narrow to show a rate beside the container name, the rate folds away
-     rather than truncating the name the operator needs to identify the hop. */
-  @container (max-width: 208px) {
-    .neighbor-rate {
-      display: none;
-    }
-  }
-
   .fg-scroll {
     overflow-x: hidden;
     overflow-y: auto;

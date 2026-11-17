@@ -30,6 +30,7 @@ import { Button } from "@/components/ui/button";
 
 import { EdgeLayer } from "./edge-layer";
 import {
+  NEIGHBOR_CARD,
   NeighborCard,
   neighborCardHeight,
   neighborRowCenter,
@@ -43,16 +44,19 @@ const MAX_PEERS = 6;
 const MAX_CONTAINERS = 6;
 
 const SIZE = {
-  pad: 16,
-  gapX: 128,
-  cardGapY: 20,
-  minCard: 190,
-  maxCard: 284,
+  pad: 20,
+  /** The strip above the cards that holds the CALLERS / CALLEES caption. */
+  headerRow: 16,
+  /** Room between two columns for the edge label. */
+  gapX: 92,
+  cardGapY: 16,
+  minCard: 214,
+  maxCard: 300,
 };
 
-const ZOOM = { min: 0.4, max: 2.4, step: 1.22 };
-const MAX_VIEW_HEIGHT = 520;
-const MIN_VIEW_HEIGHT = 220;
+const ZOOM = { min: 0.5, max: 2.4, step: 1.22 };
+const MAX_VIEW_HEIGHT = 440;
+const MIN_VIEW_HEIGHT = 260;
 
 export interface NeighborhoodProps {
   node: ServiceMapNode;
@@ -98,6 +102,8 @@ interface Layout {
   rows: NeighborRow[];
   rowNames: Map<string, string>;
   columns: string[][];
+  /** Caption above each side, so "upstream" and "downstream" read at a glance. */
+  captions: { x: number; w: number; label: string }[];
   height: number;
   width: number;
   selfBox: Box;
@@ -260,76 +266,163 @@ export function Neighborhood({
   }, [edges, nodes, shownIds]);
 
   const layout = useMemo<Layout>(() => {
-    const columns = [upGroups.map((group) => group.id), [node.id], downGroups.map((group) => group.id)]
-      .filter((column) => column.length > 0)
-      .map((column) => column.filter((id) => nodes.has(id)));
-
     const rowCountOf = (id: string) => {
       const info = containers.get(id);
       return (info?.names.length ?? 0) + (info?.extra ? 1 : 0);
     };
+    const rowIndexOf = (id: string, name: string | undefined): number => {
+      if (!name) return -1;
+      return (containers.get(id)?.names ?? []).indexOf(name);
+    };
+    const heightOf = (id: string) => neighborCardHeight(rowCountOf(id));
+
     const textWidth = Math.max(
       12,
       ...shownIds.flatMap((id) => {
         const meta = nodes.get(id);
         return [
-          nodeLabel(meta).length * 6.3,
-          (meta ? nodeMeta(meta) : "").length * 5.2,
-          ...(containers.get(id)?.names ?? []).map((name) => name.length * 5.7 + 38),
+          nodeLabel(meta).length * 6.6,
+          (meta ? nodeMeta(meta) : "").length * 5.4,
+          ...(containers.get(id)?.names ?? []).map((name) => name.length * 6.1 + 46),
         ];
       }),
     );
-    const cardWidth = clamp(Math.round(textWidth + 44), SIZE.minCard, SIZE.maxCard);
-    const span = columns.length * cardWidth + Math.max(0, columns.length - 1) * SIZE.gapX;
-    const width = span + 2 * SIZE.pad;
-    const xs = columns.map((_, index) => SIZE.pad + index * (cardWidth + SIZE.gapX));
+    const cardWidth = clamp(Math.round(textWidth + 48), SIZE.minCard, SIZE.maxCard);
 
-    const columnHeights = columns.map((column) =>
-      column.reduce((sum, id) => sum + neighborCardHeight(rowCountOf(id)), 0) +
-      Math.max(0, column.length - 1) * SIZE.cardGapY,
+    // Only the columns that exist take width: a node with only callees is a
+    // two-column drawing, not a three-column one with an empty left edge.
+    const columns: { key: "up" | "self" | "down"; ids: string[] }[] = [];
+    const upIds = upGroups.map((group) => group.id).filter((id) => nodes.has(id));
+    const downIds = downGroups.map((group) => group.id).filter((id) => nodes.has(id));
+    if (upIds.length) columns.push({ key: "up", ids: upIds });
+    if (nodes.has(node.id)) columns.push({ key: "self", ids: [node.id] });
+    if (downIds.length) columns.push({ key: "down", ids: downIds });
+
+    const xOf = (index: number) => SIZE.pad + index * (cardWidth + SIZE.gapX);
+    const span =
+      columns.length * cardWidth + Math.max(0, columns.length - 1) * SIZE.gapX;
+    const width = span + 2 * SIZE.pad;
+
+    const selfColumn = Math.max(
+      0,
+      columns.findIndex((column) => column.key === "self"),
     );
-    const tallest = Math.max(0, ...columnHeights);
-    const height = tallest + 2 * SIZE.pad;
+    const selfH = heightOf(node.id);
+    // Self is placed at y=0 in a provisional frame; every peer is positioned
+    // relative to it and the whole drawing is shifted down afterwards.
+    const selfCard: Box = { x: xOf(selfColumn), y: 0, w: cardWidth, h: selfH };
+
+    // Traffic with no container attribution attaches to the header edge, so
+    // both the alignment and the anchor use that same height.
+    const headerMid = NEIGHBOR_CARD.header / 2;
+    /** Y (in the provisional frame) of the self row a peer should line up to. */
+    const selfRowY = (container: string | undefined) => {
+      const index = rowIndexOf(node.id, container);
+      return index >= 0 ? neighborRowCenter(index) : headerMid;
+    };
+    /** Y of the peer row that carries the edge, relative to the peer's card. */
+    const peerRowY = (id: string, container: string | undefined) => {
+      const index = rowIndexOf(id, container);
+      return index >= 0 ? neighborRowCenter(index) : headerMid;
+    };
+
+    const heaviest = (group: PeerGroup) =>
+      group.edges.reduce(
+        (best, edge) => (edgeWeight(edge) > edgeWeight(best) ? edge : best),
+        group.edges[0],
+      );
 
     const cards = new Map<string, Box>();
+    cards.set(node.id, selfCard);
+
+    columns.forEach((column, columnIndex) => {
+      if (column.key === "self") return;
+      const fromPeer = column.key === "up";
+      const groups = fromPeer ? upGroups : downGroups;
+      // Line each peer's connecting container up with the self row it talks to,
+      // so the hop is a straight horizontal line between two ports. Peers that
+      // target the same row are then pushed apart to keep them from touching.
+      const placed = column.ids
+        .map((id) => {
+          const group = groups.find((candidate) => candidate.id === id);
+          if (!group) return null;
+          const edge = heaviest(group);
+          const selfContainer = fromPeer ? edge.server_container : edge.client_container;
+          const peerContainer = fromPeer ? edge.client_container : edge.server_container;
+          return {
+            id,
+            wanted: selfRowY(selfContainer) - peerRowY(id, peerContainer),
+            h: heightOf(id),
+          };
+        })
+        .filter((item): item is { id: string; wanted: number; h: number } => item != null)
+        .sort((a, b) => a.wanted - b.wanted);
+
+      let bottom = Number.NEGATIVE_INFINITY;
+      for (const item of placed) {
+        const y = Math.max(item.wanted, bottom + SIZE.cardGapY);
+        cards.set(item.id, { x: xOf(columnIndex), y, w: cardWidth, h: item.h });
+        bottom = y + item.h;
+      }
+    });
+
+    // Shift everything so the top of the drawing clears the caption strip.
+    let minY = Number.POSITIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const card of cards.values()) {
+      minY = Math.min(minY, card.y);
+      maxY = Math.max(maxY, card.y + card.h);
+    }
+    const top = SIZE.pad + SIZE.headerRow;
+    const shift = top - minY;
+    for (const card of cards.values()) card.y += shift;
+    const height = maxY - minY + top + SIZE.pad;
+
     const anchors = new Map<string, Box>();
     const rows: NeighborRow[] = [];
     const rowNames = new Map<string, string>();
-    columns.forEach((column, columnIndex) => {
-      let y = SIZE.pad + (tallest - columnHeights[columnIndex]) / 2;
-      for (const id of column) {
-        const cardHeight = neighborCardHeight(rowCountOf(id));
-        const card = { x: xs[columnIndex], y, w: cardWidth, h: cardHeight };
-        cards.set(id, card);
-        // Fallback for traffic the agent could not attribute to a container:
-        // the two sides of the card, at its vertical centre.
-        anchors.set(`${id}@out`, port(card.x + card.w, y + card.h / 2));
-        anchors.set(`${id}@in`, port(card.x, y + card.h / 2));
-        (containers.get(id)?.names ?? []).forEach((name, index) => {
-          const key = rowId(id, name);
-          const offset = neighborRowOffset(index);
-          const centre = y + neighborRowCenter(index);
-          // The out port is the circle on the card's right border, the in port
-          // the one on its left — the exact points NeighborCard draws. An edge
-          // leaves one and lands on the other at the row's own height.
-          anchors.set(`${key}@out`, port(card.x + card.w, centre));
-          anchors.set(`${key}@in`, port(card.x, centre));
-          rowNames.set(key, name);
-          rows.push({ id: key, ownerId: id, name, offset });
-        });
-        y += cardHeight + SIZE.cardGapY;
-      }
-    });
+    for (const [id, card] of cards) {
+      // Fallback for traffic the agent could not attribute to a container:
+      // the header edge, where the workload's name is, not the middle of the
+      // body — a curve there would strike through the container rows.
+      const mid = card.y + headerMid;
+      anchors.set(`${id}@out`, port(card.x + card.w, mid));
+      anchors.set(`${id}@in`, port(card.x, mid));
+      (containers.get(id)?.names ?? []).forEach((name, index) => {
+        const key = rowId(id, name);
+        const offset = neighborRowOffset(index);
+        const centre = card.y + neighborRowCenter(index);
+        // The out port is the circle on the card's right border, the in port
+        // the one on its left — the exact points NeighborCard draws.
+        anchors.set(`${key}@out`, port(card.x + card.w, centre));
+        anchors.set(`${key}@in`, port(card.x, centre));
+        rowNames.set(key, name);
+        rows.push({ id: key, ownerId: id, name, offset });
+      });
+    }
+
+    const captions: Layout["captions"] = columns
+      .map((column, index) =>
+        column.key === "self"
+          ? null
+          : {
+              x: xOf(index),
+              w: cardWidth,
+              label: column.key === "up" ? "CALLERS" : "CALLEES",
+            },
+      )
+      .filter((caption): caption is Layout["captions"][number] => caption != null);
 
     return {
       cards,
       anchors,
       rows,
       rowNames,
-      columns,
+      columns: columns.map((column) => column.ids),
+      captions,
       height,
       width,
-      selfBox: cards.get(node.id) ?? { x: 0, y: 0, w: cardWidth, h: neighborCardHeight(0) },
+      selfBox: cards.get(node.id) ?? selfCard,
     };
   }, [upGroups, downGroups, node.id, nodes, containers, shownIds, rowId]);
 
@@ -379,18 +472,26 @@ export function Neighborhood({
     return out;
   }, [upGroups, downGroups, layout.anchors, layout.rowNames, node.id, rowId]);
 
-  /** Connections per row, and which of its two ports actually carry an edge. */
-  const { perRow, usedPorts } = useMemo(() => {
+  /** Connections per row, and which ports actually carry an edge. */
+  const { perRow, usedPorts, usedCardPorts } = useMemo(() => {
     const totals = new Map<string, number>();
     const ports = new Map<string, { in?: boolean; out?: boolean }>();
+    const cardPorts = new Map<string, { in?: boolean; out?: boolean }>();
     const mark = (anchor: string) => {
       const side = anchor.endsWith("@out") ? "out" : anchor.endsWith("@in") ? "in" : null;
       if (!side) return;
-      const row = anchorBase(anchor);
-      if (!layout.rowNames.has(row)) return;
-      const state = ports.get(row) ?? {};
+      const base = anchorBase(anchor);
+      // A container port for a row, or the header port of a workload whose
+      // traffic could not be attributed to one.
+      const target = layout.rowNames.has(base)
+        ? ports
+        : layout.cards.has(base)
+          ? cardPorts
+          : null;
+      if (!target) return;
+      const state = target.get(base) ?? {};
       state[side] = true;
-      ports.set(row, state);
+      target.set(base, state);
     };
     for (const edge of shown) {
       const client = anchorBase(edge.client);
@@ -400,8 +501,8 @@ export function Neighborhood({
       mark(edge.client);
       mark(edge.server);
     }
-    return { perRow: totals, usedPorts: ports };
-  }, [shown, layout.rowNames]);
+    return { perRow: totals, usedPorts: ports, usedCardPorts: cardPorts };
+  }, [shown, layout.rowNames, layout.cards]);
 
   const reportWidth = useCallback(
     (width: number) => onPreferredWidth?.(width),
@@ -557,10 +658,22 @@ export function Neighborhood({
               transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`,
             }}
           >
+            {/* Upstream and downstream are captioned once, above the cards,
+                so a glance tells which way the traffic flows without reading
+                a legend. */}
+            {layout.captions.map((caption) => (
+              <div
+                key={caption.label}
+                className="pointer-events-none absolute text-[8.5px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60"
+                style={{ left: caption.x, top: SIZE.pad - 4, width: caption.w }}
+              >
+                {caption.label}
+              </div>
+            ))}
             <EdgeLayer
               edges={shown}
               boxes={layout.anchors}
-              // Container bands are edge endpoints, not obstacles: a label
+              // Container ports are edge endpoints, not obstacles: a label
               // only has to clear the card that owns them.
               avoid={[...layout.cards.values()]}
               windowSec={windowSec}
@@ -579,7 +692,7 @@ export function Neighborhood({
               const rows: NeighborContainer[] = (info?.names ?? []).map((name) => ({
                 name,
                 rate: rate(perRow.get(rowId(id, name)) ?? 0),
-                ports: usedPorts.get(rowId(id, name)),
+                ports: usedPorts.get(rowId(id, name)) ?? {},
               }));
               if (info?.extra) {
                 rows.push({ name: `+${info.extra} more containers`, rate: 0, more: true });
@@ -590,6 +703,7 @@ export function Neighborhood({
                   node={peer}
                   box={box}
                   containers={rows}
+                  cardPorts={usedCardPorts.get(id)}
                   cpu={peer.cpu_ns ?? 0}
                   cpuMax={cpuMax}
                   selected={id === node.id}

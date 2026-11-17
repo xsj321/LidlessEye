@@ -9,7 +9,7 @@ image:
   # Published on Docker Hub; see docker push in the release notes / deployment docs.
   repository: docker.io/xsj321/lidlesseye
   # Defaults to the chart's appVersion when empty.
-  tag: "0.10.58-ports"
+  tag: "0.10.59-hopmap"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

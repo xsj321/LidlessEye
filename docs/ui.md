@@ -267,17 +267,28 @@ border rather than resizing it. A long workload name or a third sidecar cannot
 push one over another — the browser stacks them, and card height is computed
 from the same shared geometry the card renders with. Containers that carried
 traffic in the window come first, heaviest at the top; a long tail collapses
-into `+n more containers`. The card is its own `inline-size` container: when a
-crowded hop squeezes it, the rate beside a container name folds away before the
-name is truncated.
+into `+n more containers`.
+
+**Peers line up with the container they talk to.** The layout does not centre
+each column independently, which is what made a hop look ragged: a peer card is
+placed so that the container row carrying the edge sits at the same height as
+the row it connects to on the selected card. The hop therefore reads as a
+straight horizontal line between two container ports. Peers that target the
+same row are pushed apart by the minimum card gap, so they never touch. A
+`CALLERS` / `CALLEES` caption sits above each side, so the direction of traffic
+is legible without a legend, and a side with no peers is dropped entirely
+rather than leaving an empty column.
 
 **Edges run container to container.** Each container row draws a small port on
-the card's left (`in`) and right (`out`) border, and the row's stub joins that
-port to its name. A curve leaves the caller container's `out` port and lands on
-the callee container's `in` port at that row's own height — so a sidecar's
-traffic visibly starts and ends at the sidecars, not at the workload boxes.
-Only traffic the agent could not attribute to a container falls back to the
-card's centre; unused ports are not drawn, so no circle floats without an edge.
+the border it faces — `out` on the right of a caller, `in` on the left of a
+callee, both on the selected workload — and the row's stub joins that port to
+its name. The curve leaves the caller container's `out` port and lands on the
+callee container's `in` port, at the row's own height, so a sidecar's traffic
+visibly starts and ends at the sidecars rather than at the workload boxes. Ports
+are strict: a row that only receives draws no `out` port, so a callee's dead end
+never looks like it dials out. Traffic the agent could not attribute to any
+container falls back to a port on the workload's **header edge**, where the name
+is, instead of the middle of the body where it would strike through the rows.
 Labels clear the workload cards, not the rows inside them, and stay in the
 channel between columns. The hop has its own scroll-to-zoom, drag-to-pan and
 zoom buttons, with a *fit* action that returns to a readable whole-hop view.

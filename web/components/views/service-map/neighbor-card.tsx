@@ -18,11 +18,15 @@
 //     padding and font weight never change, so a card does not jump when it
 //     becomes the selected node.
 //
-// Each container row carries two ports on the card's left and right borders.
-// The edge layer anchors lines at those exact points, so a curve visibly runs
-// from one container's port to another's — container to container, not card to
-// card. The geometry below is shared with neighborhood.tsx: change a constant
-// here and both the ports and the edge anchors move with it.
+// Each container row carries a port on the card border it faces: a caller
+// exposes `out` on its right, a callee exposes `in` on its left, and the
+// selected workload exposes both. The edge layer anchors lines at those exact
+// points, and the layout aligns a peer's port to the row it talks to, so the
+// curve between two containers is horizontal and unmistakably container to
+// container — not card to card.
+//
+// The geometry below is shared with neighborhood.tsx: change a constant here
+// and both the ports and the edge anchors move with it.
 
 import { Fragment, memo } from "react";
 
@@ -39,17 +43,17 @@ import { cn } from "@/lib/utils";
 
 /** All sizes in world pixels at scale 1; the view scales the layer, not the card. */
 export const NEIGHBOR_CARD = {
-  header: 46,
-  rowHeight: 26,
+  header: 48,
+  rowHeight: 28,
   rowGap: 6,
   /** Space between the header and the first container row. */
-  padTop: 9,
-  padBottom: 10,
+  padTop: 10,
+  padBottom: 11,
   /** How far a container row is indented from the card's left edge. */
-  indent: 22,
-  rightPad: 8,
+  indent: 24,
+  rightPad: 10,
   /** Radius of the port circles that sit on the card's left/right borders. */
-  portRadius: 3.25,
+  portRadius: 4,
 } as const;
 
 /** Height a card needs for a given number of container rows. */
@@ -97,6 +101,11 @@ export interface NeighborCardProps {
   selected?: boolean;
   onSelect?: (id: string) => void;
   testId?: string;
+  /**
+   * Ports on the card's header edge, used when traffic could not be attributed
+   * to a container. Without this the curve would end at empty card space.
+   */
+  cardPorts?: { in?: boolean; out?: boolean };
 }
 
 const TONE_COLOR = {
@@ -108,7 +117,7 @@ const TONE_COLOR = {
 function StatusGlyph({ tone }: { tone: keyof typeof TONE_COLOR }) {
   const color = TONE_COLOR[tone];
   return (
-    <svg viewBox="0 0 12 12" className="size-3 shrink-0" aria-hidden="true">
+    <svg viewBox="0 0 12 12" className="size-3.5 shrink-0" aria-hidden="true">
       {tone === "ok" ? <circle cx="6" cy="6" r="4" fill={color} /> : null}
       {tone === "warn" ? <path d="M6 1.3 11.2 10.5H0.8z" fill={color} /> : null}
       {tone === "muted" ? (
@@ -127,15 +136,20 @@ export const NeighborCard = memo(function NeighborCard({
   selected = false,
   onSelect,
   testId,
+  cardPorts,
 }: NeighborCardProps) {
   const kind = node.kind ?? "workload";
   const palette = KIND[kind] ?? KIND.workload;
   const tone = healthTone(node);
   const heat = cpuMax > 0 ? Math.min(1, Math.sqrt(cpu / cpuMax)) : 0;
   const label = nodeLabel(node);
-  const meta = nodeMeta(node);
+  const rawMeta = nodeMeta(node);
+  // A workload with no namespace would title its second line with a bare
+  // dash; the kind is the more useful thing to say there.
+  const meta = rawMeta === "—" || rawMeta === "-" ? kind : rawMeta;
+  const headerCenter = NEIGHBOR_CARD.header / 2;
   const portStyle = { borderColor: palette.bar, backgroundColor: palette.tint };
-  const stubStyle = { backgroundColor: `${palette.bar}80` };
+  const stubStyle = { backgroundColor: `${palette.bar}73` };
 
   return (
     <article
@@ -145,14 +159,15 @@ export const NeighborCard = memo(function NeighborCard({
       data-map-card=""
       aria-label={`${label} · ${meta}`}
       className={cn(
-        "absolute isolate flex-col rounded-md border border-solid bg-card text-card-foreground",
+        "absolute isolate flex-col rounded-[10px] border border-solid",
+        "shadow-[0_1px_0_0_rgba(255,255,255,0.04)_inset,0_8px_20px_-14px_rgba(0,0,0,0.9)]",
         // Selection is colour only: no border-width, padding or font-weight
         // change, so the card and its neighbours never jump.
         "transition-[border-color,box-shadow] duration-150",
         "has-[>button:focus-visible]:ring-2 has-[>button:focus-visible]:ring-ring/70",
         selected
-          ? "border-primary/80 shadow-[0_0_0_1px_var(--primary),0_6px_20px_-8px_rgba(0,0,0,0.9)]"
-          : "border-white/10 hover:border-white/25",
+          ? "border-primary/80 shadow-[0_0_0_1px_var(--primary),0_10px_26px_-10px_rgba(0,0,0,0.95)]"
+          : "border-white/[0.12] hover:border-white/[0.26]",
       )}
       style={{
         left: box.x,
@@ -160,60 +175,159 @@ export const NeighborCard = memo(function NeighborCard({
         width: box.w,
         height: box.h,
         backgroundColor: palette.tint,
-        // The card's own width drives the rate label, not the drawer's width.
-        containerType: "inline-size",
       }}
     >
       <span
         aria-hidden="true"
-        className="absolute inset-y-0 left-0 w-[3px] rounded-l-md"
+        className="absolute inset-y-0 left-0 w-[3px] rounded-l-[10px]"
         style={{ backgroundColor: palette.bar }}
       />
 
       {/* The whole card is one action: a native button stretched over the
-          article. Container rows are not interactive, so there is nothing for
-          a second control to compete with. Enter/Space come for free. */}
+          article. Container rows are not interactive, so nothing competes. */}
       <button
         type="button"
-        className="absolute inset-0 z-10 cursor-pointer rounded-md focus-visible:outline-none"
+        className="absolute inset-0 z-10 cursor-pointer rounded-[10px] focus-visible:outline-none"
         aria-label={`Open the neighbourhood of ${label}`}
         aria-expanded={selected}
         aria-controls="map-panel"
         onClick={() => onSelect?.(node.id)}
       />
 
-      <div className="flex items-center gap-1.5 px-2" style={{ height: NEIGHBOR_CARD.header }}>
+      <div
+        className="flex items-center gap-2 border-b border-white/[0.06] px-3"
+        style={{ height: NEIGHBOR_CARD.header }}
+      >
         <div className="min-w-0 flex-1 leading-none">
-          <h3 className="neighbor-trim truncate text-[10px] font-medium text-card-foreground">
+          <h3 className="neighbor-trim truncate text-[11px] font-semibold text-card-foreground">
             {label}
           </h3>
-          <p className="neighbor-trim mt-1 truncate font-mono text-[8.5px] text-muted-foreground">
+          <p className="neighbor-trim mt-1.5 truncate font-mono text-[9px] text-muted-foreground">
             {meta}
           </p>
         </div>
         <StatusGlyph tone={tone} />
+        {/* Traffic with no container attribution ends on the header edge, so
+            the curve still terminates on a visible port. */}
+        {cardPorts?.in ? (
+          <span
+            aria-hidden="true"
+            data-card-port="in"
+            className="absolute rounded-full border-[1.5px]"
+            style={{
+              left: -NEIGHBOR_CARD.portRadius,
+              top: headerCenter - NEIGHBOR_CARD.portRadius,
+              width: NEIGHBOR_CARD.portRadius * 2,
+              height: NEIGHBOR_CARD.portRadius * 2,
+              ...portStyle,
+            }}
+          />
+        ) : null}
+        {cardPorts?.out ? (
+          <span
+            aria-hidden="true"
+            data-card-port="out"
+            className="absolute rounded-full border-[1.5px]"
+            style={{
+              right: -NEIGHBOR_CARD.portRadius,
+              top: headerCenter - NEIGHBOR_CARD.portRadius,
+              width: NEIGHBOR_CARD.portRadius * 2,
+              height: NEIGHBOR_CARD.portRadius * 2,
+              ...portStyle,
+            }}
+          />
+        ) : null}
       </div>
 
       {containers.length > 0 ? (
-        <ul
-          className="relative m-0 list-none p-0"
-          style={{
-            paddingTop: NEIGHBOR_CARD.padTop,
-            paddingBottom: NEIGHBOR_CARD.padBottom,
-            paddingLeft: NEIGHBOR_CARD.indent,
-            paddingRight: NEIGHBOR_CARD.rightPad,
-          }}
-        >
+        <>
+          {/* Ports live in their own card-relative layer. They must not sit
+              inside the list: `top` is measured from the card's top, and a
+              relatively positioned list starts below the header, which would
+              push every port down by the header height. */}
+          <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-0">
+            {containers.map((container, index) => {
+              if (container.more) return null;
+              const center = neighborRowCenter(index);
+              // Strict booleans: a row that only receives must not also show
+              // an out port, or a callee's dead end looks like it dials out.
+              const hasIn = container.ports?.in === true;
+              const hasOut = container.ports?.out === true;
+              if (!hasIn && !hasOut) return null;
+              return (
+                <Fragment key={container.name}>
+                  {hasIn ? (
+                    <span
+                      data-container-port="in"
+                      data-node={node.id}
+                      data-container={container.name}
+                      className="absolute rounded-full border-[1.5px]"
+                      style={{
+                        left: -NEIGHBOR_CARD.portRadius,
+                        top: center - NEIGHBOR_CARD.portRadius,
+                        width: NEIGHBOR_CARD.portRadius * 2,
+                        height: NEIGHBOR_CARD.portRadius * 2,
+                        ...portStyle,
+                      }}
+                    />
+                  ) : null}
+                  {hasOut ? (
+                    <span
+                      data-container-port="out"
+                      data-node={node.id}
+                      data-container={container.name}
+                      className="absolute rounded-full border-[1.5px]"
+                      style={{
+                        right: -NEIGHBOR_CARD.portRadius,
+                        top: center - NEIGHBOR_CARD.portRadius,
+                        width: NEIGHBOR_CARD.portRadius * 2,
+                        height: NEIGHBOR_CARD.portRadius * 2,
+                        ...portStyle,
+                      }}
+                    />
+                  ) : null}
+                  {/* A stub joins each live port to its row, so the port reads
+                      as this row's terminal rather than a floating dot. */}
+                  {hasIn ? (
+                    <span
+                      className="absolute h-px"
+                      style={{ left: 0, top: center, width: NEIGHBOR_CARD.indent, ...stubStyle }}
+                    />
+                  ) : null}
+                  {hasOut ? (
+                    <span
+                      className="absolute h-px"
+                      style={{
+                        right: 0,
+                        top: center,
+                        width: NEIGHBOR_CARD.rightPad,
+                        ...stubStyle,
+                      }}
+                    />
+                  ) : null}
+                </Fragment>
+              );
+            })}
+          </div>
+          <ul
+            className="relative m-0 list-none p-0"
+            style={{
+              paddingTop: NEIGHBOR_CARD.padTop,
+              paddingBottom: NEIGHBOR_CARD.padBottom,
+              paddingLeft: NEIGHBOR_CARD.indent,
+              paddingRight: NEIGHBOR_CARD.rightPad,
+            }}
+          >
           {/* The spine is inside the card: container rows read as parts of
               the workload, not as neighbours that happen to sit below it. */}
           <span
             aria-hidden="true"
             className="absolute w-px"
             style={{
-              left: 11,
+              left: 13,
               top: NEIGHBOR_CARD.padTop,
               bottom: NEIGHBOR_CARD.padBottom,
-              backgroundColor: `${palette.bar}66`,
+              backgroundColor: `${palette.bar}59`,
             }}
           />
           {containers.map((container, index) => {
@@ -221,113 +335,59 @@ export const NeighborCard = memo(function NeighborCard({
               return (
                 <li
                   key={container.name}
-                  className="relative flex items-center rounded border border-white/5 bg-white/[0.05] px-1.5 italic text-muted-foreground/80"
+                  className="relative flex items-center rounded-[5px] border border-white/[0.05] bg-white/[0.03] px-2 italic text-muted-foreground/80"
                   style={{
                     height: NEIGHBOR_CARD.rowHeight,
                     marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
-                    fontSize: 8.5,
+                    fontSize: 9,
                   }}
                 >
                   {container.name}
                 </li>
               );
             }
-            const center = neighborRowCenter(index);
-            const hasIn = container.ports?.in ?? true;
-            const hasOut = container.ports?.out ?? true;
             return (
-              <Fragment key={container.name}>
-                {/* Ports on the card's borders, only on sides that carry an
-                    edge in this hop. Each curve ends on one of these circles,
-                    so the line visibly belongs to this container row. */}
-                {hasIn ? (
-                  <span
-                    aria-hidden="true"
-                    data-container-port="in"
-                    data-node={node.id}
-                    data-container={container.name}
-                    className="absolute z-0 rounded-full border-2"
-                    style={{
-                      left: -NEIGHBOR_CARD.portRadius,
-                      top: center - NEIGHBOR_CARD.portRadius,
-                      width: NEIGHBOR_CARD.portRadius * 2,
-                      height: NEIGHBOR_CARD.portRadius * 2,
-                      ...portStyle,
-                    }}
-                  />
-                ) : null}
-                {hasOut ? (
-                  <span
-                    aria-hidden="true"
-                    data-container-port="out"
-                    data-node={node.id}
-                    data-container={container.name}
-                    className="absolute z-0 rounded-full border-2"
-                    style={{
-                      right: -NEIGHBOR_CARD.portRadius,
-                      top: center - NEIGHBOR_CARD.portRadius,
-                      width: NEIGHBOR_CARD.portRadius * 2,
-                      height: NEIGHBOR_CARD.portRadius * 2,
-                      ...portStyle,
-                    }}
-                  />
-                ) : null}
-                {/* A short stub ties each live port to its row's label. */}
-                {hasIn ? (
-                  <span
-                    aria-hidden="true"
-                    className="absolute h-px"
-                    style={{ left: 0, top: center, width: NEIGHBOR_CARD.indent, ...stubStyle }}
-                  />
-                ) : null}
-                {hasOut ? (
-                  <span
-                    aria-hidden="true"
-                    className="absolute h-px"
-                    style={{
-                      right: 0,
-                      top: center,
-                      width: NEIGHBOR_CARD.rightPad,
-                      ...stubStyle,
-                    }}
-                  />
-                ) : null}
-                <li
-                  data-testid="map-container-row"
-                  data-node={node.id}
-                  data-container={container.name}
-                  className="relative flex items-center gap-1 rounded border border-white/5 bg-white/[0.05] px-1.5"
+              <li
+                key={container.name}
+                data-testid="map-container-row"
+                data-node={node.id}
+                data-container={container.name}
+                className="relative flex items-center gap-1.5 rounded-[5px] border border-white/[0.06] bg-white/[0.045] px-2"
+                style={{
+                  height: NEIGHBOR_CARD.rowHeight,
+                  marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
+                }}
+                title={`${label} · ${container.name}`}
+              >
+                <span
+                  aria-hidden="true"
+                  className="absolute h-px w-[11px]"
                   style={{
-                    height: NEIGHBOR_CARD.rowHeight,
-                    marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
+                    left: -11,
+                    top: "50%",
+                    backgroundColor: `${palette.bar}59`,
                   }}
-                  title={`${label} · ${container.name}`}
-                >
-                  <span
-                    aria-hidden="true"
-                    className="absolute h-px w-[10px]"
-                    style={{ left: -11, top: "50%", backgroundColor: `${palette.bar}66` }}
-                  />
-                  <span className="neighbor-trim min-w-0 flex-1 truncate font-mono text-[9px] text-foreground/80">
-                    {container.name}
-                  </span>
-                  <span className="neighbor-rate shrink-0 font-mono text-[8px] text-muted-foreground">
-                    {container.rate > 0 ? formatRate(container.rate) : ""}
-                  </span>
-                </li>
-              </Fragment>
+                />
+                <span className="neighbor-trim min-w-0 flex-1 truncate font-mono text-[10px] text-foreground/85">
+                  {container.name}
+                </span>
+                <span className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground">
+                  {container.rate > 0 ? formatRate(container.rate) : ""}
+                </span>
+              </li>
             );
           })}
-        </ul>
+          </ul>
+        </>
       ) : null}
 
       <span
         aria-hidden="true"
-        className="absolute inset-x-0 bottom-0 h-[2px] bg-transparent"
-        style={{ backgroundColor: heat > 0 ? "rgba(242,166,90,0.16)" : "transparent" }}
+        className="absolute inset-x-0 bottom-0 h-[2px] rounded-b-[10px] bg-transparent"
+        style={{ backgroundColor: heat > 0 ? "rgba(242,166,90,0.14)" : "transparent" }}
       >
         <span
-          className="block h-full"
+          className="block h-full rounded-b-[10px]"
           style={{ width: `${Math.round(heat * 100)}%`, backgroundColor: "#f2a65a" }}
         />
       </span>

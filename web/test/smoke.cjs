@@ -312,9 +312,14 @@ async function main() {
     if (message.type() === "error") consoleErrors.push(message.text());
   });
   page.on("pageerror", (error) => consoleErrors.push(`pageerror: ${error.message}`));
-  page.on("requestfailed", (request) =>
-    consoleErrors.push(`request failed: ${request.url()} ${request.failure()?.errorText ?? ""}`),
-  );
+  page.on("requestfailed", (request) => {
+    // Switching node or tab aborts a fetch that is still in flight; the
+    // browser reports that as ERR_ABORTED. A cancelled request is not a
+    // failure, so it must not fail the run — a real network error still does.
+    const errorText = request.failure()?.errorText ?? "";
+    if (errorText.includes("ERR_ABORTED")) return;
+    consoleErrors.push(`request failed: ${request.url()} ${errorText}`);
+  });
   page.on("response", (response) => {
     if (response.url().includes("/api/")) apiCalls.push(`${response.status()} ${response.url()}`);
   });
@@ -947,6 +952,40 @@ async function main() {
     .locator('[data-testid="map-neighborhood-self"] [data-container-port]')
     .count();
   check(ports > 0, "container rows draw connection ports", String(ports));
+  // A port must sit on its own row's centre line and on the card border. The
+  // port layer used to live inside the padded list, which shifted every port
+  // down by the header height and left a stray pair below the card.
+  const portGeometry = await mapPage.evaluate(() =>
+    [...document.querySelectorAll('[data-container-port]')].map((el) => {
+      const portRect = el.getBoundingClientRect();
+      const node = el.dataset.node ?? "";
+      const container = el.dataset.container ?? "";
+      const row = document.querySelector(
+        `[data-testid="map-container-row"][data-node="${CSS.escape(node)}"][data-container="${CSS.escape(container)}"]`,
+      );
+      const card = el.closest("article");
+      const rowRect = row?.getBoundingClientRect();
+      const cardRect = card?.getBoundingClientRect();
+      const side = el.dataset.containerPort;
+      return {
+        side,
+        dy: rowRect
+          ? Math.abs(portRect.y + portRect.height / 2 - (rowRect.y + rowRect.height / 2))
+          : null,
+        dx: cardRect
+          ? Math.abs(
+              portRect.x + portRect.width / 2 - (side === "out" ? cardRect.right : cardRect.left),
+            )
+          : null,
+      };
+    }),
+  );
+  check(
+    portGeometry.length > 0 &&
+      portGeometry.every((p) => p.dy != null && p.dy <= 2 && p.dx != null && p.dx <= 2.5),
+    "each port sits on its row's centre line and on the card border",
+    JSON.stringify(portGeometry),
+  );
   const protocols = await mapPage
     .locator('[data-testid="map-neighborhood-edges"] path[data-protocol]')
     .evaluateAll((paths) => paths.map((path) => path.dataset.protocol));
@@ -996,6 +1035,10 @@ async function main() {
     (await mapPage.locator("#map-panel-title").innerText()).trim() === "payments",
     "clicking a peer walks the graph to that workload's own neighbourhood",
   );
+  // payments is only called by cart, so this hop is the mirrored drawing: a
+  // CALLERS column on the left and no CALLEES column.
+  await mapPage.waitForTimeout(400);
+  await shot(mapPage, "9-map-callers");
   // Return to cart so the screenshot keeps the sidecar rows in view.
   const backToCart = mapPage
     .locator('[data-testid="map-neighborhood-peer"]')
