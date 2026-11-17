@@ -105,6 +105,13 @@ export interface EdgeLayerProps {
   /** Node whose incident edges should stand out, if any. */
   selected?: string | null;
   showLabels?: boolean;
+  /**
+   * Rectangles a label must not cover. Edges may end on a sub-row inside a
+   * card, so the endpoint boxes and the things that can hide a label are not
+   * necessarily the same set: the neighbourhood passes its row anchors as
+   * `boxes` and its workload cards here.
+   */
+  avoid?: Box[];
   width: number;
   height: number;
   testId?: string;
@@ -116,12 +123,15 @@ export function EdgeLayer({
   windowSec,
   selected,
   showLabels = true,
+  avoid,
   width,
   height,
   testId,
 }: EdgeLayerProps) {
   const cards: Rect[] = [];
-  for (const box of boxes.values()) cards.push({ x: box.x, y: box.y, w: box.w, h: box.h });
+  for (const box of avoid ?? [...boxes.values()]) {
+    cards.push({ x: box.x, y: box.y, w: box.w, h: box.h });
+  }
 
   const taken: Rect[] = [];
   const drawn = edges.flatMap((edge) => {

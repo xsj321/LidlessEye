@@ -254,11 +254,22 @@ it, because the numbers are about the topology that is still on screen. The
 panel opens with the node's **neighbourhood**: callers in a column on the left,
 the node in the middle, callees on the right, every edge labelled like the map's
 and every card clickable, so walking the graph is one hop per click. A column
-with nothing in it is dropped and its space given to the others. Every workload
-in that hop carries one row per container, and an edge is drawn to the row that
-actually opened it — a sidecar's traffic reads as the sidecar's. The hop has its
-own scroll-to-zoom, drag-to-pan and zoom buttons, with a *fit* action that
-returns to a readable whole-hop view.
+with nothing in it is dropped and its space given to the others.
+
+The hop uses its own layout and its own card, not the big map's. A workload is
+**one card that owns its containers**: the header names the workload, and below
+it a short spine brackets one row per container, indented and inside the same
+border. The rows are children of the card in the DOM, so a long workload name
+or a third sidecar cannot push one over another — the browser stacks them, and
+card height is computed from the same shared geometry the card renders with.
+Containers that carried traffic in the window come first, heaviest at the top;
+a long tail collapses into `+n more containers`. An edge is anchored to the
+band at its container's row height, on the card's own border, so the line
+leaves the card exactly where the row sits — a sidecar's traffic reads as the
+sidecar's. Labels clear the workload cards, not the rows inside them, and stay
+in the channel between columns. The hop has its own scroll-to-zoom,
+drag-to-pan and zoom buttons, with a *fit* action that returns to a readable
+whole-hop view.
 
 The panel is portalled to `document.body` and positioned `fixed`, so it spans
 the **full window height** rather than stopping at the map card. It opens at

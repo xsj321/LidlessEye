@@ -2,23 +2,20 @@
 
 // The neighbourhood of the selected node: what calls it, what it calls.
 //
-// This is the map, filtered to one hop, with the same cards and edges as the
-// big map. It is laid out by hand rather than by the layered layout: a column
-// of callers, the node, a column of callees, and on every edge the same rate,
-// protocol and latency the big map shows. The point of the panel is to answer
-// "what breaks if this goes away", and that question is about direction, so
-// the direction is fixed on screen.
+// This is a different drawing from the big map, not a crop of it. The big map
+// answers "what exists"; this one answers "which part of this workload holds
+// the connection", so each workload is a single card that owns its container
+// rows rather than a card and a second set of loose boxes underneath it. One
+// DOM subtree per workload means a long workload name or a third container can
+// no longer push a row on top of its neighbour: the browser stacks them.
 //
-// A workload is not one process. Every card in the drawing carries a row per
-// container, and an edge is anchored to the container that actually opened
-// the connection — so a sidecar's traffic reads as the sidecar's, not as the
-// workload's. Traffic the agent could not attribute stays on the workload
-// card. The drawing has its own pan and zoom: one hop can still be wider than
-// a drawer, and shrinking the cards until their labels are unreadable is not a
-// way to make it fit.
+// Direction is fixed: callers on the left, the selected workload in the
+// middle, callees on the right. Every card carries the same rate, protocol and
+// latency as the big map, and every card is itself clickable, so walking the
+// graph is one hop per click.
 //
 // Layout is decided in world pixels at scale 1, independent of the drawer's
-// width. The drawer asks for a width that fits that world and then the view
+// width. The drawer asks for a width that fits that world and the view then
 // scales to whatever it actually got, which keeps resizing from changing where
 // the cards sit.
 
@@ -26,25 +23,32 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { Maximize2, Minus, Plus } from "lucide-react";
 
-import { KIND, edgeWeight, formatRate, nodeLabel } from "@/lib/servicemap-graph";
+import { KIND, edgeWeight, formatRate, nodeLabel, nodeMeta } from "@/lib/servicemap-graph";
 import type { Box } from "@/lib/servicemap-graph";
 import type { ServiceMapEdge, ServiceMapNode } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 
 import { EdgeLayer } from "./edge-layer";
-import { NodeCard } from "./node-card";
+import {
+  NEIGHBOR_CARD,
+  NeighborCard,
+  neighborCardHeight,
+  neighborRowOffset,
+} from "./neighbor-card";
+import type { NeighborContainer } from "./neighbor-card";
 
 /** How many peers a column shows before it says "+n more". */
 const MAX_PEERS = 6;
+/** Containers drawn inside one workload card, before a "+n more" row. */
+const MAX_CONTAINERS = 6;
 
-// These gaps are generous on purpose. A container row is a *different thing*
-// from the workload card above it, and a peer is a different thing again: when
-// they touch, the eye reads one stack of text instead of a hierarchy. The panel
-// is zoomed to fit, so a few pixels here cost nothing in legibility but buy a
-// clear separation between card, container and neighbour.
-const CARD = { height: 40, gap: 18 };
-const ROW = { height: 26, gap: 9, indent: 18 };
-const SIZE = { pad: 14, gapX: 84, minCard: 168, maxCard: 230 };
+const SIZE = {
+  pad: 16,
+  gapX: 128,
+  cardGapY: 20,
+  minCard: 190,
+  maxCard: 284,
+};
 
 const ZOOM = { min: 0.4, max: 2.4, step: 1.22 };
 const MAX_VIEW_HEIGHT = 520;
@@ -71,20 +75,25 @@ interface PeerGroup {
   weight: number;
 }
 
-interface ContainerRow {
+interface NeighborRow {
   id: string;
-  name: string;
   ownerId: string;
-  box: Box;
+  name: string;
+  /** Row top, relative to the top of its workload card. */
+  offset: number;
 }
 
 interface Layout {
-  boxes: Map<string, Box>;
-  rows: ContainerRow[];
+  /** Workload cards — the only things a label must avoid. */
+  cards: Map<string, Box>;
+  /** Cards plus one full-width band per container row, for edge endpoints. */
+  anchors: Map<string, Box>;
+  rows: NeighborRow[];
+  rowNames: Map<string, string>;
+  columns: string[][];
   height: number;
   width: number;
   selfBox: Box;
-  rowNames: Map<string, string>;
 }
 
 function groupPeers(edges: ServiceMapEdge[], peerOf: (edge: ServiceMapEdge) => string): PeerGroup[] {
@@ -199,26 +208,37 @@ export function Neighborhood({
 
   const rowId = useCallback((owner: string, name: string) => `${owner}::${name}`, []);
 
-  // The containers worth a row: what every pod list says the workload runs,
-  // plus anything an edge named — the latter covers a pod that scaled away
-  // between the pod list refresh and this window.
+  // Containers worth a row, in reading order: the ones that actually carried
+  // traffic in this window first (heaviest at the top), then the rest of what
+  // the pod list declares. A long tail collapses into one "+n more" row rather
+  // than making a single card taller than the viewport.
   const containers = useMemo(() => {
-    const named = new Map<string, Set<string>>();
-    const add = (owner: string, name: string | undefined) => {
+    const traffic = new Map<string, Map<string, number>>();
+    const add = (owner: string, name: string | undefined, weight: number) => {
       if (!name || !shownIds.includes(owner)) return;
-      const slot = named.get(owner) ?? new Set<string>();
-      slot.add(name);
-      named.set(owner, slot);
+      const slot = traffic.get(owner) ?? new Map<string, number>();
+      slot.set(name, (slot.get(name) ?? 0) + weight);
+      traffic.set(owner, slot);
     };
-    for (const id of shownIds) {
-      for (const name of nodes.get(id)?.containers ?? []) add(id, name);
-    }
     for (const edge of edges) {
-      add(edge.client, edge.client_container);
-      add(edge.server, edge.server_container);
+      const weight = edgeWeight(edge);
+      add(edge.client, edge.client_container, weight);
+      add(edge.server, edge.server_container, weight);
     }
-    const out = new Map<string, string[]>();
-    for (const [owner, names] of named) out.set(owner, [...names].filter(Boolean).sort());
+    const out = new Map<string, { names: string[]; extra: number }>();
+    for (const id of shownIds) {
+      const active = [...(traffic.get(id)?.entries() ?? [])]
+        .sort((a, b) => b[1] - a[1])
+        .map(([name]) => name);
+      const declared = (nodes.get(id)?.containers ?? []).filter(
+        (name) => name && !active.includes(name),
+      );
+      const all = [...active, ...declared];
+      out.set(id, {
+        names: all.slice(0, MAX_CONTAINERS),
+        extra: Math.max(0, all.length - MAX_CONTAINERS),
+      });
+    }
     return out;
   }, [edges, nodes, shownIds]);
 
@@ -227,65 +247,71 @@ export function Neighborhood({
       .filter((column) => column.length > 0)
       .map((column) => column.filter((id) => nodes.has(id)));
 
-    const labelLength = (id: string) => {
-      const meta = nodes.get(id);
-      return Math.max(nodeLabel(meta).length, (meta?.namespace ?? "").length + 6);
+    const rowCountOf = (id: string) => {
+      const info = containers.get(id);
+      return (info?.names.length ?? 0) + (info?.extra ? 1 : 0);
     };
-    const widest = Math.max(
-      ...shownIds.flatMap((id) => [labelLength(id), ...(containers.get(id) ?? []).map((name) => name.length + 2)]),
+    const textWidth = Math.max(
       12,
+      ...shownIds.flatMap((id) => {
+        const meta = nodes.get(id);
+        return [
+          nodeLabel(meta).length * 6.3,
+          (meta ? nodeMeta(meta) : "").length * 5.2,
+          ...(containers.get(id)?.names ?? []).map((name) => name.length * 5.7 + 38),
+        ];
+      }),
     );
-    const cardWidth = clamp(Math.round(widest * 6.2 + 30), SIZE.minCard, SIZE.maxCard);
+    const cardWidth = clamp(Math.round(textWidth + 44), SIZE.minCard, SIZE.maxCard);
     const span = columns.length * cardWidth + Math.max(0, columns.length - 1) * SIZE.gapX;
     const width = span + 2 * SIZE.pad;
     const xs = columns.map((_, index) => SIZE.pad + index * (cardWidth + SIZE.gapX));
 
-    const stackOf = (id: string) => {
-      const names = containers.get(id) ?? [];
-      const rows = names.length
-        ? CARD.gap + names.length * ROW.height + (names.length - 1) * ROW.gap
-        : 0;
-      return CARD.height + rows;
-    };
     const columnHeights = columns.map((column) =>
-      column.reduce((sum, id) => sum + stackOf(id), 0) + Math.max(0, column.length - 1) * CARD.gap,
+      column.reduce((sum, id) => sum + neighborCardHeight(rowCountOf(id)), 0) +
+      Math.max(0, column.length - 1) * SIZE.cardGapY,
     );
     const tallest = Math.max(0, ...columnHeights);
     const height = tallest + 2 * SIZE.pad;
 
-    const boxes = new Map<string, Box>();
-    const rows: ContainerRow[] = [];
+    const cards = new Map<string, Box>();
+    const anchors = new Map<string, Box>();
+    const rows: NeighborRow[] = [];
     const rowNames = new Map<string, string>();
     columns.forEach((column, columnIndex) => {
       let y = SIZE.pad + (tallest - columnHeights[columnIndex]) / 2;
       for (const id of column) {
-        boxes.set(id, { x: xs[columnIndex], y, w: cardWidth, h: CARD.height });
-        const names = containers.get(id) ?? [];
-        let rowTop = y + CARD.height + CARD.gap;
-        for (const name of names) {
-          const idOfRow = rowId(id, name);
-          const box = {
-            x: xs[columnIndex] + ROW.indent,
-            y: rowTop,
-            w: cardWidth - ROW.indent,
-            h: ROW.height,
-          };
-          boxes.set(idOfRow, box);
-          rowNames.set(idOfRow, name);
-          rows.push({ id: idOfRow, name, ownerId: id, box });
-          rowTop += ROW.height + ROW.gap;
-        }
-        y += stackOf(id) + CARD.gap;
+        const cardHeight = neighborCardHeight(rowCountOf(id));
+        const card = { x: xs[columnIndex], y, w: cardWidth, h: cardHeight };
+        cards.set(id, card);
+        // An edge ending on a container leaves the card at that row's height,
+        // at the card's own left/right border — never in the middle of a card.
+        anchors.set(id, card);
+        (containers.get(id)?.names ?? []).forEach((name, index) => {
+          const key = rowId(id, name);
+          const offset = neighborRowOffset(index);
+          anchors.set(key, {
+            x: card.x,
+            y: y + offset,
+            w: cardWidth,
+            h: NEIGHBOR_CARD.rowHeight,
+          });
+          rowNames.set(key, name);
+          rows.push({ id: key, ownerId: id, name, offset });
+        });
+        y += cardHeight + SIZE.cardGapY;
       }
     });
 
     return {
-      boxes,
+      cards,
+      anchors,
       rows,
+      rowNames,
+      columns,
       height,
       width,
-      rowNames,
-      selfBox: boxes.get(node.id) ?? { x: 0, y: 0, w: cardWidth, h: CARD.height },
+      selfBox: cards.get(node.id) ?? { x: 0, y: 0, w: cardWidth, h: NEIGHBOR_CARD.header },
     };
   }, [upGroups, downGroups, node.id, nodes, containers, shownIds, rowId]);
 
@@ -297,14 +323,14 @@ export function Neighborhood({
       const candidate = container ? rowId(owner, container) : "";
       // An edge the agent could not attribute down to a container stays on the
       // workload card instead of disappearing from the drawing.
-      return candidate && layout.boxes.has(candidate) ? candidate : owner;
+      return candidate && layout.anchors.has(candidate) ? candidate : owner;
     };
     const emit = (group: PeerGroup, fromPeer: boolean) => {
       const pairs = new Map<string, ServiceMapEdge[]>();
       for (const edge of group.edges) {
         const client = endpoint(fromPeer ? group.id : node.id, edge.client_container);
         const server = endpoint(fromPeer ? node.id : group.id, edge.server_container);
-        if (!layout.boxes.has(client) || !layout.boxes.has(server)) continue;
+        if (!layout.anchors.has(client) || !layout.anchors.has(server)) continue;
         const key = `${client}|${server}`;
         const slot = pairs.get(key) ?? [];
         slot.push(edge);
@@ -326,7 +352,7 @@ export function Neighborhood({
     for (const group of upGroups) emit(group, true);
     for (const group of downGroups) emit(group, false);
     return out;
-  }, [upGroups, downGroups, layout.boxes, layout.rowNames, node.id, rowId]);
+  }, [upGroups, downGroups, layout.anchors, layout.rowNames, node.id, rowId]);
 
   /** Connections each container row carries, for the row's own number. */
   const perRow = useMemo(() => {
@@ -406,8 +432,8 @@ export function Neighborhood({
     if (event.button !== 0) return;
     const target = event.target as Element | null;
     // A press on a card belongs to the card: capturing it here would retarget
-    // the compatibility click away from the NodeCard, and clicking a peer
-    // would no longer walk the graph to that workload's own neighbourhood.
+    // the click away from the NeighborCard, and clicking a peer would no longer
+    // walk the graph to that workload's own neighbourhood.
     if (target?.closest("[data-map-controls]") || target?.closest("[data-map-card]")) {
       return;
     }
@@ -428,7 +454,7 @@ export function Neighborhood({
   };
 
   let cpuMax = 1;
-  for (const id of layout.boxes.keys()) cpuMax = Math.max(cpuMax, nodes.get(id)?.cpu_ns ?? 0);
+  for (const id of layout.cards.keys()) cpuMax = Math.max(cpuMax, nodes.get(id)?.cpu_ns ?? 0);
 
   const hiddenIn = allUp.length - upGroups.length;
   const hiddenOut = allDown.length - downGroups.length;
@@ -494,7 +520,10 @@ export function Neighborhood({
           >
             <EdgeLayer
               edges={shown}
-              boxes={layout.boxes}
+              boxes={layout.anchors}
+              // Container bands are edge endpoints, not obstacles: a label
+              // only has to clear the card that owns them.
+              avoid={[...layout.cards.values()]}
               windowSec={windowSec}
               // Container rows are not nodes: highlighting by id would dim every
               // edge that ends on one, so the panel leaves the whole hop lit.
@@ -503,83 +532,30 @@ export function Neighborhood({
               height={layout.height}
               testId="map-neighborhood-edges"
             />
-            {[...layout.boxes.entries()].map(([id, box]) => {
+            {layout.columns.flat().map((id) => {
               const peer = nodes.get(id);
-              if (!peer) return null;
+              const box = layout.cards.get(id);
+              if (!peer || !box) return null;
+              const info = containers.get(id);
+              const rows: NeighborContainer[] = (info?.names ?? []).map((name) => ({
+                name,
+                rate: rate(perRow.get(rowId(id, name)) ?? 0),
+              }));
+              if (info?.extra) {
+                rows.push({ name: `+${info.extra} more containers`, rate: 0, more: true });
+              }
               return (
-                <NodeCard
+                <NeighborCard
                   key={id}
                   node={peer}
                   box={box}
+                  containers={rows}
                   cpu={peer.cpu_ns ?? 0}
                   cpuMax={cpuMax}
-                  compact
                   selected={id === node.id}
                   onSelect={onSelect}
                   testId={id === node.id ? "map-neighborhood-self" : "map-neighborhood-peer"}
                 />
-              );
-            })}
-
-            {/* A spine from each workload card down its containers: the rows
-                are the pod's parts, not separate services, and a line says so
-                without another legend. */}
-            {layout.rows.length ? (
-              <svg
-                className="pointer-events-none absolute left-0 top-0 overflow-visible"
-                width={layout.width}
-                height={layout.height}
-                aria-hidden="true"
-              >
-                {layout.rows.map((row) => {
-                  const owner = layout.boxes.get(row.ownerId);
-                  if (!owner) return null;
-                  const meta = nodes.get(row.ownerId);
-                  const palette = KIND[meta?.kind ?? "workload"] ?? KIND.workload;
-                  return (
-                    <line
-                      key={`spine-${row.id}`}
-                      x1={owner.x + ROW.indent / 2}
-                      y1={owner.y + owner.h}
-                      x2={owner.x + ROW.indent / 2}
-                      y2={row.box.y + row.box.h}
-                      stroke={`${palette.bar}55`}
-                      strokeWidth={1}
-                    />
-                  );
-                })}
-              </svg>
-            ) : null}
-
-            {layout.rows.map((row) => {
-              const meta = nodes.get(row.ownerId);
-              const palette = KIND[meta?.kind ?? "workload"] ?? KIND.workload;
-              const connections = perRow.get(row.id) ?? 0;
-              return (
-                <div
-                  key={row.id}
-                  data-testid="map-container-row"
-                  data-node={row.ownerId}
-                  data-container={row.name}
-                  title={`${nodeLabel(meta)} · ${row.name}`}
-                  className="absolute flex select-none items-center gap-1 overflow-hidden rounded border border-white/5 bg-white/[0.05] pl-1.5 pr-1.5"
-                  style={{
-                    left: row.box.x,
-                    top: row.box.y,
-                    width: row.box.w,
-                    height: row.box.h,
-                    borderLeft: `2px solid ${palette.bar}99`,
-                  }}
-                >
-                  <span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-foreground/75">
-                    {row.name}
-                  </span>
-                  {connections > 0 ? (
-                    <span className="shrink-0 font-mono text-[8.5px] text-muted-foreground">
-                      {formatRate(rate(connections))}
-                    </span>
-                  ) : null}
-                </div>
               );
             })}
 

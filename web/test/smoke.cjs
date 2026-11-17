@@ -867,21 +867,55 @@ async function main() {
     "peer workloads draw their containers too",
     JSON.stringify(paymentRows),
   );
-  // A container row must sit clearly below its workload card, not glued to it:
-  // the two are different things and touching text reads as one cramped block.
-  const selfBox = await mapPage.locator('[data-testid="map-neighborhood-self"]').boundingBox();
+  // A container is a row *inside* its workload card: nested, indented, and
+  // below the header. The two must never be separate boxes that can overlap.
+  const selfCard = mapPage.locator('[data-testid="map-neighborhood-self"]');
+  const selfBox = await selfCard.boundingBox();
   const firstRowBox = await mapPage
     .locator('[data-testid="map-container-row"][data-node="shop/cart"]')
     .first()
     .boundingBox();
+  const layoutZoom = Number(
+    await mapPage
+      .locator('[data-testid="map-neighborhood"] > div[data-zoom]')
+      .getAttribute("data-zoom"),
+  );
   check(
     selfBox != null &&
       firstRowBox != null &&
-      firstRowBox.y - (selfBox.y + selfBox.height) >= 4,
-    "container rows keep a visible gap below their workload card",
+      firstRowBox.x > selfBox.x + 4 &&
+      firstRowBox.y > selfBox.y + 12 &&
+      // The row sits just under the header. `Card`'s default py-6/gap-6 used
+      // to push it down by a third of the card and clip the last row.
+      firstRowBox.y - selfBox.y < 70 * layoutZoom &&
+      firstRowBox.y + firstRowBox.height < selfBox.y + selfBox.height + 1,
+    "container rows are nested and indented inside their workload card",
     selfBox && firstRowBox
-      ? `card bottom ${(selfBox.y + selfBox.height).toFixed(1)} / row top ${firstRowBox.y.toFixed(1)}`
+      ? `card ${JSON.stringify(selfBox)} / row ${JSON.stringify(firstRowBox)}`
       : "missing box",
+  );
+  // The whole point of the dedicated layout: no two workload cards overlap,
+  // however long their names or however many containers they own.
+  const cardRects = await mapPage
+    .locator('[data-testid="map-neighborhood-self"],[data-testid="map-neighborhood-peer"]')
+    .evaluateAll((cards) =>
+      cards.map((card) => {
+        const rect = card.getBoundingClientRect();
+        return { x: rect.x, y: rect.y, w: rect.width, h: rect.height };
+      }),
+    );
+  const cardOverlap = cardRects.some((a, i) =>
+    cardRects.some(
+      (b, j) =>
+        i < j &&
+        Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x) > 1 &&
+        Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) > 1,
+    ),
+  );
+  check(
+    cardRects.length >= 2 && !cardOverlap,
+    "neighbourhood workload cards never overlap",
+    JSON.stringify(cardRects),
   );
   check(
     (await mapPage.locator('[data-testid="map-neighborhood-edges"] path[marker-end]').count()) >= 2,
