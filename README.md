@@ -92,6 +92,10 @@ Prerequisites: Linux ≥ 5.5 with BTF (`/sys/kernel/btf/vmlinux`), `clang`, root
 ```bash
 ./scripts/demo.sh                # no root, no eBPF — just Docker
 ./scripts/demo.sh --stop
+
+# or the published image, which is built from deploy/docker/Dockerfile
+docker run --rm -p 4040:4040 -v lidlesseye-data:/var/lib/lidlesseye \
+  ghcr.io/xsj321/lidlesseye:0.1.0
 ```
 
 ### Server and agents
