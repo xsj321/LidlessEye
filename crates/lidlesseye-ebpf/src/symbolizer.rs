@@ -119,6 +119,10 @@ pub(crate) struct Tally {
     pub unknown: UnknownReasons,
     /// Batches that failed outright (process gone, unreadable maps, ...).
     pub failed: u64,
+    /// Frames dropped because the walk had already left the process's address
+    /// space. They are not symbolization failures: the values were never
+    /// instruction pointers.
+    pub truncated: u64,
 }
 
 impl Tally {
@@ -129,6 +133,7 @@ impl Tally {
         self.module += other.module;
         self.jit += other.jit;
         self.failed += other.failed;
+        self.truncated += other.truncated;
         self.unknown.unmapped += other.unknown.unmapped;
         self.unknown.missing_syms += other.unknown.missing_syms;
         self.unknown.missing_component += other.unknown.missing_component;
@@ -232,6 +237,7 @@ impl FrameResolver {
                 arch = std::env::consts::ARCH,
                 kernel = %kernel,
                 named = self.tally.resolved,
+                truncated = self.tally.truncated,
                 go = self.tally.go,
                 elfless = self.tally.module,
                 unnamed,
@@ -242,11 +248,20 @@ impl FrameResolver {
             );
         }
         for issue in self.modules.take_new_issues(MAX_LINES) {
-            if issue.path.starts_with('[') {
+            if issue.path == "[unmapped]" {
                 tracing::warn!(
                     frames = issue.count,
-                    "addresses in no file-backed mapping stay unnamed (a JIT runtime without a \
-                     perf map, or a broken frame-pointer chain)"
+                    "addresses in no file-backed mapping stay unnamed (a broken frame-pointer \
+                     chain: the walk read a string or a constant as a return address)"
+                );
+                log_samples(&issue);
+                continue;
+            }
+            if issue.path == "[anonymous]" {
+                tracing::warn!(
+                    frames = issue.count,
+                    "addresses in anonymous memory stay unnamed (JIT code with no perf map: \
+                     V8, the JVM, and anything else that emits machine code at run time)"
                 );
                 log_samples(&issue);
                 continue;
@@ -406,7 +421,27 @@ impl FrameResolver {
         if ips.is_empty() {
             return Vec::new();
         }
-        let probes = probe_addrs(ips);
+        // Where the walk stops. A value in no mapping at all, or in one that is
+        // not executable, was never an instruction pointer: the frame-pointer
+        // chain broke and the unwinder is reading the stack itself (strings,
+        // small integers, a saved value). Everything after it is the same
+        // garbage, so the stack ends here — `perf` does the same.
+        //
+        // This runs before symbolization: the frames beyond the break are never
+        // stored and never counted as missing symbols, because no symbolizer
+        // could have named them. The check uses the original addresses rather
+        // than the `ip - 1` probes, since a probe is the call instruction and
+        // can fall just outside a mapping whose first byte is the return
+        // address.
+        let cut = ips
+            .iter()
+            .position(|ip| self.modules.could_be_code(tgid, *ip) == Some(false));
+        let keep = cut.unwrap_or(ips.len());
+        if let Some(cut) = cut {
+            self.tally.truncated += (ips.len() - cut) as u64;
+        }
+
+        let probes = probe_addrs(&ips[..keep]);
         let missing: Vec<u64> = probes
             .iter()
             .filter(|probe| !self.user_cache.contains_key(&(tgid, **probe)))
@@ -422,9 +457,10 @@ impl FrameResolver {
         }
 
         self.maybe_prune();
-        let mut out = Vec::with_capacity(ips.len());
-        for probe in probes {
-            if let Some(frames) = self.user_cache.get(&(tgid, probe)) {
+
+        let mut out = Vec::with_capacity(probes.len());
+        for probe in &probes {
+            if let Some(frames) = self.user_cache.get(&(tgid, *probe)) {
                 out.extend(frames.iter().cloned());
             }
         }
@@ -448,36 +484,11 @@ impl FrameResolver {
                     let mut tally = Tally::default();
                     let mut out: Vec<Vec<Frame>> = Vec::with_capacity(addrs.len());
                     for (addr, sym) in addrs.iter().zip(symbols.iter()) {
-                        let frames = match sym {
-                            Symbolized::Sym(_) => frames_from(sym, *addr, false, &mut tally),
-                            Symbolized::Unknown(reason) => {
-                                match self.fallback_frame(tgid, *addr, &mut tally) {
-                                    Some(frame) => vec![frame],
-                                    None => {
-                                        tally.unknown.record(reason);
-                                        // Naming the file that has no symbols
-                                        // is the difference between "some
-                                        // addresses" and "libc has no debug
-                                        // info installed".
-                                        let module = self
-                                            .modules
-                                            .module_for(tgid, *addr)
-                                            .unwrap_or_else(|| "[unknown]".to_string());
-                                        vec![unknown_frame(*addr, &module)]
-                                    }
-                                }
-                            }
-                        };
-                        out.push(frames);
+                        out.push(self.frames_for(tgid, *addr, Some(sym), &mut tally));
                     }
                     // A short result is not an error; keep the stack's shape.
                     for addr in addrs.iter().skip(symbols.len()) {
-                        tally.unknown.record(&Reason::IgnoredError);
-                        let module = self
-                            .modules
-                            .module_for(tgid, *addr)
-                            .unwrap_or_else(|| "[unknown]".to_string());
-                        out.push(vec![unknown_frame(*addr, &module)]);
+                        out.push(self.frames_for(tgid, *addr, None, &mut tally));
                     }
                     self.tally.merge(tally);
                     return out;
@@ -491,15 +502,90 @@ impl FrameResolver {
                         );
                         continue;
                     }
-                    tracing::debug!(error = %err, "symbolization failed");
-                    self.tally.failed += addrs.len() as u64;
-                    return addrs
-                        .iter()
-                        .map(|addr| vec![unknown_frame(*addr, "[unknown]")])
-                        .collect();
+                    // `symbolize` is all-or-nothing: one address whose file
+                    // cannot be stat'ed fails the whole batch. That is the
+                    // normal case for a container's binary — the path exists in
+                    // the target's mount namespace and not in the agent's — so
+                    // a failed batch must not turn a stack into plain
+                    // addresses. Each address is retried on its own, which
+                    // isolates the one that poisons the batch and keeps
+                    // blazesym's inline information for the rest; whatever
+                    // still fails goes through the module cache, the only
+                    // source that opens a file in another namespace.
+                    tracing::debug!(
+                        error = %err,
+                        addresses = addrs.len(),
+                        "batch symbolization failed, retrying per address"
+                    );
+                    return self.salvage(tgid, addrs);
                 }
             }
         }
+    }
+
+    /// Frames for one address: whatever `blazesym` said, plus the sources it
+    /// cannot reach.
+    ///
+    /// `sym` is `None` when the batch answered for fewer addresses than it was
+    /// given — a short result, not an error, which still deserves a name from
+    /// the module cache rather than a bare address.
+    fn frames_for(
+        &mut self,
+        tgid: u32,
+        addr: u64,
+        sym: Option<&Symbolized<'static>>,
+        tally: &mut Tally,
+    ) -> Vec<Frame> {
+        match sym {
+            Some(sym @ Symbolized::Sym(_)) => frames_from(sym, addr, false, tally),
+            Some(Symbolized::Unknown(reason)) => match self.fallback_frame(tgid, addr, tally) {
+                Some(frame) => vec![frame],
+                None => {
+                    tally.unknown.record(reason);
+                    vec![unknown_frame(addr, &self.module_name(tgid, addr))]
+                }
+            },
+            None => match self.fallback_frame(tgid, addr, tally) {
+                Some(frame) => vec![frame],
+                None => {
+                    tally.unknown.record(&Reason::IgnoredError);
+                    vec![unknown_frame(addr, &self.module_name(tgid, addr))]
+                }
+            },
+        }
+    }
+
+    /// Name what can still be named after a batch failure.
+    ///
+    /// The addresses are asked one at a time so that a single unreadable file
+    /// does not condemn the rest of the stack; each answer then runs through
+    /// [`Self::frames_for`], which adds the module cache and the JIT perf map.
+    fn salvage(&mut self, tgid: u32, addrs: &[u64]) -> Vec<Vec<Frame>> {
+        let mut tally = Tally::default();
+        let mut out: Vec<Vec<Frame>> = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            let single = [*addr];
+            let mut process = Process::new(Pid::from(tgid));
+            process.map_files = self.map_files;
+            let one = self
+                .symbolizer
+                .symbolize(&Source::Process(process), Input::AbsAddr(&single))
+                .ok()
+                .and_then(|symbols| symbols.into_iter().next())
+                .map(into_owned);
+            out.push(self.frames_for(tgid, *addr, one.as_ref(), &mut tally));
+        }
+        self.tally.merge(tally);
+        out
+    }
+
+    /// The file an address belongs to, for an `[unknown]` frame that still says
+    /// where it came from: "libc has no debug symbols" reads very differently
+    /// from "some address".
+    fn module_name(&mut self, tgid: u32, addr: u64) -> String {
+        self.modules
+            .module_for(tgid, addr)
+            .unwrap_or_else(|| "[unknown]".to_string())
     }
 
     /// Try the symbol sources `blazesym` gave up on.
@@ -801,6 +887,204 @@ mod tests {
         // PID 0 is not a process we can read; resolution must not panic.
         let frames = r.resolve_user(0, &[0x1000, 0x2000]);
         assert_eq!(frames.len(), 2);
+    }
+
+    /// A failed batch must not turn a whole stack into bare addresses.
+    ///
+    /// `symbolize` is all-or-nothing, and the usual cause of a batch failure is
+    /// a file the agent cannot `stat` — a container's binary that exists in the
+    /// target's mount namespace and not in the agent's. This is the entry point
+    /// that failure goes through: every address gets its own attempt, and none
+    /// of them may be dropped.
+    #[test]
+    fn salvage_keeps_one_frame_per_address() {
+        let mut r = FrameResolver::new();
+        // PID 0 has no readable maps, so nothing can be named.
+        let addrs = [0x1000_u64, 0x2000, 0x3000];
+        let stacks = r.salvage(0, &addrs);
+        assert_eq!(stacks.len(), addrs.len(), "no address may be dropped");
+        for (frames, addr) in stacks.iter().zip(addrs) {
+            assert_eq!(frames.len(), 1, "one address, one frame: {frames:?}");
+            assert_eq!(frames[0].addr, addr, "the address has to survive");
+        }
+        assert!(
+            r.failed_lookups() >= addrs.len() as u64,
+            "unnamed addresses still count as failed lookups"
+        );
+    }
+
+    /// The walk stops where it leaves the address space.
+    ///
+    /// A broken frame-pointer chain hands the unwinder values that were never
+    /// instruction pointers — a string, a small integer, a saved register. The
+    /// first such value ends the stack: the frames after it are the same
+    /// garbage, and storing them is what turns a flamegraph into a wall of
+    /// addresses that no symbolizer can ever name.
+    #[test]
+    fn a_broken_walk_stops_at_the_first_unmapped_address() {
+        let mut r = FrameResolver::new();
+        let marker = symbolization_marker as *const () as u64;
+        let frames = r.resolve_user(std::process::id(), &[marker, 0x1, marker]);
+        assert_eq!(
+            frames.len(),
+            1,
+            "the stack ends where the walk left the process: {frames:?}"
+        );
+        assert!(frames[0].symbol.contains("symbolization_marker"));
+        assert_eq!(r.tally.truncated, 2, "both lost frames are counted");
+    }
+
+    /// Anonymous memory is where JIT code lives, and it is not a broken walk.
+    #[test]
+    fn anonymous_code_does_not_end_the_stack() {
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "mmap failed");
+
+        let mut r = FrameResolver::new();
+        let marker = symbolization_marker as *const () as u64;
+        let frames = r.resolve_user(std::process::id(), &[map as u64, marker]);
+        unsafe { libc::munmap(map, 4096) };
+
+        assert_eq!(frames.len(), 2, "a JIT frame is a real frame: {frames:?}");
+        assert_eq!(r.tally.truncated, 0, "nothing was discarded");
+    }
+
+    /// A value in a non-executable mapping is a value, not an instruction.
+    ///
+    /// This is the other half of a broken walk: the address is inside the
+    /// process, so a plain "is it mapped" check would accept it, but nothing
+    /// ever executed there.
+    #[test]
+    fn a_data_address_ends_the_stack() {
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "mmap failed");
+
+        let mut r = FrameResolver::new();
+        let marker = symbolization_marker as *const () as u64;
+        let frames = r.resolve_user(std::process::id(), &[marker, map as u64, marker]);
+        unsafe { libc::munmap(map, 4096) };
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "a writable mapping cannot be a caller: {frames:?}"
+        );
+        assert_eq!(r.tally.truncated, 2);
+    }
+
+    /// The same through the public entry point: a stack of unreadable
+    /// addresses keeps its shape instead of collapsing to one frame.
+    #[test]
+    fn an_unresolvable_stack_keeps_its_shape() {
+        let mut r = FrameResolver::new();
+        let addrs = [0x1000_u64, 0x2000, 0x3000];
+        let frames = r.resolve_user(0, &addrs);
+        assert_eq!(frames.len(), addrs.len(), "no frame may be dropped");
+        // Interior frames are looked up at `ip - 1`, the call instruction, and
+        // the frame carries the address it was probed at.
+        let probes: Vec<u64> = addrs
+            .iter()
+            .enumerate()
+            .map(|(i, ip)| if i == 0 { *ip } else { ip - 1 })
+            .collect();
+        for (frame, probe) in frames.iter().zip(probes) {
+            assert_eq!(frame.addr, probe, "the address has to survive: {frame:?}");
+            assert_eq!(frame.module, "[unknown]", "nothing can be named: {frame:?}");
+        }
+    }
+
+    /// An unreadable sibling must not cost the rest of the batch its names.
+    ///
+    /// A mapping whose file was deleted looks exactly like a container binary
+    /// from the agent's mount namespace: `/proc/<pid>/maps` names a path that
+    /// `stat` rejects. `symbolize` fails the *whole* batch on the first such
+    /// address, which used to turn every frame of the stack into an address;
+    /// the retry walks the addresses one at a time so the healthy ones keep
+    /// their names.
+    #[test]
+    fn an_unreadable_mapping_does_not_sink_the_batch() {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!("lidlesseye-poison-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("gone.bin");
+        // Read+write: `mmap` with PROT_READ is refused on a write-only fd.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create");
+        file.write_all(&[0x90u8; 4096]).expect("write");
+        file.sync_all().expect("sync");
+
+        // Map it, then unlink: the mapping stays, the path stops resolving.
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "mmap failed");
+        drop(file);
+        std::fs::remove_file(&path).expect("unlink");
+        let poison = map as u64;
+        let good = symbolization_marker as *const () as u64;
+
+        let mut r = FrameResolver::new();
+        let frames = r.resolve_user(std::process::id(), &[good, poison]);
+        assert_eq!(frames.len(), 2, "both addresses keep a frame");
+
+        unsafe { libc::munmap(map, 4096) };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            frames[0].symbol.contains("symbolization_marker"),
+            "the nameable address lost its name: {:?}",
+            frames[0]
+        );
+    }
+
+    /// An address `blazesym` had no answer for goes through the module cache.
+    ///
+    /// This is the fallback a failed batch and a short batch result both rely
+    /// on: the module cache opens the file through `/proc/<pid>/root`, which is
+    /// how a container's binary gets named at all.
+    #[test]
+    fn a_missing_answer_falls_back_to_the_module() {
+        let mut r = FrameResolver::new();
+        let addr = symbolization_marker as *const () as u64;
+        let mut tally = Tally::default();
+        let frames = r.frames_for(std::process::id(), addr, None, &mut tally);
+        assert_eq!(frames.len(), 1);
+        assert_ne!(
+            frames[0].module, "[unknown]",
+            "the module cache should name the file: {frames:?}"
+        );
     }
 
     #[test]

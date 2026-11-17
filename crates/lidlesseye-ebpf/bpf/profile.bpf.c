@@ -154,10 +154,21 @@ struct {
     __type(value, struct stack_entry);
 } stacks SEC(".maps");
 
+/* Which of the two stacks `stack_id` indexes.
+ *
+ * Both kinds share the `stacks` map, so an id alone cannot say whether it walks
+ * user space or the kernel. The off-CPU path falls back to a kernel stack when
+ * the user walk fails, and user space symbolizes each stack with the resolver
+ * for its kind: a kernel stack left in the user slot asks blazesym to name
+ * `0xffffffff...` in a process that never executed it, and every frame comes
+ * back as an address in no mapping. */
+#define STACK_KIND_USER 0
+#define STACK_KIND_KERNEL 1
+
 struct offcpu_state {
     __u64 started_ns;
     __u32 stack_id;
-    __u32 pad;
+    __u32 kind;
 };
 
 /* tgid -> timestamp captured at kprobe:schedule */
@@ -335,8 +346,13 @@ int lidlesseye_offcpu_start(struct pt_regs_opaque *ctx) {
     struct offcpu_state state = {};
     state.started_ns = bpf_ktime_get_ns();
     state.stack_id = capture_user_stack(ctx);
+    state.kind = STACK_KIND_USER;
     if (state.stack_id == (__u32)INVALID_STACK_ID) {
+        /* The user walk failed — a blocked task's registers often point
+         * somewhere the unwinder cannot follow. Keep the kernel stack, which
+         * still says what the task was waiting in, but record what it is. */
         state.stack_id = capture_kernel_stack(ctx);
+        state.kind = STACK_KIND_KERNEL;
     }
     bpf_map_update_elem((void *)&offcpu_inflight, &tgid, &state, BPF_ANY);
     return 0;
@@ -360,6 +376,7 @@ int lidlesseye_offcpu_end(struct pt_regs_opaque *ctx) {
     __u64 now = bpf_ktime_get_ns();
     __u64 delta = now - state->started_ns;
     __u32 stack_id = state->stack_id;
+    __u32 kind = state->kind;
     bpf_map_delete_elem((void *)&offcpu_inflight, &tgid);
 
     /* Ignore sub-millisecond wakeups: they are scheduler noise, and counting
@@ -375,8 +392,17 @@ int lidlesseye_offcpu_end(struct pt_regs_opaque *ctx) {
 
     struct stack_key key = {};
     key.tgid = tgid;
-    key.user_stack = stack_id;
-    key.kernel_stack = (__u32)INVALID_STACK_ID;
+    /* The id goes in the slot its kind names. User space resolves each slot
+     * with the matching resolver, so putting a kernel stack in the user slot
+     * does not just mislabel it — it produces a wall of `[unmapped]` frames
+     * from a symbolizer being asked about addresses that never ran. */
+    if (kind == STACK_KIND_KERNEL) {
+        key.user_stack = (__u32)INVALID_STACK_ID;
+        key.kernel_stack = stack_id;
+    } else {
+        key.user_stack = stack_id;
+        key.kernel_stack = (__u32)INVALID_STACK_ID;
+    }
     add_value((void *)&offcpu_totals, &key, delta);
     return 0;
 }

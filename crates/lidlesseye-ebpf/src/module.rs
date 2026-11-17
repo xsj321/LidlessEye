@@ -34,7 +34,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,9 +60,23 @@ const MAX_MAPS: usize = 256;
 /// evicted by an unrelated one would cost more than the memory saved.
 const MAX_MODULES: usize = 16;
 
-/// Refuse to read absurd files. A 3 GiB binary is not a profiled service, and
+/// Refuse to map absurd files. A 3 GiB binary is not a profiled service, and
 /// the agent must not be the process that finds out.
-const MAX_MODULE_BYTES: u64 = 256 * 1024 * 1024;
+///
+/// The limit used to be 256 MiB, which silently excluded exactly the binaries a
+/// Kubernetes node runs: Grafana is 490 MB, Prometheus is not much smaller, and
+/// they are Go services whose function table is the only way to name a frame.
+/// The cap is now only a sanity check, because the file is mapped rather than
+/// read: a 500 MB module costs the pages its tables touch, not 500 MB of heap.
+const MAX_MODULE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Above this size, only the section the build info lives in is searched.
+///
+/// Some fallbacks walk the whole file — the Go version token and the magic
+/// scan for a renamed `.gopclntab`. On a 490 MB binary that is 490 MB of page
+/// faults for a diagnostic string, so the full-file pass is bounded and the
+/// section-based paths, which are the normal ones, still apply.
+const FULL_SCAN_BYTES: usize = 64 * 1024 * 1024;
 
 /// Per-binary cap on symbols. Chromium-sized symbol tables exist; a profiler
 /// does not need them and cannot afford them.
@@ -98,6 +111,21 @@ struct Mapping {
 }
 
 impl Mapping {
+    /// What to call this mapping in a diagnostic.
+    ///
+    /// The kernel prints no pathname for anonymous memory, which is where a JIT
+    /// runtime puts its code. An empty string as a bucket key would collapse
+    /// every such region into one unnamed issue; `[anonymous]` at least says
+    /// what the reader is looking at, and pairs with the cause that the sample
+    /// carries.
+    fn label(&self) -> String {
+        if self.path.is_empty() {
+            "[anonymous]".to_string()
+        } else {
+            self.path.clone()
+        }
+    }
+
     /// Whether the mapping is executable, i.e. whether an instruction pointer
     /// could legitimately land in it.
     fn executable(&self) -> bool {
@@ -149,7 +177,31 @@ enum Identity {
 
 struct MapsCache {
     at: Instant,
-    entries: Arc<Vec<Mapping>>,
+    snapshot: Arc<MapSnapshot>,
+}
+
+/// One read of `/proc/<pid>/maps`, kept in two views.
+///
+/// Symbolization needs the file-backed mappings with their paths; deciding
+/// whether a return address is plausible needs *every* mapping, including the
+/// anonymous ones a program allocates by the hundred — a JIT region and a
+/// string value both sit between two file mappings, and only the full table
+/// says which of them the address is in. Keeping the spans separately costs
+/// 16 bytes each instead of a `String` per arena.
+#[derive(Default)]
+struct MapSnapshot {
+    files: Vec<Mapping>,
+    /// Every mapping in the process, sorted, file-backed or not. `exec` is what
+    /// separates a JIT region from a heap: an instruction pointer can only have
+    /// executed in an executable mapping.
+    spans: Vec<Span>,
+}
+
+#[derive(Clone, Copy)]
+struct Span {
+    start: u64,
+    end: u64,
+    exec: bool,
 }
 
 /// One name range inside a binary.
@@ -233,12 +285,19 @@ impl Module {
             })
             .and_then(|section| section.data().ok())
             .and_then(|blob| GoTable::parse(blob, text))
-            .or_else(|| GoTable::scan(data, text));
+            // The magic scan walks the file; on a large binary the section
+            // above is present anyway, and the walk would dominate the cost of
+            // opening the module.
+            .or_else(|| (data.len() <= FULL_SCAN_BYTES).then(|| GoTable::scan(data, text))?);
         let go_version = go.as_ref().and_then(|_| {
             file.section_by_name(".go.buildinfo")
                 .and_then(|section| section.data().ok())
                 .and_then(go_version_of)
-                .or_else(|| go_version_of(data))
+                .or_else(|| {
+                    (data.len() <= FULL_SCAN_BYTES)
+                        .then(|| go_version_of(data))
+                        .flatten()
+                })
         });
         if syms.is_empty() && go.is_none() {
             tracing::debug!(
@@ -395,9 +454,20 @@ fn process_name(tgid: u32) -> String {
         .unwrap_or_default()
 }
 
-fn read_maps(tgid: u32) -> Option<Vec<Mapping>> {
+/// Mapping covering `addr` in a sorted, file-backed snapshot.
+fn mapping_of(files: &[Mapping], addr: u64) -> Option<Mapping> {
+    let index = files.partition_point(|mapping| mapping.start <= addr);
+    let mapping = files.get(index.checked_sub(1)?)?;
+    if addr >= mapping.end {
+        return None;
+    }
+    Some(mapping.clone())
+}
+
+fn read_maps(tgid: u32) -> Option<MapSnapshot> {
     let text = std::fs::read_to_string(format!("/proc/{tgid}/maps")).ok()?;
     let mut out = Vec::new();
+    let mut spans = Vec::new();
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         let Some(range) = fields.next() else { continue };
@@ -421,6 +491,11 @@ fn read_maps(tgid: u32) -> Option<Vec<Mapping>> {
         let Some(inode) = fields.next().and_then(|v| v.parse::<u64>().ok()) else {
             continue;
         };
+        spans.push(Span {
+            start,
+            end,
+            exec: perms.as_bytes()[2] == b'x',
+        });
         let path: String = fields.collect::<Vec<_>>().join(" ");
         // `[heap]`, `[stack]`, `[vdso]`, and anonymous mappings have no file.
         if path.is_empty() || path.starts_with('[') || inode == 0 {
@@ -439,7 +514,8 @@ fn read_maps(tgid: u32) -> Option<Vec<Mapping>> {
         });
     }
     out.sort_unstable_by_key(|mapping| mapping.start);
-    Some(out)
+    spans.sort_unstable_by_key(|span| span.start);
+    Some(MapSnapshot { files: out, spans })
 }
 
 fn parse_dev(value: &str) -> Option<u64> {
@@ -512,15 +588,62 @@ fn open_module(tgid: u32, mapping: &Mapping) -> Option<(File, &'static str, Iden
     best
 }
 
-fn read_file(mut file: File, how: &'static str) -> Option<Vec<u8>> {
-    let len = file.metadata().ok()?.len();
-    let mut data = Vec::with_capacity(len as usize);
-    file.read_to_end(&mut data).ok()?;
-    if data.is_empty() {
-        tracing::debug!(route = how, "module file is empty");
-        return None;
+/// A module file mapped read-only.
+///
+/// The alternative — `read_to_end` into a `Vec` — is what forced the 256 MiB
+/// cap, and that cap is why the largest Go binaries on a node were the ones
+/// whose frames stayed addresses. A private read-only mapping costs the pages
+/// that are actually touched, and the parser only touches the section headers
+/// plus the tables it needs.
+struct Mapped {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl Mapped {
+    fn open(file: &File) -> Option<Self> {
+        use std::os::fd::AsRawFd as _;
+        let len = file.metadata().ok()?.len();
+        if len == 0 || len > MAX_MODULE_BYTES {
+            return None;
+        }
+        // SAFETY: a read-only, private mapping of an open file descriptor; the
+        // length comes from that file's metadata.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Mapped {
+            ptr,
+            len: len as usize,
+        })
     }
-    Some(data)
+}
+
+impl AsRef<[u8]> for Mapped {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the mapping is valid for `len` bytes and lives as long as
+        // `self`; it is never written to (`PROT_READ`, `MAP_PRIVATE`).
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`len` are exactly what `mmap` returned.
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+        }
+    }
 }
 
 /// One cache slot. `module` is `None` for "nothing useful here", which is
@@ -721,7 +844,8 @@ impl ModuleCache {
 
     /// Remember one address that produced no name, with its mapping.
     fn record(&mut self, mapping: &Mapping, tgid: u32, addr: u64, miss: Miss<'_>) {
-        if self.issues.len() >= MAX_ISSUES && !self.issues.contains_key(&mapping.path) {
+        let path = mapping.label();
+        if self.issues.len() >= MAX_ISSUES && !self.issues.contains_key(&path) {
             return;
         }
         let sample = MissSample {
@@ -748,14 +872,16 @@ impl ModuleCache {
         };
         let issue = self
             .issues
-            .entry(mapping.path.clone())
+            .entry(path.clone())
             .or_insert_with(|| ModuleIssue {
-                path: mapping.path.clone(),
+                path: path.clone(),
                 go_version: miss.module.and_then(|module| module.go_version.clone()),
                 symbols: miss.module.map_or(0, |module| module.syms.len()),
                 has_go: miss.module.is_some_and(|module| module.go.is_some()),
                 count: 0,
-                unreadable: miss.module.is_none(),
+                // "Unreadable" means a file that exists and could not be
+                // opened; anonymous memory has no file at all.
+                unreadable: miss.module.is_none() && !mapping.path.is_empty(),
                 route: miss.route,
                 reported: false,
                 samples: Vec::new(),
@@ -809,12 +935,41 @@ impl ModuleCache {
         }
     }
 
+    /// Whether `addr` could have executed, for a process whose maps are known.
+    ///
+    /// `None` means the maps could not be read, so nothing can be concluded — a
+    /// return address is not called bogus on missing evidence.
+    pub(crate) fn could_be_code(&mut self, tgid: u32, addr: u64) -> Option<bool> {
+        let stale = self
+            .maps
+            .get(&tgid)
+            .is_none_or(|cache| cache.at.elapsed() > MAPS_TTL);
+        if stale && !self.refresh_maps(tgid) {
+            return None;
+        }
+        let cache = self.maps.get(&tgid)?;
+        let spans = &cache.snapshot.spans;
+        if spans.is_empty() {
+            // A process mid-exit can answer with an empty table; that is no
+            // evidence about any address.
+            return None;
+        }
+        // Every mapping counts, file-backed or not: an address in anonymous
+        // memory is JIT code and must not be mistaken for a broken walk, while
+        // one in the heap or the stack never executed anything.
+        let index = spans.partition_point(|span| span.start <= addr);
+        match index.checked_sub(1).and_then(|prev| spans.get(prev)) {
+            Some(span) if addr < span.end => Some(span.exec),
+            _ => Some(false),
+        }
+    }
+
     /// File backing `addr` in process `tgid`, whether or not it has symbols.
     ///
     /// Used to label frames that could not be symbolized: an address without a
     /// name is still worth attributing to a library.
     pub(crate) fn module_for(&mut self, tgid: u32, addr: u64) -> Option<String> {
-        self.mapping_for(tgid, addr).map(|mapping| mapping.path)
+        self.mapping_for(tgid, addr).map(|mapping| mapping.label())
     }
 
     /// Cache `module`, evicting the least recently used entry when full.
@@ -846,14 +1001,20 @@ impl ModuleCache {
     }
 
     fn load(&mut self, tgid: u32, mapping: &Mapping) -> (Option<Module>, &'static str) {
+        // Nothing to open: the address is in anonymous memory. Asking the four
+        // routes for the empty path would only produce failing syscalls.
+        if mapping.path.is_empty() {
+            return (None, "anonymous");
+        }
         let Some((file, how, identity)) = open_module(tgid, mapping) else {
             self.report(tgid, mapping);
             return (None, "none");
         };
-        let Some(data) = read_file(file, how) else {
+        let Some(data) = Mapped::open(&file) else {
+            tracing::debug!(route = how, path = %mapping.path, "module could not be mapped");
             return (None, how);
         };
-        let module = Module::parse(&data, Path::new(&mapping.path));
+        let module = Module::parse(data.as_ref(), Path::new(&mapping.path));
         if identity == Identity::Different {
             tracing::debug!(
                 path = %mapping.path,
@@ -942,28 +1103,29 @@ impl ModuleCache {
             .get(&tgid)
             .is_none_or(|cache| cache.at.elapsed() > MAPS_TTL);
         if stale {
-            let entries = read_maps(tgid).unwrap_or_default();
-            if self.maps.len() >= MAX_MAPS {
-                self.maps.clear();
-            }
-            self.maps.insert(
-                tgid,
-                MapsCache {
-                    at: Instant::now(),
-                    entries: Arc::new(entries),
-                },
-            );
+            self.refresh_maps(tgid);
         }
         let cache = self.maps.get(&tgid)?;
-        // `/proc/<pid>/maps` is sorted by address.
-        let index = cache
-            .entries
-            .partition_point(|mapping| mapping.start <= addr);
-        let mapping = cache.entries.get(index.checked_sub(1)?)?;
-        if addr >= mapping.end {
-            return None;
+        mapping_of(&cache.snapshot.files, addr)
+    }
+
+    /// Re-read `/proc/<tgid>/maps`. `false` when it is not readable, which is
+    /// what a process that exited between sampling and resolution looks like.
+    fn refresh_maps(&mut self, tgid: u32) -> bool {
+        let Some(snapshot) = read_maps(tgid) else {
+            return false;
+        };
+        if self.maps.len() >= MAX_MAPS {
+            self.maps.clear();
         }
-        Some(mapping.clone())
+        self.maps.insert(
+            tgid,
+            MapsCache {
+                at: Instant::now(),
+                snapshot: Arc::new(snapshot),
+            },
+        );
+        true
     }
 }
 
@@ -1043,6 +1205,46 @@ mod tests {
             "cause was {}",
             sample.cause
         );
+    }
+
+    /// A JIT address lives in anonymous memory, which has no file to open.
+    ///
+    /// It has to be labelled as such: "no file" and "a file the agent cannot
+    /// read" look the same in a wall of addresses and have nothing in common.
+    #[test]
+    fn anonymous_memory_is_labelled_and_not_called_unreadable() {
+        let mapping = Mapping {
+            start: 0x7f00_0000,
+            end: 0x7f00_1000,
+            perms: *b"r-xp",
+            offset: 0,
+            dev: 0,
+            inode: 0,
+            path: String::new(),
+        };
+        assert_eq!(mapping.label(), "[anonymous]");
+
+        let mut cache = ModuleCache::new();
+        cache.record(
+            &mapping,
+            std::process::id(),
+            0x7f00_0010,
+            Miss {
+                module: None,
+                vaddr: None,
+                cause: "the address is in anonymous memory (JIT code without a perf map)",
+                route: "anonymous",
+            },
+        );
+        let issues = cache.issues();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].path, "[anonymous]");
+        assert!(
+            !issues[0].unreadable,
+            "no file was involved, so nothing was unreadable"
+        );
+        assert!(issues[0].samples[0].cause.contains("anonymous memory"));
+        assert_eq!(issues[0].samples[0].inode, 0);
     }
 
     #[test]
@@ -1216,12 +1418,12 @@ mod tests {
             let Ok(comm) = std::fs::read_to_string(format!("/proc/{tgid}/comm")) else {
                 continue;
             };
-            let Some(maps) = read_maps(tgid) else {
+            let Some(snapshot) = read_maps(tgid) else {
                 continue;
             };
             checked += 1;
             let mut hit = None;
-            for mapping in &maps {
+            for mapping in &snapshot.files {
                 // A file has several mappings; only the executable one covers
                 // `.text`, and only its first page proves anything.
                 let addr = mapping.start + 0x1000;

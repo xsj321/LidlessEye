@@ -68,6 +68,15 @@ clamped to one hour so a stuck process cannot dominate a profile. The symbol
 `finish_task_switch.isra.0`, so the loader tries a list of candidate names and
 attaches the program to whichever exists.
 
+A task that is blocking cannot always be unwound in user space — the registers
+at that moment often point somewhere the frame-pointer walk cannot follow — so
+the start probe falls back to the kernel stack. Both stacks live in the same
+`stacks` map and an id alone says nothing about which, so the sample also records
+the kind and the id is written to the matching slot of `stack_key`. Without that
+flag a kernel stack sits in `user_stack`, the user-space resolver is asked to
+name `0xffff...` in a process that never executed those addresses, and the whole
+off-CPU profile comes back as frames in no mapping.
+
 ### PID namespaces
 
 A pid does not identify a task on its own. The kernel keeps one number per PID
@@ -117,6 +126,16 @@ binary itself and reads two tables, in this order: the ELF symbol table
 all a `-ldflags="-s -w"` binary has left, and what most of a Kubernetes node is
 built from (containerd, kubelet, kube-proxy, CoreDNS, etcd).
 
+That fallback has to survive a *batch* failure, not just an `Unknown` answer.
+`symbolize` is all-or-nothing: one address whose file cannot be `stat`ed fails
+the whole call, which is exactly what a container binary does when the agent
+looks for it in its own mount namespace. A failed batch is therefore retried one
+address at a time — that isolates the poison address and keeps blazesym's inline
+information for the rest — and whatever still fails goes through the module
+cache. Without this, one unreadable file turns every frame of the stack into an
+address, which is the same symptom as "nothing has symbols" but has a completely
+different cause.
+
 Opening the binary is the part that goes wrong in a cluster. `/proc/<pid>/maps`
 names files as the *target* sees them, and the agent runs in its own mount
 namespace, so `fs::read(path)` fails on every container. Four routes are tried,
@@ -139,9 +158,32 @@ the agent logs the path and the routes it tried once per binary and counts it in
 `symbol_module_failures`, which is the number that explains a wall of unnamed
 frames.
 
+The file is **mapped**, not read. That distinction is not an optimisation: a
+`read_to_end` into a `Vec` costs as much heap as the binary is large, so the
+agent used to cap modules at 256 MiB — and the binaries that exceed it are the
+Go services a node actually runs (Grafana is 490 MB, Prometheus is not much
+smaller), whose function table is the only thing that can name a frame. With a
+private read-only mapping only the touched pages are charged: the section
+headers and the tables that are parsed. The two fallbacks that walk the whole
+file — the `go1.x` token scan and the magic scan for a renamed `.gopclntab` —
+are bounded at 64 MiB for the same reason, and the section-based path, which is
+the normal one, still applies to any size.
+
 Because every frame is resolved *before* storage, a stored batch is
 self-contained: no `vmlinux`, no build ids, no `.debug` files are needed to read
 it back, and a profile of a process that has already exited remains readable.
+
+A stack **ends** where it leaves the process's address space. A broken
+frame-pointer chain does not fail politely: the unwinder reads the stack itself
+and returns whatever it finds there — a string, the constant `2`, a saved
+register — and every frame after that point is the same garbage. Those values
+are counted (`truncated` in the coverage line) and dropped rather than stored,
+because no symbolizer can name them and they are what turns a flamegraph into a
+wall of addresses. The check uses the *original* return address, not the `ip - 1`
+probe (which can point just outside a mapping whose first byte is the return
+address), and it accepts any mapping, file-backed or not: anonymous memory is
+where JIT code lives, and a JIT frame is a real frame. `perf` stops at the same
+point for the same reason.
 
 ### Labels, and what names a series
 

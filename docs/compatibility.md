@@ -130,7 +130,7 @@ The agent explains itself once a minute, at info level, so a cluster nobody can
 shell into is still diagnosable from its logs:
 
 ```text
-INFO symbol coverage named=2090 go=661 elfless=232 unnamed=3 binaries=1 parsed=21 unreadable=0
+INFO symbol coverage named=2090 truncated=2468 go=661 elfless=232 unnamed=3 binaries=1 parsed=21 unreadable=0
 WARN frames from this binary stay unnamed path=/usr/local/bin/lidlesseye go="-" route="proc-root" \
      symbols=0 go_table=false frames=3 cause="no ELF symbol table and no Go function table"
 ```
@@ -155,8 +155,9 @@ sending the reader after a build flag that would not have helped.
 
 The summary says how much was named and by which source (`go` is `.gopclntab`,
 `elfless` is the module fallback for files blazesym cannot reach), how many
-addresses stayed unnamed, how many binaries were parsed and how many could not
-be opened at all. Each offending binary then gets one line naming the file, its
+addresses stayed unnamed, how many frames were `truncated` — values a broken
+frame-pointer walk produced, dropped instead of stored — how many binaries were
+parsed and how many could not be opened at all. Each offending binary then gets one line naming the file, its
 Go release when it has build info, and the cause — because the causes have
 different fixes:
 
@@ -185,6 +186,14 @@ that share the agent's namespace, and a plain `bpf_get_current_pid_tgid` numbers
 a task in *its own* namespace — resolving that to a `/proc` entry would silently
 attribute the samples to an unrelated process. `lidlesseye collect` reports the
 number as `in another PID namespace`.
+
+Addresses in **anonymous memory** are a separate bucket, reported as
+`[anonymous]`. That is where a JIT runtime puts its code: without a perf map
+(`/tmp/perf-<pid>.map`, or `-XX:+PreserveFramePointer` for the JVM) there is no
+symbol table to consult, and the address is emitted as-is. The agent reads a
+perf map when the runtime writes one; when it does not, `[anonymous]` is the
+honest answer and it means "ask the runtime to publish its symbols", not
+"install debuginfo".
 
 ## What the differences mean in practice
 

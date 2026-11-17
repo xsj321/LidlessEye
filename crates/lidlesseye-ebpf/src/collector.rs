@@ -797,3 +797,35 @@ fn drain_map(ebpf: &mut Ebpf, name: &str) -> Result<Vec<RawRecord>, String> {
     }
     Ok(records)
 }
+
+#[cfg(test)]
+mod tests {
+    /// The off-CPU fallback has to say which stack it captured.
+    ///
+    /// User and kernel stacks share one id space (`stacks`), and the resolver
+    /// is chosen by the slot an id sits in: a kernel stack recorded as
+    /// `user_stack` is handed to the user-space symbolizer, which then reports
+    /// every `0xffff...` frame as an address in no mapping. The branch only runs
+    /// for a task whose user stack the unwinder cannot follow, which a unit test
+    /// cannot provoke, so the contract is checked against the source.
+    #[test]
+    fn the_offcpu_fallback_records_which_stack_it_captured() {
+        let source = include_str!("../bpf/profile.bpf.c");
+        assert!(
+            source.contains("state.kind = STACK_KIND_KERNEL"),
+            "the start probe must mark a kernel fallback as such"
+        );
+        let end = source
+            .split("lidlesseye_offcpu_end")
+            .nth(1)
+            .expect("the end probe is in the source");
+        assert!(
+            end.contains("key.kernel_stack = stack_id"),
+            "a kernel stack has to land in the kernel slot"
+        );
+        assert!(
+            end.contains("key.user_stack = stack_id"),
+            "a user stack has to land in the user slot"
+        );
+    }
+}
