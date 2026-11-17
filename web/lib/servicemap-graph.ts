@@ -13,7 +13,7 @@
 // reading as a stack instead of a ragged edge.
 
 import { layeredLayout } from "./servicemap-layout";
-import { formatCount, formatDuration } from "./format";
+import { formatCount } from "./format";
 import type { LabelFilter, ServiceMapEdge, ServiceMapNode } from "./types";
 
 /** Card geometry, in pixels. */
@@ -271,21 +271,46 @@ export function edgeRate(edge: ServiceMapEdge, windowSec: number): number {
   return (edge.connections ?? 0) / windowSec;
 }
 
+/** Trim trailing zeroes so a number reads as a measurement, not a float. */
+function measurement(value: number, digits: number): string {
+  const text = value.toFixed(digits);
+  return text.includes(".") ? text.replace(/\.?0+$/, "") : text;
+}
+
 export function formatRate(rate: number): string {
   if (!Number.isFinite(rate) || rate <= 0) return "0/s";
   if (rate >= 100) return `${formatCount(Math.round(rate))}/s`;
-  if (rate >= 10) return `${rate.toFixed(1)}/s`;
-  if (rate >= 0.01) return `${rate.toFixed(2)}/s`;
-  // A quiet hour is still a number: 12 connections over 3600s is 0.003/s, and
-  // rounding it to 0.00 would make every idle edge look identical to a dead one.
-  const precise = rate.toFixed(3);
-  return precise === "0.000" ? "<0.001/s" : `${precise}/s`;
+  if (rate >= 10) return `${measurement(rate, 1)}/s`;
+  if (rate >= 1) return `${measurement(rate, 1)}/s`;
+  if (rate >= 0.01) return `${measurement(rate, 2)}/s`;
+  // Below one per second a per-second rate turns into a row of leading zeroes.
+  // Per minute keeps the same information at a scale a person can compare.
+  const perMinute = rate * 60;
+  if (perMinute >= 1) return `${measurement(perMinute, 1)}/min`;
+  return `${measurement(perMinute, 2)}/min`;
 }
 
-/** Microseconds in, human duration out. */
+/**
+ * Microseconds in, a duration on the edge out.
+ *
+ * The generic formatter is happy to print `0.005s` when a unit two orders of
+ * magnitude smaller says `5ms`. An edge label is measured in pixels, so it
+ * picks the largest unit that still leaves at least one digit before the dot
+ * and drops trailing zeroes.
+ */
 export function formatRtt(rttUs: number | undefined): string {
-  if (!rttUs) return "—";
-  return formatDuration(rttUs * 1000);
+  if (!rttUs || !Number.isFinite(rttUs)) return "—";
+  const ns = rttUs * 1000;
+  if (ns < 1_000) return `${Math.round(ns)}ns`;
+  if (ns < 1_000_000) return `${measurement(ns / 1_000, ns < 10_000 ? 2 : 1)}µs`;
+  if (ns < 1_000_000_000) return `${measurement(ns / 1_000_000, ns < 10_000_000 ? 2 : 1)}ms`;
+  return `${measurement(ns / 1_000_000_000, 2)}s`;
+}
+
+/** What the edge label calls the protocol, including a payload-based hit. */
+export function edgeProtocol(edge: ServiceMapEdge): string {
+  const name = (edge.protocol || "").trim();
+  return name && name !== "tcp" ? name : "";
 }
 
 /** How heavy an edge is, for ordering and stroke width. */

@@ -223,14 +223,18 @@ are ready. Three signals share the card without competing:
 - **a hairline at the bottom** — the share of on-CPU time of the busiest node on
   the map, so cost is a bar rather than a fourth colour.
 
-Every edge is labelled with its own numbers: new connections per second and the
-mean round-trip time of the connections that closed in the window
-(`0.31/s · 149µs`). Labels are *placed*, not dropped at the geometric midpoint —
+Every edge is labelled with the application protocol the payload sniffer saw
+(or the port's fallback), new connections per second and the mean round-trip
+time of the connections that closed in the window (`http · 0.31/s · 149µs`).
+Latency picks the unit that keeps a digit before the decimal point — `8µs`,
+`149µs`, `12ms`, `1.4s` — instead of printing `0.005s`, and a rate below one per
+second switches to per-minute. Labels are *placed*, not dropped at the
+geometric midpoint —
 each is tried at nine points along its curve and seven offsets from each, and
 takes the first spot that clears every card by 4px and every other label by 2px.
-When even that fails the label drops the latency and keeps the rate, because the
-rate is the number that says a hop is alive; only when neither fits does the
-edge keep its curve and lose its text. Overlapping digits are not information,
+When space runs out the label drops the latency first, then the rate, keeping
+the protocol as long as it can; only when none of them fit does the edge keep
+its curve and lose its text. Overlapping digits are not information,
 so nothing is drawn on top of anything else: paths go in one pass and labels in
 a second, or the edge drawn last would strike a line through the number.
 Retransmits turn an edge red and dashed; an edge that runs against the column
@@ -250,14 +254,20 @@ it, because the numbers are about the topology that is still on screen. The
 panel opens with the node's **neighbourhood**: callers in a column on the left,
 the node in the middle, callees on the right, every edge labelled like the map's
 and every card clickable, so walking the graph is one hop per click. A column
-with nothing in it is dropped and its space given to the others.
+with nothing in it is dropped and its space given to the others. Every workload
+in that hop carries one row per container, and an edge is drawn to the row that
+actually opened it — a sidecar's traffic reads as the sidecar's. The hop has its
+own scroll-to-zoom, drag-to-pan and zoom buttons, with a *fit* action that
+returns to a readable whole-hop view.
 
 The panel is portalled to `document.body` and positioned `fixed`, so it spans
-the **full window height** rather than stopping at the map card. Drag its left
-edge (the `map-panel-resize` separator) to change its width; arrow keys nudge it
-by 24 px, Shift+arrow by 64 px, and Home restores the 560 px default. The width
-is kept in `localStorage["lidlesseye.map.panel.width"]`, so a reload reopens the
-drawer at the size you left it.
+the **full window height** rather than stopping at the map card. It opens at
+the width the neighbourhood needs to show that hop at scale 1, clamped to the
+window; resizing the graph or clicking another node recomputes it. Drag its
+left edge (the `map-panel-resize` separator) to take manual control of the
+width; arrow keys nudge by 24 px, Shift+arrow by 64 px, and Home returns to the
+map's fitted width. A dragged width is kept in
+`localStorage["lidlesseye.map.panel.width"]`.
 
 Below the neighbourhood are seven tabs:
 

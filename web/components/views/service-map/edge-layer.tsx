@@ -22,12 +22,21 @@
 // exist is being read, and an edge that happens to be drawn later would strike
 // a line straight through the number.
 
-import { edgePath, edgeRate, formatRate, formatRtt, pointOnEdge } from "@/lib/servicemap-graph";
+import {
+  edgePath,
+  edgeProtocol,
+  edgeRate,
+  formatRate,
+  formatRtt,
+  pointOnEdge,
+} from "@/lib/servicemap-graph";
 import type { Box, EdgePath } from "@/lib/servicemap-graph";
 import type { ServiceMapEdge } from "@/lib/types";
 
 export function edgeKey(edge: ServiceMapEdge): string {
-  return `${edge.client}->${edge.server}:${edge.protocol}`;
+  // Two containers of one pod can carry the same protocol to one peer. Without
+  // their names both edges get the same React key and one of them disappears.
+  return `${edge.client}->${edge.server}:${edge.protocol}:${edge.client_container ?? ""}:${edge.server_container ?? ""}`;
 }
 
 const LINE = {
@@ -122,23 +131,26 @@ export function EdgeLayer({
     const path = edgePath(from, to);
     const rate = edgeRate(edge, windowSec);
     const rateText = formatRate(rate);
-    const fullText = edge.rtt_us ? `${rateText} · ${formatRtt(edge.rtt_us)}` : rateText;
+    const protocol = edgeProtocol(edge);
+    const rttText = edge.rtt_us ? formatRtt(edge.rtt_us) : "";
+    const fullText = [protocol, rateText, rttText].filter(Boolean).join(" · ");
+    const withoutRtt = [protocol, rateText].filter(Boolean).join(" · ");
     const widthOf = (text: string) => Math.round(text.length * LABEL.advance + LABEL.pad);
 
-    // The number that matters most is the rate, so a crowded wire keeps it and
-    // gives up the latency rather than giving up both: the panel lists the RTT
-    // of every hop anyway, and a missing rate is an edge with nothing to say.
+    // A label gives up detail in order, never all of it at once: latency first
+    // (the panel lists it anyway), then the rate. The protocol is kept as long
+    // as a spot exists because it is the only thing on the wire that says what
+    // the hop actually carries rather than which port it happens to use.
     let text = fullText;
-    let labelWidth = widthOf(fullText);
-    let spot = showLabels ? placeLabel(path, labelWidth, cards, taken) : null;
-    if (showLabels && !spot && fullText !== rateText) {
-      text = rateText;
-      labelWidth = widthOf(rateText);
-      spot = placeLabel(path, labelWidth, cards, taken);
+    let spot = showLabels ? placeLabel(path, widthOf(text), cards, taken) : null;
+    for (const candidate of [withoutRtt, protocol, rateText]) {
+      if (spot || !showLabels || candidate === text || !candidate) continue;
+      text = candidate;
+      spot = placeLabel(path, widthOf(candidate), cards, taken);
     }
     if (spot) taken.push(spot);
 
-    return [{ edge, path, text, labelWidth, spot, rate }];
+    return [{ edge, path, text, spot, rate, protocol }];
   });
 
   return (
@@ -174,13 +186,14 @@ export function EdgeLayer({
         </marker>
       </defs>
 
-      {drawn.map(({ edge, path, rate }) => {
+      {drawn.map(({ edge, path, rate, protocol }) => {
         const warn = (edge.retransmits ?? 0) > 0;
         const touched = !selected || edge.client === selected || edge.server === selected;
         return (
           <path
             key={edgeKey(edge)}
             d={path.d}
+            data-protocol={protocol || edge.protocol || "tcp"}
             fill="none"
             opacity={touched ? 1 : 0.16}
             stroke={warn ? LINE.warn : touched && selected ? LINE.focused : LINE.idle}
@@ -196,13 +209,14 @@ export function EdgeLayer({
         );
       })}
 
-      {drawn.map(({ edge, text, spot }) => {
+      {drawn.map(({ edge, text, spot, protocol }) => {
         if (!spot) return null;
         const warn = (edge.retransmits ?? 0) > 0;
         const touched = !selected || edge.client === selected || edge.server === selected;
         return (
           <g
             key={edgeKey(edge)}
+            data-protocol={protocol || edge.protocol || "tcp"}
             opacity={touched ? 1 : 0.16}
             style={{ transition: "opacity 150ms ease" }}
             transform={`translate(${spot.x + spot.w / 2},${spot.y + spot.h / 2})`}

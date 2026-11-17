@@ -7,9 +7,11 @@
 //! for, which is what makes the map follow the same time range as the
 //! flamegraph.
 //!
-//! Edges carry only what the kernel exposes without parsing application
-//! payloads: new connections, retransmits and the protocol guess that comes
-//! from the port. Node CPU is joined from the profile store, so a service that
+//! Edges carry what the agent can observe: new connections, retransmits and an
+//! application protocol. The eBPF collector sniffs the first payload written
+//! to a socket and sets a protocol bit; a port-based guess is the fallback for
+//! a connection that carried no parseable payload (TLS without an uprobe, for
+//! instance). Node CPU is joined from the profile store, so a service that
 //! burns CPU but serves little traffic is visible as such.
 
 use std::collections::HashMap;
@@ -511,26 +513,92 @@ pub fn servicemap_histogram(
     })
 }
 
+/// Application protocols the eBPF payload sniffer can recognise.
+///
+/// The values are a bit set: one TCP connection can carry more than one
+/// protocol over its lifetime, and a batch sums flows rather than replacing
+/// them. The same numbers are compiled into `bpf/net.bpf.c`; changing one
+/// without the other would mislabel every edge on the map.
+pub mod protocol {
+    pub const HTTP: u32 = 1 << 0;
+    pub const HTTPS: u32 = 1 << 1;
+    pub const POSTGRES: u32 = 1 << 2;
+    pub const MYSQL: u32 = 1 << 3;
+    pub const MONGODB: u32 = 1 << 4;
+    pub const REDIS: u32 = 1 << 5;
+    pub const MEMCACHED: u32 = 1 << 6;
+    pub const CASSANDRA: u32 = 1 << 7;
+    pub const KAFKA: u32 = 1 << 8;
+    pub const CLICKHOUSE: u32 = 1 << 9;
+    pub const ZOOKEEPER: u32 = 1 << 10;
+    pub const FOUNDATIONDB: u32 = 1 << 11;
+    pub const HTTP2: u32 = 1 << 12;
+    pub const DNS: u32 = 1 << 13;
+    pub const GRPC: u32 = 1 << 14;
+}
+
+use protocol as p;
+
+/// Names of the protocols set in `mask`, in a stable reading order.
+pub fn protocol_names(mask: u32) -> Vec<&'static str> {
+    const ORDER: &[(u32, &str)] = &[
+        (p::HTTP, "http"),
+        (p::HTTPS, "https"),
+        (p::HTTP2, "http2"),
+        (p::GRPC, "grpc"),
+        (p::POSTGRES, "postgres"),
+        (p::MYSQL, "mysql"),
+        (p::MONGODB, "mongodb"),
+        (p::REDIS, "redis"),
+        (p::MEMCACHED, "memcached"),
+        (p::CASSANDRA, "cassandra"),
+        (p::KAFKA, "kafka"),
+        (p::CLICKHOUSE, "clickhouse"),
+        (p::ZOOKEEPER, "zookeeper"),
+        (p::FOUNDATIONDB, "foundationdb"),
+        (p::DNS, "dns"),
+    ];
+    ORDER
+        .iter()
+        .filter(|(bit, _)| mask & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+/// Protocol label for an edge: what the payload said, or the port's guess.
+pub fn protocol_label(mask: u32, fallback: &str) -> String {
+    let names = protocol_names(mask);
+    if names.is_empty() {
+        fallback.to_string()
+    } else {
+        names.join("+")
+    }
+}
+
 /// Best-effort protocol name from a port number.
 ///
-/// This is a label, not a promise: telling HTTP from gRPC needs payload
-/// inspection, which a connection-level map deliberately does not do.
+/// Used only when no payload could be classified — a long-lived TLS socket
+/// whose plaintext never passes a probed syscall, for example. A payload hit
+/// always wins over the port, because a port says what a service usually runs,
+/// not what this connection actually carried.
 pub fn protocol_for_port(port: u16) -> &'static str {
     match port {
-        80 => "http",
-        443 => "https",
-        8080 | 8000 | 3000 => "http",
-        8443 | 9443 => "https",
+        80 | 3000 | 8000 | 8080 | 9200 => "http",
+        443 | 8443 | 9443 => "https",
+        50051 => "grpc",
         53 => "dns",
         5432 => "postgres",
         3306 => "mysql",
         6379 => "redis",
         27017 => "mongodb",
-        9092 => "kafka",
+        9042 | 9160 => "cassandra",
+        9092..=9094 => "kafka",
+        8123 => "http",
+        9000 | 9009 => "clickhouse",
         5672 => "amqp",
         11211 => "memcached",
-        9200 => "elasticsearch",
         2181 => "zookeeper",
+        4500 | 4501 => "foundationdb",
         9090 | 9091 => "prometheus",
         4040 => "lidlesseye",
         _ => "tcp",
@@ -669,6 +737,18 @@ mod tests {
     fn ports_name_the_protocol_they_usually_carry() {
         assert_eq!(crate::servicemap::protocol_for_port(443), "https");
         assert_eq!(crate::servicemap::protocol_for_port(5432), "postgres");
+        assert_eq!(crate::servicemap::protocol_for_port(9042), "cassandra");
+        assert_eq!(crate::servicemap::protocol_for_port(4500), "foundationdb");
         assert_eq!(crate::servicemap::protocol_for_port(12345), "tcp");
+    }
+
+    #[test]
+    fn payload_hits_beat_the_port_and_keep_their_order() {
+        use super::protocol as p;
+        assert_eq!(
+            super::protocol_label(p::HTTP | p::MYSQL, "postgres"),
+            "http+mysql"
+        );
+        assert_eq!(super::protocol_label(0, "https"), "https");
     }
 }

@@ -12,7 +12,7 @@
 // drawer and not a page: walking the graph one hop at a time is the common
 // path, and every tab re-queries for the node now in focus.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { GripVertical, X } from "lucide-react";
@@ -111,12 +111,25 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
   const dragging = useRef(false);
   const dragStart = useRef<{ x: number; width: number } | null>(null);
   const [resizing, setResizing] = useState(false);
+  // The neighbourhood has a natural width: three columns of cards, the gap
+  // between them and room for their container rows. Until the operator drags
+  // the edge by hand, the drawer takes that width and the map fits inside it.
+  const [autoWidth, setAutoWidth] = useState(true);
+  const [preferredWidth, setPreferredWidth] = useState(DEFAULT_WIDTH);
+  const onPreferredWidth = useCallback((next: number) => setPreferredWidth(next), []);
 
   useEffect(() => {
     const next = storedWidth();
     widthRef.current = next;
     setWidth(next);
   }, []);
+
+  // Opening a different node is a new question, so it starts from the map's
+  // natural width again. A width the operator dragged to is kept only while
+  // that node stays open.
+  useEffect(() => {
+    if (node) setAutoWidth(true);
+  }, [node?.id]);
 
   const clampWidth = (value: number) => {
     if (typeof window === "undefined") return DEFAULT_WIDTH;
@@ -131,6 +144,11 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
     setWidth(next);
   };
 
+  useEffect(() => {
+    if (!open || !autoWidth || preferredWidth <= 0) return;
+    applyWidth(preferredWidth);
+  }, [open, autoWidth, preferredWidth, width]);
+
   const persistWidth = () => {
     try {
       window.localStorage.setItem(WIDTH_KEY, String(widthRef.current));
@@ -141,6 +159,7 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
 
   const onResizeDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
+    setAutoWidth(false);
     event.currentTarget.setPointerCapture(event.pointerId);
     dragging.current = true;
     dragStart.current = { x: event.clientX, width: widthRef.current };
@@ -166,10 +185,16 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
 
   const onResizeKey = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     const step = event.shiftKey ? 64 : 24;
-    if (event.key === "ArrowLeft") applyWidth(widthRef.current + step);
-    else if (event.key === "ArrowRight") applyWidth(widthRef.current - step);
-    else if (event.key === "Home") applyWidth(DEFAULT_WIDTH);
-    else return;
+    if (event.key === "ArrowLeft") {
+      setAutoWidth(false);
+      applyWidth(widthRef.current + step);
+    } else if (event.key === "ArrowRight") {
+      setAutoWidth(false);
+      applyWidth(widthRef.current - step);
+    } else if (event.key === "Home") {
+      setAutoWidth(true);
+      applyWidth(preferredWidth);
+    } else return;
     event.preventDefault();
     persistWidth();
   };
@@ -230,6 +255,7 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
       data-testid="map-panel"
       data-state={open ? "open" : "closed"}
       data-width={width}
+      data-auto-width={autoWidth ? "true" : "false"}
       style={{ width }}
       // `inert` rather than only `aria-hidden`: the drawer is translated fully
       // off-screen, and without it every button inside it stays in the tab
@@ -321,18 +347,13 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
           </header>
 
           <div className="border-b px-3 py-2">
-            <div className="mb-1 flex items-center justify-between text-[9px] uppercase tracking-wide text-muted-foreground">
-              <span>{t("Neighbours")}</span>
-              <span className="font-mono normal-case tracking-normal">
-                {inbound.length} in · {outbound.length} out
-              </span>
-            </div>
             <Neighborhood
               node={current}
               nodes={nodes}
               edges={edges}
               windowSec={windowSec}
               onSelect={onSelect}
+              onPreferredWidth={onPreferredWidth}
             />
           </div>
 

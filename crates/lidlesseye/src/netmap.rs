@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use lidlesseye_core::servicemap::{
     EXTERNAL_ID, InstanceInfo, NodeKind, ServiceEdge, ServiceMapBatch, ServiceNode,
-    protocol_for_port,
+    protocol_for_port, protocol_label,
 };
 use lidlesseye_ebpf::conntrack::{self, ConntrackConfig, ConntrackHandle, Flow, Role};
 use lidlesseye_ebpf::k8s::{PodIndex, PodMeta};
@@ -353,7 +353,11 @@ impl FlowMapper {
                 (Role::Server, _) | (Role::Unknown, _) => continue,
             };
 
-            let protocol = protocol_for_port(server_port).to_string();
+            // A payload hit names what this connection actually carried; the
+            // port is only the fallback for a socket we could not sniff (TLS
+            // without a user-space uprobe, a connection that predates the
+            // agent, or an opaque protocol).
+            let protocol = protocol_label(flow.protocols, protocol_for_port(server_port));
             let (tx, rx) = if swapped {
                 (flow.rx_bytes, flow.tx_bytes)
             } else {
@@ -1383,6 +1387,7 @@ mod tests {
             rtt_us_sum: 0,
             rtt_samples: 0,
             cgroup: 0,
+            protocols: 0,
         }
     }
 
@@ -1576,6 +1581,45 @@ mod tests {
         assert_eq!(batch.edges[0].client, "shop/checkout");
         assert_eq!(batch.edges[0].server, EXTERNAL_ID);
         assert_eq!(batch.edges[0].protocol, "https");
+    }
+
+    #[test]
+    fn a_payload_hit_names_the_edge_instead_of_the_port() {
+        // Port 9200 usually means the HTTP API. Here the sniffer recognised a
+        // native ClickHouse frame on the same socket, so that is the label.
+        let mut sample = flow(
+            ("10.0.0.2", 43210),
+            ("10.0.0.7", 9200),
+            Role::Client,
+            120,
+            700,
+        );
+        sample.protocols = lidlesseye_core::servicemap::protocol::CLICKHOUSE;
+        let mapper = mapper(&[
+            ("u1", "shop", "checkout", "10.0.0.2"),
+            ("u2", "shop", "stats", "10.0.0.7"),
+        ]);
+        let batch = mapper.batch(vec![sample], 1);
+        assert_eq!(batch.edges[0].protocol, "clickhouse");
+    }
+
+    #[test]
+    fn an_edge_can_carry_more_than_one_application_protocol() {
+        let mut sample = flow(
+            ("10.0.0.2", 43210),
+            ("10.0.0.7", 5432),
+            Role::Client,
+            120,
+            700,
+        );
+        sample.protocols = lidlesseye_core::servicemap::protocol::POSTGRES
+            | lidlesseye_core::servicemap::protocol::REDIS;
+        let mapper = mapper(&[
+            ("u1", "shop", "checkout", "10.0.0.2"),
+            ("u2", "shop", "payments", "10.0.0.7"),
+        ]);
+        let batch = mapper.batch(vec![sample], 1);
+        assert_eq!(batch.edges[0].protocol, "postgres+redis");
     }
 
     #[test]

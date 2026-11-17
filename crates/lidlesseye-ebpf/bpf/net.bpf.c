@@ -72,12 +72,32 @@ typedef long long __s64;
 #define ROLE_CLIENT 1
 #define ROLE_SERVER 2
 
+/* Keep these in sync with lidlesseye_core::servicemap::protocol. A connection
+ * can carry more than one application protocol over its lifetime, so this is
+ * a bit set rather than a single enum. */
+#define PROTO_HTTP        (1U << 0)
+#define PROTO_HTTPS       (1U << 1)
+#define PROTO_POSTGRES    (1U << 2)
+#define PROTO_MYSQL       (1U << 3)
+#define PROTO_MONGODB     (1U << 4)
+#define PROTO_REDIS       (1U << 5)
+#define PROTO_MEMCACHED   (1U << 6)
+#define PROTO_CASSANDRA   (1U << 7)
+#define PROTO_KAFKA       (1U << 8)
+#define PROTO_CLICKHOUSE  (1U << 9)
+#define PROTO_ZOOKEEPER   (1U << 10)
+#define PROTO_FOUNDATIONDB (1U << 11)
+#define PROTO_HTTP2       (1U << 12)
+#define PROTO_DNS         (1U << 13)
+#define PROTO_GRPC        (1U << 14)
+
 /* ---- helper ABI ------------------------------------------------------- */
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value,
                                    __u64 flags) = (void *)2;
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *src) = (void *)113;
+static long (*bpf_probe_read_user)(void *dst, __u32 size, const void *src) = (void *)115;
 static __u64 (*bpf_get_current_cgroup_id)(void) = (void *)80;
 
 /* ---- kernel structs, by the kernel's own names ------------------------ */
@@ -110,6 +130,23 @@ struct sock {
 
 struct tcp_sock {
     __u32 srtt_us; /* smoothed RTT, fixed point, microseconds << 3 */
+} __attribute__((preserve_access_index));
+
+/* Enough of `msghdr`/`iov_iter` to reach the first payload iovec. CO-RE
+ * relocates by member name, so only the members we read are described here;
+ * the rest of the kernel's layout is filled in at load time. */
+struct iovec {
+    void *iov_base;
+    __u64 iov_len;
+} __attribute__((preserve_access_index));
+
+struct iov_iter {
+    __u64 count;
+    const struct iovec *iov;
+} __attribute__((preserve_access_index));
+
+struct msghdr {
+    struct iov_iter msg_iter;
 } __attribute__((preserve_access_index));
 
 /* Registers of the probed function's caller. Declared with the names the
@@ -174,7 +211,9 @@ struct flow_stats {
      * from `sock_owners`, which records it where the task is known. */
     __u64 cgroup;
     __u32 role;
-    __u32 pad;
+    /* Bit set of protocols seen on this connection, from the payload sniffer.
+     * Occupies the old padding slot: the map value stays the same size. */
+    __u32 protocols;
 };
 
 #define __uint(name, val) int (*name)[val]
@@ -276,6 +315,395 @@ static __always_inline struct flow_stats *stats_for(struct flow_key *key) {
 }
 
 /* --------------------------------------------------------------------- */
+/* Application protocol sniffing                                          */
+/* --------------------------------------------------------------------- */
+/* A kprobe on tcp_sendmsg sees the application's buffer before the kernel
+ * splits it into segments. Reading the first iovec is enough to recognise the
+ * request line or binary frame header of the protocols the service map cares
+ * about, and it keeps the probe cheap: one bounded user read per send, no
+ * per-packet work and no perf-buffer events.
+ *
+ * The parsers deliberately answer "which protocol", not "which request".
+ * Getting that far costs per-request state and a userspace decoder; naming the
+ * wire protocol on an edge is what the map needs, and a conservative guess is
+ * better than labelling a long-lived connection as whatever it carried once.
+ */
+
+#define PAYLOAD_SAMPLE 128
+#define PAYLOAD_MASK (PAYLOAD_SAMPLE - 1)
+
+static __always_inline __u32 be32(const char *p) {
+    return ((__u32)(__u8)p[0] << 24) | ((__u32)(__u8)p[1] << 16) |
+           ((__u32)(__u8)p[2] << 8) | (__u32)(__u8)p[3];
+}
+
+static __always_inline __u32 le32(const char *p) {
+    return (__u32)(__u8)p[0] | ((__u32)(__u8)p[1] << 8) |
+           ((__u32)(__u8)p[2] << 16) | ((__u32)(__u8)p[3] << 24);
+}
+
+static __always_inline __u32 be16(const char *p) {
+    return ((__u32)(__u8)p[0] << 8) | (__u32)(__u8)p[1];
+}
+
+static __always_inline char at(const char *buf, __u64 offset) {
+    return buf[offset & PAYLOAD_MASK];
+}
+
+static __always_inline __u32 is_http(const char *b, __u32 size) {
+    if (size < 8) {
+        return 0;
+    }
+    if (at(b, 0) == 'G' && at(b, 1) == 'E' && at(b, 2) == 'T') {
+        return PROTO_HTTP;
+    }
+    if (at(b, 0) == 'P' && at(b, 1) == 'O' && at(b, 2) == 'S' && at(b, 3) == 'T') {
+        return PROTO_HTTP;
+    }
+    if (at(b, 0) == 'P' && at(b, 1) == 'U' && at(b, 2) == 'T') {
+        return PROTO_HTTP;
+    }
+    if (at(b, 0) == 'H' && at(b, 1) == 'E' && at(b, 2) == 'A' && at(b, 3) == 'D') {
+        return PROTO_HTTP;
+    }
+    if (at(b, 0) == 'D' && at(b, 1) == 'E' && at(b, 2) == 'L' && at(b, 3) == 'E' &&
+        at(b, 4) == 'T' && at(b, 5) == 'E') {
+        return PROTO_HTTP;
+    }
+    if (at(b, 0) == 'O' && at(b, 1) == 'P' && at(b, 2) == 'T' && at(b, 3) == 'I' &&
+        at(b, 4) == 'O' && at(b, 5) == 'N' && at(b, 6) == 'S') {
+        return PROTO_HTTP;
+    }
+    if (at(b, 0) == 'P' && at(b, 1) == 'A' && at(b, 2) == 'T' && at(b, 3) == 'C' &&
+        at(b, 4) == 'H') {
+        return PROTO_HTTP;
+    }
+    // A response travels on the server's socket; recognising it matters for
+    // inbound-only flows whose request predates the agent.
+    if (at(b, 0) == 'H' && at(b, 1) == 'T' && at(b, 2) == 'T' && at(b, 3) == 'P' &&
+        at(b, 4) == '/' && at(b, 5) >= '0' && at(b, 5) <= '9' && at(b, 6) == '.' &&
+        at(b, 7) >= '0' && at(b, 7) <= '9') {
+        return PROTO_HTTP;
+    }
+    return 0;
+}
+
+static __always_inline __u32 is_https(const char *b, __u32 size) {
+    if (size < 6 || (__u8)at(b, 0) != 0x16 || (__u8)at(b, 1) != 0x03) {
+        return 0;
+    }
+    if ((__u8)at(b, 2) > 0x04) {
+        return 0;
+    }
+    return be16(b + 3) + 5 <= size ? PROTO_HTTPS : 0;
+}
+
+static __always_inline __u32 is_http2(const char *b, __u32 size) {
+    if (size >= 24 && at(b, 0) == 'P' && at(b, 1) == 'R' && at(b, 2) == 'I' &&
+        at(b, 3) == ' ' && at(b, 4) == '*') {
+        return PROTO_HTTP2;
+    }
+    if (size < 9) {
+        return 0;
+    }
+    __u32 length = be32(b) >> 8;
+    __u8 type = (__u8)at(b, 3);
+    // Settings, headers, data, Windows update and ping are the frames a
+    // client or server sends first; type 0 also covers an empty DATA frame.
+    if (type > 0x9 || length + 9 > size) {
+        return 0;
+    }
+    return PROTO_HTTP2;
+}
+
+static __always_inline __u32 is_postgres(const char *b, __u32 size) {
+    if (size < 5) {
+        return 0;
+    }
+    __u32 length = be32(b + 1);
+    char cmd = at(b, 0);
+    // Startup packet: 196608 is protocol 3.0 in network byte order.
+    if (length == 196608) {
+        return PROTO_POSTGRES;
+    }
+    if (length + 1 == size &&
+        (cmd == 'Q' || cmd == 'P' || cmd == 'C' || cmd == 'S')) {
+        return PROTO_POSTGRES;
+    }
+    if ((cmd == 'E' || cmd == 'T' || cmd == 'D' || cmd == 'C' || cmd == 't' ||
+         cmd == '1' || cmd == '2') && length + 1 <= size) {
+        return PROTO_POSTGRES;
+    }
+    return 0;
+}
+
+static __always_inline __u32 is_mysql(const char *b, __u32 size) {
+    if (size < 5) {
+        return 0;
+    }
+    __u32 length = (__u32)(__u8)at(b, 0) | ((__u32)(__u8)at(b, 1) << 8) |
+                   ((__u32)(__u8)at(b, 2) << 16);
+    if (length + 4 != size || (__u8)at(b, 3) != 0) {
+        return 0;
+    }
+    __u8 cmd = (__u8)at(b, 4);
+    if (cmd == 0 || cmd == 1 || cmd == 2 || cmd == 3 || cmd == 0x16 || cmd == 0x17 ||
+        cmd == 0x19) {
+        return PROTO_MYSQL;
+    }
+    return 0;
+}
+
+static __always_inline __u32 is_mongodb(const char *b, __u32 size) {
+    if (size < 16) {
+        return 0;
+    }
+    __u32 length = (__u32)(__s32)be32(b);
+    __u32 opcode = (__u32)(__s32)be32(b + 12);
+    if (length < 16 || length != size) {
+        return 0;
+    }
+    // OP_MSG and OP_COMPRESSED are what modern drivers use; OP_QUERY (2004)
+    // is still emitted by older ones and by the handshake.
+    if (opcode == 2013 || opcode == 2012 || opcode == 2004) {
+        return PROTO_MONGODB;
+    }
+    return 0;
+}
+
+static __always_inline __u32 is_redis(const char *b, __u32 size) {
+    if (size < 11 || at(b, 0) != '*' || at(b, 1) < '0' || at(b, 1) > '9') {
+        return 0;
+    }
+    __u64 p;
+    if (at(b, 2) == '\r' && at(b, 3) == '\n') {
+        p = 4;
+    } else if (at(b, 2) >= '0' && at(b, 2) <= '9' && at(b, 3) == '\r' &&
+               at(b, 4) == '\n') {
+        p = 5;
+    } else {
+        return 0;
+    }
+    if (at(b, p) != '$' || at(b, p + 1) < '0' || at(b, p + 1) > '9') {
+        return 0;
+    }
+    if (at(b, p + 2) == '\r' && at(b, p + 3) == '\n') {
+        p += 4;
+    } else if (at(b, p + 2) >= '0' && at(b, p + 2) <= '9' && at(b, p + 3) == '\r' &&
+               at(b, p + 4) == '\n') {
+        p += 5;
+    } else {
+        return 0;
+    }
+    char c = at(b, p);
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ? PROTO_REDIS : 0;
+}
+
+static __always_inline __u32 is_memcached(const char *b, __u32 size) {
+    if (size < 9 || at(b, size - 2) != '\r' || at(b, size - 1) != '\n') {
+        return 0;
+    }
+    if (at(b, 0) == 's' && at(b, 1) == 'e' && at(b, 2) == 't' && at(b, 3) == ' ') {
+        return PROTO_MEMCACHED;
+    }
+    if (at(b, 0) == 'g' && (at(b, 1) == 'a' || at(b, 1) == 'e') && at(b, 2) == 't' &&
+        (at(b, 3) == ' ' || at(b, 3) == 's')) {
+        return PROTO_MEMCACHED;
+    }
+    if (at(b, 0) == 'a' && at(b, 1) == 'd' && at(b, 2) == 'd' && at(b, 3) == ' ') {
+        return PROTO_MEMCACHED;
+    }
+    if (at(b, 0) == 'i' && at(b, 1) == 'n' && at(b, 2) == 'c' && at(b, 3) == 'r' &&
+        at(b, 4) == ' ') {
+        return PROTO_MEMCACHED;
+    }
+    if (at(b, 0) == 'd' && at(b, 1) == 'e' && at(b, 2) == 'c' && at(b, 3) == 'r' &&
+        at(b, 4) == ' ') {
+        return PROTO_MEMCACHED;
+    }
+    if (at(b, 0) == 'V' && at(b, 1) == 'A' && at(b, 2) == 'L') {
+        return PROTO_MEMCACHED;
+    }
+    if (at(b, 0) == 'S' && at(b, 1) == 'T' && at(b, 2) == 'O') {
+        return PROTO_MEMCACHED;
+    }
+    return 0;
+}
+
+static __always_inline __u32 is_cassandra(const char *b, __u32 size) {
+    if (size < 5) {
+        return 0;
+    }
+    __u8 version = (__u8)at(b, 0);
+    __u8 opcode = (__u8)at(b, 4);
+    // Requests use 0x04, responses 0x84; v3 and v5 are still in the wild.
+    if (version != 0x03 && version != 0x04 && version != 0x05 && version != 0x83 &&
+        version != 0x84 && version != 0x85) {
+        return 0;
+    }
+    return (opcode == 0x00 || opcode == 0x07 || opcode == 0x08 || opcode == 0x0a ||
+            opcode == 0x0d)
+               ? PROTO_CASSANDRA
+               : 0;
+}
+
+static __always_inline __u32 is_kafka(const char *b, __u32 size) {
+    if (size < 12) {
+        return 0;
+    }
+    __u32 length = be32(b);
+    __u32 api_key = be16(b + 4);
+    __s32 correlation = (__s32)be32(b + 8);
+    return (length + 4 == size && correlation >= 0 && api_key <= 67) ? PROTO_KAFKA : 0;
+}
+
+static __always_inline __u32 is_clickhouse(const char *b, __u32 size) {
+    if (size < 40 || (__u8)at(b, 0) != 1) {
+        return 0;
+    }
+    __u8 query_id_len = (__u8)at(b, 1);
+    if (query_id_len != 0 && query_id_len != 36) {
+        return 0;
+    }
+    __u64 off = 2 + query_id_len;
+    __u8 kind = (__u8)at(b, off);
+    if (kind != 1 && kind != 2) {
+        return 0;
+    }
+    off += 1;
+    __u8 user_len = (__u8)at(b, off);
+    if (user_len > 63) {
+        return 0;
+    }
+    off += 1 + user_len;
+    __u8 initial_len = (__u8)at(b, off);
+    if (initial_len > 63) {
+        return 0;
+    }
+    off += 1 + initial_len;
+    __u8 addr_len = (__u8)at(b, off);
+    if (addr_len > 48) {
+        return 0;
+    }
+    off += 1 + addr_len + 8;
+    __u8 iface = (__u8)at(b, off);
+    return (iface >= 1 && iface <= 8) ? PROTO_CLICKHOUSE : 0;
+}
+
+static __always_inline __u32 is_zookeeper(const char *b, __u32 size) {
+    if (size < 12) {
+        return 0;
+    }
+    __u32 length = be32(b);
+    __s32 xid = (__s32)be32(b + 4);
+    __s32 opcode = (__s32)be32(b + 8);
+    if (length + 4 != size || (xid < 0 && xid != -1 && xid != -2)) {
+        return 0;
+    }
+    return ((opcode >= 0 && opcode <= 21) || opcode == -11 || opcode == 100 ||
+            opcode == 101 || opcode == -1)
+               ? PROTO_ZOOKEEPER
+               : 0;
+}
+
+static __always_inline __u32 is_fdb_id(__u32 id) {
+    // The common file identifiers from FoundationDB's Flow serialisation.
+    // The full list lives in flow's generated headers; these cover the client
+    // reads/writes and the worker frames that make up ordinary cluster traffic.
+    switch (id) {
+    case 8454530U:  /* GetValueRequest */
+    case 6795746U:  /* GetKeyValuesRequest */
+    case 6795747U:  /* GetMappedKeyValuesRequest */
+    case 93948U:    /* CommitTransactionRequest */
+    case 838566U:   /* GetReadVersionRequest */
+    case 7554186U:  /* SetRequest */
+    case 8500026U:  /* ClearRequest */
+    case 10457870U: /* GetKeyRequest */
+    case 1378929U:  /* GetValueReply */
+    case 1783066U:  /* GetKeyValuesReply */
+    case 1783067U:  /* GetMappedKeyValuesReply */
+    case 11226513U: /* GetKeyReply */
+    case 15709388U: /* GetReadVersionReply */
+    case 14332605U: /* RegisterWorkerRequest */
+    case 1254174U:  /* GetWorkersRequest */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static __always_inline __u32 is_foundationdb(const char *b, __u32 size) {
+    if (size < 36) {
+        return 0;
+    }
+    // ConnectPacket carries 0x1FDB at bytes 10-11, then one or more length-
+    // prefixed Flow messages. Plain and TLS frames put the file identifier
+    // at different offsets.
+    if ((__u8)at(b, 10) == 0xdb && (__u8)at(b, 11) == 0x1f) {
+        return PROTO_FOUNDATIONDB;
+    }
+    return (is_fdb_id(le32(b + 24)) || is_fdb_id(le32(b + 32))) ? PROTO_FOUNDATIONDB : 0;
+}
+
+static __always_inline __u32 is_dns(const char *b, __u32 size) {
+    if (size < 12 || be16(b) + 2 != size) {
+        return 0;
+    }
+    // Standard query/response with no authoritative-answer bit nonsense: a
+    // TCP DNS message is length-prefixed, which is what tells it from Kafka.
+    if ((__u8)at(b, 2) & 0x80) {
+        return PROTO_DNS;
+    }
+    return ((__u8)at(b, 3) & 0x0f) == 0 ? PROTO_DNS : 0;
+}
+
+static __always_inline __u32 classify_payload(char *b, __u32 size) {
+    __u32 mask = 0;
+    mask |= is_http(b, size);
+    mask |= is_https(b, size);
+    mask |= is_http2(b, size);
+    mask |= is_postgres(b, size);
+    mask |= is_mysql(b, size);
+    mask |= is_mongodb(b, size);
+    mask |= is_redis(b, size);
+    mask |= is_memcached(b, size);
+    mask |= is_cassandra(b, size);
+    mask |= is_kafka(b, size);
+    mask |= is_clickhouse(b, size);
+    mask |= is_zookeeper(b, size);
+    mask |= is_foundationdb(b, size);
+    mask |= is_dns(b, size);
+    return mask;
+}
+
+/* Read the first iovec of a tcp_sendmsg. The payload belongs to user space,
+ * but a few in-kernel callers pass a kvec, hence the kernel fallback. */
+static __always_inline int read_send_payload(struct msghdr *msg, char *dst, __u32 *size_out) {
+    const struct iovec *vec = 0;
+    if (bpf_probe_read_kernel(&vec, sizeof(vec), &msg->msg_iter.iov) != 0 || vec == 0) {
+        return -1;
+    }
+    struct iovec iov = {};
+    if (bpf_probe_read_kernel(&iov, sizeof(iov), vec) != 0) {
+        return -1;
+    }
+    __u64 len = iov.iov_len;
+    if (len > PAYLOAD_SAMPLE) {
+        len = PAYLOAD_SAMPLE;
+    }
+    if (len < 4 || iov.iov_base == 0) {
+        return -1;
+    }
+    __builtin_memset(dst, 0, PAYLOAD_SAMPLE);
+    if (bpf_probe_read_user(dst, (__u32)len, iov.iov_base) != 0 &&
+        bpf_probe_read_kernel(dst, (__u32)len, iov.iov_base) != 0) {
+        return -1;
+    }
+    *size_out = (__u32)len;
+    return 0;
+}
+
+/* --------------------------------------------------------------------- */
 /* State transitions: the connection lifecycle                            */
 /* --------------------------------------------------------------------- */
 SEC("kprobe/tcp_set_state")
@@ -372,8 +800,25 @@ int lidlesseye_tcp_send(struct pt_regs *ctx) {
         return 0;
     }
     struct flow_stats *stats = stats_for(&entry->key);
-    if (stats) {
-        __sync_fetch_and_add(&stats->tx_bytes, size);
+    if (!stats) {
+        return 0;
+    }
+    __sync_fetch_and_add(&stats->tx_bytes, size);
+
+    /* Once a protocol is known it stays known for the window: a healthy
+     * connection reuses the same protocol, and re-reading every iovec would
+     * turn one classify per send into one per request. */
+    if (stats->protocols == 0) {
+        char payload[PAYLOAD_SAMPLE] = {};
+        __u32 used = 0;
+        if (read_send_payload((struct msghdr *)PARM2(ctx), payload, &used) == 0) {
+            __u32 detected = classify_payload(payload, used);
+            if (detected != 0) {
+                // Not atomic on purpose: BPF has no 32-bit atomic OR, and a
+                // lost bit here only means one flow falls back to its port.
+                stats->protocols |= detected;
+            }
+        }
     }
     return 0;
 }

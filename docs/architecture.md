@@ -477,9 +477,10 @@ two views of the same window.
 
 ## Service map
 
-The map answers "who talks to whom, and what does it cost". It is a *network*
-graph — L4 edges with connection counts, bytes, retransmits and round-trip time
-— plus the profiles already stored, joined per workload.
+The map answers "who talks to whom, what they say to each other, and what it
+costs". It is a *network* graph — edges with connection counts, bytes,
+retransmits, round-trip time and an application protocol — plus the profiles
+already stored, joined per workload.
 
 ### Two collectors, one rule set
 
@@ -491,7 +492,7 @@ here cannot take the profiler down) hooks four kernel functions:
 | Program | Symbol | What it adds |
 | --- | --- | --- |
 | `lidlesseye_tcp_state` | `tcp_set_state` | a new connection, and which end opened it |
-| `lidlesseye_tcp_send` | `tcp_sendmsg` | bytes sent, retransmit accounting |
+| `lidlesseye_tcp_send` | `tcp_sendmsg` | bytes sent and the application protocol in the first payload |
 | `lidlesseye_tcp_recv` | `tcp_cleanup_rbuf` | bytes received |
 | `lidlesseye_tcp_retrans` | `tcp_retransmit_skb` | retransmits |
 
@@ -521,6 +522,26 @@ kube-scheduler, for instance — never see a handshake. For those the role is
 inferred from the pod spec: a pod listening on the local port is the server, a
 peer whose pod declares the remote port makes this pod the client. When neither
 holds the connection is dropped rather than drawn backwards.
+
+### Application protocols
+
+`lidlesseye_tcp_send` reads the first iovec of a socket write into a bounded
+128-byte stack buffer and matches request lines and binary frame headers. The
+result is a bit set on the flow, so one long-lived connection can be labelled
+with every protocol it carried; the UI prints the names on the edge label and
+keeps the full set in the Net tab. The detectors cover HTTP/1, HTTP/2, TLS
+client hellos, Postgres, MySQL, MongoDB, Redis, Memcached, Cassandra, Kafka,
+ClickHouse, ZooKeeper, FoundationDB and DNS over TCP. A payload hit always
+beats the server port's guess: `9200` is normally an HTTP API, but a native
+ClickHouse frame on that port is ClickHouse.
+
+The sniff is deliberately shallow. It does not decode requests, methods,
+statuses or statement text; it does not follow TLS beyond the handshake, and it
+does not add user-space uprobes to OpenSSL, Go's `crypto/tls` or rustls. An
+encrypted connection with no visible handshake keeps the port-derived label
+(`https`, `grpc`, ...). Connections that predate the agent, or that carry an
+opaque protocol, fall back to the same port map. The port map is a label, not a
+promise — it is used only where the payload could not decide.
 
 *Fallback* (`/proc/<pid>/net/tcp`) is what the agent used before the eBPF
 collector existed and still runs when the programs cannot be loaded.
@@ -631,9 +652,12 @@ the container on each end when the agent can tell:
 
 Containers also become an edge key, so two containers of one pod talking to the
 same peer are two rows in the store, not one. The node carries the container
-names it runs, as a gauge merged like the replica counts, and the panel under a
-clicked node draws one row per container with the edges anchored on the row that
-owns them; traffic the agent could not attribute stays on the workload card.
+names it runs, as a gauge merged like the replica counts. The one-hop map under
+a clicked node draws a row per container for **every** workload in the drawing,
+not only the one that was clicked, and anchors every edge on the row that owns
+it; traffic the agent could not attribute stays on the workload card. That
+drawing has its own pan and zoom and reports its natural width to the drawer,
+so the panel opens wide enough to read the hop instead of shrinking it.
 
 Two limits are worth stating. A `hostNetwork` pod shares the node's address, so
 an outgoing socket on an ephemeral port can still be credited to the wrong *pod*
@@ -673,12 +697,13 @@ for.
 ### Known limits
 
 Stated rather than hidden, because each one changes how a number on screen
-should be read: there is no L7 parsing, so an edge's
-protocol is inferred from the server port and an edge reports connections, not
-requests; traffic in a pod's own namespace (`localhost`) is ignored; a
-long-lived idle connection is counted when it appears, not re-counted per
-window; and the round-trip time is sampled once, when the connection closes, so
-a connection still open in this window contributes bytes but no latency. Static
+should be read: the protocol sniffer names the wire protocol but does not count
+requests, so an edge still reports connections, not requests, and a TLS socket
+whose payload was never visible keeps its port-derived label; traffic in a
+pod's own namespace (`localhost`) is ignored; a long-lived idle connection is
+counted when it appears, not re-counted per window; and the round-trip time is
+sampled once, when the connection closes, so a connection still open in this
+window contributes bytes but no latency. Static
 pods are owned by their `Node` in `ownerReferences`; treating that as a workload
 would merge every control-plane component on a node into one entry, so it is
 ignored and each pod keeps its own name.

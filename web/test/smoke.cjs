@@ -837,25 +837,64 @@ async function main() {
     cartLines[1],
   );
 
-  // Clicking it opens the panel, where the workload's containers get a row
-  // each and the edges are anchored on the container that owns them.
+  // Clicking it opens the panel. Every workload in the one-hop drawing gets
+  // container rows now — not just the node that was clicked — and each edge is
+  // anchored to the container that actually opened it.
   await cartCard.click();
   await mapPage.waitForSelector('[data-testid="map-panel"][data-state="open"]', { timeout: 10000 });
   await mapPage.waitForSelector('[data-testid="map-container-row"]', { timeout: 10000 });
-  const containerRows = await mapPage
-    .locator('[data-testid="map-container-row"]')
+  const cartRows = await mapPage
+    .locator('[data-testid="map-container-row"][data-node="shop/cart"]')
+    .allInnerTexts();
+  const paymentRows = await mapPage
+    .locator('[data-testid="map-container-row"][data-node="shop/payments"]')
     .allInnerTexts();
   check(
-    containerRows.length === 2 &&
-      containerRows.some((row) => row.includes("istio-proxy")) &&
-      containerRows.some((row) => row.includes("app")),
-    "the panel draws one row per container",
-    JSON.stringify(containerRows),
+    cartRows.length === 2 &&
+      cartRows.some((row) => row.includes("istio-proxy")) &&
+      cartRows.some((row) => row.includes("app")),
+    "the clicked workload draws one row per container",
+    JSON.stringify(cartRows),
   );
   check(
-    (await mapPage.locator('[data-testid="map-neighborhood"] svg path[marker-end]').count()) >= 2,
+    paymentRows.length === 1 && paymentRows[0].includes("app"),
+    "peer workloads draw their containers too",
+    JSON.stringify(paymentRows),
+  );
+  check(
+    (await mapPage.locator('[data-testid="map-neighborhood-edges"] path[marker-end]').count()) >= 2,
     "container rows carry their own edges",
   );
+  const protocols = await mapPage
+    .locator('[data-testid="map-neighborhood-edges"] path[data-protocol]')
+    .evaluateAll((paths) => paths.map((path) => path.dataset.protocol));
+  check(
+    protocols.includes("http") && protocols.includes("grpc"),
+    "edges are labelled with their application protocol",
+    JSON.stringify(protocols),
+  );
+  const autoWidth = await mapPage
+    .locator('[data-testid="map-panel"]')
+    .getAttribute("data-auto-width");
+  check(autoWidth === "true", "the drawer starts at the map's natural width", String(autoWidth));
+
+  const zoomOf = () =>
+    mapPage
+      .locator('[data-testid="map-neighborhood"] > div[data-zoom]')
+      .getAttribute("data-zoom")
+      .then(Number);
+  const zoomBefore = await zoomOf();
+  await mapPage.click('[data-testid="map-neighborhood-zoom-in"]');
+  const zoomIn = await zoomOf();
+  check(zoomIn > zoomBefore, "the neighbourhood zooms in", `${zoomBefore} -> ${zoomIn}`);
+  await mapPage.click('[data-testid="map-neighborhood-fit"]');
+  const zoomFit = await zoomOf();
+  check(
+    Math.abs(zoomFit - zoomBefore) < 0.01,
+    "fit returns the neighbourhood to a readable size",
+    `${zoomIn} -> ${zoomFit}`,
+  );
+
   // The drawer slides in over 300ms; a screenshot taken mid-flight looks like
   // a clipped layout, so let the transition finish first.
   await mapPage.waitForTimeout(400);

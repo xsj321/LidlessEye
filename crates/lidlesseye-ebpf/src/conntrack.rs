@@ -78,6 +78,10 @@ pub struct Flow {
     /// unrelated to the connection). It is what names the container that
     /// dialled, down to the sidecar.
     pub cgroup: u64,
+    /// Bit set of application protocols recognised in the payload. Zero when
+    /// the socket carried nothing parseable; the map then falls back to the
+    /// server port's guess.
+    pub protocols: u32,
 }
 
 impl Flow {
@@ -158,7 +162,7 @@ struct FlowStats {
     rtt_samples: u64,
     cgroup: u64,
     role: u32,
-    pad: u32,
+    protocols: u32,
 }
 
 unsafe impl aya::Pod for FlowStats {}
@@ -342,6 +346,7 @@ fn to_flow(key: &FlowKey, stats: &FlowStats) -> Option<Flow> {
         rtt_us_sum: stats.rtt_us_sum,
         rtt_samples: stats.rtt_samples,
         cgroup: stats.cgroup,
+        protocols: stats.protocols,
     })
 }
 
@@ -442,6 +447,53 @@ mod tests {
         .expect("a dual-stack socket is a flow");
         assert_eq!(flow.local, ("172.18.0.4".parse().unwrap(), 9930));
         assert_eq!(flow.remote, ("10.244.0.1".parse().unwrap(), 6443));
+    }
+
+    /// The bit values are duplicated between Rust and C because the kernel
+    /// object cannot import the Rust enum. A source contract is the cheapest
+    /// way to stop one side drifting; the object is compiled in CI as well.
+    #[test]
+    fn the_probe_and_the_core_agree_on_protocol_bits() {
+        use lidlesseye_core::servicemap::protocol as p;
+        let source = include_str!("../bpf/net.bpf.c");
+        for (name, value) in [
+            ("PROTO_HTTP", p::HTTP),
+            ("PROTO_HTTPS", p::HTTPS),
+            ("PROTO_POSTGRES", p::POSTGRES),
+            ("PROTO_MYSQL", p::MYSQL),
+            ("PROTO_MONGODB", p::MONGODB),
+            ("PROTO_REDIS", p::REDIS),
+            ("PROTO_MEMCACHED", p::MEMCACHED),
+            ("PROTO_CASSANDRA", p::CASSANDRA),
+            ("PROTO_KAFKA", p::KAFKA),
+            ("PROTO_CLICKHOUSE", p::CLICKHOUSE),
+            ("PROTO_ZOOKEEPER", p::ZOOKEEPER),
+            ("PROTO_FOUNDATIONDB", p::FOUNDATIONDB),
+            ("PROTO_HTTP2", p::HTTP2),
+            ("PROTO_DNS", p::DNS),
+            ("PROTO_GRPC", p::GRPC),
+        ] {
+            let expected = format!("#define {name:<17} (1U << {})", value.trailing_zeros());
+            assert!(
+                source.contains(&expected),
+                "{name} changed on one side of the ABI"
+            );
+        }
+        assert!(source.contains("read_send_payload"));
+        assert!(source.contains("stats->protocols |= detected"));
+    }
+
+    #[test]
+    fn a_payload_hit_travels_with_the_flow() {
+        let flow = to_flow(
+            &key([10, 0, 0, 2], [10, 0, 0, 7], 43210, 8080),
+            &FlowStats {
+                protocols: 0x1001, // HTTP and ClickHouse
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(flow.protocols, 0x1001);
     }
 
     #[test]
