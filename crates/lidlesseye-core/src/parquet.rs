@@ -336,6 +336,14 @@ pub(crate) fn refresh_views(conn: &Connection, state: &ParquetState) -> Result<(
     Ok(())
 }
 
+/// The projection used when merging a group of local Parquet files, shared by
+/// the archive write and its test. `union_by_name` lets files written before a
+/// column was added merge with files written after it; naming columns here
+/// would instead make the binder reject any file that predates one of them.
+fn merge_projection(list: &str) -> String {
+    format!("SELECT * FROM read_parquet([{list}], hive_partitioning=false, union_by_name=true)")
+}
+
 /// Free the current wall-clock hour as YYYYMMDDHH (UTC) for file naming.
 fn hour_tag() -> String {
     let secs = SystemTime::now()
@@ -430,10 +438,16 @@ pub(crate) fn archive_local(
                 .collect::<Vec<_>>()
                 .join(", ");
             let key = format!("{}/{}/hour={}.parquet", state.s3_base(), def.name, hour);
+            // `SELECT *` with `union_by_name` is deliberate here, for the same
+            // reason the VIEWs use it: an hour's local files can span an
+            // upgrade, and the older ones predate columns such as `containers`.
+            // Naming those columns explicitly makes the binder reject the whole
+            // merge, so the archive never uploads and the local copies are
+            // never reclaimed. A missing column reads as NULL instead, which
+            // is how the read path already treats it.
             let sql = format!(
-                "COPY (SELECT {cols} FROM read_parquet([{list}], hive_partitioning=false, union_by_name=true)) \
-                 TO '{key}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
-                cols = def.columns,
+                "COPY ({}) TO '{key}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
+                merge_projection(&list),
             );
             conn.execute_batch(&sql)
                 .map_err(|e| Error::Db(format!("uploading {} to S3: {e}", def.name)))?;
@@ -628,6 +642,74 @@ mod tests {
             .query_row("SELECT containers FROM net_nodes", [], |row| row.get(0))
             .unwrap();
         assert_eq!(containers, None, "a column the file predates reads as NULL");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archiving_a_hour_that_spans_an_upgrade_succeeds() {
+        // The S3 failure seen after adding container columns: an hour's local
+        // files include one written before `containers` existed. The archive
+        // merge must read it (missing column -> NULL), not reject it.
+        let dir = std::env::temp_dir().join(format!("ldx-pq-archive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.parquet");
+        let new = dir.join("new.parquet");
+        let merged = dir.join("merged.parquet");
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 1::BIGINT AS bucket_ns, 'a' AS node_id, 7::BIGINT AS connections) \
+             TO '{}' (FORMAT PARQUET)",
+            old.to_string_lossy().replace('\\', "/")
+        ))
+        .unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 2::BIGINT AS bucket_ns, 'b' AS node_id, 9::BIGINT AS connections, \
+             '[\"app\",\"proxy\"]' AS containers) TO '{}' (FORMAT PARQUET)",
+            new.to_string_lossy().replace('\\', "/")
+        ))
+        .unwrap();
+
+        let list = [&old, &new]
+            .iter()
+            .map(|p| format!("'{}'", p.to_string_lossy().replace('\\', "/")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!(
+            "COPY ({}) TO '{}' (FORMAT PARQUET)",
+            merge_projection(&list),
+            merged.to_string_lossy().replace('\\', "/")
+        ))
+        .unwrap();
+
+        let rows: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet('{}', union_by_name=true)",
+                    merged.to_string_lossy().replace('\\', "/")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "both the legacy and the modern row are merged");
+        let nulls: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet('{}', union_by_name=true) \
+                     WHERE containers IS NULL",
+                    merged.to_string_lossy().replace('\\', "/")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            nulls, 1,
+            "the pre-upgrade row keeps a NULL containers column"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
