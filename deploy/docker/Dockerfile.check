@@ -1,0 +1,34 @@
+# Compile gate for the Linux-only crates.
+#
+# Most of `lidlesseye-ebpf` is behind `#[cfg(target_os = "linux")]`, so on a
+# Windows or macOS workstation `cargo check` silently skips the symbolizer, the
+# BPF loader and the collector — the parts where a mistake is expensive. This
+# image compiles them, runs clippy at `-D warnings`, and runs the unit tests
+# that do not need a kernel:
+#
+#     docker build -f deploy/docker/Dockerfile.check -t lidlesseye-check .
+#
+# It is not part of a release; `Dockerfile` builds the shipped image.
+FROM rust:1.98-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        clang llvm libelf-dev libzstd-dev pkg-config ca-certificates git \
+        libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add clippy rustfmt
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+# `rust-embed` needs the dashboard directory to exist; its contents are what the
+# UI stage produces in the real image.
+RUN mkdir -p web/dist && printf '' > web/dist/index.html
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo fmt --all --check \
+    && cargo clippy --workspace --all-targets -- -D warnings \
+    && cargo test -p lidlesseye-ebpf --lib \
+    && cargo test -p lidlesseye-core --lib

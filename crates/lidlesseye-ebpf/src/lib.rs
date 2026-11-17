@@ -35,6 +35,9 @@ mod gopclntab;
 /// Available on every platform: it is a plain snapshot with no eBPF in it, and
 /// the non-Linux build of this crate keeps the same `CollectorConfig` shape.
 pub mod k8s;
+/// Opening the binaries of profiled processes across mount namespaces.
+#[cfg(target_os = "linux")]
+mod module;
 #[cfg(target_os = "linux")]
 mod perf_map;
 #[cfg(target_os = "linux")]
@@ -161,6 +164,12 @@ pub struct StatsSnapshot {
     pub symbol_go: u64,
     /// Frames named through a JIT runtime's perf map.
     pub symbol_jit: u64,
+    /// Frames named from an ELF symbol table that the primary symbolizer could
+    /// not reach, i.e. a file only visible through the target's namespace.
+    pub symbol_module: u64,
+    /// Mappings whose binary could not be opened by any route. A non-zero value
+    /// here is the reason a node full of containers shows `[unknown]`.
+    pub symbol_module_failures: u64,
     /// Unresolved addresses, split by cause. Always zero off Linux.
     pub symbol_unknown: UnknownReasons,
     /// Samples discarded because the process was gone. Always zero off Linux.

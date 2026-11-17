@@ -515,9 +515,19 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
         stats.cpu_records, stats.offcpu_records, stats.drains
     );
     println!(
-        "symbols: {} named frames ({} from DWARF inline info, {} from Go pclntab, {} from JIT maps)",
-        stats.symbol_frames, stats.symbol_inlined, stats.symbol_go, stats.symbol_jit
+        "symbols: {} named frames ({} from DWARF inline info, {} from Go pclntab, {} from ELF symbol tables, {} from JIT maps)",
+        stats.symbol_frames,
+        stats.symbol_inlined,
+        stats.symbol_go,
+        stats.symbol_module,
+        stats.symbol_jit
     );
+    if stats.symbol_module_failures > 0 {
+        println!(
+            "warning: {} binaries could not be opened (paths only visible inside the target's namespace); their frames stay unnamed",
+            stats.symbol_module_failures
+        );
+    }
     let (dropped_reports, dropped_maps) = publisher.drop_stats();
     if dropped_reports > 0 || dropped_maps > 0 {
         println!(

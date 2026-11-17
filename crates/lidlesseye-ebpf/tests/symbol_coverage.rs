@@ -213,8 +213,8 @@ fn reports_symbol_coverage() {
         pct(inlined, frames.max(1)),
     );
     println!(
-        "named without ELF symbols: {} from Go pclntab, {} from JIT perf maps",
-        stats.symbol_go, stats.symbol_jit
+        "named without the primary symbolizer: {} from Go pclntab, {} from the module cache, {} from JIT perf maps ({} unreadable binaries)",
+        stats.symbol_go, stats.symbol_module, stats.symbol_jit, stats.symbol_module_failures
     );
     println!(
         "samples dropped: {} process gone, {} pid not visible, {} empty stack",

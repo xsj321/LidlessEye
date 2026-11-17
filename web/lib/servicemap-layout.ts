@@ -7,17 +7,23 @@
 // points on the left, what they call to their right, and so on. That is how
 // Coroot draws it, and it is what this computes.
 //
-// Pipeline, in order:
+// Pipeline, in order, and it is Coroot's:
 //
-//   1. condense strongly connected components — a service map is full of
-//      cycles (a cache that calls back, two services behind each other's
-//      retry), and ranking a cycle has no answer,
+//   1. break cycles by dropping the back edges a depth-first walk finds — a
+//      service map is full of cycles (a cache that calls back, two services
+//      behind each other's retry) and a cycle has no longest path,
 //   2. rank the resulting DAG by longest path from a source, so a service sits
 //      one column right of everything that feeds it,
 //   3. order each column by the mean position of its neighbours in the column
 //      before (barycenter), twice, which is enough to remove most crossings at
 //      this size,
 //   4. spread each column vertically, centred against the tallest one.
+//
+// Step 1 is the one that decides how the map reads. Collapsing a cycle into a
+// single component — the obvious alternative — puts both halves of a mutual
+// dependency in the same column, where their edges are vertical and the
+// direction is gone. Breaking the loop instead leaves the back edge visible as
+// one long line going left, which is exactly the shape a retry loop has.
 //
 // The gaps come from the canvas rather than from constants, because the graph
 // series fits the node bounding box into the drawing rect with one scale for
@@ -102,37 +108,10 @@ export function layeredLayout(
     incoming[to].push(from);
   }
 
-  const comp = stronglyConnected(count, out);
-  const compCount = Math.max(...comp, 0) + 1;
-
-  // Condensed DAG.
-  const compOut: Set<number>[] = Array.from({ length: compCount }, () => new Set());
-  const compIn: number[] = new Array(compCount).fill(0);
-  for (let from = 0; from < count; from += 1) {
-    for (const to of out[from]) {
-      const a = comp[from];
-      const b = comp[to];
-      if (a === b || compOut[a].has(b)) continue;
-      compOut[a].add(b);
-      compIn[b] += 1;
-    }
-  }
-
-  // Longest path from a source: a service sits right of everything feeding it.
-  const rank = new Array<number>(compCount).fill(0);
-  const ready: number[] = [];
-  for (let c = 0; c < compCount; c += 1) if (compIn[c] === 0) ready.push(c);
-  for (let cursor = 0; cursor < ready.length; cursor += 1) {
-    const current = ready[cursor];
-    for (const next of compOut[current]) {
-      rank[next] = Math.max(rank[next], rank[current] + 1);
-      compIn[next] -= 1;
-      if (compIn[next] === 0) ready.push(next);
-    }
-  }
+  const rank = longestPath(count, breakCycles(count, out));
 
   const columns: number[][] = Array.from({ length: Math.max(...rank, 0) + 1 }, () => []);
-  for (let node = 0; node < count; node += 1) columns[rank[comp[node]]].push(node);
+  for (let node = 0; node < count; node += 1) columns[rank[node]].push(node);
 
   // Start from the busiest, so the first column reads top-down by importance.
   for (const column of columns) {
@@ -211,61 +190,67 @@ function clamp(value: number, low: number, high: number): number {
 }
 
 /**
- * Tarjan's algorithm, iterative: a recursive version would be simpler but the
- * graph is user data and a 600-node chain would be 600 frames deep.
+ * Edges left after a depth-first walk drops every back edge.
  *
- * Returns the component id of every node; all nodes of one cycle share an id.
+ * A back edge is one that points at a node still on the walk's stack, i.e. the
+ * edge that closes a cycle. Dropping them is what turns the graph into a DAG
+ * while keeping every service in a column of its own. Forward and cross edges
+ * pointing at finished nodes are kept: they cannot close a cycle, and they are
+ * real dependencies.
+ *
+ * Iterative on purpose — the graph is user data and a 600-service chain would
+ * be 600 frames deep.
  */
-function stronglyConnected(count: number, out: number[][]): number[] {
-  const index = new Array<number>(count).fill(-1);
-  const low = new Array<number>(count).fill(0);
-  const onStack = new Array<boolean>(count).fill(false);
-  const comp = new Array<number>(count).fill(-1);
-  const stack: number[] = [];
+function breakCycles(count: number, out: number[][]): number[][] {
+  // 0 = unvisited, 1 = on the stack, 2 = finished.
+  const state = new Uint8Array(count);
+  const dag: number[][] = Array.from({ length: count }, () => []);
   const frames: { node: number; next: number }[] = [];
-  let counter = 0;
-  let components = 0;
 
   for (let root = 0; root < count; root += 1) {
-    if (index[root] !== -1) continue;
+    if (state[root] !== 0) continue;
+    state[root] = 1;
     frames.push({ node: root, next: 0 });
     while (frames.length > 0) {
       const frame = frames[frames.length - 1];
-      const node = frame.node;
-      if (frame.next === 0 && index[node] === -1) {
-        index[node] = counter;
-        low[node] = counter;
-        counter += 1;
-        stack.push(node);
-        onStack[node] = true;
+      const peers = out[frame.node];
+      if (frame.next >= peers.length) {
+        state[frame.node] = 2;
+        frames.pop();
+        continue;
       }
-
-      let descended = false;
-      while (frame.next < out[node].length) {
-        const peer = out[node][frame.next];
-        frame.next += 1;
-        if (index[peer] === -1) {
-          frames.push({ node: peer, next: 0 });
-          descended = true;
-          break;
-        }
-        if (onStack[peer]) low[node] = Math.min(low[node], index[peer]);
+      const peer = peers[frame.next];
+      frame.next += 1;
+      if (state[peer] === 1) continue;
+      dag[frame.node].push(peer);
+      if (state[peer] === 0) {
+        state[peer] = 1;
+        frames.push({ node: peer, next: 0 });
       }
-      if (descended) continue;
-
-      if (low[node] === index[node]) {
-        let member = -1;
-        do {
-          member = stack.pop() as number;
-          onStack[member] = false;
-          comp[member] = components;
-        } while (member !== node);
-        components += 1;
-      }
-      frames.pop();
-      const parent = frames[frames.length - 1];
-      if (parent) low[parent.node] = Math.min(low[parent.node], low[node]);
     }
   }
-  return comp;
+  return dag;
+}
+
+/**
+ * Longest path from a source, over a DAG: a service ends up one column right of
+ * the deepest thing that feeds it, which is the rank Coroot assigns.
+ */
+function longestPath(count: number, dag: number[][]): number[] {
+  const indegree = new Array<number>(count).fill(0);
+  for (let from = 0; from < count; from += 1) {
+    for (const to of dag[from]) indegree[to] += 1;
+  }
+  const rank = new Array<number>(count).fill(0);
+  const ready: number[] = [];
+  for (let node = 0; node < count; node += 1) if (indegree[node] === 0) ready.push(node);
+  for (let cursor = 0; cursor < ready.length; cursor += 1) {
+    const current = ready[cursor];
+    for (const next of dag[current]) {
+      rank[next] = Math.max(rank[next], rank[current] + 1);
+      indegree[next] -= 1;
+      if (indegree[next] === 0) ready.push(next);
+    }
+  }
+  return rank;
 }

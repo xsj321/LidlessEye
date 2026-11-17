@@ -111,6 +111,34 @@ The agent owns symbolization (`blazesym`), not the server:
 - results are cached per `(tgid, address)`, and the cache is dropped wholesale
   past 200k entries (a container restart invalidates it anyway).
 
+Addresses `blazesym` cannot name fall back to a module cache that opens the
+binary itself and reads two tables, in this order: the ELF symbol table
+(`.symtab` / `.dynsym`), then the Go function table in `.gopclntab` — which is
+all a `-ldflags="-s -w"` binary has left, and what most of a Kubernetes node is
+built from (containerd, kubelet, kube-proxy, CoreDNS, etcd).
+
+Opening the binary is the part that goes wrong in a cluster. `/proc/<pid>/maps`
+names files as the *target* sees them, and the agent runs in its own mount
+namespace, so `fs::read(path)` fails on every container. Four routes are tried,
+and the plain path is deliberately *not* first: `/usr/local/bin/foo` usually
+exists in the agent's own image too, and symbolizing against that copy produces
+either nothing or names from the wrong build.
+
+1. `/proc/<pid>/root<path>` — the target's namespace; needs ptrace read
+   permission, not `CAP_SYS_ADMIN`, so it works on hardened clusters.
+2. `<host root><path>` — for charts that mount the host filesystem at `/host`.
+3. `path` — correct only when the agent shares the target's namespace.
+4. `/proc/<pid>/map_files/<start>-<end>` — the exact file behind a mapping,
+   deleted files included; requires `CAP_SYS_ADMIN`.
+
+Candidates are matched by **inode**, not by `(device, inode)`: an overlayfs
+reports the same inode under a different `st_dev` than `/proc/<pid>/maps`, so
+requiring both rejects the correct file. A candidate that opens a *different*
+file is discarded rather than used as a last resort. When nothing can be opened,
+the agent logs the path and the routes it tried once per binary and counts it in
+`symbol_module_failures`, which is the number that explains a wall of unnamed
+frames.
+
 Because every frame is resolved *before* storage, a stored batch is
 self-contained: no `vmlinux`, no build ids, no `.debug` files are needed to read
 it back, and a profile of a process that has already exited remains readable.

@@ -136,6 +136,10 @@ pub struct CollectorStats {
     pub symbol_inlined: AtomicU64,
     pub symbol_go: AtomicU64,
     pub symbol_jit: AtomicU64,
+    /// Frames named through the module cache's own ELF symbol table.
+    pub symbol_module: AtomicU64,
+    /// Mappings no route could open, cumulative.
+    pub symbol_module_failed: AtomicU64,
     pub symbol_unknown: Mutex<UnknownReasons>,
     /// Records dropped because the process no longer exists, cumulatively.
     pub skipped: AtomicU64,
@@ -169,6 +173,13 @@ pub struct StatsSnapshot {
     pub symbol_go: u64,
     /// Frames named through a JIT runtime's perf map.
     pub symbol_jit: u64,
+    /// Frames named from an ELF symbol table the primary symbolizer could not
+    /// reach, because the file is only visible through `/proc/<pid>/root`.
+    pub symbol_module: u64,
+    /// Mappings whose binary could not be opened by any route. Non-zero means
+    /// the agent cannot see the files it is profiling, which is the usual
+    /// reason a node full of containers reports `[unknown]`.
+    pub symbol_module_failures: u64,
     /// Unresolved addresses, split by cause.
     pub symbol_unknown: UnknownReasons,
     /// Samples discarded because the process was gone before it could be
@@ -205,6 +216,8 @@ impl CollectorHandle {
             symbol_inlined: self.stats.symbol_inlined.load(Ordering::Relaxed),
             symbol_go: self.stats.symbol_go.load(Ordering::Relaxed),
             symbol_jit: self.stats.symbol_jit.load(Ordering::Relaxed),
+            symbol_module: self.stats.symbol_module.load(Ordering::Relaxed),
+            symbol_module_failures: self.stats.symbol_module_failed.load(Ordering::Relaxed),
             symbol_unknown: *self
                 .stats
                 .symbol_unknown
@@ -643,6 +656,11 @@ where
     stats.symbol_inlined.store(tally.inlined, Ordering::Relaxed);
     stats.symbol_go.store(tally.go, Ordering::Relaxed);
     stats.symbol_jit.store(tally.jit, Ordering::Relaxed);
+    stats.symbol_module.store(tally.module, Ordering::Relaxed);
+    let (_, module_failures) = resolver.module_counts();
+    stats
+        .symbol_module_failed
+        .store(module_failures, Ordering::Relaxed);
     stats.skipped.fetch_add(skipped, Ordering::Relaxed);
     stats.empty_stacks.fetch_add(empty, Ordering::Relaxed);
     stats

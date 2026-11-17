@@ -35,7 +35,7 @@ use blazesym::symbolize::{CodeInfo, Input, Symbolized, Symbolizer};
 use lidlesseye_core::Frame;
 
 use crate::UnknownReasons;
-use crate::gopclntab::GoFallback;
+use crate::module::{ModuleCache, Source as ModuleSource};
 use crate::perf_map::PerfMapFallback;
 
 /// Hard cap on the symbol cache by entry count.
@@ -107,6 +107,10 @@ pub(crate) struct Tally {
     /// empty. Without this fallback every Go binary on a node is a wall of
     /// addresses.
     pub go: u64,
+    /// Frames named from an ELF symbol table that `blazesym` could not reach,
+    /// because the file is only visible through `/proc/<pid>/root`. See
+    /// [`crate::module`].
+    pub module: u64,
     /// Frames named by a JIT runtime's perf map.
     pub jit: u64,
     /// Addresses that came back as `Symbolized::Unknown`.
@@ -120,6 +124,7 @@ impl Tally {
         self.resolved += other.resolved;
         self.inlined += other.inlined;
         self.go += other.go;
+        self.module += other.module;
         self.jit += other.jit;
         self.failed += other.failed;
         self.unknown.unmapped += other.unknown.unmapped;
@@ -144,8 +149,10 @@ pub(crate) struct FrameResolver {
     /// from `user_cache` because it is a bound on *churn*: the entries blazesym
     /// cannot evict are exactly the processes that are already gone.
     processes: std::collections::HashSet<u32>,
-    /// Last resort for binaries without any ELF symbols. See [`crate::gopclntab`].
-    go: GoFallback,
+    /// Last resort for binaries without any ELF symbols, and for binaries whose
+    /// file is only reachable through the target's mount namespace. See
+    /// [`crate::module`].
+    modules: ModuleCache,
     /// Last resort for code that exists in no file at all. See
     /// [`crate::perf_map`].
     perf_map: PerfMapFallback,
@@ -170,7 +177,7 @@ impl FrameResolver {
             user_bytes: 0,
             kernel_bytes: 0,
             processes: std::collections::HashSet::new(),
-            go: GoFallback::new(),
+            modules: ModuleCache::new(),
             perf_map: PerfMapFallback::new(),
             tally: Tally::default(),
             map_files: true,
@@ -185,6 +192,15 @@ impl FrameResolver {
     /// Cumulative tally, for publication through the collector stats.
     pub(crate) fn tally(&self) -> Tally {
         self.tally
+    }
+
+    /// `(binaries parsed, mappings whose file could not be opened)`.
+    ///
+    /// The second number is the diagnostic that matters on a node where every
+    /// frame is `[unknown]`: it separates "the agent cannot see your files"
+    /// from "your binaries really have no symbols".
+    pub(crate) fn module_counts(&self) -> (u64, u64) {
+        self.modules.counts()
     }
 
     /// Drop everything cached for processes that are no longer in the batch.
@@ -209,7 +225,7 @@ impl FrameResolver {
         // The fallbacks keep one map per pid too. Without this they hold the
         // `/proc/<pid>/maps` of every process that ever appeared, long after
         // the process is gone and its pid has been reused.
-        self.go.retain_processes(&alive);
+        self.modules.retain_processes(&alive);
         self.perf_map.retain_processes(&alive);
     }
 
@@ -231,7 +247,7 @@ impl FrameResolver {
             "rebasing symbol caches after too many processes"
         );
         self.symbolizer = Symbolizer::new();
-        self.go = GoFallback::new();
+        self.modules = ModuleCache::new();
         self.perf_map = PerfMapFallback::new();
         self.clear_caches();
         self.processes.clear();
@@ -318,7 +334,7 @@ impl FrameResolver {
                                         // addresses" and "libc has no debug
                                         // info installed".
                                         let module = self
-                                            .go
+                                            .modules
                                             .module_for(tgid, *addr)
                                             .unwrap_or_else(|| "[unknown]".to_string());
                                         vec![unknown_frame(*addr, &module)]
@@ -332,7 +348,7 @@ impl FrameResolver {
                     for addr in addrs.iter().skip(symbols.len()) {
                         tally.unknown.record(&Reason::IgnoredError);
                         let module = self
-                            .go
+                            .modules
                             .module_for(tgid, *addr)
                             .unwrap_or_else(|| "[unknown]".to_string());
                         out.push(vec![unknown_frame(*addr, &module)]);
@@ -360,18 +376,22 @@ impl FrameResolver {
         }
     }
 
-    /// Try the symbol sources that do not need an ELF symbol table.
+    /// Try the symbol sources `blazesym` gave up on.
     ///
-    /// Order matters only for cost: a Go binary never publishes a perf map, and
-    /// a JIT region is never inside a Go function table, so the two are
-    /// disjoint. The Go lookup is tried first because its table is parsed once
-    /// and cached, while the perf map is re-read as the runtime compiles more
-    /// code.
+    /// The module cache comes first: it is the only source that can open a file
+    /// living in another mount namespace, and it covers both cases that matter
+    /// in practice — a stripped Go binary (function table) and an ordinary
+    /// binary whose ELF symbols `blazesym` could not reach. A JIT region is
+    /// never inside a mapped file, and a Go binary never publishes a perf map,
+    /// so the sources are disjoint and the order only affects cost.
     fn fallback_frame(&mut self, tgid: u32, addr: u64, tally: &mut Tally) -> Option<Frame> {
-        if let Some((module, name)) = self.go.resolve(tgid, addr) {
+        if let Some(resolved) = self.modules.resolve(tgid, addr) {
             tally.resolved += 1;
-            tally.go += 1;
-            let mut frame = Frame::new(module, name);
+            match resolved.source {
+                ModuleSource::Go => tally.go += 1,
+                ModuleSource::Symbols => tally.module += 1,
+            }
+            let mut frame = Frame::new(resolved.module, resolved.name);
             frame.addr = addr;
             return Some(frame);
         }
