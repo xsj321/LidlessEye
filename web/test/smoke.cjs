@@ -814,9 +814,15 @@ async function main() {
     "the histogram endpoint returns per-bucket request counts",
     JSON.stringify(mapHist).slice(0, 200),
   );
+  const edgeLabelTexts = await mapPage
+    .locator('[data-testid="service-map-canvas"] svg text')
+    .evaluateAll((nodes) => nodes.map((node) => node.textContent ?? ""));
   check(
-    (await mapPage.locator('[data-testid="service-map-canvas"] svg text').count()) > 0,
-    "the service map labels its seeded edge",
+    edgeLabelTexts.length > 0 &&
+      edgeLabelTexts.some((text) => text.includes("ms")) &&
+      !edgeLabelTexts.some((text) => /1000(ms|µs|s)|0\.00\d*\s*(s|ms|µs)/.test(text)),
+    "edge latencies pick a unit with a digit in the ones place",
+    edgeLabelTexts.join(" | "),
   );
 
   // A workload card is titled with the workload, not with its namespace or an
@@ -861,6 +867,22 @@ async function main() {
     "peer workloads draw their containers too",
     JSON.stringify(paymentRows),
   );
+  // A container row must sit clearly below its workload card, not glued to it:
+  // the two are different things and touching text reads as one cramped block.
+  const selfBox = await mapPage.locator('[data-testid="map-neighborhood-self"]').boundingBox();
+  const firstRowBox = await mapPage
+    .locator('[data-testid="map-container-row"][data-node="shop/cart"]')
+    .first()
+    .boundingBox();
+  check(
+    selfBox != null &&
+      firstRowBox != null &&
+      firstRowBox.y - (selfBox.y + selfBox.height) >= 4,
+    "container rows keep a visible gap below their workload card",
+    selfBox && firstRowBox
+      ? `card bottom ${(selfBox.y + selfBox.height).toFixed(1)} / row top ${firstRowBox.y.toFixed(1)}`
+      : "missing box",
+  );
   check(
     (await mapPage.locator('[data-testid="map-neighborhood-edges"] path[marker-end]').count()) >= 2,
     "container rows carry their own edges",
@@ -894,6 +916,38 @@ async function main() {
     "fit returns the neighbourhood to a readable size",
     `${zoomIn} -> ${zoomFit}`,
   );
+
+  // A peer card in the one-hop map is itself a clickable workload: pressing it
+  // must walk the graph to that workload's own neighbourhood. A pan capture on
+  // the card would swallow the click and leave the panel on cart.
+  const peerCard = mapPage
+    .locator('[data-testid="map-neighborhood-peer"]')
+    .filter({ hasText: "payments" })
+    .first();
+  check((await peerCard.count()) === 1, "the peer workload is a card in the neighbourhood");
+  await peerCard.click();
+  await mapPage.waitForFunction(
+    () =>
+      document.querySelector("#map-panel-title")?.textContent?.trim() === "payments",
+    null,
+    { timeout: 5000 },
+  );
+  check(
+    (await mapPage.locator("#map-panel-title").innerText()).trim() === "payments",
+    "clicking a peer walks the graph to that workload's own neighbourhood",
+  );
+  // Return to cart so the screenshot keeps the sidecar rows in view.
+  const backToCart = mapPage
+    .locator('[data-testid="map-neighborhood-peer"]')
+    .filter({ hasText: "cart" })
+    .first();
+  await backToCart.click();
+  await mapPage.waitForFunction(
+    () => document.querySelector("#map-panel-title")?.textContent?.trim() === "cart",
+    null,
+    { timeout: 5000 },
+  );
+  await mapPage.waitForSelector('[data-testid="map-container-row"]', { timeout: 5000 });
 
   // The drawer slides in over 300ms; a screenshot taken mid-flight looks like
   // a clipped layout, so let the transition finish first.

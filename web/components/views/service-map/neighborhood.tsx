@@ -37,9 +37,14 @@ import { NodeCard } from "./node-card";
 /** How many peers a column shows before it says "+n more". */
 const MAX_PEERS = 6;
 
-const CARD = { height: 36, gap: 10 };
-const ROW = { height: 24, gap: 5, indent: 14 };
-const SIZE = { pad: 12, gapX: 72, minCard: 154, maxCard: 214 };
+// These gaps are generous on purpose. A container row is a *different thing*
+// from the workload card above it, and a peer is a different thing again: when
+// they touch, the eye reads one stack of text instead of a hierarchy. The panel
+// is zoomed to fit, so a few pixels here cost nothing in legibility but buy a
+// clear separation between card, container and neighbour.
+const CARD = { height: 40, gap: 18 };
+const ROW = { height: 26, gap: 9, indent: 18 };
+const SIZE = { pad: 14, gapX: 84, minCard: 168, maxCard: 230 };
 
 const ZOOM = { min: 0.4, max: 2.4, step: 1.22 };
 const MAX_VIEW_HEIGHT = 520;
@@ -400,7 +405,10 @@ export function Neighborhood({
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     const target = event.target as Element | null;
-    if (target?.closest("[data-map-controls]") || target?.closest('[data-testid="map-node"]')) {
+    // A press on a card belongs to the card: capturing it here would retarget
+    // the compatibility click away from the NodeCard, and clicking a peer
+    // would no longer walk the graph to that workload's own neighbourhood.
+    if (target?.closest("[data-map-controls]") || target?.closest("[data-map-card]")) {
       return;
     }
     event.currentTarget.setPointerCapture(event.pointerId);

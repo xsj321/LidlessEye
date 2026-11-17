@@ -162,7 +162,7 @@ export function ServiceGraph({
         // A press on a card belongs to the card: capturing the pointer here
         // would retarget the compatibility click event to this element and the
         // card would never see its own click. Panning starts on the background.
-        if (target?.closest('[data-testid="map-node"]')) return;
+        if (target?.closest("[data-map-card]")) return;
         (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
         drag.current = {
           x: event.clientX,
@@ -187,7 +187,7 @@ export function ServiceGraph({
         // handles its own click), on the background it clears. Checking the
         // target here rather than trusting the click keeps the two from
         // fighting over the same gesture.
-        const onCard = (event.target as Element | null)?.closest('[data-testid="map-node"]');
+        const onCard = (event.target as Element | null)?.closest("[data-map-card]");
         if (state && !state.moved && !onCard) onSelect(null);
       }}
       onPointerCancel={() => {

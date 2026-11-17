@@ -295,16 +295,49 @@ export function formatRate(rate: number): string {
  *
  * The generic formatter is happy to print `0.005s` when a unit two orders of
  * magnitude smaller says `5ms`. An edge label is measured in pixels, so it
- * picks the largest unit that still leaves at least one digit before the dot
- * and drops trailing zeroes.
+ * picks the unit that leaves exactly one non-zero digit in the ones place —
+ * never a leading `0.` and never a four-digit `1000ms` that should have
+ * carried into `1s`.
+ *
+ * The subtlety is rounding: `999.6µs` rounds to `1000µs`, which is the same as
+ * `1ms` but reads worse and loses the digit. So the value is rounded first and
+ * carried into the next unit while it reaches 1000. Working in nanoseconds as
+ * an integer keeps the boundaries exact — floating-point `99.9999` must not
+ * decide the unit by itself.
  */
+const RTT_UNITS = [
+  { ns: 1, suffix: "ns" },
+  { ns: 1_000, suffix: "µs" },
+  { ns: 1_000_000, suffix: "ms" },
+  { ns: 1_000_000_000, suffix: "s" },
+] as const;
+
 export function formatRtt(rttUs: number | undefined): string {
-  if (!rttUs || !Number.isFinite(rttUs)) return "—";
-  const ns = rttUs * 1000;
-  if (ns < 1_000) return `${Math.round(ns)}ns`;
-  if (ns < 1_000_000) return `${measurement(ns / 1_000, ns < 10_000 ? 2 : 1)}µs`;
-  if (ns < 1_000_000_000) return `${measurement(ns / 1_000_000, ns < 10_000_000 ? 2 : 1)}ms`;
-  return `${measurement(ns / 1_000_000_000, 2)}s`;
+  if (rttUs == null || !Number.isFinite(rttUs) || rttUs <= 0) return "—";
+  const ns = Math.round(rttUs * 1000);
+  if (ns <= 0) return "—";
+
+  // Pick the unit whose value sits in [1, 1000): the ones digit is then always
+  // a real number, and the label never starts with `0.`.
+  let index = 0;
+  for (let i = RTT_UNITS.length - 1; i >= 0; i--) {
+    if (ns >= RTT_UNITS[i].ns) {
+      index = i;
+      break;
+    }
+  }
+  // Round to the precision that fits, then carry: `999.6µs -> 1000µs -> 1ms`.
+  // The carry test uses the same digit count the label will print, or a value
+  // printed with no decimals (`999.6`) would slip through as `1000µs`.
+  // Re-evaluating against the original nanoseconds avoids drifting per carry.
+  let value = ns / RTT_UNITS[index].ns;
+  let digits = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  while (index < RTT_UNITS.length - 1 && Number(value.toFixed(digits)) >= 1000) {
+    index += 1;
+    value = ns / RTT_UNITS[index].ns;
+    digits = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  }
+  return `${measurement(value, digits)}${RTT_UNITS[index].suffix}`;
 }
 
 /** What the edge label calls the protocol, including a payload-based hit. */

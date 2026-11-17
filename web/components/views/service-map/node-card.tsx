@@ -86,6 +86,11 @@ export const NodeCard = memo(function NodeCard({
       aria-expanded={selected}
       aria-controls="map-panel"
       data-testid={testId}
+      // Every clickable card carries this marker, on the big map and in the
+      // neighbourhood alike. A pan surface must not capture the pointer on a
+      // card press, or the card's own click never fires — the popup used the
+      // big map's test id for this check and silently lost its node jumps.
+      data-map-card=""
       title={`${label}\n${node.id}${meta ? `\n${meta}` : ""}`}
       onClick={(event) => {
         event.stopPropagation();
