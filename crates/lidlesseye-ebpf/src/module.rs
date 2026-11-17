@@ -87,6 +87,10 @@ pub(crate) struct LoadSegment {
 struct Mapping {
     start: u64,
     end: u64,
+    /// `r-xp` and friends. An instruction pointer that lands in a mapping
+    /// without `x` is not a symbol problem at all: the stack walk produced an
+    /// address that never executed.
+    perms: [u8; 4],
     offset: u64,
     dev: u64,
     inode: u64,
@@ -94,6 +98,12 @@ struct Mapping {
 }
 
 impl Mapping {
+    /// Whether the mapping is executable, i.e. whether an instruction pointer
+    /// could legitimately land in it.
+    fn executable(&self) -> bool {
+        self.perms[2] == b'x'
+    }
+
     /// Identity of the file this mapping was made from, as far as `meta` agrees.
     ///
     /// The inode is the only field that survives a mount namespace unchanged.
@@ -378,6 +388,13 @@ pub(crate) fn go_version_of_for_test(data: &[u8]) -> Option<String> {
     go_version_of(data)
 }
 
+/// `comm` of a pid, trimmed, for a sample line that survives the process.
+fn process_name(tgid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{tgid}/comm"))
+        .map(|name| name.trim().to_string())
+        .unwrap_or_default()
+}
+
 fn read_maps(tgid: u32) -> Option<Vec<Mapping>> {
     let text = std::fs::read_to_string(format!("/proc/{tgid}/maps")).ok()?;
     let mut out = Vec::new();
@@ -392,7 +409,7 @@ fn read_maps(tgid: u32) -> Option<Vec<Mapping>> {
             continue;
         };
         // perms, then offset, dev, inode, then the path.
-        let Some(_perms) = fields.next() else {
+        let Some(perms) = fields.next().filter(|perms| perms.len() == 4) else {
             continue;
         };
         let Some(offset) = fields.next().and_then(|v| u64::from_str_radix(v, 16).ok()) else {
@@ -409,9 +426,12 @@ fn read_maps(tgid: u32) -> Option<Vec<Mapping>> {
         if path.is_empty() || path.starts_with('[') || inode == 0 {
             continue;
         }
+        let mut flags = [b'-'; 4];
+        flags.copy_from_slice(&perms.as_bytes()[..4]);
         out.push(Mapping {
             start,
             end,
+            perms: flags,
             offset,
             dev,
             inode,
@@ -520,6 +540,46 @@ struct CachedModule {
 /// those addresses (stripped, no Go table, or a stale build). The two need
 /// different fixes, and on a cluster the user cannot shell into, the agent has
 /// to name the binary and the reason for them.
+/// One concrete address that stayed an address, with everything needed to
+/// reproduce it on the node: the process, the instruction pointer, and what
+/// `/proc/<pid>/maps` said about that pointer.
+///
+/// A per-binary count says "this file is a problem"; a sample says *which*
+/// address, in *which* process, hit *which* mapping — which is the difference
+/// between a report one can act on and one that needs another round trip.
+#[derive(Clone)]
+pub(crate) struct MissSample {
+    pub pid: u32,
+    /// `/proc/<pid>/comm`, so the line names the process, not just a pid that
+    /// may already be gone by the time somebody reads it.
+    pub comm: String,
+    pub ip: u64,
+    /// The mapping `/proc/<pid>/maps` returned for `ip`, or all zeroes when
+    /// the address is in no file-backed mapping at all.
+    pub perms: [u8; 4],
+    pub start: u64,
+    pub end: u64,
+    pub offset: u64,
+    /// `major << 32 | minor`, as `maps` prints it.
+    pub dev: u64,
+    pub inode: u64,
+    /// Address in the file's own space, when a module was parsed.
+    pub vaddr: Option<u64>,
+    pub cause: &'static str,
+    pub path: String,
+}
+
+/// What a caller knows about one unnamed address beyond the mapping itself.
+struct Miss<'a> {
+    module: Option<&'a Module>,
+    vaddr: Option<u64>,
+    cause: &'static str,
+    route: &'static str,
+}
+
+/// How many addresses per binary are kept as samples.
+const MAX_SAMPLES: usize = 3;
+
 #[derive(Clone)]
 pub(crate) struct ModuleIssue {
     pub path: String,
@@ -537,6 +597,8 @@ pub(crate) struct ModuleIssue {
     pub route: &'static str,
     /// Whether this binary was already named in the log.
     pub reported: bool,
+    /// A few concrete unnamed addresses, for reproducing the problem.
+    pub samples: Vec<MissSample>,
 }
 
 /// How many binaries get an issue entry. A node runs a few hundred binaries and
@@ -553,9 +615,6 @@ pub(crate) struct ModuleCache {
     issues: HashMap<String, ModuleIssue>,
     /// Last value handed out by the use counter.
     tick: u64,
-    /// Modules whose lookups already produced a diagnostic, so the message
-    /// stays readable on a node full of them.
-    misses: HashSet<String>,
     /// Paths already reported as unreadable, so the warning appears once.
     reported: HashSet<String>,
     opened: u64,
@@ -583,7 +642,10 @@ impl ModuleCache {
 
     /// Resolve `addr` of process `tgid` to a symbol name.
     pub(crate) fn resolve(&mut self, tgid: u32, addr: u64) -> Option<Resolved> {
-        let mapping = self.mapping_for(tgid, addr)?;
+        let Some(mapping) = self.mapping_for(tgid, addr) else {
+            self.record_unmapped(tgid, addr);
+            return None;
+        };
         let key = (mapping.dev, mapping.inode);
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
@@ -591,44 +653,63 @@ impl ModuleCache {
             let (module, route) = self.load(tgid, &mapping);
             self.insert(key, module.map(Arc::new), tick, route);
         }
-        let entry = self.modules.get_mut(&key)?;
-        entry.used = tick;
-        let route = entry.route;
-        let module = entry.module.as_ref()?;
-        let bias = module.bias(mapping.start, mapping.offset)?;
-        let vaddr = addr.checked_sub(bias)?;
+        // The entry is cloned out before anything else is recorded: the issue
+        // map needs `&mut self` while the module cache holds a borrow.
+        let (module, route) = {
+            let entry = self.modules.get_mut(&key)?;
+            entry.used = tick;
+            (entry.module.clone(), entry.route)
+        };
+        let Some(module) = module else {
+            self.record(
+                &mapping,
+                tgid,
+                addr,
+                Miss {
+                    module: None,
+                    vaddr: None,
+                    cause: "the file could not be opened through any route",
+                    route: "none",
+                },
+            );
+            return None;
+        };
+        let Some(vaddr) = module
+            .bias(mapping.start, mapping.offset)
+            .and_then(|bias| addr.checked_sub(bias))
+        else {
+            self.record(
+                &mapping,
+                tgid,
+                addr,
+                Miss {
+                    module: None,
+                    vaddr: None,
+                    cause: "the load bias could not be computed",
+                    route,
+                },
+            );
+            return None;
+        };
         let Some((name, source)) = module.lookup(vaddr) else {
-            if self.issues.len() < MAX_ISSUES || self.issues.contains_key(&mapping.path) {
-                let issue =
-                    self.issues
-                        .entry(mapping.path.clone())
-                        .or_insert_with(|| ModuleIssue {
-                            path: mapping.path.clone(),
-                            go_version: module.go_version.clone(),
-                            symbols: module.syms.len(),
-                            has_go: module.go.is_some(),
-                            count: 0,
-                            unreadable: false,
-                            route,
-                            reported: false,
-                        });
-                issue.count += 1;
-            }
-            if tracing::enabled!(tracing::Level::DEBUG)
-                && self.misses.len() < MAX_REPORTED
-                && self.misses.insert(mapping.path.clone())
-            {
-                tracing::debug!(
-                    path = %mapping.path,
-                    addr = format_args!("{addr:x}"),
-                    map = format_args!("{:x}+{:x}", mapping.start, mapping.offset),
-                    bias = format_args!("{bias:x}"),
-                    vaddr = format_args!("{vaddr:x}"),
-                    text = module.go.as_ref().map_or(0, |go| go.text()),
-                    symbols = module.syms.len(),
-                    "address falls in a module that names nothing here"
-                );
-            }
+            let cause = if module.syms.is_empty() && module.go.is_none() {
+                "no ELF symbol table and no Go function table"
+            } else if module.go.is_some() {
+                "the address is outside the Go function table"
+            } else {
+                "the address is outside every ELF symbol"
+            };
+            self.record(
+                &mapping,
+                tgid,
+                addr,
+                Miss {
+                    module: Some(&module),
+                    vaddr: Some(vaddr),
+                    cause,
+                    route,
+                },
+            );
             return None;
         };
         Some(Resolved {
@@ -636,6 +717,96 @@ impl ModuleCache {
             name: name.to_string(),
             source,
         })
+    }
+
+    /// Remember one address that produced no name, with its mapping.
+    fn record(&mut self, mapping: &Mapping, tgid: u32, addr: u64, miss: Miss<'_>) {
+        if self.issues.len() >= MAX_ISSUES && !self.issues.contains_key(&mapping.path) {
+            return;
+        }
+        let sample = MissSample {
+            pid: tgid,
+            comm: process_name(tgid),
+            ip: addr,
+            perms: mapping.perms,
+            start: mapping.start,
+            end: mapping.end,
+            offset: mapping.offset,
+            dev: mapping.dev,
+            inode: mapping.inode,
+            vaddr: miss.vaddr,
+            // An IP in a mapping without `x` never executed. Saying so on the
+            // sample separates "this file has no symbols" (a build problem)
+            // from "the stack walk produced this value" (an unwinding problem)
+            // — the two look identical in a flamegraph.
+            cause: if mapping.executable() {
+                miss.cause
+            } else {
+                "the address is in a mapping that never executes (broken stack walk)"
+            },
+            path: mapping.path.clone(),
+        };
+        let issue = self
+            .issues
+            .entry(mapping.path.clone())
+            .or_insert_with(|| ModuleIssue {
+                path: mapping.path.clone(),
+                go_version: miss.module.and_then(|module| module.go_version.clone()),
+                symbols: miss.module.map_or(0, |module| module.syms.len()),
+                has_go: miss.module.is_some_and(|module| module.go.is_some()),
+                count: 0,
+                unreadable: miss.module.is_none(),
+                route: miss.route,
+                reported: false,
+                samples: Vec::new(),
+            });
+        issue.count += 1;
+        if issue.samples.len() < MAX_SAMPLES {
+            issue.samples.push(sample);
+        }
+    }
+
+    /// Remember an address that is in no file-backed mapping at all.
+    ///
+    /// These never reach a module, so they need a bucket of their own: a
+    /// flamegraph full of addresses with no file behind them is a JIT runtime
+    /// without a perf map, or a stack that was corrupted.
+    fn record_unmapped(&mut self, tgid: u32, addr: u64) {
+        let path = "[unmapped]".to_string();
+        if self.issues.len() >= MAX_ISSUES && !self.issues.contains_key(&path) {
+            return;
+        }
+        let issue = self
+            .issues
+            .entry(path.clone())
+            .or_insert_with(|| ModuleIssue {
+                path: path.clone(),
+                go_version: None,
+                symbols: 0,
+                has_go: false,
+                count: 0,
+                unreadable: false,
+                route: "none",
+                reported: false,
+                samples: Vec::new(),
+            });
+        issue.count += 1;
+        if issue.samples.len() < MAX_SAMPLES {
+            issue.samples.push(MissSample {
+                pid: tgid,
+                comm: process_name(tgid),
+                ip: addr,
+                perms: *b"----",
+                start: 0,
+                end: 0,
+                offset: 0,
+                dev: 0,
+                inode: 0,
+                vaddr: None,
+                cause: "the address is in no file-backed mapping",
+                path,
+            });
+        }
     }
 
     /// File backing `addr` in process `tgid`, whether or not it has symbols.
@@ -746,6 +917,7 @@ impl ModuleCache {
                 unreadable: true,
                 route: "none",
                 reported: false,
+                samples: Vec::new(),
             });
         }
         if self.reported.len() >= MAX_REPORTED || !self.reported.insert(mapping.path.clone()) {
@@ -804,6 +976,73 @@ mod tests {
         assert_eq!(parse_dev("fd:01"), Some((0xfd << 32) | 0x01));
         assert_eq!(parse_dev("00:00"), Some(0));
         assert_eq!(parse_dev("nope"), None);
+    }
+
+    /// A count says "this file is a problem"; the sample says which process and
+    /// which instruction pointer, which is what makes it reproducible.
+    #[test]
+    fn unmapped_addresses_are_recorded_with_pid_and_ip() {
+        let mut cache = ModuleCache::new();
+        let pid = std::process::id();
+        for ip in [0xdead_beef_u64, 0xfeed_face, 0x1000, 0x2000, 0x3000] {
+            cache.record_unmapped(pid, ip);
+        }
+        let issues = cache.issues();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].path, "[unmapped]");
+        assert_eq!(issues[0].count, 5, "every address is counted");
+        assert_eq!(
+            issues[0].samples.len(),
+            MAX_SAMPLES,
+            "but only a few are kept"
+        );
+        let sample = &issues[0].samples[0];
+        assert_eq!(sample.pid, pid);
+        assert_eq!(sample.ip, 0xdead_beef);
+        assert!(
+            !sample.comm.is_empty(),
+            "the process is named, not just a pid"
+        );
+        assert_eq!(sample.inode, 0, "there is no file behind it");
+    }
+
+    /// An address in a read-only data mapping is not an instruction pointer:
+    /// the sample has to say so, or a broken stack walk looks like a missing
+    /// symbol table.
+    #[test]
+    fn a_sample_in_a_non_executable_mapping_blames_the_stack_walk() {
+        let mut cache = ModuleCache::new();
+        let mapping = Mapping {
+            start: 0x7f00_0000,
+            end: 0x7f01_0000,
+            perms: *b"rw-p",
+            offset: 0x1000,
+            dev: 0x8_0000_0001,
+            inode: 42,
+            path: "/usr/bin/app".to_string(),
+        };
+        cache.record(
+            &mapping,
+            std::process::id(),
+            0x7f00_1234,
+            Miss {
+                module: None,
+                vaddr: Some(0x1234),
+                cause: "no ELF symbol table and no Go function table",
+                route: "proc-root",
+            },
+        );
+        let issues = cache.issues();
+        assert_eq!(issues.len(), 1);
+        let sample = &issues[0].samples[0];
+        assert_eq!(sample.perms, *b"rw-p");
+        assert_eq!(sample.offset, 0x1000);
+        assert_eq!(sample.inode, 42);
+        assert!(
+            sample.cause.contains("never executes"),
+            "cause was {}",
+            sample.cause
+        );
     }
 
     #[test]
@@ -933,6 +1172,7 @@ mod tests {
         let mapping = Mapping {
             start: 0x1000,
             end: 0x2000,
+            perms: *b"r-xp",
             offset: 0,
             dev: 1,
             inode: 2,

@@ -242,6 +242,15 @@ impl FrameResolver {
             );
         }
         for issue in self.modules.take_new_issues(MAX_LINES) {
+            if issue.path.starts_with('[') {
+                tracing::warn!(
+                    frames = issue.count,
+                    "addresses in no file-backed mapping stay unnamed (a JIT runtime without a \
+                     perf map, or a broken frame-pointer chain)"
+                );
+                log_samples(&issue);
+                continue;
+            }
             let cause = if issue.unreadable {
                 "the file could not be opened through any route"
             } else if issue.symbols == 0 && !issue.has_go {
@@ -261,6 +270,7 @@ impl FrameResolver {
                 cause,
                 "frames from this binary stay unnamed"
             );
+            log_samples(&issue);
         }
     }
 
@@ -575,6 +585,33 @@ impl FrameResolver {
             }
         }
         out
+    }
+}
+
+/// One line per sample: pid, process name, the instruction pointer, and exactly
+/// what `/proc/<pid>/maps` said about it.
+///
+/// This is the difference between "some frames are unnamed" and a report
+/// somebody can reproduce: the pid and ip can be checked on the node, and the
+/// mapping line says whether the file was found, and which one it was.
+fn log_samples(issue: &crate::module::ModuleIssue) {
+    for sample in &issue.samples {
+        tracing::info!(
+            path = %sample.path,
+            pid = sample.pid,
+            comm = %sample.comm,
+            ip = format_args!("{:x}", sample.ip),
+            perms = %String::from_utf8_lossy(&sample.perms),
+            map = format_args!("{:x}-{:x}+{:x}", sample.start, sample.end, sample.offset),
+            dev = format_args!("{:x}:{:x}", sample.dev >> 32, sample.dev & 0xffff_ffff),
+            inode = sample.inode,
+            vaddr = sample
+                .vaddr
+                .map(|vaddr| format!("{vaddr:x}"))
+                .unwrap_or_else(|| "-".to_string()),
+            cause = sample.cause,
+            "unnamed frame sample"
+        );
     }
 }
 

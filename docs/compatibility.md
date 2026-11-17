@@ -135,6 +135,24 @@ WARN frames from this binary stay unnamed path=/usr/local/bin/lidlesseye go="-" 
      symbols=0 go_table=false frames=3 cause="no ELF symbol table and no Go function table"
 ```
 
+Each offending binary is followed by up to three samples — the pid, the
+process name, the instruction pointer and the mapping `maps` returned for it —
+so a report can be reproduced on the node without another round trip:
+
+```text
+INFO unnamed frame sample path=/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30 pid=185768 comm=lidlesseye \
+     ip=7a4b77a6bdf0 map=7a4b77a6b000-7a4b77b6c000+99000 dev=0:18e inode=310569 vaddr="99df0" \
+     cause="the address is outside every ELF symbol"
+```
+
+The sample carries the mapping's permissions too. An `ip` in a mapping without
+`x` — or in **no** mapping at all, which is labelled `[unmapped]` — is the
+stack walk, not the symbols: a process built without frame pointers hands
+`bpf_get_stackid` a broken chain, and the kernel reports whatever the chain
+pointed at (a heap string, the value `2`, a block of machine code). Those
+frames can never be named by any symbolizer, and `cause` says so instead of
+sending the reader after a build flag that would not have helped.
+
 The summary says how much was named and by which source (`go` is `.gopclntab`,
 `elfless` is the module fallback for files blazesym cannot reach), how many
 addresses stayed unnamed, how many binaries were parsed and how many could not

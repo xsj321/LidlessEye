@@ -170,11 +170,6 @@ impl GoTable {
         None
     }
 
-    /// Address `entryOff` values are relative to, for diagnostics.
-    pub(crate) fn text(&self) -> u64 {
-        self.text
-    }
-
     /// Name of the function containing `vaddr`, if any.
     pub(crate) fn lookup(&self, vaddr: u64) -> Option<&str> {
         let off = u32::try_from(vaddr.checked_sub(self.text)?).ok()?;
