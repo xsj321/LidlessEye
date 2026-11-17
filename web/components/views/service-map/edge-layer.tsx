@@ -112,6 +112,13 @@ export interface EdgeLayerProps {
    * `boxes` and its workload cards here.
    */
   avoid?: Box[];
+  /**
+   * Draw the curves above the cards instead of behind them. The neighbourhood
+   * anchors a hop on a container row's edge, which sits a few pixels inside the
+   * card's border: behind the card, that last stretch would be swallowed by the
+   * card's fill and the line would look like it stopped at the card after all.
+   */
+  above?: boolean;
   width: number;
   height: number;
   testId?: string;
@@ -124,6 +131,7 @@ export function EdgeLayer({
   selected,
   showLabels = true,
   avoid,
+  above = false,
   width,
   height,
   testId,
@@ -165,7 +173,11 @@ export function EdgeLayer({
 
   return (
     <svg
-      className="pointer-events-none absolute left-0 top-0 overflow-visible"
+      className={
+        above
+          ? "pointer-events-none absolute left-0 top-0 z-30 overflow-visible"
+          : "pointer-events-none absolute left-0 top-0 overflow-visible"
+      }
       width={width}
       height={height}
       data-testid={testId}

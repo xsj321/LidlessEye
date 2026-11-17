@@ -34,7 +34,9 @@ import {
   NeighborCard,
   neighborCardHeight,
   neighborRowCenter,
+  neighborRowLeft,
   neighborRowOffset,
+  neighborRowRight,
 } from "./neighbor-card";
 import type { NeighborContainer } from "./neighbor-card";
 
@@ -94,11 +96,12 @@ interface Layout {
   cards: Map<string, Box>;
   /**
    * Edge endpoints. Every container row has two point-sized anchors: `<key>@out`
-   * on the card's right border and `<key>@in` on its left, matching the two
-   * ports drawn on the card. A curve leaves a source's `@out` and lands on a
-   * target's `@in`, so it runs container-to-container at the row's own height.
+   * on the row's right edge and `<key>@in` on its left, matching the two ports
+   * drawn on that row. A curve leaves a source row's `@out` and lands on a
+   * target row's `@in`, so it runs container-to-container at the row's own
+   * height and terminates on the container, not on the workload card.
    * Workloads whose edge could not be attributed to a container get `<id>@out`
-   * / `<id>@in` at the card's vertical centre.
+   * / `<id>@in` on the card's header edge.
    */
   anchors: Map<string, Box>;
   rows: NeighborRow[];
@@ -394,10 +397,12 @@ export function Neighborhood({
         const key = rowId(id, name);
         const offset = neighborRowOffset(index);
         const centre = card.y + neighborRowCenter(index);
-        // The out port is the circle on the card's right border, the in port
-        // the one on its left — the exact points NeighborCard draws.
-        anchors.set(`${key}@out`, port(card.x + card.w, centre));
-        anchors.set(`${key}@in`, port(card.x, centre));
+        // A container's endpoints are its **own** pane edges, not the card's
+        // borders: the row is what holds the connection, so the line has to
+        // land on the row. The drawer keeps these two numbers equal to the
+        // dots NeighborCard draws (NEIGHBOR_CARD.indent / rightPad).
+        anchors.set(`${key}@out`, port(card.x + neighborRowRight(card.w), centre));
+        anchors.set(`${key}@in`, port(card.x + neighborRowLeft(), centre));
         rowNames.set(key, name);
         rows.push({ id: key, ownerId: id, name, offset });
       });
@@ -684,6 +689,12 @@ export function Neighborhood({
               // Container ports are edge endpoints, not obstacles: a label
               // only has to clear the card that owns them.
               avoid={[...layout.cards.values()]}
+              // A hop now ends on a container row, which is a few pixels
+              // inside the card border. Behind the card that terminal stretch
+              // would be covered by the card's translucent fill, so the curves
+              // go above it — only the last few pixels ever overlap a card,
+              // and the labels keep clearing them either way.
+              above
               windowSec={windowSec}
               // Container rows are not nodes: highlighting by id would dim every
               // edge that ends on one, so the panel leaves the whole hop lit.

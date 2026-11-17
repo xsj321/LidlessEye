@@ -282,15 +282,19 @@ is legible without a legend, and a side with no peers is dropped entirely
 rather than leaving an empty column.
 
 **Edges run container to container.** Each container row draws a small port on
-the border it faces — `out` on the right of a caller, `in` on the left of a
-callee, both on the selected workload. The row is inset by only a few pixels,
-so the port sits against its own row and needs no stub to claim it. The curve leaves the caller container's `out` port and lands on the
-callee container's `in` port, at the row's own height, so a sidecar's traffic
-visibly starts and ends at the sidecars rather than at the workload boxes. Ports
-are strict: a row that only receives draws no `out` port, so a callee's dead end
-never looks like it dials out. Traffic the agent could not attribute to any
-container falls back to a port on the workload's **header edge**, where the name
-is, instead of the middle of the body where it would strike through the rows.
+its **own left and right edge** — `out` beside the container on the right, `in`
+on the left of a callee, both on the selected workload's rows. The endpoint is
+the row, not the workload card: the container is what holds a connection, so a
+hop has to start and end on the pane that represents it. Because the row is
+inset a few pixels inside the card, the edge layer for this drawing is rendered
+*above* the cards — behind them, the terminal stretch would be swallowed by the
+card's translucent fill and the line would look like it stopped at the card
+border after all. Ports are strict: a row that only receives draws no `out`
+port, so a callee's dead end never looks like it dials out, and a row with a
+port on one side takes that much extra text padding so the dot never covers the
+rate. Traffic the agent could not attribute to any container falls back to a
+port on the workload's **header edge**, where the name is, instead of the middle
+of the body where it would strike through the rows.
 Labels clear the workload cards, not the rows inside them, and stay in the
 channel between columns. The hop has its own scroll-to-zoom, drag-to-pan and
 zoom buttons, with a *fit* action that returns to a readable whole-hop view.

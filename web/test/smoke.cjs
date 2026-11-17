@@ -952,9 +952,11 @@ async function main() {
     .locator('[data-testid="map-neighborhood-self"] [data-container-port]')
     .count();
   check(ports > 0, "container rows draw connection ports", String(ports));
-  // A port must sit on its own row's centre line and on the card border. The
-  // port layer used to live inside the padded list, which shifted every port
-  // down by the header height and left a stray pair below the card.
+  // A port must sit on its own row's centre line and on the **row's** edge, not
+  // on the card border: the row is the container, so that is where a hop has to
+  // terminate. The port layer used to live inside the padded list, which
+  // shifted every port down by the header height and left a stray pair below
+  // the card.
   const portGeometry = await mapPage.evaluate(() =>
     [...document.querySelectorAll('[data-container-port]')].map((el) => {
       const portRect = el.getBoundingClientRect();
@@ -967,14 +969,19 @@ async function main() {
       const rowRect = row?.getBoundingClientRect();
       const cardRect = card?.getBoundingClientRect();
       const side = el.dataset.containerPort;
+      const portX = portRect.x + portRect.width / 2;
       return {
         side,
         dy: rowRect
           ? Math.abs(portRect.y + portRect.height / 2 - (rowRect.y + rowRect.height / 2))
           : null,
-        dx: cardRect
-          ? Math.abs(
-              portRect.x + portRect.width / 2 - (side === "out" ? cardRect.right : cardRect.left),
+        // Distance from the port centre to the row edge it belongs to.
+        dx: rowRect ? Math.abs(portX - (side === "out" ? rowRect.right : rowRect.left)) : null,
+        // How far that edge sits inside the card's own border. Zero would mean
+        // the port is still on the card, which is exactly what this guards.
+        inset: rowRect && cardRect
+          ? Math.round(
+              side === "out" ? cardRect.right - rowRect.right : rowRect.left - cardRect.left,
             )
           : null,
       };
@@ -982,8 +989,10 @@ async function main() {
   );
   check(
     portGeometry.length > 0 &&
-      portGeometry.every((p) => p.dy != null && p.dy <= 2 && p.dx != null && p.dx <= 2.5),
-    "each port sits on its row's centre line and on the card border",
+      portGeometry.every(
+        (p) => p.dy != null && p.dy <= 2 && p.dx != null && p.dx <= 2.5 && (p.inset ?? 0) >= 3,
+      ),
+    "each port sits on its own container row's edge, inside the card",
     JSON.stringify(portGeometry),
   );
   const protocols = await mapPage

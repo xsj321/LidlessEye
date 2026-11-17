@@ -21,12 +21,13 @@
 //     padding and font weight never change, so a card does not jump when it
 //     becomes the selected node.
 //
-// Each container row carries a port on the card border it faces: a caller
-// exposes `out` on its right, a callee exposes `in` on its left, and the
-// selected workload exposes both. The edge layer anchors lines at those exact
-// points, and the layout aligns a peer's port to the row it talks to, so the
-// curve between two containers is horizontal and unmistakably container to
-// container — not card to card.
+// Each container row carries a port on **its own** left and right edge — not
+// on the card's border: a caller exposes `out` beside the container name, a
+// callee exposes `in` on the other side, and the selected workload exposes
+// both. The edge layer anchors lines at those exact points, so a curve starts
+// on the pane that owns the connection and ends on the pane that serves it.
+// Traffic the agent could not attribute to a container keeps a port on the
+// card's header edge, where the workload's name is.
 //
 // The geometry below is shared with neighborhood.tsx: change a constant here
 // and both the ports and the edge anchors move with it.
@@ -58,15 +59,25 @@ export const NEIGHBOR_CARD = {
   padBottom: 14,
   /**
    * How far a container row is inset from the card's side edges — and the
-   * header's own padding, so the title and the rows share one left edge. Kept
-   * small on purpose: the row runs nearly to the border, so a port on the
-   * border reads as that row's terminal without a connector line.
+   * header's own padding, so the title and the rows share one left edge. This
+   * is also where the row's ports sit: the row's edge is the endpoint of a
+   * connection, so the dot belongs on the pane, not on the card border.
    */
   indent: 8,
   rightPad: 8,
-  /** Radius of the port circles that sit on the card's left/right borders. */
+  /** Radius of the port circles on a container row's left/right edge. */
   portRadius: 4,
 } as const;
+
+/** X of a container row's left edge, relative to the card's left edge. */
+export function neighborRowLeft(): number {
+  return NEIGHBOR_CARD.border + NEIGHBOR_CARD.indent;
+}
+
+/** X of a container row's right edge, relative to the card's left edge. */
+export function neighborRowRight(cardWidth: number): number {
+  return cardWidth - NEIGHBOR_CARD.border - NEIGHBOR_CARD.rightPad;
+}
 
 /** Height a card needs for a given number of container rows. */
 export function neighborCardHeight(containerCount: number): number {
@@ -263,8 +274,10 @@ export const NeighborCard = memo(function NeighborCard({
           {/* Ports live in their own card-relative layer. They must not sit
               inside the list: `top` is measured from the card's top, and a
               relatively positioned list starts below the header, which would
-              push every port down by the header height. */}
-          <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-0">
+              push every port down by the header height. They paint above the
+              panes so the dot reads as attached to the row's edge rather than
+              hidden under it. */}
+          <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-20">
             {containers.map((container, index) => {
               if (container.more) return null;
               const center = neighborRowCenter(index);
@@ -273,9 +286,9 @@ export const NeighborCard = memo(function NeighborCard({
               const hasIn = container.ports?.in === true;
               const hasOut = container.ports?.out === true;
               if (!hasIn && !hasOut) return null;
-              // No stub joins the port to its row: the row is inset by only
-              // 8px, so the dot already sits against its own row. A hairline
-              // there was a line saying what the gap already said.
+              // The dot is centred on the pane's own edge, so the edge layer's
+              // anchor — and therefore the line — terminates on the container
+              // element. No stub joins dot to row: the dot *is* the row's edge.
               return (
                 <Fragment key={container.name}>
                   {hasIn ? (
@@ -285,7 +298,7 @@ export const NeighborCard = memo(function NeighborCard({
                       data-container={container.name}
                       className="absolute rounded-full border-[1.5px]"
                       style={{
-                        left: -NEIGHBOR_CARD.portRadius,
+                        left: neighborRowLeft() - NEIGHBOR_CARD.portRadius,
                         top: center - NEIGHBOR_CARD.portRadius,
                         width: NEIGHBOR_CARD.portRadius * 2,
                         height: NEIGHBOR_CARD.portRadius * 2,
@@ -300,7 +313,10 @@ export const NeighborCard = memo(function NeighborCard({
                       data-container={container.name}
                       className="absolute rounded-full border-[1.5px]"
                       style={{
-                        right: -NEIGHBOR_CARD.portRadius,
+                        right:
+                          box.w -
+                          neighborRowRight(box.w) -
+                          NEIGHBOR_CARD.portRadius,
                         top: center - NEIGHBOR_CARD.portRadius,
                         width: NEIGHBOR_CARD.portRadius * 2,
                         height: NEIGHBOR_CARD.portRadius * 2,
@@ -344,11 +360,11 @@ export const NeighborCard = memo(function NeighborCard({
                 data-node={node.id}
                 data-container={container.name}
                 // A pane of glass resting on the card, not a box drawn in it:
-                // a translucent white gradient, a lit top edge and a shadow
-                // underneath. The lift says "part of the workload above",
-                // which is more than the old border and spine managed.
+                // a translucent surface with a shadow underneath. The lift
+                // says "part of the workload above", which is more than the
+                // old border and spine managed.
                 className={cn(
-                  "relative flex items-center gap-1.5 rounded-[7px] px-2",
+                  "relative flex items-center gap-1.5 rounded-[7px]",
                   "bg-white/[0.10] backdrop-blur-[3px]",
                   // The lift is a cast shadow, not a lit edge: a hairline along
                   // the top of every row would be the same divider this change
@@ -358,6 +374,17 @@ export const NeighborCard = memo(function NeighborCard({
                 style={{
                   height: NEIGHBOR_CARD.rowHeight,
                   marginBottom: index < containers.length - 1 ? NEIGHBOR_CARD.rowGap : 0,
+                  // A port eats half of the row's padding where it sits, so
+                  // the text gets that half back: without it the rate ends up
+                  // touching the dot on a busy row.
+                  paddingLeft:
+                    container.ports?.in === true
+                      ? NEIGHBOR_CARD.indent + NEIGHBOR_CARD.portRadius
+                      : NEIGHBOR_CARD.indent,
+                  paddingRight:
+                    container.ports?.out === true
+                      ? NEIGHBOR_CARD.rightPad + NEIGHBOR_CARD.portRadius
+                      : NEIGHBOR_CARD.rightPad,
                 }}
                 title={`${label} · ${container.name}`}
               >
