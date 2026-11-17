@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or usage help
+    url: https://github.com/xsj321/LidlessEye/blob/master/docs/USAGE.md
+    about: The step-by-step guide covers the dashboard, ranges, filters and the CLI.
+  - name: Deployment and chart options
+    url: https://github.com/xsj321/LidlessEye/blob/master/docs/deployment.md
+    about: Storage modes, S3 archiving, retention, quotas and the full values list.
+  - name: Security issue
+    url: https://github.com/xsj321/LidlessEye/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue.

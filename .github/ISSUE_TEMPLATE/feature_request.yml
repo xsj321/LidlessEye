@@ -1,0 +1,48 @@
+name: Feature request
+description: A capability that is missing, or a behaviour that should change.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `docs/architecture.md` and the *Limits* section of the README list what
+        is deliberately out of scope today — allocation profiling, clustering,
+        non-Linux collection. If your idea is on that list, saying why the
+        constraint no longer holds is the most useful thing you can write.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to answer or do, and what blocks it today? Describe the situation, not the implementation.
+      placeholder: |
+        I cannot tell which *container* of a workload opened a connection to a
+        database; the map shows the workload and I have to guess between the
+        app and its sidecar.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would expect
+      description: The behaviour you want, in terms of what you would see or what the API would return.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today
+      description: A workaround, another tool, or a query you run by hand. This tells us how much the feature is worth.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Agent / eBPF collection
+        - Server API
+        - Storage
+        - Dashboard
+        - Deployment / Helm
+        - Documentation

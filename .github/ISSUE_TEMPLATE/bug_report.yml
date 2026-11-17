@@ -1,0 +1,71 @@
+name: Bug report
+description: Something is wrong — a wrong number, a crash, a broken view.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: please check `docs/` for the behaviour you expect, and
+        run `lidlesseye version`. If this is a security issue, close this form
+        and use [private reporting](../security/advisories/new) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The behaviour you saw, and the behaviour you expected.
+      placeholder: |
+        Clicking a caller in the neighbourhood highlights the node instead of
+        opening that node's own neighbourhood.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Commands, clicks, or a request that shows the problem. A curl with the URL and the response is ideal for API issues.
+      placeholder: |
+        1. `helm install ...` / `lidlesseye serve --agent --data-dir ./data`
+        2. open http://localhost:4040, click `shop/cart` on the map
+        3. click the `payments` card
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `lidlesseye version`, or the image tag.
+      placeholder: 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Where is it
+      multiple: true
+      options:
+        - Agent / eBPF collection
+        - Server API
+        - Storage (DuckDB or Parquet/S3)
+        - Dashboard
+        - Helm chart or container image
+        - Documentation
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Kernel, distribution, CPU architecture, and whether this is Kubernetes (with version) or a bare host.
+      placeholder: Ubuntu 24.04, 6.8.0, x86_64, k3s v1.31
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Server or agent output around the failure. `RUST_LOG=lidlesseye=debug` for API problems; the browser console for dashboard problems.
+      render: shell

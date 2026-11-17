@@ -4,11 +4,13 @@
 
 **面向 Linux 的持续性能分析 —— 单个 Rust 二进制、eBPF 采集、DuckDB 存储，打开页面即是服务地图。**
 
+[![CI](https://github.com/xsj321/LidlessEye/actions/workflows/ci.yml/badge.svg)](https://github.com/xsj321/LidlessEye/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/xsj321/LidlessEye?sort=semver&color=blue)](https://github.com/xsj321/LidlessEye/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](crates)
 [![DuckDB](https://img.shields.io/badge/storage-DuckDB%202.0-yellow.svg)](crates/lidlesseye-core)
 
-[English](README.md) · [中文](README.zh-CN.md) · [Step-by-step usage](docs/USAGE.md) · [使用指南（中文）](docs/USAGE.zh-CN.md)
+[English](README.md) · [中文](README.zh-CN.md) · [Step-by-step usage](docs/USAGE.md) · [使用指南（中文）](docs/USAGE.zh-CN.md) · [更新日志](CHANGELOG.md)
 
 </div>
 
@@ -196,6 +198,24 @@ cargo fmt --all --check
 - **单机存储**：一个存储卷对应一个服务端，没有集群或复制。
 - **暂不支持动态追踪**：目前只有 CPU 和 off-CPU，uprobe 与分配分析是后续工作。
 - **用户态调用栈需要 frame pointers**（`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`）。没有它们时耗时统计依然正确。
+
+## 文档
+
+| 文档 | 回答什么 |
+| --- | --- |
+| [使用指南](docs/USAGE.zh-CN.md) · [English](docs/USAGE.md) | 看板、时间范围、筛选、CLI，上手第一小时 |
+| [架构](docs/architecture.md) | eBPF 采集、导入、DuckDB 与服务地图如何串起来，以及为什么这样选 |
+| [HTTP API](docs/api.md) | 每个端点、参数与返回结构 |
+| [部署](docs/deployment.md) | Helm values、存储模式、S3 归档、保留期、配额 |
+| [看板与 UI 规则](docs/ui.md) | 每个视图展示什么，以及前端必须遵守的设计规则 |
+| [嵌入](docs/embedding.md) | 把服务端当作 Rust crate 使用 |
+| [多租户](docs/multi-tenancy.md) | token、`X-Scope-OrgID` 与隔离保证 |
+| [兼容性](docs/compatibility.md) | 内核、发行版、Kubernetes 版本 |
+| [更新日志](CHANGELOG.md) | 每个版本改了什么 |
+
+## 参与贡献
+
+欢迎提 issue 和 pull request。[CONTRIBUTING.md](CONTRIBUTING.md) 说明了改动必须通过的检查与看板的设计规则；[SECURITY.md](SECURITY.md) 说明如何私下报告安全问题。发布由 tag 驱动 —— `git tag v0.1.0 && git push origin v0.1.0` —— `.github/workflows/release.yml` 会发布说明与 Helm chart。
 
 ## 许可证
 

@@ -1,0 +1,37 @@
+version: 2
+
+# Two ecosystems, two schedules. The Rust crates move together because aya and
+# the DuckDB binding both pin kernel- and ABI-level details; the npm packages
+# are grouped so one Tailwind bump is one pull request instead of eight.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+    ignore:
+      # A DuckDB bump changes the on-disk format and the C++ ABI; it is a
+      # deliberate upgrade with a migration note, not a weekly patch.
+      - dependency-name: duckdb
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      dashboard-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

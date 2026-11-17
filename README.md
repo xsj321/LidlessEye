@@ -4,11 +4,13 @@
 
 **Continuous profiling for Linux — one Rust binary, eBPF collection, DuckDB storage, and a dashboard that opens on your service map.**
 
+[![CI](https://github.com/xsj321/LidlessEye/actions/workflows/ci.yml/badge.svg)](https://github.com/xsj321/LidlessEye/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/xsj321/LidlessEye?sort=semver&color=blue)](https://github.com/xsj321/LidlessEye/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](crates)
 [![DuckDB](https://img.shields.io/badge/storage-DuckDB%202.0-yellow.svg)](crates/lidlesseye-core)
 
-[English](README.md) · [中文](README.zh-CN.md) · [Step-by-step usage](docs/USAGE.md) · [使用指南（中文）](docs/USAGE.zh-CN.md)
+[English](README.md) · [中文](README.zh-CN.md) · [Step-by-step usage](docs/USAGE.md) · [使用指南（中文）](docs/USAGE.zh-CN.md) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -201,6 +203,28 @@ The browser test seeds two tenants and fails on any console error, so a renderin
 - **Per-host storage**: one server per volume; no clustering or replication.
 - **No dynamic tracing yet**: CPU and off-CPU only — uprobes and allocation profiling are future work.
 - **User stacks need frame pointers** (`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`). The profiled time is still correct without them.
+
+## Documentation
+
+| Document | What it answers |
+| --- | --- |
+| [Step-by-step usage](docs/USAGE.md) · [中文](docs/USAGE.zh-CN.md) | the dashboard, ranges, filters, the CLI, first hour with the tool |
+| [Architecture](docs/architecture.md) | how eBPF collection, ingest, DuckDB and the service map fit together, and why |
+| [HTTP API](docs/api.md) | every endpoint, parameter and response shape |
+| [Deployment](docs/deployment.md) | Helm values, storage modes, S3 archiving, retention, quotas |
+| [Dashboard and UI rules](docs/ui.md) | what each view shows, and the design rules the front end is held to |
+| [Embedding](docs/embedding.md) | using the server as a Rust crate |
+| [Multi-tenancy](docs/multi-tenancy.md) | tokens, `X-Scope-OrgID`, isolation guarantees |
+| [Compatibility](docs/compatibility.md) | kernels, distributions, Kubernetes versions |
+| [Changelog](CHANGELOG.md) | what changed in each release |
+
+## Contributing
+
+Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) lists the
+gates a change has to pass and the design rules the dashboard is held to;
+[SECURITY.md](SECURITY.md) explains how to report a vulnerability privately.
+Releases are tag-driven — `git tag v0.1.0 && git push origin v0.1.0` — and the
+workflow in `.github/workflows/release.yml` publishes the notes and the chart.
 
 ## License
 

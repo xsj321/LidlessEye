@@ -1,0 +1,74 @@
+name: Release
+
+# Publishing is tag-driven: `git tag v0.1.0 && git push origin v0.1.0`.
+#
+# The notes come from the matching `CHANGELOG.md` section rather than from a
+# generated commit list — a release is what changed for the operator, not what
+# changed in the tree. The chart is attached so the release can be installed
+# without cloning.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag against the declared versions
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          chart="$(sed -n 's/^version: \(.*\)/\1/p' deploy/helm/lidlesseye/Chart.yaml | head -n1)"
+          ui="$(sed -n 's/^ *"version": "\(.*\)",*$/\1/p' web/package.json | head -n1)"
+          echo "tag=$tag cargo=$manifest chart=$chart ui=$ui"
+          for candidate in "$manifest" "$chart" "$ui"; do
+            if [ "$candidate" != "$tag" ]; then
+              echo "::error::version mismatch: tag is $tag but a manifest says $candidate"
+              exit 1
+            fi
+          done
+
+      - name: Extract release notes
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          awk -v heading="## [$tag]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $tag"
+            exit 1
+          fi
+          {
+            echo
+            echo "---"
+            echo
+            echo "**Install:** \`helm install lidlesseye https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/lidlesseye-${tag}.tgz\`"
+            echo "or run the container: \`docker run -p 4040:4040 ghcr.io/${{ github.repository_owner }}/lidlesseye:${GITHUB_REF_NAME}\`."
+            echo "Full documentation is in [\`docs/\`](https://github.com/${{ github.repository }}/tree/${GITHUB_REF_NAME}/docs)."
+          } >> release-notes.md
+          cat release-notes.md
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Package the chart
+        run: helm package deploy/helm/lidlesseye --destination dist
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: dist/lidlesseye-*.tgz
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

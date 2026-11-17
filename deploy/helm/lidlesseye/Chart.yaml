@@ -11,8 +11,8 @@ keywords:
   - observability
   - flamegraph
   - continuous-profiling
-home: https://github.com/lidlesseye/lidlesseye
+home: https://github.com/xsj321/LidlessEye
 sources:
-  - https://github.com/lidlesseye/lidlesseye
+  - https://github.com/xsj321/LidlessEye
 maintainers:
   - name: LidlessEye authors

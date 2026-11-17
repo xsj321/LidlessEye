@@ -11,6 +11,9 @@
 | [embedding.md](embedding.md) | embed the server in a Rust program, write a custom collector, ingest without the CLI |
 | [multi-tenancy.md](multi-tenancy.md) | isolate tenants: layout, naming, tokens, limits, pruning, failure behaviour |
 | [compatibility.md](compatibility.md) | compare with Pyroscope: what matches, what differs, what is out of scope |
+| [../CHANGELOG.md](../CHANGELOG.md) | see what changed in a release, and what the `0.1` line still promises not to break |
+| [../CONTRIBUTING.md](../CONTRIBUTING.md) | send a patch: the gates it has to pass, the design rules the dashboard is held to, how a release is cut |
+| [../SECURITY.md](../SECURITY.md) | report a vulnerability privately, or check what counts as one for a privileged agent |
 
 The root [README](../README.md) is the tour and the quick start; the CLI is
 documented there too.
