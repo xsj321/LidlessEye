@@ -1727,6 +1727,14 @@ impl Store {
     /// a zero rather than a missing row. Buckets are relative to `from_ns` for
     /// the same reason as [`Store::net_node_history`] — the absolute ns value
     /// is far past the exact integer range of a double.
+    /// A batch describes a window, not an instant: its counters belong to the
+    /// whole `[batch start, next batch start)`. Putting the total on the single
+    /// bucket that happens to contain `batch start` makes a five-minute sample
+    /// rate look like a spike train once the brush zooms below five minutes —
+    /// the 1h view has 30-second buckets and would show ten empty slots between
+    /// every bar. Spread the batch over every bucket it overlaps instead, and
+    /// let the newest batch run to `until_ns` so the right edge of the brush is
+    /// not permanently blank.
     pub fn net_histogram(
         &self,
         from_ns: u64,
@@ -1734,27 +1742,108 @@ impl Store {
         step_ns: u64,
         buckets: usize,
     ) -> Result<Vec<u64>> {
-        let mut out = vec![0u64; buckets.max(1)];
-        let step = ts(step_ns.max(1));
+        let buckets = buckets.max(1);
+        let mut out = vec![0u64; buckets];
+        if until_ns <= from_ns {
+            return Ok(out);
+        }
+        let step = step_ns.max(1);
+
+        // A batch that started just before `from_ns` still covers the left
+        // edge of the window. Look one hour back so that batch is included;
+        // the spread below clips it to the visible range.
+        const LOOKBACK_NS: u64 = 3_600_000_000_000;
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT CAST((bucket_ns - ?) / ? AS BIGINT) AS slot, sum(connections) \
-                 FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
-                 GROUP BY slot ORDER BY slot",
+                "SELECT bucket_ns, sum(connections) FROM net_edges \
+                 WHERE bucket_ns >= ? AND bucket_ns < ? \
+                 GROUP BY bucket_ns ORDER BY bucket_ns",
             )
             .map_err(db_err)?;
         let mut rows = stmt
-            .query(params![ts(from_ns), step, ts(from_ns), ts(until_ns)])
+            .query(params![
+                ts(from_ns.saturating_sub(LOOKBACK_NS)),
+                ts(until_ns)
+            ])
             .map_err(db_err)?;
+        let mut batches: Vec<(u64, u64)> = Vec::new();
         while let Some(row) = rows.next().map_err(db_err)? {
-            let slot: i64 = row.get(0).map_err(db_err)?;
-            if slot < 0 {
+            let start: i64 = row.get(0).map_err(db_err)?;
+            if start < 0 {
                 continue;
             }
             let value = row.get::<_, i64>(1).unwrap_or(0).max(0) as u64;
-            if let Some(cell) = out.get_mut(slot as usize) {
-                *cell = value;
+            batches.push((start as u64, value));
+        }
+        if batches.is_empty() {
+            return Ok(out);
+        }
+
+        // A gap much larger than the usual reporting cadence means the agents
+        // were down, not that the last batch carried hours of traffic. Cap the
+        // spread at twice the median gap so an outage stays visible as zeros.
+        let mut gaps: Vec<u64> = batches
+            .windows(2)
+            .map(|pair| pair[1].0.saturating_sub(pair[0].0))
+            .filter(|gap| *gap > 0)
+            .collect();
+        gaps.sort_unstable();
+        // With a single batch there is no cadence to learn from; treat it as
+        // covering the requested range so a short query still gets a shape.
+        let max_span = match gaps.get(gaps.len() / 2).copied() {
+            Some(median) => median.saturating_mul(2).max(step),
+            None => batches
+                .first()
+                .map(|&(start, _)| until_ns.saturating_sub(start))
+                .unwrap_or(step)
+                .max(step),
+        };
+
+        for (index, &(start, value)) in batches.iter().enumerate() {
+            if value == 0 {
+                continue;
+            }
+            let next = batches
+                .get(index + 1)
+                .map(|&(at, _)| at)
+                .unwrap_or(until_ns);
+            let end = next.min(start.saturating_add(max_span)).min(until_ns);
+            let visible_start = start.max(from_ns);
+            if end <= visible_start {
+                continue;
+            }
+            // Only the part of the batch that falls inside the query window is
+            // counted; the look-back batch may start before it.
+            let span = end - start;
+            let visible_span = end - visible_start;
+            let visible_value = (value as u128 * visible_span as u128 / span as u128) as u64;
+            let mut assigned = 0u64;
+            let mut cursor = visible_start;
+            while cursor < end {
+                let slot = ((cursor - from_ns) / step) as usize;
+                let slot_end = from_ns + (slot as u64 + 1) * step;
+                let segment_end = end.min(slot_end);
+                let overlap = segment_end - cursor;
+                let mut share = if segment_end == end {
+                    visible_value - assigned
+                } else {
+                    (visible_value as u128 * overlap as u128 / visible_span as u128) as u64
+                };
+                share = share.min(visible_value - assigned);
+                assigned += share;
+                if let Some(cell) = out.get_mut(slot) {
+                    *cell += share;
+                }
+                cursor = segment_end;
+            }
+            // Integer division loses a few connections; give them to the last
+            // bucket instead of dropping them from the total.
+            if assigned < visible_value {
+                let last = ((end - 1 - from_ns) / step) as usize;
+                if let Some(cell) = out.get_mut(last) {
+                    *cell += visible_value - assigned;
+                }
             }
         }
         Ok(out)
@@ -2689,6 +2778,93 @@ mod tests {
         assert_eq!(histogram.len(), 2, "the brush gets one entry per bucket");
         assert_eq!(histogram[0], edges[0].connections);
         assert_eq!(histogram[1], edges[1].connections);
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A batch describes a window, so a five-minute sample must light up every
+    /// sub-bucket it covers. Bucketing by `batch start` alone leaves the 1h
+    /// brush (30-second buckets) with ten empty slots between bars.
+    #[test]
+    fn histogram_spreads_a_batch_over_the_buckets_it_covers() {
+        use crate::servicemap::ServiceEdge;
+
+        let (store, dir) = temp_store("net-histogram-spread");
+        let start = 1_700_000_000_000_000_000u64;
+        let batch_ns = 60_000_000_000u64;
+        store
+            .append_servicemap(&ServiceMapBatch {
+                start_ns: start,
+                end_ns: start + batch_ns,
+                edges: vec![ServiceEdge {
+                    client: "shop/a".to_string(),
+                    server: "shop/b".to_string(),
+                    protocol: "http".to_string(),
+                    connections: 600,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // 120 buckets over a one-minute batch = 500ms each.
+        let histogram = store
+            .net_histogram(start, start + batch_ns, batch_ns / 120, 120)
+            .unwrap();
+        assert_eq!(histogram.len(), 120);
+        assert!(
+            histogram.iter().all(|value| *value > 0),
+            "every bucket inside the batch must carry traffic: {histogram:?}"
+        );
+        assert_eq!(
+            histogram.iter().sum::<u64>(),
+            600,
+            "spreading must conserve the batch total"
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A query that starts in the middle of a batch must still see that
+    /// batch's share of the window: the brush's left edge is a time, not a
+    /// batch boundary.
+    #[test]
+    fn histogram_clips_a_batch_that_started_before_the_window() {
+        use crate::servicemap::ServiceEdge;
+
+        let (store, dir) = temp_store("net-histogram-clip");
+        let start = 1_700_000_000_000_000_000u64;
+        let batch_ns = 60_000_000_000u64;
+        store
+            .append_servicemap(&ServiceMapBatch {
+                start_ns: start,
+                end_ns: start + batch_ns,
+                edges: vec![ServiceEdge {
+                    client: "shop/a".to_string(),
+                    server: "shop/b".to_string(),
+                    protocol: "http".to_string(),
+                    connections: 600,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Second half of the batch, 30 one-second buckets.
+        let histogram = store
+            .net_histogram(start + batch_ns / 2, start + batch_ns, 1_000_000_000, 30)
+            .unwrap();
+        assert!(
+            histogram.iter().all(|value| *value > 0),
+            "the half-open left edge must still carry traffic: {histogram:?}"
+        );
+        assert_eq!(
+            histogram.iter().sum::<u64>(),
+            300,
+            "only the visible half of the batch counts"
+        );
 
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
