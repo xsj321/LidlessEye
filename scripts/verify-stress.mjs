@@ -53,15 +53,26 @@ for (let d = 0; d < DAYS; d++) {
     `names=${String(names).padStart(4)} depth=${String(maxLevel).padStart(3)}  map=${map}`);
 }
 
-const hist = await get(
-  `/api/v1/servicemap/histogram?from=${Math.round(first)}ns&until=${Math.round(now)}ns&buckets=240`,
-);
-const nonZero = (hist.connections || []).filter((v) => v > 0).length;
-console.log(`histogram: ${nonZero}/240 non-empty buckets; deepest flame level: ${deepMax}`);
+// A stress seed is only dense if the histogram is full at every zoom level.
+// 120 buckets is the UI default; 1h/6h/24h/30d are the ranges the brush offers.
+const BUCKETS = 120;
+let histogramOk = true;
+for (const [label, hours] of [["1h", 1], ["6h", 6], ["24h", 24], ["30d", DAYS * 24]]) {
+  const from = Math.round(now - hours * HOUR);
+  const hist = await get(
+    `/api/v1/servicemap/histogram?from=${from}ns&until=${Math.round(now)}ns&buckets=${BUCKETS}`,
+  );
+  const values = hist.connections || [];
+  const nonZero = values.filter((v) => v > 0).length;
+  const full = nonZero === BUCKETS;
+  console.log(`${full ? "ok  " : "FAIL"} histogram ${label}: ${nonZero}/${BUCKETS} non-empty buckets`);
+  histogramOk = histogramOk && full;
+}
+console.log(`deepest flame level: ${deepMax}`);
 
-if (ok === DAYS && nonZero > DAYS && deepMax >= 8) {
-  console.log(`PASS: ${ok}/${DAYS} days queryable, deep stacks present`);
+if (ok === DAYS && histogramOk && deepMax >= 8) {
+  console.log(`PASS: ${ok}/${DAYS} days queryable, deep stacks present, histogram dense at all ranges`);
 } else {
-  console.error(`FAIL: ${ok}/${DAYS} days, histogram ${nonZero}/240, depth ${deepMax}`);
+  console.error(`FAIL: ${ok}/${DAYS} days, histogram dense=${histogramOk}, depth ${deepMax}`);
   process.exitCode = 1;
 }

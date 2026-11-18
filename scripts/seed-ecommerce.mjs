@@ -9,17 +9,21 @@
 //
 // Two profiles:
 //   demo   8h, 19 services, shallow stacks — quick visual demo (default).
-//   stress 30d, 60+ services, 60 deep stacks per report — load/query testing.
+//   stress 30d, 60+ services, 60 deep stacks per report, 5-minute buckets —
+//             load/query testing with a dense request histogram at every window.
 //
 // Usage:
 //   node scripts/seed-ecommerce.mjs                       # demo profile
 //   node scripts/seed-ecommerce.mjs --profile stress      # 30-day stress seed
 //   node scripts/seed-ecommerce.mjs --profile stress --days 1   # short trial
 //   # split a long run into segments that each fit one command timeout:
-//   node scripts/seed-ecommerce.mjs --profile stress --from-hours-ago 720 --hours 240
-//   node scripts/seed-ecommerce.mjs --profile stress --from-hours-ago 480 --hours 240
-//   node scripts/seed-ecommerce.mjs --profile stress --from-hours-ago 240 --hours 240
+//   node scripts/seed-ecommerce.mjs --profile stress --from-hours-ago 720 --hours 120
+//   node scripts/seed-ecommerce.mjs --profile stress --from-hours-ago 600 --hours 120
+//   ... down to --from-hours-ago 120 --hours 120 (six 5-day segments)
 //   node scripts/seed-ecommerce.mjs --tenant default
+//   # all segments share one anchor so there are no seams:
+//   ANCHOR=$(node -e 'process.stdout.write(String(Date.now()))')
+//   node scripts/seed-ecommerce.mjs --profile stress --now-ms $ANCHOR --from-hours-ago 720 --hours 120
 //   node scripts/seed-ecommerce.mjs --hours 4 --window 60 --services 30
 //   node scripts/seed-ecommerce.mjs --map-only            # top up map deltas
 //   node scripts/seed-ecommerce.mjs --no-verify
@@ -48,7 +52,7 @@ if (!["demo", "stress"].includes(PROFILE)) throw new Error(`unknown --profile ${
 
 // Stress defaults are deliberately large; every one is overridable.
 const DEFAULTS = isStress
-  ? { days: 30, window: 1800, services: 64, stacks: 60, depth: 24, batch: 8, reports: 1500 }
+  ? { days: 30, window: 300, services: 64, stacks: 60, depth: 24, batch: 8, reports: 1500 }
   : { days: 0, hours: 8, window: 120, services: 19, stacks: 4, depth: 4, batch: 12, reports: 240 };
 
 const BASE = (process.env.LIDLESSEYE_BASE || "http://127.0.0.1:4040").replace(/\/+$/, "");
@@ -431,8 +435,15 @@ async function getJson(path) {
 // Main
 // ---------------------------------------------------------------------------
 
-const nowNs = Date.now() * 1e6;
-const segmentEndNs = nowNs - (FROM_HOURS_AGO - HOURS) * HOUR_NS;
+// Pin `now` for a multi-segment run: every segment must derive its boundaries
+// from the same instant, otherwise the hours spent writing segment N open a
+// gap before segment N+1 and the histogram shows empty buckets at the seams.
+const nowNs = Number(arg("now-ms", Date.now())) * 1e6;
+// `--until-ms` lets the final segment end at the real current time while the
+// earlier segments stay pinned to the shared anchor. Without it, a long run
+// would stop at the anchor and the newest hour would stay empty.
+const untilMs = Number(arg("until-ms", 0));
+const segmentEndNs = untilMs ? untilMs * 1e6 : nowNs - (FROM_HOURS_AGO - HOURS) * HOUR_NS;
 const firstNs = segmentEndNs - HOURS * HOUR_NS;
 const slot = (i) => ({ start: firstNs + i * WINDOW_NS, end: firstNs + (i + 1) * WINDOW_NS });
 
@@ -492,7 +503,7 @@ if (!DRY_RUN && !NO_VERIFY) {
   const sliceNs = HOURS >= 24 ? 24 * HOUR_NS : HOUR_NS;
   const count = Math.floor(HOURS * HOUR_NS / sliceNs);
   for (let k = 0; k < count; k++) {
-    slices.push([firstNs + k * sliceNs + 1e9, Math.min(firstNs + (k + 1) * sliceNs - 1e9, nowNs)]);
+    slices.push([firstNs + k * sliceNs + 1e9, Math.min(firstNs + (k + 1) * sliceNs - 1e9, segmentEndNs)]);
   }
   console.log(`\nverifying ${slices.length} time slices...`);
   let ok = 0;
@@ -521,13 +532,18 @@ if (!DRY_RUN && !NO_VERIFY) {
   const maxLevel = Math.max(-1, ...(deep.levels || []));
   console.log(`${names > 20 && maxLevel >= 8 ? "ok  " : "FAIL"} deep stacks: ${names} frame names, max depth level ${maxLevel}`);
 
+  // Every UI-scale bucket must carry traffic. Use the segment's own end as
+  // `until`: historical segments end days before `now`, and comparing them
+  // against a 30-day domain would leave most buckets empty by construction.
+  const buckets = Math.min(240, WINDOWS);
   const histogram = await getJson(
-    `/api/v1/servicemap/histogram?from=${Math.round(firstNs)}ns&until=${Math.round(nowNs)}ns&buckets=240`,
+    `/api/v1/servicemap/histogram?from=${Math.round(firstNs)}ns&until=${Math.round(segmentEndNs)}ns&buckets=${buckets}`,
   );
   const nonZero = (histogram.connections || []).filter((v) => v > 0).length;
-  console.log(`${nonZero > 120 ? "ok  " : "FAIL"} histogram: ${nonZero}/240 non-empty buckets`);
+  const dense = nonZero === buckets;
+  console.log(`${dense ? "ok  " : "FAIL"} histogram: ${nonZero}/${buckets} non-empty buckets`);
 
-  if (ok !== slices.length || nonZero <= 120) {
+  if (ok !== slices.length || !dense) {
     console.error(`\nverification failed: ${ok}/${slices.length} slices queryable`);
     process.exitCode = 1;
   } else {
