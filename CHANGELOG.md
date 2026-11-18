@@ -8,6 +8,18 @@ Rust API follows the same rule.
 
 ## [Unreleased]
 
+### Changed
+
+- The release image is published to Docker Hub as well as GHCR, and the Docker
+  Hub copy is a manifest copy of the GHCR image rather than a second build, so
+  both names resolve to the same digest.
+- The chart no longer pins a development tag: `image.tag` defaults to
+  `appVersion`, which is the tag the release workflow publishes. Installing a
+  released chart used to pull whichever dev build happened to be in
+  `values.yaml`.
+- `image.repository` stays `docker.io/xsj321/lidlesseye`, which is now what the
+  release notes and README tell you to run.
+
 ## [0.1.0] - 2026-11-18
 
 The first public release: one Rust binary that profiles Linux processes with

@@ -80,7 +80,15 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 The `Release` workflow checks those four numbers, extracts the changelog
-section, packages the chart and publishes the release.
+section, packages the chart and publishes the release. The `Image` workflow
+builds `deploy/docker/Dockerfile` once, pushes it to GHCR, and copies the same
+manifest to Docker Hub, which is the registry the chart points at. Docker Hub
+publishing needs two repository secrets — `DOCKERHUB_USERNAME` and
+`DOCKERHUB_TOKEN` (a Docker Hub access token, not the account password); without
+them the image job warns and publishes to GHCR only, leaving the chart's default
+`image.repository` unpullable for that tag. The chart has no `image.tag` of its
+own: it resolves to `appVersion`, so a release cannot hand out a chart whose
+image is a different version.
 
 ## Reporting a security issue
 

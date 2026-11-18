@@ -4,6 +4,12 @@ name: Image
 # release.yml) and an image that matches it. The image is built from the same
 # Dockerfile used for manual deploys, so a release cannot drift from the
 # documented build path.
+#
+# It is published to two registries. GHCR needs no setup and always runs;
+# Docker Hub is what the chart defaults to, and its login only runs when
+# DOCKERHUB_USERNAME and DOCKERHUB_TOKEN exist as repository secrets. The
+# Docker Hub copy is a manifest copy of the GHCR image rather than a second
+# build, so the two registries cannot serve different bytes.
 
 on:
   push:
@@ -19,7 +25,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Push to GHCR
+    name: Publish
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +37,28 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Docker Hub is optional infrastructure, not a hidden requirement: a
+      # missing secret produces a warning and a GHCR-only release rather than a
+      # failed one, and the run says which registry the chart will find empty.
+      - name: Check for Docker Hub credentials
+        id: dockerhub
+        env:
+          USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$USERNAME" ] && [ -n "$TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set: publishing to GHCR only. The chart defaults to docker.io, so add both secrets before the next release."
+          fi
+
+      - uses: docker/login-action@v3
+        if: steps.dockerhub.outputs.enabled == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - id: meta
         uses: docker/metadata-action@v5
@@ -58,10 +86,34 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Report the digest
+      # `imagetools create` copies the manifest and its blobs by digest. Building
+      # again for the second registry would work too, but then two independent
+      # builds could disagree and the chart would install something other than
+      # what GHCR serves under the same version.
+      - name: Mirror the same digest to Docker Hub
+        if: steps.dockerhub.outputs.enabled == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          echo "### Image" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.meta.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          while IFS= read -r source; do
+            [ -n "$source" ] || continue
+            target="docker.io/${source#ghcr.io/}"
+            echo "==> $source -> $target"
+            docker buildx imagetools create --tag "$target" "$source"
+          done <<< "$TAGS"
+
+      - name: Report the digests
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.meta.outputs.digest }}
+          DOCKERHUB: ${{ steps.dockerhub.outputs.enabled }}
+        run: |
+          {
+            echo "### Image"
+            echo '```'
+            echo "$TAGS"
+            echo "docker.io/${GITHUB_REPOSITORY_OWNER}/lidlesseye  (mirror: $DOCKERHUB)"
+            echo "$DIGEST"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

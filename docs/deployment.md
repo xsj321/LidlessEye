@@ -218,6 +218,34 @@ What the chart creates:
 | `ServiceMonitor` (optional) | scrapes `/metrics` |
 | `ServiceAccount` | shared by both workloads |
 
+### Where the image comes from
+
+The chart points at **Docker Hub** by default — `docker.io/xsj321/lidlesseye` —
+and leaves `image.tag` empty, which the template resolves to `appVersion`. A
+released chart therefore installs the image built from that same version, not
+whatever tag the last person happened to set.
+
+```bash
+docker pull docker.io/xsj321/lidlesseye:0.1.0
+# the same manifest, copied by digest rather than rebuilt:
+docker pull ghcr.io/xsj321/lidlesseye:0.1.0
+```
+
+Both names come out of one build: the release workflow pushes the image to GHCR
+and copies the manifest to Docker Hub, so the digests match and a pin in a values
+file means the same bytes whichever registry a cluster can reach. For a
+maintainer, Docker Hub publishing needs `DOCKERHUB_USERNAME` and
+`DOCKERHUB_TOKEN` as repository secrets; without them the workflow warns and
+publishes to GHCR only.
+
+Point a cluster at the mirror, or at a private copy, with two values:
+
+```bash
+helm install lidlesseye deploy/helm/lidlesseye \
+  --set image.repository=ghcr.io/xsj321/lidlesseye \
+  --set image.tag=0.1.0
+```
+
 ### Local clusters (Docker Desktop, kind, minikube)
 
 There is no registry to push to, so build the image locally and give every
@@ -225,7 +253,7 @@ build a **distinct tag**. A cluster caches the image by tag at pod creation, and
 `imagePullPolicy: IfNotPresent` will happily keep running the previous build:
 
 ```bash
-docker build -f deploy/docker/Dockerfile -t ghcr.io/lidlesseye/lidlesseye:0.1.0-dev1 .
+docker build -f deploy/docker/Dockerfile -t docker.io/xsj321/lidlesseye:0.1.0-dev1 .
 helm install lidlesseye deploy/helm/lidlesseye -n lidlesseye --create-namespace \
   --set image.tag=0.1.0-dev1 \
   --set server.persistence.size=5Gi

@@ -6,10 +6,15 @@
 #     with eBPF and pushes the profiles to that server.
 
 image:
-  # Published on Docker Hub; see docker push in the release notes / deployment docs.
+  # Docker Hub is the registry the chart points at; the release workflow mirrors
+  # the same manifest to ghcr.io/xsj321/lidlesseye. `docker.io/` is spelled out
+  # because a bare `xsj321/lidlesseye` means `docker.io/library/xsj321/lidlesseye`
+  # to the daemon and something else again to a chart — a pull failure either way.
   repository: docker.io/xsj321/lidlesseye
-  # Defaults to the chart's appVersion when empty.
-  tag: "0.10.59-hopmap"
+  # Empty means the chart's appVersion, which is also the tag the release
+  # workflow publishes, so a chart and its image cannot drift apart. A local
+  # build overrides this with its own distinct tag (see docs/deployment.md).
+  tag: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

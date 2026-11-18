@@ -55,7 +55,10 @@ jobs:
             echo "---"
             echo
             echo "**Install:** \`helm install lidlesseye https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/lidlesseye-${tag}.tgz\`"
-            echo "or run the container: \`docker run -p 4040:4040 ghcr.io/${{ github.repository_owner }}/lidlesseye:${GITHUB_REF_NAME}\`."
+            # The chart's default image.repository is the Docker Hub name, so the
+            # release notes name the registry a plain `helm install` will pull
+            # from first; GHCR is the mirror of the same digest.
+            echo "or run the container: \`docker run -p 4040:4040 docker.io/${{ github.repository_owner }}/lidlesseye:${GITHUB_REF_NAME}\` — the same digest is mirrored to \`ghcr.io/${{ github.repository }}:${GITHUB_REF_NAME}\`."
             echo "Full documentation is in [\`docs/\`](https://github.com/${{ github.repository }}/tree/${GITHUB_REF_NAME}/docs)."
           } >> release-notes.md
           cat release-notes.md

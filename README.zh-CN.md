@@ -93,9 +93,10 @@ sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 ./scripts/demo.sh                # 无需 root、无需 eBPF，只要 Docker
 ./scripts/demo.sh --stop
 
-# 或者用发布镜像（由 deploy/docker/Dockerfile 构建）
+# 或者用发布镜像（由 deploy/docker/Dockerfile 构建，同一 digest 镜像到
+# ghcr.io/xsj321/lidlesseye）
 docker run --rm -p 4040:4040 -v lidlesseye-data:/var/lib/lidlesseye \
-  ghcr.io/xsj321/lidlesseye:0.1.0
+  docker.io/xsj321/lidlesseye:0.1.0
 ```
 
 ### 服务端 + agent
