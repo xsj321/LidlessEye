@@ -37,9 +37,14 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY web ./web
-# The dashboard comes from the Node stage; the copy above carries the sources
-# only, because `.dockerignore` drops any local `web/dist`.
+# The dashboard comes from the Node stage; the copies above carry the sources
+# only, because `.dockerignore` drops any local `web/dist` and `ui/`.
+# Seed `ui/` from the same export as `web/dist`: rust-embed expands `ui/` while
+# build.rs runs, and having build.rs copy a fresh export over a stale `ui/`
+# mid-compile can make the folder vanish from under it. Seeded from identical
+# bytes, mirror() is a no-op and the folder stays stable at expansion time.
 COPY --from=ui /ui/dist ./web/dist
+RUN rm -rf crates/lidlesseye-server/ui && cp -a web/dist crates/lidlesseye-server/ui
 # A dummy `main` keeps the dependency layer cacheable when only sources change.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
