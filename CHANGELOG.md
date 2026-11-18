@@ -10,8 +10,19 @@ Rust API follows the same rule.
 
 ## [0.1.1] - 2026-11-18
 
-A packaging release: the image and the chart now ship from the same place. No
-collection, storage or dashboard behaviour changed since 0.1.0.
+A packaging release: the image and the chart now ship from the same place, and
+the crates are on crates.io. No collection, storage or dashboard behaviour
+changed since 0.1.0.
+
+### Added
+
+- The workspace crates are published: `lidlesseye` (builder and CLI),
+  `lidlesseye-server`, `lidlesseye-core` and `lidlesseye-ebpf`, so
+  `cargo add lidlesseye` is enough to embed the whole stack. The dashboard ships
+  inside `lidlesseye-server` — `build.rs` mirrors `web/dist` into the crate's
+  `ui/`, which is what `cargo package` uploads and what `rust-embed` reads.
+- `scripts/publish-crates.sh` publishes them in dependency order, waits for each
+  version to reach the index and skips what is already there.
 
 ### Changed
 

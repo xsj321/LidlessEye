@@ -6,6 +6,8 @@
 
 [![CI](https://github.com/xsj321/LidlessEye/actions/workflows/ci.yml/badge.svg)](https://github.com/xsj321/LidlessEye/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/xsj321/LidlessEye?sort=semver&color=blue)](https://github.com/xsj321/LidlessEye/releases)
+[![crates.io](https://img.shields.io/crates/v/lidlesseye?logo=rust&color=orange)](https://crates.io/crates/lidlesseye)
+[![docs.rs](https://img.shields.io/docsrs/lidlesseye?logo=docs.rs)](https://docs.rs/lidlesseye)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](crates)
 [![DuckDB](https://img.shields.io/badge/storage-DuckDB%202.0-yellow.svg)](crates/lidlesseye-core)
@@ -25,6 +27,10 @@ sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 ```
 
 No Linux box handy? `./scripts/demo.sh` seeds a realistic demo in Docker and prints the URL. Nothing is installed on the host.
+
+Already have a toolchain? The same server is on crates.io: `cargo install lidlesseye`. It links DuckDB dynamically, so `libduckdb.so` must be on the loader path — which is why the container image is the zero-dependency route.
+
+To use it as a library instead, `cargo add lidlesseye` and start from the [embedding guide](docs/embedding.md).
 
 The dashboard opens on the **service map**. Click any node to inspect its SLO, replicas, CPU, memory, network, DNS and a flamegraph scoped to that workload — without leaving the topology.
 

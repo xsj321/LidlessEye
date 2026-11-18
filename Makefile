@@ -4,7 +4,7 @@
 CARGO ?= cargo
 HELM  ?= helm
 
-.PHONY: help build release test test-ebpf lint fmt bpf ui ui-test helm-lint docker
+.PHONY: help build release test test-ebpf lint fmt bpf ui ui-test helm-lint docker publish-crates
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -59,3 +59,6 @@ helm-lint: ## Lint the chart
 
 docker: ## Build the container image
 	docker build -f deploy/docker/Dockerfile -t lidlesseye:dev .
+
+publish-crates: ## Publish the workspace crates to crates.io (needs CARGO_REGISTRY_TOKEN)
+	./scripts/publish-crates.sh

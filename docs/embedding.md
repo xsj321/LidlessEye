@@ -9,6 +9,19 @@ lidlesseye = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
+All four crates are published, and the dependency graph is flat enough to use
+one of them on its own:
+
+| Crate | Use it when |
+| --- | --- |
+| [`lidlesseye`](https://crates.io/crates/lidlesseye) | the default: builder, collector, server and store in one dependency |
+| [`lidlesseye-server`](https://crates.io/crates/lidlesseye-server) | you have your own collector and want the ingest/query API and the dashboard |
+| [`lidlesseye-core`](https://crates.io/crates/lidlesseye-core) | only the profile model, the DuckDB store and the query engine |
+| [`lidlesseye-ebpf`](https://crates.io/crates/lidlesseye-ebpf) | only eBPF collection, with your own storage |
+
+The dashboard travels inside `lidlesseye-server` (in its `ui/` folder), so an
+embedded server serves the real UI rather than a placeholder.
+
 ```rust
 use lidlesseye::{LidlessEye, Result};
 
@@ -248,3 +261,29 @@ publisher.send(report);          // non-blocking
   combined with high service cardinality is the one pattern to avoid.
 - Queries never block ingestion: the store's index is an `RwLock` held only for
   the metadata, and the actual scans run in `spawn_blocking`.
+
+## Publishing the crates
+
+Maintainers only. `scripts/publish-crates.sh` publishes all four crates in
+dependency order and waits for each version to show up in the index before
+starting the next one; a re-run skips versions that are already published, so a
+half-finished upload is resumable.
+
+```bash
+printf %s "$CRATES_IO_TOKEN" > .tmp/crates-token        # gitignored
+./scripts/dev.sh bash scripts/publish-crates.sh         # host rustc is older than rust-version
+./scripts/dev.sh bash scripts/publish-crates.sh --dry-run
+```
+
+Two details decide whether the published crate is usable:
+
+- **The dashboard is embedded at package time.** `lidlesseye-server`'s
+  `build.rs` mirrors `web/dist` into the crate's `ui/`, `cargo package` ships
+  that folder, and `rust-embed` reads it. Publish without an export and every
+  consumer gets the "UI is not embedded in this build" placeholder, so the
+  script refuses to run until `web/dist/index.html` exists (`make ui`, or
+  `--build-ui`).
+- **The version is the workspace version.** All four crates share it, and the
+  release workflow requires it to match `deploy/helm/lidlesseye/Chart.yaml`,
+  `web/package.json` and the tag. A published version cannot be reused, so a
+  mistake costs a patch release rather than a re-upload.
