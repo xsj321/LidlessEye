@@ -369,9 +369,19 @@ pub(crate) fn flush_hot(conn: &Connection, state: &ParquetState) -> Result<usize
         if count <= 0 {
             continue;
         }
+        // `count` is not unique within an hour: two flushes of the same number
+        // of rows used to write the same file name, so the second COPY
+        // silently overwrote the first and those rows vanished from every
+        // view. Use the wall clock at nanosecond resolution instead — the
+        // hour prefix (used for TTL/archival) stays intact, and two flushes
+        // in the same hour can no longer collide.
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         let file = state
             .table_dir(def.name)
-            .join(format!("{tag}-{count}.parquet"));
+            .join(format!("{tag}-{stamp}-{count}.parquet"));
         let sql = format!(
             "COPY (SELECT {cols} FROM {hot}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
             file.to_string_lossy().replace('\\', "/"),
@@ -587,6 +597,33 @@ mod tests {
             "flushed rows readable zero-copy from parquet"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_equal_flushes_in_one_hour_do_not_overwrite_each_other() {
+        let (store, dir) = parquet_store("collision", u64::MAX);
+        // Each flush moves exactly one batch. Both land in the same hour with
+        // the same row count, which used to produce one file name and lose
+        // the first batch.
+        store
+            .append(&report("checkout", 1_000_000_000, 20))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+        store
+            .append(&report("checkout", 2_000_000_000, 22))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+
+        let files = dir
+            .join("parquet")
+            .join("samples")
+            .read_dir()
+            .unwrap()
+            .count();
+        assert_eq!(files, 2, "two flushes must leave two distinct files");
+        assert_eq!(store.stats().batch_count, 2, "both batches survive");
+        assert_eq!(flame_total(&store), 42, "both values queryable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
