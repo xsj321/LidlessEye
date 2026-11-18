@@ -1,6 +1,13 @@
 [package]
 name = "lidlesseye-server"
 description = "HTTP API, query engine service and embedded UI for LidlessEye"
+readme = "README.md"
+# The embedded dashboard lives in `ui/`: `build.rs` mirrors `web/dist` into it,
+# and it is gitignored because it is a build artefact. `cargo package` only
+# honours `include` for files git ignores when they are listed here, and a
+# published crate without them would serve the "UI is not embedded" placeholder
+# to everyone who runs `cargo install lidlesseye`.
+include = ["src/**", "ui/**", "tests/**", "build.rs", "README.md"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

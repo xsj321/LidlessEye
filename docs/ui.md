@@ -462,11 +462,13 @@ without animation.
 ## How it is built
 
 React 19 with shadcn/ui over a Next.js static export, and no second process:
-`next build` emits `web/out`, `npm run sync` copies it to `web/dist`, and
-`rust-embed` inlines that into the binary at compile time. The export is not
-committed — `make ui` produces it, and `lidlesseye-server`'s `build.rs` keeps an
-empty placeholder so a checkout without Node still compiles (the server then
-answers 503 at `/` until the real build is in place).
+`next build` emits `web/out`, `npm run sync` copies it to `web/dist`,
+`lidlesseye-server`'s `build.rs` mirrors that into the crate's `ui/`, and
+`rust-embed` inlines it into the binary at compile time. The export is not
+committed — `make ui` produces it — but `ui/` is what `cargo package` ships, so
+the published crate embeds the dashboard too. Without an export, `build.rs`
+keeps an empty placeholder so a checkout without Node still compiles (the server
+then answers 503 at `/` until the real build is in place).
 
 | Path | Responsibility |
 | --- | --- |

@@ -442,9 +442,12 @@ ship an old dashboard. Only `npm install` is gated on the lockfile (through the
 marker npm writes into `node_modules`), so a no-op rebuild costs one `next build`.
 
 `web/dist` is not committed: it is a build artefact, and keeping
-it out of git removes a megabyte of generated chunks from every UI diff. A
-`build.rs` in `lidlesseye-server` creates the directory when it is missing, so a
-checkout without Node still compiles — the binary then answers 503
+it out of git removes a megabyte of generated chunks from every UI diff.
+`lidlesseye-server`'s `build.rs` mirrors it into the crate's `ui/` folder, which
+is the directory `rust-embed` reads: that folder travels with `cargo package`,
+so the crate on crates.io embeds the same dashboard a checkout does. When
+neither exists (a fresh checkout, no Node) the script creates an empty `ui/` so
+the crate still compiles — the binary then answers 503
 `UI is not embedded in this build` at `/`, while the API keeps working. The
 Dockerfile builds the export in its own Node stage and copies it into the Rust
 builder, so the image never depends on local state.

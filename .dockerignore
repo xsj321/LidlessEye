@@ -22,10 +22,13 @@ lidlesseye-data/
 # The dashboard is built in the Dockerfile's Node stage. Shipping the local
 # copy would make the Rust layer depend on whatever was last built on this
 # machine — including node_modules with the wrong platform binaries.
+# `crates/lidlesseye-server/ui` is the same export mirrored into the crate by
+# `build.rs`, so it has to be dropped for the same reason.
 web/node_modules
 web/.next
 web/out
 web/dist
+crates/lidlesseye-server/ui
 
 # Not needed by the image
 docs/

@@ -3,8 +3,9 @@
 # The UI is embedded into the binary at compile time and is not committed, so it
 # has to exist before `cargo build` runs. Building it in its own stage keeps
 # Node out of the Rust image and lets the npm layer cache independently of the
-# Rust sources; `sync` writes the static export into `web/dist`, which is what
-# rust-embed reads.
+# Rust sources; `sync` writes the static export into `web/dist`, which
+# `lidlesseye-server`'s build script mirrors into the crate's `ui/` for
+# `rust-embed`.
 FROM node:22-bookworm-slim AS ui
 
 WORKDIR /ui
