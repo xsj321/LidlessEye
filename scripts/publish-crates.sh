@@ -5,6 +5,11 @@
 #   ./scripts/publish-crates.sh --dry-run
 #   ./scripts/publish-crates.sh --build-ui
 #
+# `--dry-run` packages and verifies without uploading. Verification resolves the
+# dependencies from the registry, so for a brand-new version only the first
+# crate can be dry-run: the others are checked for the first time by the upload,
+# which stops at the first failure.
+#
 # Run it through the toolchain container when the host rustc is older than the
 # workspace `rust-version` (that is the normal case here):
 #
@@ -38,7 +43,8 @@ for arg in "$@"; do
     --dry-run) dry_run=1 ;;
     --build-ui) build_ui=1 ;;
     -h | --help)
-      sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      # The leading comment block, without the `# ` markers.
+      awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
