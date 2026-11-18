@@ -76,7 +76,7 @@ Maintainers only. A release is a tag whose version matches `Cargo.toml`,
 section in `CHANGELOG.md`:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.1.1 && git push origin v0.1.1
 ```
 
 The `Release` workflow checks those four numbers, extracts the changelog

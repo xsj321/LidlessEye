@@ -96,7 +96,7 @@ Prerequisites: Linux ≥ 5.5 with BTF (`/sys/kernel/btf/vmlinux`), `clang`, root
 # or the published image, which is built from deploy/docker/Dockerfile and
 # mirrored to ghcr.io/xsj321/lidlesseye under the same digest
 docker run --rm -p 4040:4040 -v lidlesseye-data:/var/lib/lidlesseye \
-  docker.io/xsj321/lidlesseye:0.1.0
+  docker.io/xsj321/lidlesseye:0.1.1
 ```
 
 ### Server and agents
@@ -228,7 +228,7 @@ The browser test seeds two tenants and fails on any console error, so a renderin
 Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) lists the
 gates a change has to pass and the design rules the dashboard is held to;
 [SECURITY.md](SECURITY.md) explains how to report a vulnerability privately.
-Releases are tag-driven — `git tag v0.1.0 && git push origin v0.1.0` — and the
+Releases are tag-driven — `git tag v0.1.1 && git push origin v0.1.1` — and the
 workflow in `.github/workflows/release.yml` publishes the notes and the chart.
 
 ## License

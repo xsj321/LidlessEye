@@ -8,15 +8,20 @@ Rust API follows the same rule.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-18
+
+A packaging release: the image and the chart now ship from the same place. No
+collection, storage or dashboard behaviour changed since 0.1.0.
+
 ### Changed
 
 - The release image is published to Docker Hub as well as GHCR, and the Docker
   Hub copy is a manifest copy of the GHCR image rather than a second build, so
   both names resolve to the same digest.
 - The chart no longer pins a development tag: `image.tag` defaults to
-  `appVersion`, which is the tag the release workflow publishes. Installing a
-  released chart used to pull whichever dev build happened to be in
-  `values.yaml`.
+  `appVersion`, which is the tag the release workflow publishes. Installing the
+  chart attached to 0.1.0 pulled `0.10.59-hopmap` instead of the version the
+  chart claimed to be.
 - `image.repository` stays `docker.io/xsj321/lidlesseye`, which is now what the
   release notes and README tell you to run.
 
@@ -93,5 +98,6 @@ service map.
 - User stacks need frame pointers; CPU and off-CPU only, no allocation
   profiling yet.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/xsj321/LidlessEye/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/xsj321/LidlessEye/releases/tag/v0.1.0
