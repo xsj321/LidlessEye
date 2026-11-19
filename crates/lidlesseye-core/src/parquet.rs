@@ -344,8 +344,8 @@ fn merge_projection(list: &str) -> String {
     format!("SELECT * FROM read_parquet([{list}], hive_partitioning=false, union_by_name=true)")
 }
 
-/// Free the current wall-clock hour as YYYYMMDDHH (UTC) for file naming.
-fn hour_tag() -> String {
+/// Free the current wall-clock hour as `h<epoch-hour>` for file naming.
+pub(crate) fn hour_tag() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -490,6 +490,120 @@ pub(crate) fn archive_local(
     Ok(stats)
 }
 
+/// Result of one local compaction pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompactStats {
+    /// Small files replaced by a merged file.
+    pub files_merged: usize,
+    /// Merged files written.
+    pub files_written: usize,
+    /// Bytes of the small files removed.
+    pub bytes_reclaimed: u64,
+}
+
+/// Merge the local Parquet files of each completed hour into one file per
+/// table, without touching any rows.
+///
+/// A five-minute ingest cadence flushes twelve files an hour per table, and
+/// every query opens all of them just to read their footers. The metadata cost
+/// therefore grows with the ingest rate rather than with the amount of data.
+/// Rewriting the hour once keeps the file count bounded.
+///
+/// `current_hour` is skipped: it is still being appended to, and rewriting it
+/// on every tick would cost more than it saves. Pass [`u64::MAX`] in tests.
+pub(crate) fn compact_local(
+    conn: &Connection,
+    state: &ParquetState,
+    current_hour: u64,
+) -> Result<CompactStats> {
+    // A first run against months of history would otherwise rewrite thousands
+    // of hours in one tick, holding the connection and spiking memory. Bound
+    // each pass; the tick runs again in ten minutes and works through the rest.
+    const MAX_MERGES_PER_PASS: usize = 48;
+    let mut stats = CompactStats::default();
+    let mut changed = false;
+    'tables: for def in TABLES {
+        let dir = state.table_dir(def.name);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut by_hour: std::collections::BTreeMap<u64, Vec<PathBuf>> =
+            std::collections::BTreeMap::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(hour) = parse_hour_tag(&name) else {
+                continue;
+            };
+            if hour >= current_hour {
+                continue;
+            }
+            by_hour.entry(hour).or_default().push(entry.path());
+        }
+        for (hour, files) in by_hour {
+            if files.len() < 2 {
+                continue;
+            }
+            if stats.files_written >= MAX_MERGES_PER_PASS {
+                break 'tables;
+            }
+            let list = files
+                .iter()
+                .map(|p| format!("'{}'", p.to_string_lossy().replace('\\', "/")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let target = dir.join(format!("h{hour}-compact-{unique}.parquet"));
+            let tmp = dir.join(format!("h{hour}-compact-{unique}.parquet.tmp"));
+            let sql = format!(
+                "COPY ({}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
+                merge_projection(&list),
+                tmp.to_string_lossy().replace('\\', "/"),
+            );
+            if let Err(err) = conn.execute_batch(&sql) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::Db(format!(
+                    "compacting {} hour {hour}: {err}",
+                    def.name
+                )));
+            }
+            let rows: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM read_parquet('{}')",
+                        tmp.to_string_lossy().replace('\\', "/")
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if rows <= 0 {
+                let _ = std::fs::remove_file(&tmp);
+                continue;
+            }
+            // Publish the merged file before removing the parts. If the rename
+            // fails the old files are still there; if a remove fails the merged
+            // file is a superset, so a duplicate is the worst case, never a gap.
+            std::fs::rename(&tmp, &target).map_err(Error::Io)?;
+            for file in &files {
+                if let Ok(meta) = std::fs::metadata(file) {
+                    stats.bytes_reclaimed += meta.len();
+                }
+                let _ = std::fs::remove_file(file);
+            }
+            stats.files_merged += files.len();
+            stats.files_written += 1;
+            changed = true;
+        }
+    }
+    if changed {
+        refresh_views(conn, state)?;
+    }
+    Ok(stats)
+}
+
 /// Size on local disk of the staged Parquet files.
 pub(crate) fn staged_bytes(state: &ParquetState) -> u64 {
     let mut total = 0u64;
@@ -624,6 +738,45 @@ mod tests {
         assert_eq!(files, 2, "two flushes must leave two distinct files");
         assert_eq!(store.stats().batch_count, 2, "both batches survive");
         assert_eq!(flame_total(&store), 42, "both values queryable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_merges_same_hour_files_and_keeps_rows() {
+        let (store, dir) = parquet_store("compact", u64::MAX);
+        store
+            .append(&report("checkout", 1_000_000_000, 20))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+        store
+            .append(&report("checkout", 2_000_000_000, 22))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+
+        let samples = dir.join("parquet").join("samples");
+        assert_eq!(
+            samples.read_dir().unwrap().count(),
+            2,
+            "two flushes in one hour leave two files"
+        );
+
+        let stats = store.compact_all_for_test().unwrap();
+        // samples, batches and stacks each had two parts; frames is a shared
+        // dictionary and may already be a single file, so assert the lower
+        // bound rather than a table count that can change with the schema.
+        assert!(
+            stats.files_written >= 3,
+            "one merged file per multi-part table"
+        );
+        assert!(stats.files_merged >= 6);
+        assert_eq!(
+            samples.read_dir().unwrap().count(),
+            1,
+            "the parts are replaced by the merged file"
+        );
+        assert_eq!(store.stats().batch_count, 2, "both batches survive");
+        assert_eq!(flame_total(&store), 42, "merged rows stay queryable");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

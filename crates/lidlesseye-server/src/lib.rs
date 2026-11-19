@@ -593,11 +593,12 @@ impl LidlessEye {
                 let registry = compact_registry.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let now = lidlesseye_core::now_ns();
-                    for (tenant, flushed, uploaded) in registry.compaction_tick(now) {
+                    for (tenant, flushed, uploaded, merged) in registry.compaction_tick(now) {
                         info!(
                             tenant = %tenant,
                             flushed,
                             uploaded,
+                            merged,
                             "parquet compaction"
                         );
                     }

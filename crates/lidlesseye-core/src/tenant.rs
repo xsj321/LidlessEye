@@ -334,9 +334,10 @@ impl TenantStore {
     }
 
     /// Run one Parquet compaction pass across all tenants: flush each hot tier
-    /// to local Parquet, then archive files past the local TTL to S3. Returns
-    /// `(tenant, rows_flushed, files_uploaded)`. No-op when not in Parquet mode.
-    pub fn compaction_tick(&self, now_ns: u64) -> Vec<(TenantId, usize, usize)> {
+    /// to local Parquet, merge completed hours, then archive files past the
+    /// local TTL to S3. Returns `(tenant, rows_flushed, files_uploaded,
+    /// files_merged)`. No-op when not in Parquet mode.
+    pub fn compaction_tick(&self, now_ns: u64) -> Vec<(TenantId, usize, usize, usize)> {
         let mut out = Vec::new();
         if self.base.storage_mode != crate::store::StorageMode::Parquet {
             return out;
@@ -359,8 +360,18 @@ impl TenantStore {
                     0
                 }
             };
-            if flushed > 0 || uploaded > 0 {
-                out.push((id, flushed, uploaded));
+            // Merge each finished hour into one file per table. Without this a
+            // five-minute ingest cadence leaves twelve files an hour, and every
+            // query pays to open all of their footers.
+            let merged = match store.compact_local() {
+                Ok(stats) => stats.files_merged,
+                Err(err) => {
+                    warn!(tenant = %id, error = %err, "parquet local compaction failed");
+                    0
+                }
+            };
+            if flushed > 0 || uploaded > 0 || merged > 0 {
+                out.push((id, flushed, uploaded, merged));
             }
         }
         out

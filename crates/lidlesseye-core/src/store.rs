@@ -318,6 +318,14 @@ pub struct Store {
     ids: Mutex<Ids>,
     /// Present only in Parquet mode: layout + lifecycle of the local/S3 files.
     parquet: Option<ParquetState>,
+    /// Wall-clock instant of the last local Parquet compaction pass. The
+    /// compaction tick runs every few seconds; rewriting an hour's files that
+    /// often would cost more than it saves.
+    last_compact_ns: std::sync::atomic::AtomicU64,
+    /// Cached [`StoreStats`] and when it was computed. Every open dashboard
+    /// polls `stats`, and in Parquet mode that query opens every file's footer
+    /// just to count rows.
+    stats_cache: Mutex<Option<(u64, StoreStats)>>,
 }
 
 impl Store {
@@ -432,6 +440,8 @@ impl Store {
             frame_cache: Mutex::new(HashMap::new()),
             ids: Mutex::new(ids),
             parquet: parquet_state,
+            last_compact_ns: std::sync::atomic::AtomicU64::new(0),
+            stats_cache: Mutex::new(None),
         };
         Ok(store)
     }
@@ -667,6 +677,9 @@ impl Store {
             "wrote batch"
         );
 
+        // A caller that appends and then asks for stats must see its own write.
+        // The cache only short-circuits polling between writes.
+        *self.stats_cache.lock() = None;
         Ok(Arc::new(BatchMeta {
             batch_id,
             profile_type: report.profile_type.clone(),
@@ -956,6 +969,15 @@ impl Store {
     }
 
     pub fn stats(&self) -> StoreStats {
+        let now = now_ns();
+        // Dashboards poll this every few seconds. In Parquet mode the query
+        // reads every file's footer, so a short cache removes a surprising
+        // amount of metadata I/O without making the number stale to the eye.
+        if let Some((at, cached)) = *self.stats_cache.lock()
+            && now.saturating_sub(at) < 30_000_000_000
+        {
+            return cached;
+        }
         let fallback = StoreStats::default();
         let conn = self.conn.lock();
         let row = conn.query_row(
@@ -979,14 +1001,16 @@ impl Store {
                 return fallback;
             }
         };
-        StoreStats {
+        let stats = StoreStats {
             batch_count: count.max(0) as usize,
             total_bytes: self.disk_bytes(),
             logical_bytes: logical.max(0) as u64,
             total_value: value.max(0) as u64,
             earliest_ns: earliest.map(|v| v.max(0) as u64),
             latest_ns: latest.map(|v| v.max(0) as u64),
-        }
+        };
+        *self.stats_cache.lock() = Some((now, stats));
+        stats
     }
 
     /// Physical footprint of the tenant's database: the file DuckDB keeps its
@@ -1021,6 +1045,42 @@ impl Store {
         };
         let conn = self.conn.lock();
         parquet::flush_hot(&conn, state)
+    }
+
+    /// Merge each completed hour's local Parquet files into one per table.
+    /// No-op in DuckDB mode, and throttled to once every ten minutes so the
+    /// ten-second compaction tick stays cheap.
+    pub fn compact_local(&self) -> Result<parquet::CompactStats> {
+        let Some(state) = &self.parquet else {
+            return Ok(parquet::CompactStats::default());
+        };
+        let now = now_ns();
+        const INTERVAL_NS: u64 = 600_000_000_000;
+        let last = self
+            .last_compact_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < INTERVAL_NS {
+            return Ok(parquet::CompactStats::default());
+        }
+        self.last_compact_ns
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        let current_hour = parquet::hour_tag()
+            .trim_start_matches('h')
+            .parse::<u64>()
+            .unwrap_or(u64::MAX);
+        let conn = self.conn.lock();
+        parquet::compact_local(&conn, state, current_hour)
+    }
+
+    /// Compact every hour, including the current one. Tests only: the public
+    /// method deliberately leaves the hour being written alone.
+    #[cfg(test)]
+    pub(crate) fn compact_all_for_test(&self) -> Result<parquet::CompactStats> {
+        let Some(state) = &self.parquet else {
+            return Ok(parquet::CompactStats::default());
+        };
+        let conn = self.conn.lock();
+        parquet::compact_local(&conn, state, u64::MAX)
     }
 
     /// Merge local Parquet files older than the local TTL into one object per
@@ -1241,6 +1301,9 @@ impl Store {
             conn.execute_batch("CHECKPOINT").map_err(db_err)?;
         }
 
+        // The counts just changed; drop the value `before` cached so both this
+        // pass and the caller observe the pruned state.
+        *self.stats_cache.lock() = None;
         let after = self.stats();
         // Physical file size stays at its high-water mark after DELETE, so
         // report the logical size actually released instead.
@@ -1285,6 +1348,7 @@ impl Store {
             parquet::refresh_views(&conn, state)?;
         }
         self.frame_cache.lock().clear();
+        *self.stats_cache.lock() = None;
         let mut ids = self.ids.lock();
         ids.next_frame = 0;
         ids.next_stack = 0;
@@ -1503,6 +1567,9 @@ impl Store {
         match result {
             Ok(()) => {
                 conn.execute_batch("COMMIT").map_err(db_err)?;
+                // The map contributes to `total_bytes`; a cached stats value
+                // from before this window would undercount it.
+                *self.stats_cache.lock() = None;
                 Ok(())
             }
             Err(err) => {
