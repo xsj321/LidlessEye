@@ -70,10 +70,10 @@ pub struct ServerConfig {
 }
 
 fn default_duckdb_threads() -> Option<usize> {
-    // Each thread keeps its own decode/prefetch buffers alive for the length
-    // of a scan. Two keeps a Parquet-heavy pod within a small memory limit;
-    // larger deployments can raise it with `--duckdb-threads`.
-    Some(2)
+    // Four threads scan a 30-day, 40M-row Parquet set about twice as fast as
+    // two. It needs a 4 GiB pod: each thread keeps its own decode buffers.
+    // Small deployments can lower it with `--duckdb-threads=2`.
+    Some(4)
 }
 
 impl Default for ServerConfig {

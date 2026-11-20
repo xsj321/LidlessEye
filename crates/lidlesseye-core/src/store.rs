@@ -787,10 +787,22 @@ impl Store {
         let conn = self.conn.lock();
         let types = query.profile_type.source_types();
         let placeholders = vec!["?"; types.len()].join(", ");
-        let mut sql = format!(
-            "SELECT stack_id, service_name, labels, SUM(value) FROM samples \
-             WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ?"
-        );
+        // A selector or a `group_by` needs the series columns; a plain
+        // flamegraph does not. Those columns are the bulk of every sample row
+        // (a full label map repeated per stack), so reading only
+        // `stack_id, value` removes most of the I/O on a wide scan.
+        let needs_series = !query.selector.is_empty() || query.group_by.is_some();
+        let mut sql = if needs_series {
+            format!(
+                "SELECT stack_id, service_name, labels, SUM(value) FROM samples \
+                 WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ?"
+            )
+        } else {
+            format!(
+                "SELECT stack_id, SUM(value) FROM samples \
+                 WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ?"
+            )
+        };
         let mut args: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
         for t in &types {
             args.push(Box::new(t.as_str().to_string()));
@@ -807,7 +819,11 @@ impl Store {
         // Grouping by the series as well as the stack keeps the label string
         // available for the exact matchers, and lets the same stack appear
         // once per series (which is what `group_by` needs).
-        sql.push_str(" GROUP BY stack_id, service_name, labels");
+        if needs_series {
+            sql.push_str(" GROUP BY stack_id, service_name, labels");
+        } else {
+            sql.push_str(" GROUP BY stack_id");
+        }
 
         let mut stmt = conn.prepare(&sql).map_err(db_err)?;
         let refs: Vec<&dyn duckdb::ToSql> = args.iter().map(|a| a.as_ref()).collect();
@@ -827,6 +843,17 @@ impl Store {
                 break;
             }
             let stack_id = row.get::<_, i64>(0).map_err(db_err)?.max(0) as u64;
+            // No selector and no grouping: the query selected only
+            // `stack_id, value`, and there is no series to keep.
+            if !needs_series {
+                let value = row.get::<_, i64>(1).map_err(db_err)?.max(0) as u64;
+                rows.push(SampleRow {
+                    stack_id,
+                    value,
+                    group: None,
+                });
+                continue;
+            }
             let service_name: String = row.get(1).map_err(db_err)?;
             let labels_text: String = row.get(2).map_err(db_err)?;
             let value = row.get::<_, i64>(3).map_err(db_err)?.max(0) as u64;

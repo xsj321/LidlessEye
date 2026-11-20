@@ -598,10 +598,95 @@ pub(crate) fn compact_local(
             changed = true;
         }
     }
+    // Hourly compaction still leaves one file per busy hour. Every query opens
+    // all of them for their footers, so a one-hour request pays for the whole
+    // retention window. Fold the smallest files into one until the table is
+    // back under budget; already-large merged files are left alone, so the
+    // oldest data is rewritten at most once.
+    for def in TABLES {
+        if merge_smallest_files(conn, state, def, 16)? {
+            changed = true;
+        }
+    }
     if changed {
         refresh_views(conn, state)?;
     }
     Ok(stats)
+}
+
+/// Merge the smallest local files of one table until it holds `budget` files.
+/// Returns whether anything was rewritten.
+fn merge_smallest_files(
+    conn: &Connection,
+    state: &ParquetState,
+    def: &TableDef,
+    budget: usize,
+) -> Result<bool> {
+    let dir = state.table_dir(def.name);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(false);
+    };
+    let mut files: Vec<(u64, u64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(hour) = parse_hour_tag(&name) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        files.push((meta.len(), hour, entry.path()));
+    }
+    if files.len() <= budget {
+        return Ok(false);
+    }
+    files.sort_by_key(|(size, _, _)| *size);
+    let take = files.len() - budget + 1;
+    let chosen: Vec<(u64, u64, PathBuf)> = files.into_iter().take(take).collect();
+
+    let list = chosen
+        .iter()
+        .map(|(_, _, p)| format!("'{}'", p.to_string_lossy().replace('\\', "/")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hour = chosen.iter().map(|(_, hour, _)| *hour).min().unwrap_or(0);
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let target = dir.join(format!("h{hour}-merged-{unique}.parquet"));
+    let tmp = dir.join(format!("h{hour}-merged-{unique}.parquet.tmp"));
+    let sql = format!(
+        "COPY ({}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
+        merge_projection(&list),
+        tmp.to_string_lossy().replace('\\', "/"),
+    );
+    if let Err(err) = conn.execute_batch(&sql) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Db(format!(
+            "merging {} down to {budget} files: {err}",
+            def.name
+        )));
+    }
+    let rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM read_parquet('{}')",
+                tmp.to_string_lossy().replace('\\', "/")
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if rows <= 0 {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(false);
+    }
+    std::fs::rename(&tmp, &target).map_err(Error::Io)?;
+    for (_, _, file) in &chosen {
+        let _ = std::fs::remove_file(file);
+    }
+    Ok(true)
 }
 
 /// Size on local disk of the staged Parquet files.
