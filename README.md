@@ -78,6 +78,37 @@ The dashboard opens on the **service map**. Click any node to inspect its SLO, r
 
 ![Time range and filters](docs/images/time-range.png) ![Top functions](docs/images/top.png)
 
+## Performance
+
+Measured on a single server replica against a synthetic 30-day e-commerce cluster: 64 services, 244 edges, 687,792 profile reports (~41M stack samples), stacks up to 1,022 frames, 490 MB on disk. No pre-aggregation and no external index: every number below scans the Parquet the ingest path wrote.
+
+| Query (one-hour window) | p50 | p95 |
+| --- | ---: | ---: |
+| Stats | 37 ms | 41 ms |
+| Service map | 41 ms | 46 ms |
+| Map histogram | 11 ms | 33 ms |
+| Time series | 33 ms | 35 ms |
+| Top functions | 135 ms | 193 ms |
+| Flamegraph | 178 ms | 212 ms |
+
+A wider flamegraph grows with the data rather than falling off a cliff:
+
+| Window | p50 | p95 |
+| --- | ---: | ---: |
+| 1 hour | 167 ms | 192 ms |
+| 6 hours | 689 ms | 752 ms |
+| 24 hours | 2.8 s | 3.0 s |
+| 7 days | 6.2 s | 7.4 s |
+| 30 days | 7.8 s | 9.2 s |
+
+The 30-day row is the full 41M-row scan behind "show me the whole month"; normal dashboard use stays in the tens to low hundreds of milliseconds.
+
+**Concurrent dashboards.** 16 clients polling stats, map, histogram and series for 15 seconds: **34 req/s**, p50 356 ms, p95 894 ms, p99 999 ms, zero errors on one replica. The server keeps one DuckDB connection and serialises queries, so this is the queue a real dashboard sees rather than a synthetic parallel scan.
+
+**What it costs.** During the run Prometheus measured **1.35 GB average / 1.97 GB peak RSS** and **1.96 / 3.39 cores average/peak** on a 20-vCPU node. The 30 days occupy **490 MB** on disk.
+
+Reproduce it: generate the dataset with `node scripts/seed-ecommerce.mjs --profile stress`, then run `node scripts/bench.mjs --base http://127.0.0.1:4040 --tenant shop-stress`. The script prints the same tables and can write JSON/Markdown for a release note.
+
 ## Dashboard tour
 
 The left drawer switches between Service map, Overview, Flamegraph, Compare, Top functions, Time series and Labels. It collapses to icons with a single click; the choice is remembered in this browser. The header bar holds the tenant selector (left of the version) and Refresh; the profile toolbar is hidden on the service map, where the relative range is picked beside the histogram. The histogram above the map counts requests (new connections), not CPU samples. **Settings** sits at the bottom of the drawer and controls the interface language (English / 简体中文), start-up view, default range, refresh interval, map edge labels and their zoom threshold, flamegraph frame cap and histogram resolution.
