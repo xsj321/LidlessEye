@@ -88,6 +88,25 @@ typedef long long __s64;
 #define ROLE_CLIENT 1
 #define ROLE_SERVER 2
 
+/* Keep these in sync with lidlesseye_core::servicemap::protocol. A connection
+ * can carry more than one application protocol over its lifetime, so this is
+ * a bit set rather than a single enum. */
+#define PROTO_HTTP        (1U << 0)
+#define PROTO_HTTPS       (1U << 1)
+#define PROTO_POSTGRES    (1U << 2)
+#define PROTO_MYSQL       (1U << 3)
+#define PROTO_MONGODB     (1U << 4)
+#define PROTO_REDIS       (1U << 5)
+#define PROTO_MEMCACHED   (1U << 6)
+#define PROTO_CASSANDRA   (1U << 7)
+#define PROTO_KAFKA       (1U << 8)
+#define PROTO_CLICKHOUSE  (1U << 9)
+#define PROTO_ZOOKEEPER   (1U << 10)
+#define PROTO_FOUNDATIONDB (1U << 11)
+#define PROTO_HTTP2       (1U << 12)
+#define PROTO_DNS         (1U << 13)
+#define PROTO_GRPC        (1U << 14)
+
 /* ---- helper ABI ------------------------------------------------------- */
 /* `const` is not decoration: without it clang keeps the pointer in .data and
  * emits an indirect call whose target the verifier cannot resolve, which it
@@ -226,6 +245,10 @@ struct flow_stats {
      * from `sock_owners`, which records it where the task is known. */
     __u64 cgroup;
     __u32 role;
+    /* Bit set of protocols recognised by `lidlesseye_tcp_classify`. Zero until
+     * the first send of the window is inspected, and again after every drain;
+     * the map then falls back to the server port's guess. */
+    __u32 protocols;
     /* Payload samples already sent to user space for this flow. The map is
      * drained every interval, so this is a per-window budget: a chatty
      * connection must not fill the ring buffer, but the first request of a
@@ -386,6 +409,152 @@ static __always_inline char at(const char *buf, __u64 offset) {
      * buffer, but the verifier rejects any bitwise op on a pointer. */
     volatile __u32 index = (__u32)offset & PAYLOAD_MASK;
     return buf[index];
+}
+
+/* --------------------------------------------------------------------- */
+/* Protocol classification                                               */
+/* --------------------------------------------------------------------- */
+/* Names the wire protocol of a connection whose protocol is not known yet, so
+ * an edge keeps its label even when no payload was sampled for it and even for
+ * the formats the agent does not decode (Redis, Kafka, MongoDB...).
+ *
+ * Every check here reads a *constant* byte offset inside a 16-byte window.
+ * That is the whole point of this shape: the earlier version indexed the
+ * sample through a masked variable offset, and the verifier explores those
+ * offsets one state per value — fifteen parsers built that way reached 63k
+ * states and 1.1M processed instructions, which this kernel rejects outright.
+ * With constants the budget stays small enough to run on every new flow.
+ *
+ * Framing formats are identified from their declared length compared with the
+ * size of the write, which is a scalar comparison and costs nothing. Checks
+ * that need to walk a variable-length header (ClickHouse, Cassandra) are
+ * deliberately shallow: the port guess covers the rest, and a wrong label is
+ * worse than a generic one. */
+
+#define HEAD_WINDOW 16
+
+static __always_inline __u32 be16(const __u8 *p) {
+    return ((__u32)p[0] << 8) | (__u32)p[1];
+}
+
+static __always_inline __u32 be32(const __u8 *p) {
+    return ((__u32)p[0] << 24) | ((__u32)p[1] << 16) | ((__u32)p[2] << 8) | (__u32)p[3];
+}
+
+static __always_inline __u32 classify_payload(const __u8 *h, __u32 size) {
+    if (size < 6) {
+        return 0;
+    }
+    __u32 mask = 0;
+
+    /* One TLS record: content type 0x16, version 3.x. */
+    if (h[0] == 0x16 && h[1] == 0x03 && h[2] <= 0x04) {
+        mask |= PROTO_HTTPS;
+    }
+
+    /* HTTP/1 request line, or a response's status line. */
+    if ((h[0] == 'G' && h[1] == 'E' && h[2] == 'T' && h[3] == ' ') ||
+        (h[0] == 'P' && h[1] == 'O' && h[2] == 'S' && h[3] == 'T') ||
+        (h[0] == 'P' && h[1] == 'U' && h[2] == 'T' && h[3] == ' ') ||
+        (h[0] == 'H' && h[1] == 'E' && h[2] == 'A' && h[3] == 'D') ||
+        (h[0] == 'D' && h[1] == 'E' && h[2] == 'L' && h[3] == 'E') ||
+        (h[0] == 'O' && h[1] == 'P' && h[2] == 'T' && h[3] == 'I') ||
+        (h[0] == 'P' && h[1] == 'A' && h[2] == 'T' && h[3] == 'C') ||
+        (h[0] == 'H' && h[1] == 'T' && h[2] == 'T' && h[3] == 'P' && h[4] == '/' &&
+         h[5] >= '0' && h[5] <= '9')) {
+        mask |= PROTO_HTTP;
+    }
+
+    /* HTTP/2 connection preface. */
+    if (h[0] == 'P' && h[1] == 'R' && h[2] == 'I' && h[3] == ' ' && h[4] == '*' &&
+        h[5] == ' ') {
+        mask |= PROTO_HTTP2;
+    }
+
+    /* PostgreSQL: a startup packet, or a typed message whose length fits. */
+    if (be32(h + 1) == 196608) {
+        mask |= PROTO_POSTGRES;
+    } else if ((h[0] == 'Q' || h[0] == 'P' || h[0] == 'C' || h[0] == 'S' || h[0] == 'E' ||
+                h[0] == 'T' || h[0] == 'D' || h[0] == 't' || h[0] == '1' || h[0] == '2') &&
+               be32(h + 1) + 1 == size) {
+        mask |= PROTO_POSTGRES;
+    }
+
+    /* MySQL: length(3) + sequence 0 + a command byte. */
+    {
+        __u32 length = (__u32)h[0] | ((__u32)h[1] << 8) | ((__u32)h[2] << 16);
+        __u8 command = h[4];
+        if (h[3] == 0 && length + 4 == size &&
+            (command == 0 || command == 1 || command == 2 || command == 3 ||
+             command == 0x16 || command == 0x17 || command == 0x19)) {
+            mask |= PROTO_MYSQL;
+        }
+    }
+
+    /* MongoDB: the frame length covers the whole write and the opcode is one
+     * the drivers use. */
+    if (be32(h) == size &&
+        (be32(h + 12) == 2013 || be32(h + 12) == 2012 || be32(h + 12) == 2004)) {
+        mask |= PROTO_MONGODB;
+    }
+
+    /* Redis: array of bulk strings. */
+    if (h[0] == '*' && h[1] >= '0' && h[1] <= '9') {
+        mask |= PROTO_REDIS;
+    }
+
+    /* Memcached text verbs. */
+    if ((h[0] == 'g' && h[1] == 'e' && h[2] == 't' && h[3] == ' ') ||
+        (h[0] == 's' && h[1] == 'e' && h[2] == 't' && h[3] == ' ') ||
+        (h[0] == 'a' && h[1] == 'd' && h[2] == 'd' && h[3] == ' ') ||
+        (h[0] == 'd' && h[1] == 'e' && h[2] == 'l' && h[3] == 'e') ||
+        (h[0] == 'i' && h[1] == 'n' && h[2] == 'c' && h[3] == 'r') ||
+        (h[0] == 'd' && h[1] == 'e' && h[2] == 'c' && h[3] == 'r') ||
+        (h[0] == 's' && h[1] == 't' && h[2] == 'a' && h[3] == 't')) {
+        mask |= PROTO_MEMCACHED;
+    }
+
+    /* Kafka and ZooKeeper share the 4-byte length prefix; the next two fields
+     * tell them apart. */
+    if (be32(h) + 4 == size) {
+        if (be32(h + 8) >= 0 && be16(h + 4) <= 67) {
+            mask |= PROTO_KAFKA;
+        }
+        {
+            __s32 xid = (__s32)be32(h + 4);
+            __s32 opcode = (__s32)be32(h + 8);
+            if ((xid >= 0 || xid == -1 || xid == -2) &&
+                ((opcode >= 0 && opcode <= 21) || opcode == -11 || opcode == 100 ||
+                 opcode == 101 || opcode == -1)) {
+                mask |= PROTO_ZOOKEEPER;
+            }
+        }
+    }
+
+    /* FoundationDB's connect packet carries 0x1FDB at bytes 10-11. */
+    if (h[10] == 0xdb && h[11] == 0x1f) {
+        mask |= PROTO_FOUNDATIONDB;
+    }
+
+    /* DNS over TCP: 2-byte length, then a flags word whose opcode and rcode
+     * are the zero a query carries. */
+    if (be16(h) + 2 == size && (h[2] & 0x80) && (h[3] & 0x0f) == 0) {
+        mask |= PROTO_DNS;
+    }
+
+    /* Cassandra native protocol: version 4/5, then a frame whose 4-byte length
+     * counts everything after itself. */
+    if ((h[0] == 4 || h[0] == 5) && h[1] <= 9 && be32(h + 5) + 9 == size) {
+        mask |= PROTO_CASSANDRA;
+    }
+
+    /* ClickHouse: the first byte is the packet kind, and the client hello
+     * starts with a 0 or 36-byte query id. */
+    if (h[0] == 1 && (h[1] == 0 || h[1] == 36)) {
+        mask |= PROTO_CLICKHOUSE;
+    }
+
+    return mask;
 }
 
 /* --------------------------------------------------------------------- */
@@ -574,6 +743,54 @@ int lidlesseye_tcp_state(struct pt_regs *ctx) {
 /* --------------------------------------------------------------------- */
 /* Bytes sent by the application                                          */
 /* --------------------------------------------------------------------- */
+/* Name the protocol of a connection whose protocol is not known yet.
+ *
+ * This is a separate program on the same kprobe, and separate on purpose: the
+ * classifiers are what pushed a combined program past the verifier's
+ * one-million-instruction ceiling, and two programs are verified
+ * independently. Splitting also keeps the payload copy cheap — this one reads
+ * at most 128 bytes, holds no ring-buffer event on its stack, and runs once
+ * per flow per window (the counters are drained every interval, so
+ * `protocols` is zero again for the next window's first send).
+ *
+ * It runs for both directions: a server's first bytes are a response, and
+ * `is_http` recognises the status line, which is how an inward-only flow gets
+ * a name at all. */
+SEC("kprobe/tcp_sendmsg_classify")
+int lidlesseye_tcp_classify(struct pt_regs *ctx) {
+    __u64 addr = PARM1(ctx);
+    if (addr == 0) {
+        return 0;
+    }
+    struct sock_flow *entry = bpf_map_lookup_elem((void *)&sock_flows, &addr);
+    if (!entry) {
+        return 0;
+    }
+    struct flow_stats *stats = bpf_map_lookup_elem((void *)&flows, &entry->key);
+    if (!stats || stats->protocols != 0) {
+        return 0;
+    }
+    // The reader fills up to L7_SAMPLE bytes, so the buffer has to be that
+    // wide; the classifiers are written against the first 128 and a larger
+    // bound only makes the verifier explore more states.
+    char payload[L7_SAMPLE] = {};
+    __u32 used = 0;
+    if (read_send_payload(PARM2(ctx), payload, &used) != 0) {
+        return 0;
+    }
+    __u32 seen = used;
+    if (seen > PAYLOAD_SAMPLE) {
+        seen = PAYLOAD_SAMPLE;
+    }
+    __u32 detected = classify_payload((const __u8 *)payload, seen);
+    if (detected != 0) {
+        // Not atomic on purpose: BPF has no 32-bit atomic OR, and a lost bit
+        // here only means this window falls back to the port guess.
+        stats->protocols |= detected;
+    }
+    return 0;
+}
+
 /* Sample the first writes of a connection and hand them to user space. The
  * budget is per window: a chatty connection must not fill the ring buffer,
  * but the first request of a fresh one always gets through. Server flows get

@@ -22,10 +22,12 @@ Rust API follows the same rule.
 ### Changed
 
 - Payload parsing moved to the agent. The kernel copies the first bytes of a
-  request into a perf ring buffer and the agent decides what they are; the
-  fifteen in-kernel protocol classifiers are gone. They were the reason the
-  send probe failed to load on kernels where `struct iov_iter` had changed — a
-  CO-RE miss there becomes an invalid call the verifier rejects.
+  request into a perf ring buffer and the agent reads the host and the SQL out
+  of them. Protocol naming stays in the kernel, in its own program: the two
+  halves are verified separately because together they crossed the verifier's
+  instruction ceiling, which is why the send probe used to fail to load. The
+  classifier now uses constant byte offsets instead of masked variable
+  indexing, which is what made the state count fit.
 - The payload pointer's offset is read from the running kernel's BTF instead of
   a CO-RE field name, because kernel 6.16 renamed `iov_iter.iov` to `__iov`.
 

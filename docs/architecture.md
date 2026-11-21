@@ -528,20 +528,28 @@ holds the connection is dropped rather than drawn backwards.
 
 ### Application protocols and request detail
 
-`lidlesseye_tcp_send` copies the first bytes of a client write into a perf
-ring buffer, and the agent decides what they are. Nothing in the kernel
-classifies anymore: fifteen protocol parsers in one program is what made the
-verifier reject the send probe outright (the program is capped at a million
-instructions, and the classifiers alone exceeded it). Moving them to user
-space also means a new protocol costs a Rust function instead of a slice of
-that budget.
+Two programs sit on `tcp_sendmsg`, and the split is not cosmetic: the fifteen
+per-protocol parsers and the payload copy together exceed the verifier's
+one-million-instruction ceiling, and a single program that tried to do both was
+rejected outright (63k states, 1.1M processed instructions). Verified
+separately, each stays well inside the budget.
 
-The probe samples at most twelve writes per connection per window (three on
-the server side, where only the first bytes matter), so a chatty socket cannot
-flood the ring. Bulk writes are never copied: a TLS record or a result set
-cannot name a host or a statement.
+**`lidlesseye_tcp_classify`** names the protocol of a flow, once per window
+(the counters are drained every interval, so `protocols` starts at zero again
+for the next window's first send). It reads a window of the request and every
+check uses a *constant* byte offset — the earlier masked-variable indexing is
+what cost one verifier state per possible offset. Framing formats are
+recognised by comparing their declared length against the size of the write.
+It covers HTTP/1, HTTP/2, TLS, PostgreSQL, MySQL, MongoDB, Redis, Memcached,
+Kafka, ZooKeeper, FoundationDB, DNS, Cassandra and ClickHouse; checks that need
+to walk a variable-length header are deliberately shallow, because the port
+guess covers the rest and a wrong label is worse than a generic one.
 
-On the agent side `l7` reads each sample and fills two fields on the edge:
+**`lidlesseye_tcp_send`** counts bytes and samples the first writes into a perf
+ring buffer — at most twelve per connection per window on the client side,
+three on the server side, so a chatty socket cannot flood the ring. Bulk writes
+are never copied: a TLS record or a result set cannot name a host or a
+statement. The agent parses the samples and fills two fields on the edge:
 
 * **`host`** — the `Host:` header of an HTTP/1.x request. This is the name the
   client asked for, which a ClusterIP or a load balancer address cannot tell
@@ -552,8 +560,9 @@ On the agent side `l7` reads each sample and fills two fields on the edge:
   PostgreSQL `Query` / `Parse` message. Prepared statements are what modern
   drivers use, so both commands are read.
 
-A statement longer than the sample is marked with `…` instead of being shown
-truncated mid-word without a hint.
+A statement longer than the sample is marked with `…`. The agent also adds the
+protocol it recognises to the edge's bit set, which is how a TLS flow — whose
+plaintext the classifier cannot see — still gets labelled.
 
 Encrypted traffic needs the optional TLS uprobe (`LIDLESSEYE_SSL_UPROBE=1` on
 the agent). It attaches `SSL_write` / `SSL_write_ex` to every `libssl`,
@@ -562,13 +571,12 @@ deduplicated by inode — and emits the same samples, keyed by cgroup instead of
 by socket. It is off by default: every TLS write pays a user-memory read. The
 same uprobe is what covers MySQL and PostgreSQL over TLS, not just HTTPS.
 
-The protocol label still falls back to the server port's guess when no sample
-was parsed (an encrypted connection with no uprobe, an opaque protocol, or a
-connection that predates the agent). A parsed payload always wins: `9200` is
-normally an HTTP API, but a native ClickHouse frame on that port is
+The protocol label falls back to the server port's guess when the classifier
+recognised nothing and no sample was parsed. A recognised payload always wins:
+`9200` is normally an HTTP API, but a native ClickHouse frame on that port is
 ClickHouse.
 
-Two offsets the code needs — where the payload pointer sits inside
+Two offsets the payload copy needs — where the pointer sits inside
 `struct msghdr` and `struct iov_iter` — are read from the running kernel's BTF
 at startup and patched into the program as constants. Kernel 6.16 renamed
 `iov_iter.iov` to `__iov` and moved it; a CO-RE access by name resolves on one

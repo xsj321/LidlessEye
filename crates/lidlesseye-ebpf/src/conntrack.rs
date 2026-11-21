@@ -209,6 +209,10 @@ struct FlowStats {
     rtt_samples: u64,
     cgroup: u64,
     role: u32,
+    /// Bit set of protocols the classifier recognised. Zero until the first
+    /// send of the window is inspected; the agent adds what its own parsers
+    /// recognise on top.
+    protocols: u32,
     /// Payload samples already emitted for this flow in the window.
     l7_samples: u32,
 }
@@ -542,6 +546,11 @@ where
     // leaves a record of what this kernel does support.
     let mut attached: Vec<&'static str> = Vec::new();
     for (program, symbols) in [
+        // Two programs on one kprobe: the classifiers are what push a single
+        // program past the verifier's instruction ceiling, and verified
+        // separately each stays well below it. Order matters only in that the
+        // classifier should see a flow before its first payload is sampled.
+        ("lidlesseye_tcp_classify", &["tcp_sendmsg"][..]),
         ("lidlesseye_tcp_send", &["tcp_sendmsg"][..]),
         ("lidlesseye_tcp_recv", &["tcp_cleanup_rbuf"][..]),
         ("lidlesseye_tcp_retrans", &["tcp_retransmit_skb"][..]),
@@ -734,9 +743,7 @@ fn to_flow(key: &FlowKey, stats: &FlowStats) -> Option<Flow> {
         rtt_us_sum: stats.rtt_us_sum,
         rtt_samples: stats.rtt_samples,
         cgroup: stats.cgroup,
-        // Filled from the payload samples by `L7Cache::apply`; the kernel no
-        // longer classifies, so nothing arrives from the map.
-        protocols: 0,
+        protocols: stats.protocols,
         host: String::new(),
         sql: String::new(),
     })
@@ -841,6 +848,40 @@ mod tests {
         assert_eq!(flow.remote, ("10.244.0.1".parse().unwrap(), 6443));
     }
 
+    /// The bit values are duplicated between Rust and C because the kernel
+    /// object cannot import the Rust enum. A source contract is the cheapest
+    /// way to stop one side drifting; the object is compiled in CI as well.
+    #[test]
+    fn the_probe_and_the_core_agree_on_protocol_bits() {
+        use lidlesseye_core::servicemap::protocol as p;
+        let source = include_str!("../bpf/net.bpf.c");
+        for (name, value) in [
+            ("PROTO_HTTP", p::HTTP),
+            ("PROTO_HTTPS", p::HTTPS),
+            ("PROTO_POSTGRES", p::POSTGRES),
+            ("PROTO_MYSQL", p::MYSQL),
+            ("PROTO_MONGODB", p::MONGODB),
+            ("PROTO_REDIS", p::REDIS),
+            ("PROTO_MEMCACHED", p::MEMCACHED),
+            ("PROTO_CASSANDRA", p::CASSANDRA),
+            ("PROTO_KAFKA", p::KAFKA),
+            ("PROTO_CLICKHOUSE", p::CLICKHOUSE),
+            ("PROTO_ZOOKEEPER", p::ZOOKEEPER),
+            ("PROTO_FOUNDATIONDB", p::FOUNDATIONDB),
+            ("PROTO_HTTP2", p::HTTP2),
+            ("PROTO_DNS", p::DNS),
+            ("PROTO_GRPC", p::GRPC),
+        ] {
+            let expected = format!("#define {name:<17} (1U << {})", value.trailing_zeros());
+            assert!(
+                source.contains(&expected),
+                "{name} changed on one side of the ABI"
+            );
+        }
+        assert!(source.contains("lidlesseye_tcp_classify"));
+        assert!(source.contains("classify_payload"));
+    }
+
     /// The C struct and this mirror must stay byte-compatible: the kernel
     /// writes it, `aya` copies it, and a field added on one side alone would
     /// silently shift every counter that follows.
@@ -863,15 +904,18 @@ mod tests {
     }
 
     #[test]
-    fn a_flow_starts_without_a_protocol() {
-        // Classification moved to the agent, so nothing arrives from the map;
-        // `L7Cache::apply` is what adds the bit.
+    fn a_classified_flow_carries_the_kernel_bits() {
+        // The classifier runs in the kernel so a flow has a name even when no
+        // payload is sampled; the agent's parser can only add to this.
         let flow = to_flow(
             &key([10, 0, 0, 2], [10, 0, 0, 7], 43210, 8080),
-            &FlowStats::default(),
+            &FlowStats {
+                protocols: 0x1001, // HTTP and ClickHouse
+                ..Default::default()
+            },
         )
         .unwrap();
-        assert_eq!(flow.protocols, 0);
+        assert_eq!(flow.protocols, 0x1001);
     }
 
     #[test]
