@@ -34,6 +34,13 @@ fn main() {
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_endian = std::env::var("CARGO_CFG_TARGET_ENDIAN").unwrap_or_default();
 
+    // The crate embeds these objects with `include_bytes!`, and cargo checks a
+    // unit's inputs *before* the build script rewrites them. Without a changing
+    // line here, a build that recompiles the object can still reuse the crate's
+    // previous rlib and embed the old bytes — which is exactly how a fixed
+    // probe kept failing to load from a freshly built image.
+    let mut digest = 0xcbf29ce484222325u64;
+
     for (source, prebuilt) in OBJECTS {
         // The output keeps the prebuilt's name: `include_bytes!` in the crate
         // refers to `net.bpf.o`, not to the `.c` it was compiled from.
@@ -63,7 +70,14 @@ fn main() {
             &defines,
             &std::env::var("CC").unwrap_or_else(|_| "clang".to_string()),
         );
+        if let Ok(bytes) = std::fs::read(&out) {
+            for byte in bytes {
+                digest ^= u64::from(byte);
+                digest = digest.wrapping_mul(0x100000001b3);
+            }
+        }
     }
+    println!("cargo:rustc-env=LIDLESSEYE_BPF_DIGEST={digest:016x}");
 }
 
 fn build_object(

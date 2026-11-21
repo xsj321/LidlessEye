@@ -526,25 +526,54 @@ inferred from the pod spec: a pod listening on the local port is the server, a
 peer whose pod declares the remote port makes this pod the client. When neither
 holds the connection is dropped rather than drawn backwards.
 
-### Application protocols
+### Application protocols and request detail
 
-`lidlesseye_tcp_send` reads the first iovec of a socket write into a bounded
-128-byte stack buffer and matches request lines and binary frame headers. The
-result is a bit set on the flow, so one long-lived connection can be labelled
-with every protocol it carried; the UI prints the names on the edge label and
-keeps the full set in the Net tab. The detectors cover HTTP/1, HTTP/2, TLS
-client hellos, Postgres, MySQL, MongoDB, Redis, Memcached, Cassandra, Kafka,
-ClickHouse, ZooKeeper, FoundationDB and DNS over TCP. A payload hit always
-beats the server port's guess: `9200` is normally an HTTP API, but a native
-ClickHouse frame on that port is ClickHouse.
+`lidlesseye_tcp_send` copies the first bytes of a client write into a perf
+ring buffer, and the agent decides what they are. Nothing in the kernel
+classifies anymore: fifteen protocol parsers in one program is what made the
+verifier reject the send probe outright (the program is capped at a million
+instructions, and the classifiers alone exceeded it). Moving them to user
+space also means a new protocol costs a Rust function instead of a slice of
+that budget.
 
-The sniff is deliberately shallow. It does not decode requests, methods,
-statuses or statement text; it does not follow TLS beyond the handshake, and it
-does not add user-space uprobes to OpenSSL, Go's `crypto/tls` or rustls. An
-encrypted connection with no visible handshake keeps the port-derived label
-(`https`, `grpc`, ...). Connections that predate the agent, or that carry an
-opaque protocol, fall back to the same port map. The port map is a label, not a
-promise — it is used only where the payload could not decide.
+The probe samples at most twelve writes per connection per window (three on
+the server side, where only the first bytes matter), so a chatty socket cannot
+flood the ring. Bulk writes are never copied: a TLS record or a result set
+cannot name a host or a statement.
+
+On the agent side `l7` reads each sample and fills two fields on the edge:
+
+* **`host`** — the `Host:` header of an HTTP/1.x request. This is the name the
+  client asked for, which a ClusterIP or a load balancer address cannot tell
+  you, and it is what turns a row of `external` connections into a list of
+  destinations. HTTP/2 keeps its headers in a compressed HPACK block and
+  contributes nothing.
+* **`sql`** — the text of a MySQL `COM_QUERY` / `COM_STMT_PREPARE` or a
+  PostgreSQL `Query` / `Parse` message. Prepared statements are what modern
+  drivers use, so both commands are read.
+
+A statement longer than the sample is marked with `…` instead of being shown
+truncated mid-word without a hint.
+
+Encrypted traffic needs the optional TLS uprobe (`LIDLESSEYE_SSL_UPROBE=1` on
+the agent). It attaches `SSL_write` / `SSL_write_ex` to every `libssl`,
+GnuTLS and NSS it can find — system directories plus each `/proc/<pid>/root`,
+deduplicated by inode — and emits the same samples, keyed by cgroup instead of
+by socket. It is off by default: every TLS write pays a user-memory read. The
+same uprobe is what covers MySQL and PostgreSQL over TLS, not just HTTPS.
+
+The protocol label still falls back to the server port's guess when no sample
+was parsed (an encrypted connection with no uprobe, an opaque protocol, or a
+connection that predates the agent). A parsed payload always wins: `9200` is
+normally an HTTP API, but a native ClickHouse frame on that port is
+ClickHouse.
+
+Two offsets the code needs — where the payload pointer sits inside
+`struct msghdr` and `struct iov_iter` — are read from the running kernel's BTF
+at startup and patched into the program as constants. Kernel 6.16 renamed
+`iov_iter.iov` to `__iov` and moved it; a CO-RE access by name resolves on one
+layout and fails on the other, and a failed relocation becomes an invalid call
+that the verifier rejects.
 
 *Fallback* (`/proc/<pid>/net/tcp`) is what the agent used before the eBPF
 collector existed and still runs when the programs cannot be loaded.

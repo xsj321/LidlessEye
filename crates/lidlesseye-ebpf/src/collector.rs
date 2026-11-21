@@ -35,7 +35,10 @@ use crate::UnknownReasons;
 use crate::procfs;
 use crate::symbolizer::FrameResolver;
 
-const BPF_OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/profile.bpf.o"));
+// From the source tree, not `OUT_DIR`: see the note in `conntrack.rs`. A build
+// script that rewrites its output without changing a `.rs` file does not force
+// cargo to recompile the crate, so an `OUT_DIR` path can embed stale bytes.
+const BPF_OBJECT: &[u8] = include_bytes!("../bpf/profile.bpf.o");
 
 pub(crate) fn bpf_object() -> &'static [u8] {
     BPF_OBJECT

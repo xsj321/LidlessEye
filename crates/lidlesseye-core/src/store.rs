@@ -1675,7 +1675,8 @@ impl Store {
                 "SELECT client_id, server_id, protocol, client_container, server_container, \
                         sum(connections), sum(retransmits), \
                         sum(tx_bytes), sum(rx_bytes), sum(rtt_us_sum), sum(rtt_samples), \
-                        arg_max(host, bucket_ns), arg_max(sql, bucket_ns) \
+                        arg_max(nullif(host, ''), bucket_ns), \
+                        arg_max(nullif(sql, ''), bucket_ns) \
                  FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY client_id, server_id, protocol, client_container, server_container \
                  HAVING sum(connections) + sum(tx_bytes) + sum(rx_bytes) > 0 \
@@ -2792,6 +2793,53 @@ mod tests {
         assert_eq!(map.edges.len(), 1);
         assert_eq!(map.edges[0].client_container, "istio-proxy");
         assert_eq!(map.edges[0].server_container, "app");
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A payload sample lands in one window; the next report for the same edge
+    /// carries nothing, because not every window catches a request. Taking the
+    /// newest row's value would blank the host one window later, which is what
+    /// made a captured host disappear from the map.
+    #[test]
+    fn map_detail_survives_a_window_that_carried_no_sample() {
+        use crate::servicemap::{ServiceEdge, ServiceNode};
+
+        let (store, dir) = temp_store("net-detail-window");
+        let start = 1_700_000_000_000_000_000u64;
+        let report = |start_ns: u64, host: &str, sql: &str| ServiceMapBatch {
+            start_ns,
+            end_ns: start_ns + 10_000_000_000,
+            nodes: vec![
+                ServiceNode::new("shop/a", NodeKind::Workload),
+                ServiceNode::new("shop/b", NodeKind::Workload),
+            ],
+            edges: vec![ServiceEdge {
+                client: "shop/a".into(),
+                server: "shop/b".into(),
+                protocol: "http".into(),
+                connections: 1,
+                host: host.into(),
+                sql: sql.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        store
+            .append_servicemap(&report(start, "checkout.example.com", "select 1"))
+            .unwrap();
+        store
+            .append_servicemap(&report(start + 10_000_000_000, "", ""))
+            .unwrap();
+
+        let edges = store
+            .net_edges(start, start + 20_000_000_000)
+            .expect("the window is readable");
+        assert_eq!(edges.len(), 1, "one edge, two windows");
+        assert_eq!(edges[0].host, "checkout.example.com");
+        assert_eq!(edges[0].sql, "select 1");
 
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

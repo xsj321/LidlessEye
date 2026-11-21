@@ -115,6 +115,26 @@ Outside a cluster nothing is attempted: `KUBERNETES_SERVICE_HOST` **and** a
 mounted service account are both required, so a host install, a plain container
 and a CI runner keep naming series after the process.
 
+### Encrypted request detail
+
+The service map reads a client's `Host:` header and the text of a MySQL or
+PostgreSQL statement from the first bytes of a write. Plaintext traffic needs
+nothing; TLS hides those bytes, so the agent can attach a uprobe to the TLS
+library instead:
+
+```bash
+helm upgrade lidlesseye deploy/helm/lidlesseye \
+  --reuse-values --set agent.sslUprobe=true
+```
+
+The chart sets `LIDLESSEYE_SSL_UPROBE=1`, which attaches `SSL_write` /
+`SSL_write_ex` to every `libssl`, GnuTLS and NSS it finds — the system
+directories and each `/proc/<pid>/root`, deduplicated by inode — so a container
+with its own copy of OpenSSL is covered. It is off by default because every TLS
+write then pays a user-memory read and a protocol check. Go binaries and Java
+use their own TLS stacks and are not covered; HTTP/2 keeps its headers
+compressed and contributes no host either way.
+
 ### Authentication
 
 ```bash

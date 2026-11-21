@@ -29,14 +29,32 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use aya::Ebpf;
-use aya::maps::{HashMap as AyaHashMap, MapData};
+use aya::maps::perf::{PerfEvent, PerfEventArrayBuffer};
+use aya::maps::{HashMap as AyaHashMap, MapData, PerfEventArray};
 use aya::programs::uprobe::UProbeScope;
 use aya::programs::{KProbe, UProbe};
 use tracing::{debug, info, warn};
 
+use crate::l7;
 use crate::procfs;
 
-const NET_BPF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net.bpf.o"));
+// Read the object from the source tree rather than `OUT_DIR`. The build script
+// refreshes it there, and rustc records the file in the crate's dependency
+// list, so editing the `.c` recompiles whatever embeds it. With the object in
+// `OUT_DIR` cargo reruns the build script but can still consider the crate
+// fresh, and the binary keeps the previous bytes — which cost an afternoon of
+// chasing a verifier error that the checked-in object did not contain.
+const NET_BPF: &[u8] = include_bytes!("../bpf/net.bpf.o");
+
+/// Pages per CPU of the payload ring buffer. Each page is 4 KiB, and the
+/// collector drains every `flush_interval`, so this is a burst allowance: a
+/// sample is at most 312 bytes, and 64 pages hold roughly 800 of them.
+const PERF_PAGES: usize = 64;
+
+/// Ceiling on the cgroup-keyed TLS detail kept between windows. A cgroup with
+/// no traffic for this many samples has long stopped being interesting, and the
+/// kernel map this mirrors holds 4096 entries.
+const CGROUP_CACHE: usize = 4096;
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
@@ -81,9 +99,9 @@ pub struct Flow {
     /// unrelated to the connection). It is what names the container that
     /// dialled, down to the sidecar.
     pub cgroup: u64,
-    /// Bit set of application protocols recognised in the payload. Zero when
-    /// the socket carried nothing parseable; the map then falls back to the
-    /// server port's guess.
+    /// Bit set of application protocols recognised in the payload — by the
+    /// agent, from the sampled bytes, not by the kernel. Zero means nothing
+    /// parseable was seen and the map falls back to the server port's guess.
     pub protocols: u32,
     /// `Host:` header of the last client request, empty when the flow carried
     /// no HTTP or the client sent none. This is the name the application asked
@@ -165,6 +183,20 @@ struct FlowKey {
 
 unsafe impl aya::Pod for FlowKey {}
 
+impl FlowKey {
+    /// Rebuild the key from the 40 raw bytes a ring-buffer sample carries.
+    fn from_ne_bytes(bytes: &[u8; 40]) -> Self {
+        let mut key = FlowKey::default();
+        key.saddr.copy_from_slice(&bytes[0..16]);
+        key.daddr.copy_from_slice(&bytes[16..32]);
+        key.sport = u16::from_ne_bytes([bytes[32], bytes[33]]);
+        key.dport = u16::from_ne_bytes([bytes[34], bytes[35]]);
+        key.family = u16::from_ne_bytes([bytes[36], bytes[37]]);
+        key.pad = u16::from_ne_bytes([bytes[38], bytes[39]]);
+        key
+    }
+}
+
 // SAFETY: as above; nine 64-bit and two 32-bit counters.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -177,32 +209,191 @@ struct FlowStats {
     rtt_samples: u64,
     cgroup: u64,
     role: u32,
-    protocols: u32,
+    /// Payload samples already emitted for this flow in the window.
+    l7_samples: u32,
 }
 
 unsafe impl aya::Pod for FlowStats {}
 
-/// L7 detail from the `flow_l7` map, keyed by the same flow. Separate from
-/// [`FlowStats`] so the send probes do not carry 240 bytes of buffers on
-/// their stack; that alone made the kernel reject them with EINVAL.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct FlowL7 {
-    host: [u8; 80],
-    sql: [u8; 96],
+/// What the probes have told user space about a connection's payloads since
+/// the last window.
+///
+/// Two indexings, because the two probes know different things. A send on a
+/// socket names its connection, so the detail is exact. A TLS write has no
+/// socket at all, so its detail is keyed by cgroup and applies to whatever
+/// that task opened. The kernel map is not consulted for either: the samples
+/// arrive as ring-buffer events, and this is where they are accumulated.
+#[derive(Default)]
+struct L7Cache {
+    /// Latest detail per connection. Pruned to the flows of the window being
+    /// drained: the kernel counter that anchors a flow is itself per window.
+    by_flow: HashMap<FlowKey, l7::Detail>,
+    /// Latest detail per cgroup, with the arrival order used to bound it.
+    by_cgroup: HashMap<u64, Stamped>,
+    seq: u64,
+    /// Samples the kernel dropped because the ring buffer was full.
+    lost: u64,
+    /// Records read from the ring, and how they resolved. Counters rather than
+    /// logs: a busy node produces thousands a second, and the ratio is what
+    /// tells an operator the probes are alive.
+    seen: u64,
+    parsed: u64,
+    unparsed: u64,
 }
 
-unsafe impl aya::Pod for FlowL7 {}
-
-/// Plaintext detail captured by the optional TLS uprobe, keyed by cgroup.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct SslDetail {
-    host: [u8; 80],
-    sql: [u8; 160],
+struct Stamped {
+    detail: l7::Detail,
+    seq: u64,
 }
 
-unsafe impl aya::Pod for SslDetail {}
+impl L7Cache {
+    fn apply(&mut self, key: &FlowKey, flow: &mut Flow) {
+        if let Some(detail) = self.by_flow.get(key) {
+            // The probe only classifies a payload it recognises, so a parse on
+            // this path is a second opinion that can only add a bit the port
+            // guess would have missed.
+            flow.protocols |= detail.protocol;
+            copy_detail(flow, detail);
+        }
+        if let Some(stamped) = self.by_cgroup.get(&flow.cgroup) {
+            copy_detail(flow, &stamped.detail);
+        }
+    }
+
+    /// Keep the map proportional to the flows that still exist.
+    fn retain(&mut self, live: &[FlowKey]) {
+        let live: HashSet<&FlowKey> = live.iter().collect();
+        self.by_flow.retain(|key, _| live.contains(key));
+        if self.by_cgroup.len() > CGROUP_CACHE {
+            let floor = self.seq.saturating_sub(CGROUP_CACHE as u64 / 2);
+            self.by_cgroup.retain(|_, entry| entry.seq > floor);
+        }
+    }
+
+    fn absorb(&mut self, event: PerfEvent<'_>) {
+        match event {
+            PerfEvent::Lost { count } => {
+                self.lost = self.lost.saturating_add(count);
+                warn!(
+                    dropped = count,
+                    total = self.lost,
+                    "payload ring buffer overflow"
+                );
+            }
+            PerfEvent::Sample { head, tail } => self.record(head, tail),
+        }
+    }
+
+    fn record(&mut self, head: &[u8], tail: &[u8]) {
+        self.seen += 1;
+        // A sample that straddles the end of the ring arrives in two pieces.
+        let mut joined;
+        let raw = if tail.is_empty() {
+            head
+        } else {
+            joined = Vec::with_capacity(head.len() + tail.len());
+            joined.extend_from_slice(head);
+            joined.extend_from_slice(tail);
+            &joined
+        };
+        let Some(sample) = l7::decode(raw) else {
+            if self.unparsed < 5 {
+                debug!(
+                    len = raw.len(),
+                    head = ?&raw[..raw.len().min(64)],
+                    "undecodable payload sample"
+                );
+            }
+            self.unparsed += 1;
+            return;
+        };
+        let Some(detail) = l7::parse(sample.payload) else {
+            if self.unparsed < 5 {
+                debug!(
+                    payload = ?&sample.payload[..sample.payload.len().min(12)],
+                    "unrecognised payload sample"
+                );
+            }
+            self.unparsed += 1;
+            return;
+        };
+        self.parsed += 1;
+        match sample.flow {
+            Some(bytes) => {
+                self.by_flow.insert(FlowKey::from_ne_bytes(&bytes), detail);
+            }
+            None => {
+                // TLS detail is keyed by cgroup, so a sample that parses to
+                // nothing useful is still worth seeing once: it means the
+                // uprobe fired on bytes the parser does not understand.
+                if self.by_cgroup.len() < 32 {
+                    debug!(
+                        cgroup = sample.cgroup,
+                        payload = ?&sample.payload[..sample.payload.len().min(16)],
+                        "TLS payload sample"
+                    );
+                }
+                self.seq += 1;
+                self.by_cgroup.insert(
+                    sample.cgroup,
+                    Stamped {
+                        detail,
+                        seq: self.seq,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn copy_detail(flow: &mut Flow, detail: &l7::Detail) {
+    if let Some(host) = &detail.host {
+        flow.host.clone_from(host);
+    }
+    if let Some(sql) = &detail.sql {
+        flow.sql.clone_from(sql);
+    }
+}
+
+/// The ring buffers, one per CPU, plus the map they are registered in. The
+/// array must outlive the buffers: dropping it clears the map entries they
+/// are reached through.
+struct L7Ring {
+    buffers: Vec<PerfEventArrayBuffer>,
+    _array: PerfEventArray<MapData>,
+}
+
+impl L7Ring {
+    fn drain(&mut self, cache: &mut L7Cache) {
+        for buffer in &mut self.buffers {
+            buffer.for_each(|event| cache.absorb(event));
+        }
+    }
+}
+
+/// Open one ring buffer per CPU. Best effort: a host where `perf_event_open`
+/// is denied keeps the map and its counters, it just cannot name Hosts or SQL.
+fn open_l7_ring(ebpf: &mut Ebpf) -> Result<L7Ring, String> {
+    let Some(map) = ebpf.take_map("l7_events") else {
+        return Err("net.bpf.o is missing the `l7_events` map".to_string());
+    };
+    let mut array =
+        PerfEventArray::try_from(map).map_err(|err| format!("invalid `l7_events` map: {err}"))?;
+    let cpus = aya::util::online_cpus().map_err(|(_, err)| err.to_string())?;
+    let mut buffers = Vec::with_capacity(cpus.len());
+    for cpu in cpus {
+        let buffer = PerfEventArrayBuffer::open(cpu, PERF_PAGES)
+            .map_err(|err| format!("could not open the perf ring for CPU {cpu}: {err}"))?;
+        array
+            .set(cpu, &buffer)
+            .map_err(|err| format!("could not register the perf ring for CPU {cpu}: {err}"))?;
+        buffers.push(buffer);
+    }
+    Ok(L7Ring {
+        buffers,
+        _array: array,
+    })
+}
 
 /// Attach `lidlesseye_ssl_write` to every TLS library this host can see.
 ///
@@ -311,48 +502,6 @@ fn ssl_library_paths() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Read and clear the TLS detail map. A cgroup may have several connections;
-/// the newest statement is what the map shows, so one entry per cgroup.
-fn drain_ssl_details(ebpf: &mut Ebpf) -> HashMap<u64, (String, String)> {
-    let Some(map) = ebpf.map_mut("ssl_details") else {
-        return HashMap::new();
-    };
-    let Ok(mut map) = AyaHashMap::<&mut MapData, u64, SslDetail>::try_from(map) else {
-        return HashMap::new();
-    };
-    let keys: Vec<u64> = map.keys().filter_map(|key| key.ok()).collect();
-    let mut out = HashMap::new();
-    for key in &keys {
-        if let Ok(detail) = map.get(key, 0) {
-            out.insert(*key, (fixed_str(&detail.host), fixed_str(&detail.sql)));
-        }
-    }
-    for key in keys {
-        let _ = map.remove(&key);
-    }
-    out
-}
-
-/// Read the plaintext L7 detail written by `lidlesseye_tcp_l7`. The map is
-/// not cleared: it holds the latest statement per flow, and a window with no
-/// new request should still show it.
-fn drain_flow_l7(ebpf: &mut Ebpf) -> HashMap<FlowKey, (String, String)> {
-    let Some(map) = ebpf.map_mut("flow_l7_map") else {
-        return HashMap::new();
-    };
-    let Ok(mut map) = AyaHashMap::<&mut MapData, FlowKey, FlowL7>::try_from(map) else {
-        return HashMap::new();
-    };
-    let keys: Vec<FlowKey> = map.keys().filter_map(|key| key.ok()).collect();
-    let mut out = HashMap::new();
-    for key in &keys {
-        if let Ok(detail) = map.get(key, 0) {
-            out.insert(*key, (fixed_str(&detail.host), fixed_str(&detail.sql)));
-        }
-    }
-    out
-}
-
 /// Load the programs and start draining. `on_flows` runs on the collector
 /// thread once per `flush_interval`.
 ///
@@ -367,7 +516,23 @@ where
     }
     procfs::raise_memlock_limit();
 
-    let mut ebpf = aya::EbpfLoader::new()
+    // Tell the send probe where the payload is. The layout moved in 6.16 and
+    // the old access turned into an invalid call the verifier rejects, so the
+    // offsets come from the kernel's own BTF instead of a CO-RE field name.
+    let layout = crate::kernel_btf::iov_layout();
+    let mut loader = aya::EbpfLoader::new();
+    match &layout {
+        Ok(layout) => {
+            debug!(?layout, "payload offsets resolved from kernel BTF");
+            loader.override_global("msg_iter_offset", &layout.msg_iter, true);
+            loader.override_global("iov_ptr_offset", &layout.iov_ptr, true);
+        }
+        Err(err) => warn!(
+            error = %err,
+            "kernel BTF did not describe the payload layout; keeping the built-in default"
+        ),
+    }
+    let mut ebpf = loader
         .load(NET_BPF)
         .map_err(|err| format!("failed to load net.bpf.o: {err}"))?;
 
@@ -378,10 +543,6 @@ where
     let mut attached: Vec<&'static str> = Vec::new();
     for (program, symbols) in [
         ("lidlesseye_tcp_send", &["tcp_sendmsg"][..]),
-        // `lidlesseye_tcp_l7` is compiled into the object but not attached:
-        // its bounded copy loops push the program over what this kernel's
-        // verifier accepts on the send path. The SSL uprobe covers encrypted
-        // traffic; plaintext L7 detail is the remaining gap.
         ("lidlesseye_tcp_recv", &["tcp_cleanup_rbuf"][..]),
         ("lidlesseye_tcp_retrans", &["tcp_retransmit_skb"][..]),
     ] {
@@ -406,13 +567,28 @@ where
     )
     .ok_or_else(|| "could not attach to tcp_set_state".to_string())?;
     attached.push(state);
-    info!(programs = %attached.join(","), "conntrack programs attached");
+    info!(
+        programs = %attached.join(","),
+        object = env!("LIDLESSEYE_BPF_DIGEST"),
+        "conntrack programs attached"
+    );
 
     // Optional and best-effort: a host with no readable TLS library keeps the
     // map, it just cannot name the Host or the SQL behind encryption.
     if config.ssl_uprobe {
         let _ = attach_ssl_uprobes(&mut ebpf);
     }
+
+    // Payload samples arrive out of band from the counters, so the ring has to
+    // be drained while waiting too: a burst that fills it loses samples, and
+    // the burst is exactly what a dashboard is opened to see.
+    let mut ring = match open_l7_ring(&mut ebpf) {
+        Ok(ring) => Some(ring),
+        Err(err) => {
+            warn!(error = %err, "payload capture is off; hosts and SQL stay empty");
+            None
+        }
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -424,19 +600,33 @@ where
         .name("lidlesseye-conntrack".to_string())
         .spawn(move || {
             let mut ebpf = ebpf;
+            let mut cache = L7Cache::default();
             while !flag.load(Ordering::Relaxed) {
                 let deadline = std::time::Instant::now() + interval;
                 while std::time::Instant::now() < deadline && !flag.load(Ordering::Relaxed) {
+                    if let Some(ring) = ring.as_mut() {
+                        ring.drain(&mut cache);
+                    }
                     thread::sleep(Duration::from_millis(200));
                 }
                 if flag.load(Ordering::Relaxed) {
                     break;
                 }
-                match drain(&mut ebpf) {
+                if let Some(ring) = ring.as_mut() {
+                    ring.drain(&mut cache);
+                }
+                match drain(&mut ebpf, &mut cache) {
                     Ok(batch) => {
                         if !batch.is_empty() {
                             counter.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                            debug!(flows = batch.len(), "drained connection window");
+                            debug!(
+                                flows = batch.len(),
+                                samples = cache.seen,
+                                parsed = cache.parsed,
+                                unparsed = cache.unparsed,
+                                lost = cache.lost,
+                                "drained connection window"
+                            );
                             on_flows(batch);
                         }
                     }
@@ -490,11 +680,7 @@ fn attach_kprobe(ebpf: &mut Ebpf, program: &str, symbols: &[&'static str]) -> Op
     None
 }
 
-fn drain(ebpf: &mut Ebpf) -> Result<Vec<Flow>, String> {
-    // Read the TLS detail first: it is keyed by cgroup, and the flows below
-    // may belong to the cgroups that just wrote a statement.
-    let details = drain_ssl_details(ebpf);
-    let l7 = drain_flow_l7(ebpf);
+fn drain(ebpf: &mut Ebpf, cache: &mut L7Cache) -> Result<Vec<Flow>, String> {
     let map = ebpf
         .map_mut("flows")
         .ok_or_else(|| "net.bpf.o is missing the `flows` map".to_string())?;
@@ -507,31 +693,11 @@ fn drain(ebpf: &mut Ebpf) -> Result<Vec<Flow>, String> {
         if let Ok(stats) = map.get(key, 0)
             && let Some(mut flow) = to_flow(key, &stats)
         {
-            // The uprobe has no socket to key on, so it stores detail per
-            // cgroup; attaching it here is what ties an encrypted Host/SQL to
-            // the connection the cgroup opened.
-            // Plaintext detail comes from the flow-keyed map; encrypted
-            // detail from the cgroup-keyed uprobe map. The latter wins when
-            // both are present, because a TLS flow never writes plaintext.
-            if let Some((host, sql)) = l7.get(key) {
-                if !host.is_empty() {
-                    flow.host = host.clone();
-                }
-                if !sql.is_empty() {
-                    flow.sql = sql.clone();
-                }
-            }
-            if let Some((host, sql)) = details.get(&flow.cgroup) {
-                if !host.is_empty() {
-                    flow.host = host.clone();
-                }
-                if !sql.is_empty() {
-                    flow.sql = sql.clone();
-                }
-            }
+            cache.apply(key, &mut flow);
             out.push(flow);
         }
     }
+    cache.retain(&keys);
     // The counters are per window: clearing them here is what makes the next
     // drain a delta again. An update that lands between the read and the
     // delete is lost, which at this scale is a handful of bytes.
@@ -568,21 +734,12 @@ fn to_flow(key: &FlowKey, stats: &FlowStats) -> Option<Flow> {
         rtt_us_sum: stats.rtt_us_sum,
         rtt_samples: stats.rtt_samples,
         cgroup: stats.cgroup,
-        protocols: stats.protocols,
-        // Filled from `flow_l7` / `ssl_details` during the drain.
+        // Filled from the payload samples by `L7Cache::apply`; the kernel no
+        // longer classifies, so nothing arrives from the map.
+        protocols: 0,
         host: String::new(),
         sql: String::new(),
     })
-}
-
-/// Read a NUL-terminated fixed-size field from the map. The kernel zero-fills
-/// the arrays, so a missing value is simply an empty string.
-fn fixed_str(bytes: &[u8]) -> String {
-    let end = bytes
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 fn address(bytes: &[u8; 16], family: u16) -> Option<IpAddr> {
@@ -684,51 +841,37 @@ mod tests {
         assert_eq!(flow.remote, ("10.244.0.1".parse().unwrap(), 6443));
     }
 
-    /// The bit values are duplicated between Rust and C because the kernel
-    /// object cannot import the Rust enum. A source contract is the cheapest
-    /// way to stop one side drifting; the object is compiled in CI as well.
+    /// The C struct and this mirror must stay byte-compatible: the kernel
+    /// writes it, `aya` copies it, and a field added on one side alone would
+    /// silently shift every counter that follows.
     #[test]
-    fn the_probe_and_the_core_agree_on_protocol_bits() {
-        use lidlesseye_core::servicemap::protocol as p;
+    fn the_flow_stats_layout_matches_the_probe() {
         let source = include_str!("../bpf/net.bpf.c");
-        for (name, value) in [
-            ("PROTO_HTTP", p::HTTP),
-            ("PROTO_HTTPS", p::HTTPS),
-            ("PROTO_POSTGRES", p::POSTGRES),
-            ("PROTO_MYSQL", p::MYSQL),
-            ("PROTO_MONGODB", p::MONGODB),
-            ("PROTO_REDIS", p::REDIS),
-            ("PROTO_MEMCACHED", p::MEMCACHED),
-            ("PROTO_CASSANDRA", p::CASSANDRA),
-            ("PROTO_KAFKA", p::KAFKA),
-            ("PROTO_CLICKHOUSE", p::CLICKHOUSE),
-            ("PROTO_ZOOKEEPER", p::ZOOKEEPER),
-            ("PROTO_FOUNDATIONDB", p::FOUNDATIONDB),
-            ("PROTO_HTTP2", p::HTTP2),
-            ("PROTO_DNS", p::DNS),
-            ("PROTO_GRPC", p::GRPC),
-        ] {
-            let expected = format!("#define {name:<17} (1U << {})", value.trailing_zeros());
-            assert!(
-                source.contains(&expected),
-                "{name} changed on one side of the ABI"
-            );
+        let struct_start = source
+            .find("struct flow_stats {")
+            .expect("flow_stats is in the object");
+        let struct_end = source[struct_start..]
+            .find("};")
+            .expect("the struct is closed")
+            + struct_start;
+        let fields = &source[struct_start..struct_end];
+        for field in ["opens", "tx_bytes", "rx_bytes", "retransmits"] {
+            assert!(fields.contains(field), "{field} missing from flow_stats");
         }
         assert!(source.contains("read_send_payload"));
-        assert!(source.contains("stats->protocols |= detected"));
+        assert!(source.contains("bpf_perf_event_output"));
     }
 
     #[test]
-    fn a_payload_hit_travels_with_the_flow() {
+    fn a_flow_starts_without_a_protocol() {
+        // Classification moved to the agent, so nothing arrives from the map;
+        // `L7Cache::apply` is what adds the bit.
         let flow = to_flow(
             &key([10, 0, 0, 2], [10, 0, 0, 7], 43210, 8080),
-            &FlowStats {
-                protocols: 0x1001, // HTTP and ClickHouse
-                ..Default::default()
-            },
+            &FlowStats::default(),
         )
         .unwrap();
-        assert_eq!(flow.protocols, 0x1001);
+        assert_eq!(flow.protocols, 0);
     }
 
     #[test]

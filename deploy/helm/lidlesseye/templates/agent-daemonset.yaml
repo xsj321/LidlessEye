@@ -96,6 +96,13 @@ spec:
                   name: {{ include "lidlesseye.authSecretName" . }}
                   key: token
             {{- end }}
+            {{- if .Values.agent.sslUprobe }}
+            # Reads the plaintext of SSL_write so encrypted HTTP and database
+            # traffic can name a host and a statement. Off by default: every
+            # TLS write then pays a user-memory read.
+            - name: LIDLESSEYE_SSL_UPROBE
+              value: "1"
+            {{- end }}
           securityContext:
             # Loading BPF programs needs CAP_BPF/CAP_PERFMON (or root), and the
             # stack trace map needs CAP_SYS_ADMIN. `privileged` is the portable

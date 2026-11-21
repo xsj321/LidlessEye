@@ -463,12 +463,16 @@ export function NetTab({ node, data, inbound, outbound, windowSec, nodes, onSele
     : 0;
   const rateIn = inbound.reduce((sum, edge) => sum + edgeRate(edge, windowSec), 0);
   const rateOut = outbound.reduce((sum, edge) => sum + edgeRate(edge, windowSec), 0);
-  // L7 detail the kernel parsed from the client's send buffer. Deduplicated by
-  // value so the same ingress host does not appear once per connection.
+  // L7 detail parsed from the client's send buffer. A name that resolves
+  // outside the cluster says more than an address that does, so external peers
+  // come first; duplicates by value keep the list one line per host.
+  const outside = (edge: ServiceMapEdge) =>
+    edge.client === "external" || edge.server === "external";
   const hosts = Array.from(
     new Map(
       [...inbound, ...outbound]
         .filter((edge) => edge.host)
+        .sort((a, b) => Number(outside(b)) - Number(outside(a)))
         .map((edge) => [edge.host, edge] as const),
     ).values(),
   );
@@ -570,7 +574,7 @@ export function NetTab({ node, data, inbound, outbound, windowSec, nodes, onSele
         )}
       </Section>
 
-      <Section title="External hosts" hint="Host header">
+      <Section title="Requested hosts" hint="Host header · external first">
         {hosts.length ? (
           <ul className="space-y-1">
             {hosts.slice(0, 6).map((edge) => (
@@ -582,16 +586,17 @@ export function NetTab({ node, data, inbound, outbound, windowSec, nodes, onSele
                   {edge.host}
                 </span>
                 <span className="shrink-0 text-[9px] uppercase text-muted-foreground">
-                  {edge.protocol}
+                  {outside(edge) ? "external" : edge.protocol}
                 </span>
               </li>
             ))}
           </ul>
         ) : (
           <Note>
-            No Host header in this window. HTTP requests carry one; set{" "}
+            No request named a host in this window. A plaintext HTTP request carries its{" "}
+            <code className="font-mono">Host</code> header; set{" "}
             <code className="font-mono">LIDLESSEYE_SSL_UPROBE=1</code> on the agent to read it
-            from HTTPS as well.
+            from TLS as well. HTTP/2 keeps its headers compressed and is not covered.
           </Note>
         )}
       </Section>

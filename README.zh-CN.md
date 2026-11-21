@@ -238,7 +238,7 @@ cargo fmt --all --check
 - **在导入时符号化**：无法读取模块的帧会显示为 `[unknown]`；agent 需要 `hostPID` 和二进制文件的读权限。
 - **每个 agent 只能覆盖一个 PID namespace**：其他容器中的进程会被计为 `in another PID namespace`，不会被错误归属。
 - **单机存储**：一个存储卷对应一个服务端，没有集群或复制。
-- **暂不支持动态追踪**：目前只有 CPU 和 off-CPU，uprobe 与分配分析是后续工作。
+- **uprobe 需要显式开启且范围有限**：目前只有 TLS 明文捕获（`LIDLESSEYE_SSL_UPROBE=1`），分配分析仍是后续工作。
 - **用户态调用栈需要 frame pointers**（`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`）。没有它们时耗时统计依然正确。
 
 ## 文档

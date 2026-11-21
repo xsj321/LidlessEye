@@ -8,6 +8,27 @@ Rust API follows the same rule.
 
 ## [Unreleased]
 
+### Added
+
+- The service map names the destination a client actually asked for. An HTTP
+  request's `Host:` header and the text of a MySQL or PostgreSQL statement now
+  travel from the probe to the edge, and the node panel shows them under
+  *Requested hosts* and *Recent SQL*.
+- An optional TLS uprobe (`LIDLESSEYE_SSL_UPROBE=1`) reads the plaintext of
+  `SSL_write` from every libssl, GnuTLS and NSS it can find, so HTTPS and
+  encrypted database traffic contribute the same detail. Off by default: every
+  TLS write pays a user-memory read.
+
+### Changed
+
+- Payload parsing moved to the agent. The kernel copies the first bytes of a
+  request into a perf ring buffer and the agent decides what they are; the
+  fifteen in-kernel protocol classifiers are gone. They were the reason the
+  send probe failed to load on kernels where `struct iov_iter` had changed — a
+  CO-RE miss there becomes an invalid call the verifier rejects.
+- The payload pointer's offset is read from the running kernel's BTF instead of
+  a CO-RE field name, because kernel 6.16 renamed `iov_iter.iov` to `__iov`.
+
 ## [0.1.1] - 2026-11-18
 
 A packaging release: the image and the chart now ship from the same place, and

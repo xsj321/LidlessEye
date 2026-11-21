@@ -243,7 +243,7 @@ The browser test seeds two tenants and fails on any console error, so a renderin
 - **Symbolized at ingest**: modules that cannot be opened become `[unknown]` frames; agents need `hostPID` and read access to the binaries.
 - **One PID namespace per agent**: processes in other containers are counted as `in another PID namespace`, never misattributed.
 - **Per-host storage**: one server per volume; no clustering or replication.
-- **No dynamic tracing yet**: CPU and off-CPU only — uprobes and allocation profiling are future work.
+- **uprobes are opt-in and narrow**: the only one today is TLS plaintext capture (`LIDLESSEYE_SSL_UPROBE=1`); allocation profiling is future work.
 - **User stacks need frame pointers** (`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`). The profiled time is still correct without them.
 
 ## Documentation

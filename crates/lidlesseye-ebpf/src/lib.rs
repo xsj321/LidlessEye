@@ -35,6 +35,15 @@ mod gopclntab;
 /// Available on every platform: it is a plain snapshot with no eBPF in it, and
 /// the non-Linux build of this crate keeps the same `CollectorConfig` shape.
 pub mod k8s;
+/// Offsets inside kernel structs that CO-RE cannot name across releases.
+#[cfg(target_os = "linux")]
+pub mod kernel_btf;
+/// Parsing of the payload samples the network probes emit.
+///
+/// The kernel ships raw request bytes and the host name or statement is found
+/// here, so a new protocol costs a function instead of a slice of the
+/// verifier's instruction budget.
+pub mod l7;
 /// Opening the binaries of profiled processes across mount namespaces.
 #[cfg(target_os = "linux")]
 mod module;

@@ -193,6 +193,12 @@ agent:
     # interval, and their samples are stored against the pod UID meanwhile.
     refresh: 30s
 
+  # Attach a uprobe to TLS libraries (`SSL_write`) so encrypted HTTP and
+  # database traffic can contribute a requested host and a SQL statement to the
+  # service map. Off by default: every TLS write pays a user-memory read and a
+  # protocol check.
+  sslUprobe: false
+
   # The agent must see the host PID namespace to symbolize stacks, and needs
   # privileges to load BPF programs. These are the defaults that work; override
   # only if you know what you are doing.
