@@ -83,8 +83,8 @@ pub(crate) const TABLES: &[TableDef] = &[
     },
     TableDef {
         name: "net_edges",
-        columns: "bucket_ns, client_id, server_id, protocol, client_container, server_container, connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples",
-        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, client_id VARCHAR NOT NULL, server_id VARCHAR NOT NULL, protocol VARCHAR NOT NULL, client_container VARCHAR DEFAULT '' NOT NULL, server_container VARCHAR DEFAULT '' NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, rx_bytes BIGINT NOT NULL, rtt_us_sum BIGINT NOT NULL, rtt_samples BIGINT NOT NULL)",
+        columns: "bucket_ns, client_id, server_id, protocol, client_container, server_container, connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples, host, sql",
+        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, client_id VARCHAR NOT NULL, server_id VARCHAR NOT NULL, protocol VARCHAR NOT NULL, client_container VARCHAR DEFAULT '' NOT NULL, server_container VARCHAR DEFAULT '' NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, rx_bytes BIGINT NOT NULL, rtt_us_sum BIGINT NOT NULL, rtt_samples BIGINT NOT NULL, host VARCHAR DEFAULT '' NOT NULL, sql VARCHAR DEFAULT '' NOT NULL)",
     },
 ];
 
@@ -206,6 +206,14 @@ pub(crate) fn create_schema(conn: &Connection, state: &ParquetState) -> Result<(
         conn.execute_batch(&ddl)
             .map_err(|e| Error::Db(format!("creating hot table {}: {e}", def.name)))?;
         std::fs::create_dir_all(state.table_dir(def.name)).map_err(Error::Io)?;
+    }
+    // Columns added after a release: `CREATE TABLE` above is a no-op on an
+    // existing database, so the hot tier needs an explicit migration. Old
+    // Parquet files simply lack the column and `union_by_name` reads NULL.
+    for column in ["host", "sql"] {
+        let _ = conn.execute_batch(&format!(
+            "ALTER TABLE net_edges_hot ADD COLUMN IF NOT EXISTS {column} VARCHAR DEFAULT '' NOT NULL"
+        ));
     }
     refresh_views(conn, state)
 }

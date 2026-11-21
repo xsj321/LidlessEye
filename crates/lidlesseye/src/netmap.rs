@@ -112,6 +112,9 @@ pub struct NetMapConfig {
     pub services: Option<Arc<ServiceIndex>>,
     /// Prefer the eBPF source, falling back to `/proc` when it cannot attach.
     pub ebpf: bool,
+    /// Attach TLS uprobes to read the plaintext Host/SQL behind encryption.
+    /// Off by default: every TLS write pays a user-memory read and parsing.
+    pub ssl_uprobe: bool,
 }
 
 impl NetMapConfig {
@@ -121,6 +124,12 @@ impl NetMapConfig {
             pods,
             services: None,
             ebpf: true,
+            // Opt-in because the uprobe runs on every TLS write. The DaemonSet
+            // enables it with `LIDLESSEYE_SSL_UPROBE=1` rather than a CLI flag,
+            // so an embedded agent does not grow an argument it cannot use.
+            ssl_uprobe: std::env::var("LIDLESSEYE_SSL_UPROBE")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
         }
     }
 }
@@ -195,6 +204,7 @@ where
     conntrack::start(
         ConntrackConfig {
             flush_interval: config.interval,
+            ssl_uprobe: config.ssl_uprobe,
         },
         move |flows| {
             let batch = mapper.batch(flows, lidlesseye_core::now_ns());
@@ -358,6 +368,10 @@ impl FlowMapper {
             // without a user-space uprobe, a connection that predates the
             // agent, or an opaque protocol).
             let protocol = protocol_label(flow.protocols, protocol_for_port(server_port));
+            // The kernel parsed these off the client's send buffer; clone them
+            // before the edge map takes ownership of the slot.
+            let host = flow.host.clone();
+            let sql = flow.sql.clone();
             let (tx, rx) = if swapped {
                 (flow.rx_bytes, flow.tx_bytes)
             } else {
@@ -436,6 +450,14 @@ impl FlowMapper {
             edge.rx_bytes += rx;
             edge.rtt_us_sum += flow.rtt_us_sum;
             edge.rtt_samples += flow.rtt_samples;
+            // Several flows collapse into one edge; keep the newest non-empty
+            // detail rather than blanking a value a quieter flow just set.
+            if !host.is_empty() {
+                edge.host = host;
+            }
+            if !sql.is_empty() {
+                edge.sql = sql;
+            }
         }
 
         if skipped > 0 {
@@ -1388,6 +1410,8 @@ mod tests {
             rtt_samples: 0,
             cgroup: 0,
             protocols: 0,
+            host: String::new(),
+            sql: String::new(),
         }
     }
 

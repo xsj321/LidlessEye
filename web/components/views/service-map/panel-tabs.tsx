@@ -463,6 +463,16 @@ export function NetTab({ node, data, inbound, outbound, windowSec, nodes, onSele
     : 0;
   const rateIn = inbound.reduce((sum, edge) => sum + edgeRate(edge, windowSec), 0);
   const rateOut = outbound.reduce((sum, edge) => sum + edgeRate(edge, windowSec), 0);
+  // L7 detail the kernel parsed from the client's send buffer. Deduplicated by
+  // value so the same ingress host does not appear once per connection.
+  const hosts = Array.from(
+    new Map(
+      [...inbound, ...outbound]
+        .filter((edge) => edge.host)
+        .map((edge) => [edge.host, edge] as const),
+    ).values(),
+  );
+  const statements = [...inbound, ...outbound].filter((edge) => edge.sql);
 
   return (
     <div className="space-y-3">
@@ -557,6 +567,58 @@ export function NetTab({ node, data, inbound, outbound, windowSec, nodes, onSele
           </div>
         ) : (
           <Note>This node opens no connections in the selected window.</Note>
+        )}
+      </Section>
+
+      <Section title="External hosts" hint="Host header">
+        {hosts.length ? (
+          <ul className="space-y-1">
+            {hosts.slice(0, 6).map((edge) => (
+              <li
+                key={`host:${edge.client}:${edge.server}:${edge.host}`}
+                className="flex items-baseline gap-2 text-[11px]"
+              >
+                <span className="min-w-0 flex-1 truncate font-mono" title={edge.host}>
+                  {edge.host}
+                </span>
+                <span className="shrink-0 text-[9px] uppercase text-muted-foreground">
+                  {edge.protocol}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <Note>
+            No Host header in this window. HTTP requests carry one; set{" "}
+            <code className="font-mono">LIDLESSEYE_SSL_UPROBE=1</code> on the agent to read it
+            from HTTPS as well.
+          </Note>
+        )}
+      </Section>
+
+      <Section title="Recent SQL" hint="MySQL / PostgreSQL">
+        {statements.length ? (
+          <ul className="space-y-1">
+            {statements.slice(0, 4).map((edge) => (
+              <li
+                key={`sql:${edge.client}:${edge.server}`}
+                className="rounded bg-secondary/40 px-2 py-1"
+              >
+                <div className="mb-0.5 flex items-center gap-2 text-[9px] uppercase text-muted-foreground">
+                  <span>{edge.protocol}</span>
+                  <span className="truncate">{edge.server}</span>
+                </div>
+                <code className="block break-all font-mono text-[10px] leading-snug text-foreground/90">
+                  {edge.sql}
+                </code>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <Note>
+            No plaintext SQL statement in this window. The TLS uprobe also covers MySQL and
+            PostgreSQL when the driver negotiates encryption.
+          </Note>
         )}
       </Section>
     </div>

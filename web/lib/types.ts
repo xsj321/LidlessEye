@@ -134,6 +134,10 @@ export interface ServiceMapEdge {
   rx_bytes?: number;
   /** Average round-trip time in microseconds; 0 when nothing closed. */
   rtt_us?: number;
+  /** `Host:` header of the last HTTP request on this edge. */
+  host?: string;
+  /** Last MySQL/PostgreSQL statement on this edge. */
+  sql?: string;
 }
 
 export interface ServiceMapPayload {

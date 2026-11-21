@@ -216,8 +216,27 @@ struct flow_stats {
     __u32 protocols;
 };
 
+/* L7 detail lives in its own map. Folding 240 bytes into `flow_stats` made
+ * every program that touches a flow carry that value on its stack, and the
+ * kernel rejected the send probes with EINVAL before they got past the
+ * verifier. Keyed by the same flow so user space can join them. */
+struct flow_l7 {
+    __u8 host[80];
+    /* 96, not 160: the zero value of this struct is materialised on the
+     * stack together with the 128-byte payload sample, and 240 + 128 exceeds
+     * the kernel's 512-byte BPF stack. */
+    __u8 sql[96];
+};
+
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) typeof(val) *name
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct flow_key);
+    __type(value, struct flow_l7);
+} flow_l7_map SEC(".maps");
 
 /* Per window counters, drained and cleared by user space once per interval. */
 struct {
@@ -347,7 +366,12 @@ static __always_inline __u32 be16(const char *p) {
 }
 
 static __always_inline char at(const char *buf, __u64 offset) {
-    return buf[offset & PAYLOAD_MASK];
+    /* `volatile` keeps the compiler from folding `base | (offset & 127)`
+     * into one instruction. That fold is valid for a 128-byte aligned stack
+     * buffer, but the verifier rejects any bitwise op on a pointer, and the
+     * wider loops in the L7 parsers are enough to make it choose that shape. */
+    volatile __u32 index = (__u32)offset & PAYLOAD_MASK;
+    return buf[index];
 }
 
 static __always_inline __u32 is_http(const char *b, __u32 size) {
@@ -676,6 +700,97 @@ static __always_inline __u32 classify_payload(char *b, __u32 size) {
     return mask;
 }
 
+/* --------------------------------------------------------------------- */
+/* L7 detail: the Host header and the SQL text                           */
+/* --------------------------------------------------------------------- */
+/* Fixed-size copies, bounded by constants the verifier can check. The
+ * destination is a field of the `flows` map value, so nothing here allocates
+ * and nothing leaves the kernel. */
+/* Kept small on purpose: the verifier explores every loop state, and a nested
+ * 128 × 160 scan pushed the program past the one-million-instruction limit.
+ * These lengths are what a dashboard can show without truncation anyway. */
+#define HOST_MAX 64
+#define SQL_MAX 96
+
+static __always_inline __u32 smaller(__u32 a, __u32 b) {
+    return a < b ? a : b;
+}
+
+static __always_inline void copy_text(__u8 *dst, __u32 cap, const char *src,
+                                      __u32 size, __u32 offset) {
+    __u32 n = 0;
+    for (__u32 i = 0; i < SQL_MAX; i++) {
+        if (i + 1 >= cap || offset + i >= size) {
+            break;
+        }
+        char c = at(src, offset + i);
+        if (c == 0 || c == '\r' || c == '\n') {
+            break;
+        }
+        dst[n++] = (__u8)c;
+    }
+    dst[n] = 0;
+}
+
+/* The parsers return an offset instead of copying. Three copy loops in one
+ * verification unit is what pushed the program past the instruction ceiling,
+ * even when the branches are exclusive; one shared copy keeps it small. */
+static __always_inline __u32 http_host_offset(const char *b, __u32 size) {
+    /* The request line and Host are in the first packet; 64 bytes is enough
+     * for the header and keeps the scan's state count small. */
+    __u32 limit = smaller(size, 64);
+    for (__u32 i = 0; i + 6 < limit; i++) {
+        char c = at(b, i);
+        if ((c == 'H' || c == 'h') && at(b, i + 1) == 'o' && at(b, i + 2) == 's' &&
+            at(b, i + 3) == 't' && at(b, i + 4) == ':') {
+            __u32 j = i + 5;
+            if (j < limit && at(b, j) == ' ') {
+                j++;
+            }
+            return j;
+        }
+    }
+    return 0;
+}
+
+/* MySQL: a command packet is length(3) + sequence(1) + command(1) + body.
+ * COM_QUERY (0x03) carries the statement as plain text. */
+static __always_inline __u32 mysql_sql_offset(const char *b, __u32 size) {
+    if (size < 6) {
+        return 0;
+    }
+    __u32 length = (__u32)(__u8)at(b, 0) | ((__u32)(__u8)at(b, 1) << 8) |
+                   ((__u32)(__u8)at(b, 2) << 16);
+    if (length + 4 > size || (__u8)at(b, 3) != 0 || (__u8)at(b, 4) != 0x03) {
+        return 0;
+    }
+    return 5;
+}
+
+/* PostgreSQL: 'Q' is a simple query, 'P' a Parse whose body is
+ * statement-name\0 query\0. Extended-protocol Execute carries no text. */
+static __always_inline __u32 pg_sql_offset(const char *b, __u32 size) {
+    if (size < 6) {
+        return 0;
+    }
+    char kind = at(b, 0);
+    if (kind == 'Q') {
+        return 5;
+    }
+    if (kind == 'P') {
+        __u32 p = 5;
+        for (__u32 i = 0; i < 32; i++) {
+            if (p >= size) {
+                return 0;
+            }
+            if (at(b, p++) == 0) {
+                return p;
+            }
+        }
+    }
+    return 0;
+}
+
 /* Read the first iovec of a tcp_sendmsg. The payload belongs to user space,
  * but a few in-kernel callers pass a kvec, hence the kernel fallback. */
 static __always_inline int read_send_payload(struct msghdr *msg, char *dst, __u32 *size_out) {
@@ -788,7 +903,7 @@ int lidlesseye_tcp_state(struct pt_regs *ctx) {
 /* --------------------------------------------------------------------- */
 /* Bytes sent by the application                                          */
 /* --------------------------------------------------------------------- */
-SEC("kprobe/tcp_sendmsg")
+SEC("kprobe/tcp_sendmsg_send")
 int lidlesseye_tcp_send(struct pt_regs *ctx) {
     __u64 addr = PARM1(ctx);
     __u64 size = PARM3(ctx);
@@ -823,6 +938,62 @@ int lidlesseye_tcp_send(struct pt_regs *ctx) {
     return 0;
 }
 
+/* L7 detail lives in its own program. Keeping it in `lidlesseye_tcp_send`
+ * would put the protocol classifiers and three bounded copy loops into one
+ * verification unit, and the combined state count crosses the verifier's
+ * one-million-instruction ceiling. Two programs on the same kprobe are
+ * verified independently and each stays well below it. */
+SEC("kprobe/tcp_sendmsg_l7")
+int lidlesseye_tcp_l7(struct pt_regs *ctx) {
+    __u64 addr = PARM1(ctx);
+    __u64 size = PARM3(ctx);
+    if (addr == 0 || size < 8) {
+        return 0;
+    }
+    struct sock_flow *entry = bpf_map_lookup_elem((void *)&sock_flows, &addr);
+    if (!entry) {
+        return 0;
+    }
+    struct flow_stats *stats = bpf_map_lookup_elem((void *)&flows, &entry->key);
+    // Only the client's send buffer carries a request Host or a statement;
+    // parsing the server side would overwrite them with status lines and rows.
+    if (!stats || stats->role != ROLE_CLIENT || stats->protocols == 0) {
+        return 0;
+    }
+    char payload[PAYLOAD_SAMPLE] = {};
+    __u32 used = 0;
+    if (read_send_payload((struct msghdr *)PARM2(ctx), payload, &used) != 0) {
+        return 0;
+    }
+    struct flow_l7 *detail = bpf_map_lookup_elem((void *)&flow_l7_map, &entry->key);
+    if (!detail) {
+        struct flow_l7 fresh = {};
+        bpf_map_update_elem((void *)&flow_l7_map, &entry->key, &fresh, BPF_ANY);
+        detail = bpf_map_lookup_elem((void *)&flow_l7_map, &entry->key);
+    }
+    if (!detail) {
+        return 0;
+    }
+    __u32 known = stats->protocols;
+    if (known & PROTO_HTTP) {
+        __u32 offset = http_host_offset(payload, used);
+        if (offset != 0) {
+            copy_text(detail->host, HOST_MAX, payload, used, offset);
+        }
+    } else if (known & PROTO_MYSQL) {
+        __u32 offset = mysql_sql_offset(payload, used);
+        if (offset != 0) {
+            copy_text(detail->sql, SQL_MAX, payload, used, offset);
+        }
+    } else if (known & PROTO_POSTGRES) {
+        __u32 offset = pg_sql_offset(payload, used);
+        if (offset != 0) {
+            copy_text(detail->sql, SQL_MAX, payload, used, offset);
+        }
+    }
+    return 0;
+}
+
 /* --------------------------------------------------------------------- */
 /* Bytes consumed by the application                                      */
 /* --------------------------------------------------------------------- */
@@ -850,6 +1021,73 @@ int lidlesseye_tcp_recv(struct pt_regs *ctx) {
 /* --------------------------------------------------------------------- */
 /* Retransmissions                                                        */
 /* --------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
+/* TLS plaintext, via an optional uprobe on the TLS library               */
+/* --------------------------------------------------------------------- */
+/* A TLS library hands `SSL_write` the plaintext before it encrypts it. The
+ * probe has no socket to key on, so it stores the detail per cgroup and user
+ * space attaches it to the flows that cgroup owns. One recent statement per
+ * cgroup is enough for the map; keeping a history would multiply the memory
+ * for a value nobody scrolls. */
+struct ssl_detail {
+    __u8 host[80];
+    __u8 sql[160];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, struct ssl_detail);
+} ssl_details SEC(".maps");
+
+/* `SSL_write(SSL *ssl, const void *buf, int num)` and
+ * `SSL_write_ex(SSL *ssl, const void *buf, size_t num, size_t *written)` put
+ * the plaintext in the same argument, so one program covers both on every
+ * ABI this file supports. */
+SEC("uprobe/SSL_write")
+int lidlesseye_ssl_write(struct pt_regs *ctx) {
+    const char *buf = (const char *)PARM2(ctx);
+    /* Bound `len` explicitly: the verifier does not infer a positive range
+     * through `min()` of a register loaded from pt_regs, and rejects a size
+     * it cannot prove non-negative. */
+    __u32 len = (__u32)PARM3(ctx) & PAYLOAD_MASK;
+    if (buf == 0 || len < 8) {
+        return 0;
+    }
+    char payload[PAYLOAD_SAMPLE] = {};
+    if (bpf_probe_read_user(payload, len, buf) != 0) {
+        return 0;
+    }
+    struct ssl_detail detail = {};
+    // Only the three protocols this probe can name. Running the full
+    // classifier here would add a dozen parsers to the same verification unit
+    // for protocols whose plaintext detail is not collected over TLS anyway.
+    __u32 proto = is_http(payload, len) | is_postgres(payload, len) | is_mysql(payload, len);
+    if (proto & PROTO_HTTP) {
+        __u32 offset = http_host_offset(payload, len);
+        if (offset != 0) {
+            copy_text(detail.host, HOST_MAX, payload, len, offset);
+        }
+    } else if (proto & PROTO_MYSQL) {
+        __u32 offset = mysql_sql_offset(payload, len);
+        if (offset != 0) {
+            copy_text(detail.sql, SQL_MAX, payload, len, offset);
+        }
+    } else if (proto & PROTO_POSTGRES) {
+        __u32 offset = pg_sql_offset(payload, len);
+        if (offset != 0) {
+            copy_text(detail.sql, SQL_MAX, payload, len, offset);
+        }
+    }
+    if (detail.host[0] == 0 && detail.sql[0] == 0) {
+        return 0;
+    }
+    __u64 cgroup = bpf_get_current_cgroup_id();
+    bpf_map_update_elem((void *)&ssl_details, &cgroup, &detail, BPF_ANY);
+    return 0;
+}
+
 SEC("kprobe/tcp_retransmit_skb")
 int lidlesseye_tcp_retrans(struct pt_regs *ctx) {
     __u64 addr = PARM1(ctx);

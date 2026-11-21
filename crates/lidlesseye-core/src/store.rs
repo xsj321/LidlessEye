@@ -1566,8 +1566,8 @@ impl Store {
                     .prepare(&format!(
                         "INSERT INTO {edges_t} (bucket_ns, client_id, server_id, protocol, \
                          client_container, server_container, connections, retransmits, \
-                         tx_bytes, rx_bytes, rtt_us_sum, rtt_samples) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                         tx_bytes, rx_bytes, rtt_us_sum, rtt_samples, host, sql) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     ))
                     .map_err(db_err)?;
                 for edge in &batch.edges {
@@ -1584,6 +1584,8 @@ impl Store {
                         edge.rx_bytes as i64,
                         edge.rtt_us_sum as i64,
                         edge.rtt_samples as i64,
+                        edge.host,
+                        edge.sql,
                     ])
                     .map_err(db_err)?;
                 }
@@ -1672,7 +1674,8 @@ impl Store {
             .prepare(
                 "SELECT client_id, server_id, protocol, client_container, server_container, \
                         sum(connections), sum(retransmits), \
-                        sum(tx_bytes), sum(rx_bytes), sum(rtt_us_sum), sum(rtt_samples) \
+                        sum(tx_bytes), sum(rx_bytes), sum(rtt_us_sum), sum(rtt_samples), \
+                        arg_max(host, bucket_ns), arg_max(sql, bucket_ns) \
                  FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY client_id, server_id, protocol, client_container, server_container \
                  HAVING sum(connections) + sum(tx_bytes) + sum(rx_bytes) > 0 \
@@ -1699,6 +1702,17 @@ impl Store {
                 // Mean round-trip time over the connections that closed inside
                 // the window; zero when none did.
                 rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
+                // Old Parquet files predate these columns and read as NULL.
+                host: row
+                    .get::<_, Option<String>>(11)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                sql: row
+                    .get::<_, Option<String>>(12)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
             });
         }
         Ok(out)
@@ -2140,6 +2154,8 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
             ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
             ("client_container", "VARCHAR DEFAULT '' NOT NULL"),
             ("server_container", "VARCHAR DEFAULT '' NOT NULL"),
+            ("host", "VARCHAR DEFAULT '' NOT NULL"),
+            ("sql", "VARCHAR DEFAULT '' NOT NULL"),
         ],
     )?;
     add_columns(

@@ -193,6 +193,16 @@ pub struct ServiceEdge {
     pub rtt_us_sum: u64,
     #[serde(default)]
     pub rtt_samples: u64,
+    /// `Host:` header the client asked for, when the connection carried HTTP.
+    /// This is often the only name for an external peer behind a load
+    /// balancer, where the address is just an ingress IP.
+    #[serde(default)]
+    pub host: String,
+    /// Last SQL statement observed on the edge (MySQL COM_QUERY, PostgreSQL
+    /// Query/Parse). Empty for every non-database protocol, and for encrypted
+    /// connections unless the optional SSL uprobe is enabled.
+    #[serde(default)]
+    pub sql: String,
 }
 
 /// One collection window, produced by an agent.
@@ -296,6 +306,15 @@ impl ServiceMapBatch {
                     self.edges[i].rx_bytes += edge.rx_bytes;
                     self.edges[i].rtt_us_sum += edge.rtt_us_sum;
                     self.edges[i].rtt_samples += edge.rtt_samples;
+                    // The Host and SQL are "latest wins" fields, not counters:
+                    // keep a non-empty value instead of blanking what another
+                    // agent or window observed.
+                    if !edge.host.is_empty() {
+                        self.edges[i].host = edge.host;
+                    }
+                    if !edge.sql.is_empty() {
+                        self.edges[i].sql = edge.sql;
+                    }
                 }
                 None => {
                     edge_index.insert(key, self.edges.len());
@@ -373,6 +392,13 @@ pub struct MapEdge {
     /// rather than a stale number).
     #[serde(default)]
     pub rtt_us: u64,
+    /// `Host:` header most recently seen on this edge, if it carried HTTP.
+    #[serde(default)]
+    pub host: String,
+    /// Last SQL statement seen on this edge, if it carried MySQL or
+    /// PostgreSQL. Encrypted database traffic needs the SSL uprobe.
+    #[serde(default)]
+    pub sql: String,
 }
 
 /// `GET /api/v1/servicemap` response.
@@ -636,6 +662,7 @@ mod tests {
                 rx_bytes: 400,
                 rtt_us_sum: 900,
                 rtt_samples: 1,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -658,6 +685,7 @@ mod tests {
                 rx_bytes: 600,
                 rtt_us_sum: 2100,
                 rtt_samples: 2,
+                ..Default::default()
             }],
             ..Default::default()
         };
