@@ -1729,7 +1729,8 @@ impl Store {
                         arg_max(nullif(host, ''), bucket_ns), \
                         arg_max(nullif(sql, ''), bucket_ns) \
                  FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
-                 GROUP BY client_id, server_id, protocol, client_container, server_container \
+                 GROUP BY client_id, server_id, protocol, client_container, server_container, \
+                          CASE WHEN server_id = 'external' THEN coalesce(host, '') ELSE '' END \
                  HAVING sum(connections) + sum(tx_bytes) + sum(rx_bytes) > 0 \
                  ORDER BY sum(connections) + sum(tx_bytes) / 1024 DESC LIMIT 4000",
             )
@@ -1815,6 +1816,69 @@ impl Store {
                 rtt_us: 0,
                 pods: row.get::<_, i64>(5).unwrap_or(0).max(0) as u32,
                 ready: row.get::<_, i64>(6).unwrap_or(0).max(0) as u32,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The same buckets, but for one destination host of the aggregate
+    /// `external` node.
+    ///
+    /// A host node is synthesized from the edges that name it, so it has no
+    /// rows of its own in `net_nodes`; its counters *are* the edges. Bytes are
+    /// reported from the host's side of the call, which is what
+    /// [`Store::net_edge_history`] already does when the node is the server.
+    ///
+    /// The match is on `lower(host)` because that is how the node id is
+    /// built; the stored value keeps whatever case the client typed.
+    pub fn net_host_edge_history(
+        &self,
+        host: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>> {
+        let step = ts(step_ns.max(1));
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST((bucket_ns - ?) / ? AS BIGINT) AS slot, \
+                        sum(connections), sum(retransmits), \
+                        sum(tx_bytes), sum(rx_bytes), \
+                        sum(rtt_us_sum), sum(rtt_samples) \
+                 FROM net_edges \
+                 WHERE server_id = 'external' \
+                   AND (lower(host) = ? OR lower(host) = ? || '.') \
+                   AND bucket_ns >= ? AND bucket_ns < ? \
+                 GROUP BY slot ORDER BY slot",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt
+            .query(params![
+                ts(from_ns),
+                step,
+                host,
+                host,
+                ts(from_ns),
+                ts(until_ns)
+            ])
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let slot: i64 = row.get(0).map_err(db_err)?;
+            let rtt_us_sum = row.get::<_, i64>(5).unwrap_or(0).max(0) as u64;
+            let rtt_samples = row.get::<_, i64>(6).unwrap_or(0).max(0) as u64;
+            out.push(MapHistoryPoint {
+                bucket_ns: from_ns
+                    .saturating_add((slot.max(0) as u64).saturating_mul(step_ns.max(1))),
+                // From the host's side: what the clients sent it is its rx.
+                rx_bytes: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                tx_bytes: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                connections: row.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+                retransmits: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
+                pods: 0,
+                ready: 0,
             });
         }
         Ok(out)
@@ -2910,6 +2974,86 @@ mod tests {
         assert_eq!(edges.len(), 1, "one edge, two windows");
         assert_eq!(edges[0].host, "checkout.example.com");
         assert_eq!(edges[0].sql, "select 1");
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// External traffic is one grey blob unless the destination is used. The
+    /// host the client asked for is already on the edge, so a request to
+    /// `api.example.com` becomes its own node, case-folded, and the aggregate
+    /// node keeps only what had no host at all.
+    #[test]
+    fn external_edges_split_into_a_node_per_host() {
+        use crate::servicemap::{EXTERNAL_ID, ServiceEdge, ServiceNode, servicemap};
+
+        let (store, dir) = temp_store("map-external-hosts");
+        let start = 1_700_000_000_000_000_000u64;
+        let window = 60_000_000_000u64;
+        let edge = |host: &str, connections: u64| ServiceEdge {
+            client: "shop/api".to_string(),
+            server: EXTERNAL_ID.to_string(),
+            protocol: "http".to_string(),
+            connections,
+            host: host.to_string(),
+            ..Default::default()
+        };
+        store
+            .append_servicemap(&ServiceMapBatch {
+                start_ns: start,
+                end_ns: start + window,
+                nodes: vec![
+                    ServiceNode::new("shop/api", NodeKind::Workload),
+                    // The agent reports the aggregate node with the same
+                    // counters its edges carry; the split subtracts from it.
+                    ServiceNode {
+                        connections: 10,
+                        ..ServiceNode::new(EXTERNAL_ID, NodeKind::External)
+                    },
+                ],
+                edges: vec![
+                    edge("API.Example.com:8443", 4),
+                    edge("api.example.com:8443", 1),
+                    edge("db.example.com", 3),
+                    // No host: TLS without the uprobe, or not HTTP at all.
+                    edge("", 2),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let map = servicemap(&store, start, start + window).unwrap();
+        let ids: Vec<&str> = map.nodes.iter().map(|node| node.id.as_str()).collect();
+        assert!(ids.contains(&"external/api.example.com:8443"), "{ids:?}");
+        assert!(ids.contains(&"external/db.example.com"), "{ids:?}");
+        assert!(
+            ids.contains(&EXTERNAL_ID),
+            "the host-less call keeps the aggregate node: {ids:?}"
+        );
+
+        let api = map
+            .nodes
+            .iter()
+            .find(|node| node.id == "external/api.example.com:8443")
+            .expect("host node");
+        assert_eq!(api.connections, 5, "the two spellings are one host");
+        assert_eq!(api.service, "api.example.com:8443");
+        assert_eq!(api.kind, NodeKind::External);
+
+        let aggregate = map
+            .nodes
+            .iter()
+            .find(|node| node.id == EXTERNAL_ID)
+            .expect("aggregate node");
+        assert_eq!(
+            aggregate.connections, 2,
+            "the aggregate keeps only the host-less traffic, not the total"
+        );
+        // Every edge still points at a node that exists.
+        for edge in &map.edges {
+            assert!(ids.contains(&edge.client.as_str()), "{}", edge.client);
+            assert!(ids.contains(&edge.server.as_str()), "{}", edge.server);
+        }
 
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

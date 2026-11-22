@@ -24,8 +24,17 @@ use crate::store::{NetMetric, Store};
 /// Node id for traffic that has no endpoint inside the cluster.
 pub const EXTERNAL_ID: &str = "external";
 
+/// Prefix of a node that stands for one destination host outside the cluster:
+/// `external/api.example.com:8443`.
+pub const EXTERNAL_HOST_PREFIX: &str = "external/";
+
 /// How many nodes a single response may contain.
 pub const MAX_NODES: usize = 600;
+
+/// How many destination hosts the outside world is split into. Beyond this the
+/// traffic stays on the aggregate `external` node rather than pushing the
+/// cluster's own services out of the map.
+pub const MAX_EXTERNAL_HOSTS: usize = 40;
 
 /// Node id for a namespace/workload pair, or just the name outside Kubernetes.
 ///
@@ -422,11 +431,109 @@ impl ServiceMap {
 /// Query the map for a window, joining per-service CPU from the profiles.
 pub fn servicemap(store: &Store, from_ns: u64, until_ns: u64) -> Result<ServiceMap> {
     let mut nodes = store.net_nodes(from_ns, until_ns, MAX_NODES + 1)?;
-    let truncated = nodes.len() > MAX_NODES;
-    nodes.truncate(MAX_NODES);
+    let mut truncated = nodes.len() > MAX_NODES;
+    let mut edges = store.net_edges(from_ns, until_ns)?;
+
+    // External traffic is split by the destination the client asked for.
+    //
+    // One grey "external" blob answers nothing: a page that calls three APIs
+    // and a database looks like one dependency, and "which of them is slow" has
+    // no node to click. The agent already carries the HTTP `Host:` (and, under
+    // the TLS uprobe, the host of an HTTPS request), so the split costs nothing
+    // at query time. Traffic with no observed host — encrypted without the
+    // uprobe, or not HTTP at all — stays on the aggregate node, which keeps its
+    // honest meaning of "outside, destination unknown".
+    let mut totals: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
+    for edge in &edges {
+        if edge.server != EXTERNAL_ID {
+            continue;
+        }
+        let host = host_node_name(&edge.host);
+        if host.is_empty() {
+            continue;
+        }
+        let entry = totals.entry(host).or_insert((0, 0, 0, 0));
+        entry.0 += edge.connections;
+        entry.1 += edge.retransmits;
+        entry.2 += edge.tx_bytes;
+        entry.3 += edge.rx_bytes;
+    }
+
+    // A crawler can name thousands of hosts. Cap the split at the busiest few,
+    // so the outside world cannot push the cluster's own services off a map
+    // that only holds `MAX_NODES` — the rest stays on the aggregate node,
+    // unsummed and unlabelled, which is exactly what it is.
+    let split_hosts: HashMap<String, (u64, u64, u64, u64)> = {
+        let mut ranked: Vec<(String, (u64, u64, u64, u64))> = totals.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            let weight = |t: &(u64, u64, u64, u64)| t.0 + (t.2 + t.3) / 1024;
+            weight(&b.1).cmp(&weight(&a.1)).then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(MAX_EXTERNAL_HOSTS);
+        ranked.into_iter().collect()
+    };
+
+    if !split_hosts.is_empty() {
+        let (mut split_connections, mut split_retransmits) = (0u64, 0u64);
+        let (mut split_tx, mut split_rx) = (0u64, 0u64);
+        let mut host_nodes: Vec<MapNode> = Vec::with_capacity(split_hosts.len());
+        for (host, (connections, retransmits, tx, rx)) in &split_hosts {
+            let id = format!("{EXTERNAL_HOST_PREFIX}{host}");
+            split_connections += connections;
+            split_retransmits += retransmits;
+            split_tx += tx;
+            split_rx += rx;
+            host_nodes.push(MapNode {
+                id,
+                service: host.clone(),
+                kind: NodeKind::External,
+                connections: *connections,
+                retransmits: *retransmits,
+                tx_bytes: *tx,
+                rx_bytes: *rx,
+                ..Default::default()
+            });
+        }
+        for edge in &mut edges {
+            if edge.server != EXTERNAL_ID {
+                continue;
+            }
+            let host = host_node_name(&edge.host);
+            if split_hosts.contains_key(&host) {
+                edge.server = format!("{EXTERNAL_HOST_PREFIX}{host}");
+            }
+        }
+
+        // The aggregate node was summed over *every* external edge, including
+        // the ones just split out. Subtracting them leaves it with the traffic
+        // that had no host, and drops it entirely when there is none.
+        if let Some(external) = nodes.iter_mut().find(|node| node.id == EXTERNAL_ID) {
+            external.connections = external.connections.saturating_sub(split_connections);
+            external.retransmits = external.retransmits.saturating_sub(split_retransmits);
+            external.tx_bytes = external.tx_bytes.saturating_sub(split_tx);
+            external.rx_bytes = external.rx_bytes.saturating_sub(split_rx);
+        }
+        nodes.extend(host_nodes);
+        nodes.retain(|node| {
+            node.id != EXTERNAL_ID
+                || node.connections + node.retransmits + node.tx_bytes + node.rx_bytes > 0
+        });
+        // Busiest first, the order the limit below is applied in.
+        nodes.sort_by(|a, b| {
+            let weight = |node: &MapNode| node.connections + (node.tx_bytes + node.rx_bytes) / 1024;
+            weight(b).cmp(&weight(a)).then_with(|| a.id.cmp(&b.id))
+        });
+        if nodes.len() > MAX_NODES {
+            nodes.truncate(MAX_NODES);
+            truncated = true;
+        }
+    } else {
+        // Nothing was split, so the node list keeps the order and the limit the
+        // store already applied.
+        nodes.truncate(MAX_NODES);
+    }
 
     let keep: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-    let mut edges = store.net_edges(from_ns, until_ns)?;
     // An edge to a node the limit clipped would dangle in the drawing.
     edges.retain(|e| keep.contains(e.client.as_str()) && keep.contains(e.server.as_str()));
 
@@ -442,6 +549,30 @@ pub fn servicemap(store: &Store, from_ns: u64, until_ns: u64) -> Result<ServiceM
         edges,
         truncated,
     })
+}
+
+/// Longest host that may become a node name.
+const MAX_HOST_LEN: usize = 96;
+
+/// A `Host:` header as a node name.
+///
+/// The header is client-controlled: it can carry a port, a trailing dot, mixed
+/// case, or four kilobytes of garbage. Keep the characters a hostname can
+/// actually contain, fold case (DNS is case-insensitive), bound the length, and
+/// return an empty string when nothing usable is left — the caller then keeps
+/// the traffic on the aggregate external node rather than inventing a node.
+fn host_node_name(host: &str) -> String {
+    let trimmed = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let mut out = String::with_capacity(trimmed.len().min(MAX_HOST_LEN));
+    for ch in trimmed.chars() {
+        if out.len() >= MAX_HOST_LEN {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':') {
+            out.push(ch);
+        }
+    }
+    out.trim_matches('.').to_string()
 }
 
 /// One bucket of a single node's history.
@@ -498,6 +629,20 @@ pub fn servicemap_history(
     step_ns: u64,
 ) -> Result<MapHistory> {
     let step_ns = step_ns.max(1);
+    // A host node exists only in the drawing: it is synthesized from the edges
+    // that name it, so it has no rows of its own in `net_nodes`. Its counters
+    // are those edges, and the same buckets serve as both series.
+    if let Some(host) = node.strip_prefix(EXTERNAL_HOST_PREFIX) {
+        let points = store.net_host_edge_history(host, from_ns, until_ns, step_ns)?;
+        return Ok(MapHistory {
+            node: node.to_string(),
+            from_ns,
+            until_ns,
+            step_ns,
+            edges: points.clone(),
+            points,
+        });
+    }
     Ok(MapHistory {
         node: node.to_string(),
         from_ns,

@@ -53,7 +53,10 @@ export interface Point {
  */
 export function nodeLabel(node: ServiceMapNode | undefined): string {
   if (!node) return "—";
-  if (node.kind === "external") return "external";
+  // The outside world is one node per destination host: `external` itself is
+  // the aggregate of everything whose host we could not read, and a host node
+  // carries the host in `service`.
+  if (node.kind === "external") return node.service || "external";
   if (node.kind === "workload") return node.workload || node.service || node.id;
   return node.service || node.workload || node.id;
 }
@@ -485,6 +488,45 @@ export function edgePath(a: Box, b: Box, bow?: EdgeBow): EdgePath {
     c2: { x: cx, y: y2 },
     p3: { x: x2, y: y2 },
   };
+}
+
+/**
+ * One line per pair.
+ *
+ * The store keeps an edge per (client, server, protocol, container pair),
+ * because that is what the panel's per-container rows need. The map is a
+ * service graph: four edges between the same two services draw four identical
+ * curves, so the top one hides the others, their labels land on top of each
+ * other, and a dotted external hop under a solid one reads as a line that
+ * stops in mid-air. Merging here — not in the payload — keeps the panel's
+ * detail and gives the drawing one stroke per relationship.
+ */
+export function mergeParallelEdges(edges: ServiceMapEdge[]): ServiceMapEdge[] {
+  const groups = new Map<string, ServiceMapEdge>();
+  for (const edge of edges) {
+    const key = `${edge.client}\u0000${edge.server}`;
+    const current = groups.get(key);
+    if (!current) {
+      groups.set(key, { ...edge, client_container: "", server_container: "" });
+      continue;
+    }
+    const before = current.connections;
+    const w1 = before || 1;
+    const w2 = edge.connections || 1;
+    // Round-trip time is a mean, so merging means weighting by the
+    // connections that carried it — an idle sidecar hop must not drag down a
+    // busy app hop.
+    current.rtt_us = Math.round(((current.rtt_us ?? 0) * w1 + (edge.rtt_us ?? 0) * w2) / (w1 + w2));
+    current.connections = before + edge.connections;
+    current.retransmits = (current.retransmits ?? 0) + (edge.retransmits ?? 0);
+    current.tx_bytes = (current.tx_bytes ?? 0) + (edge.tx_bytes ?? 0);
+    current.rx_bytes = (current.rx_bytes ?? 0) + (edge.rx_bytes ?? 0);
+    // The busier protocol names the line; the panel still lists every one.
+    if (edge.connections > before) current.protocol = edge.protocol;
+    if (!current.host) current.host = edge.host;
+    if (!current.sql) current.sql = edge.sql;
+  }
+  return [...groups.values()];
 }
 
 /** New connections per second, the rate the edges are labelled with.

@@ -30,7 +30,13 @@ import { Maximize2, Minus, Plus, RotateCcw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useT } from "@/lib/i18n";
 import { useSettings } from "@/lib/settings";
-import { mapZones, nodeLabel, placeNodes, worldBounds } from "@/lib/servicemap-graph";
+import {
+  mapZones,
+  mergeParallelEdges,
+  nodeLabel,
+  placeNodes,
+  worldBounds,
+} from "@/lib/servicemap-graph";
 import type { Box, MapZone } from "@/lib/servicemap-graph";
 import type { ServiceMapEdge, ServiceMapNode } from "@/lib/types";
 
@@ -141,9 +147,13 @@ export function ServiceGraph({
   const focusing = focus && selected !== null;
 
   const drawing = useMemo(() => {
-    if (!focusing || !selected) return { nodes, edges };
+    // One stroke per pair: the payload keeps an edge per protocol and container
+    // pair for the panel, and drawing all of them puts four identical curves on
+    // the same pixels.
+    const merged = mergeParallelEdges(edges);
+    if (!focusing || !selected) return { nodes, edges: merged };
     const keep = new Set<string>([selected]);
-    for (const edge of edges) {
+    for (const edge of merged) {
       if (edge.client === selected) keep.add(edge.server);
       if (edge.server === selected) keep.add(edge.client);
     }
@@ -151,7 +161,7 @@ export function ServiceGraph({
     // to" is only half the picture if the peers' own relationships vanish.
     return {
       nodes: nodes.filter((node) => keep.has(node.id)),
-      edges: edges.filter((edge) => keep.has(edge.client) && keep.has(edge.server)),
+      edges: merged.filter((edge) => keep.has(edge.client) && keep.has(edge.server)),
     };
   }, [nodes, edges, focusing, selected]);
 
@@ -486,7 +496,7 @@ export function ServiceGraph({
           const box = boxes.get(node.id);
           if (!box) return null;
           const incident =
-            !selected || node.id === selected || edges.some(
+            !selected || node.id === selected || drawing.edges.some(
               (edge) =>
                 (edge.client === selected && edge.server === node.id) ||
                 (edge.server === selected && edge.client === node.id),

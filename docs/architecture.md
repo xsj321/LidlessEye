@@ -711,6 +711,26 @@ an outgoing socket on an ephemeral port can still be credited to the wrong *pod*
 connection that both opened and closed between two drains, on a socket the
 handshake map no longer knows, arrives with no container at all.
 
+### The outside world, by host
+
+`external` is an aggregate, and an aggregate is a dead end: three APIs and a
+database behind one grey node cannot answer "which dependency got slower". The
+agent already records the HTTP `Host:` on an edge (and the SNI/host of a TLS
+connection when the uprobe is on), so the query splits external edges by that
+value and synthesizes one node per host. Two details make it honest:
+
+* `net_edges` groups by a computed `host` key **only for `server_id = 'external'`**,
+  so an internal edge keeps one row per protocol/container pair and the panel's
+  per-container rows are unaffected;
+* the aggregate node keeps the traffic that never named a host (encrypted
+  without the uprobe, or not HTTP at all), and is dropped when nothing is left.
+  Hosts are capped at the busiest [`MAX_EXTERNAL_HOSTS`], because a crawler can
+  name thousands of them and the map only holds [`MAX_NODES`].
+
+A host node has no rows of its own in `net_nodes`, so its history comes from the
+edges that named it (`net_host_edge_history`), matched on `lower(host)` because
+that is how the node id is built.
+
 ### History for the panel
 
 The map shows one window; the panel that opens on a node draws that window's

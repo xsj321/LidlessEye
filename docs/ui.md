@@ -444,8 +444,18 @@ threshold are in [Settings](#settings).
 
 The protocol on an edge comes from the server port; the map does not parse
 payloads, so the rate is *new connections* per second, not requests.
-*External* collects everything the map cannot name — traffic that really does
-come from outside the cluster — so an edge to it is worth a second look. The
+*External* is split by the destination the client asked for: the agent reads
+the HTTP `Host:` (and, with the TLS uprobe, the host of an HTTPS request), so a
+page that calls three APIs and a database shows four nodes instead of one grey
+blob, each clickable and each with its own history. Traffic whose host was never
+observed stays on the aggregate *external* node, which then means exactly that —
+outside, destination unknown. The split is capped at the busiest 40 hosts, so a
+crawler cannot push the cluster's own services off a map that holds 600 nodes.
+Several edges between the same two nodes — one per protocol and container pair —
+are drawn as **one stroke**, with the rates added and the latency weighted by
+connections: four identical curves on the same pixels hid each other and put
+four labels on top of one another, which reads as a line that stops in mid-air.
+The
 time chart above the map plots one of the three counters the agent records —
 new connections, bytes, or retransmits — because which one matters depends on
 the incident. The range itself is the same one the flamegraph uses: *Relative*

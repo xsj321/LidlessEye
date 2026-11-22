@@ -53,6 +53,16 @@ Rust API follows the same rule.
 - Hovering a card drops every line that does not touch it to a hint, so the
   pointer answers "what does this talk to" on a map whose overview is a
   hairball — without selecting the node first.
+- External traffic is split by destination host: `external/api.example.com`
+  is its own node with its own history, built from the `Host:` the agent
+  already reads, instead of one grey "outside the world" blob. Destinations
+  with no observed host stay on the aggregate `external` node, and the split is
+  capped at the busiest 40 hosts so a crawler cannot crowd out the cluster.
+- The map draws **one stroke per pair** of nodes. The payload keeps an edge per
+  protocol and container pair for the panel, so a pair with two protocols drew
+  two identical curves: the top one hid the other, their labels landed on each
+  other, and a dotted hop under a solid one looked like a line that stops in
+  mid-air.
 - The row above the map carries an **edge key** — `call`, `selected`,
   `retransmit`, `outside` — drawn from the same colour and dash constants the
   canvas strokes with, plus `arrow = direction · width = traffic`. Four line
