@@ -231,6 +231,10 @@ pub struct SeriesInfo {
 pub struct SampleRow {
     pub stack_id: u64,
     pub value: u64,
+    /// How many sample rows were folded into this row's `value`. The value
+    /// alone cannot answer "how often was this frame seen", because a sample
+    /// can weigh more than one unit (a 1 ms CPU interval, say).
+    pub samples: u64,
     /// Value of the group-by label, decoded from the batch labels.
     pub group: Option<String>,
 }
@@ -794,12 +798,12 @@ impl Store {
         let needs_series = !query.selector.is_empty() || query.group_by.is_some();
         let mut sql = if needs_series {
             format!(
-                "SELECT stack_id, service_name, labels, SUM(value) FROM samples \
+                "SELECT stack_id, service_name, labels, SUM(value), COUNT(*) FROM samples \
                  WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ?"
             )
         } else {
             format!(
-                "SELECT stack_id, SUM(value) FROM samples \
+                "SELECT stack_id, SUM(value), COUNT(*) FROM samples \
                  WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ?"
             )
         };
@@ -847,9 +851,11 @@ impl Store {
             // `stack_id, value`, and there is no series to keep.
             if !needs_series {
                 let value = row.get::<_, i64>(1).map_err(db_err)?.max(0) as u64;
+                let samples = row.get::<_, i64>(2).map_err(db_err)?.max(0) as u64;
                 rows.push(SampleRow {
                     stack_id,
                     value,
+                    samples,
                     group: None,
                 });
                 continue;
@@ -857,6 +863,7 @@ impl Store {
             let service_name: String = row.get(1).map_err(db_err)?;
             let labels_text: String = row.get(2).map_err(db_err)?;
             let value = row.get::<_, i64>(3).map_err(db_err)?.max(0) as u64;
+            let samples = row.get::<_, i64>(4).map_err(db_err)?.max(0) as u64;
 
             // Only the encoded payload is the cache key: `matches_meta` and
             // `group_by` both take service_name separately, so the decoded
@@ -884,6 +891,7 @@ impl Store {
             rows.push(SampleRow {
                 stack_id,
                 value,
+                samples,
                 group,
             });
         }

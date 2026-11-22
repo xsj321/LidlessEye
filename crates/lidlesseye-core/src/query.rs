@@ -32,6 +32,11 @@ pub struct Flamegraph {
     pub names: Vec<String>,
     pub levels: Vec<i64>,
     pub values: Vec<i64>,
+    /// Sample rows under each node, parallel to `names`. `values[i] / weight`
+    /// is close to this but not equal: a sample can weigh more than one unit,
+    /// so the two ratios differ and both are worth showing.
+    #[serde(default)]
+    pub sample_counts: Vec<i64>,
     /// Total value of the root node.
     pub total: i64,
     /// Unit of `values`.
@@ -48,6 +53,7 @@ impl Flamegraph {
             names: vec!["root".to_string()],
             levels: vec![-1],
             values: vec![0],
+            sample_counts: vec![0],
             total: 0,
             unit: unit.as_str().to_string(),
             samples: 0,
@@ -223,6 +229,11 @@ struct TreeBuilder {
     node_frame: Vec<u32>,
     parent: Vec<i32>,
     self_value: Vec<u64>,
+    /// Sample rows attributed to each node, before the inclusive pass. Kept
+    /// apart from `self_value` because the two are not proportional: one
+    /// sample weighs a fixed amount, so a frame can hold 10% of the time in
+    /// 2% of the samples, and that gap is what a reader wants to see.
+    self_samples: Vec<u64>,
     children: Vec<HashMap<u32, usize>>,
     truncated_node: Option<usize>,
     truncated: bool,
@@ -239,6 +250,7 @@ impl TreeBuilder {
             node_frame: vec![u32::MAX],
             parent: vec![-1],
             self_value: vec![0],
+            self_samples: vec![0],
             children: vec![HashMap::new()],
             truncated_node: None,
             truncated: false,
@@ -263,6 +275,7 @@ impl TreeBuilder {
         self.node_frame.push(frame);
         self.parent.push(parent as i32);
         self.self_value.push(0);
+        self.self_samples.push(0);
         self.children.push(HashMap::new());
         if frame != u32::MAX {
             self.children[parent].insert(frame, idx);
@@ -270,11 +283,12 @@ impl TreeBuilder {
         idx
     }
 
-    fn add_stack(&mut self, group: Option<&str>, frames: &[u32], value: u64) {
+    fn add_stack(&mut self, group: Option<&str>, frames: &[u32], value: u64, samples: u64) {
         let mut node = match group {
             Some(group) => self.group_node(group),
             None => 0usize,
         };
+        self.self_samples[node] = self.self_samples[node].saturating_add(samples);
         // Stacks are stored leaf-first; the tree is built root-first.
         for &frame in frames.iter().rev() {
             if frame == u32::MAX {
@@ -300,6 +314,7 @@ impl TreeBuilder {
                     }
                 }
             };
+            self.self_samples[node] = self.self_samples[node].saturating_add(samples);
         }
         self.self_value[node] = self.self_value[node].saturating_add(value);
     }
@@ -308,6 +323,12 @@ impl TreeBuilder {
         // Inclusive values: children always have a larger index than their
         // parent, so one reverse pass is enough.
         let mut value = self.self_value.clone();
+        // `self_samples` is already inclusive: `add_stack` adds a row's count
+        // to every node on its path, so an ancestor's count is the number of
+        // rows under it. Running the inclusive pass over it too would count
+        // each row once per level. Still `mut`: pruning has to subtract a
+        // dropped subtree from its parent.
+        let mut samples = self.self_samples.clone();
         for i in (1..value.len()).rev() {
             let p = self.parent[i];
             if p >= 0 {
@@ -342,6 +363,7 @@ impl TreeBuilder {
             let p = self.parent[idx] as usize;
             alive_children[p] = alive_children[p].saturating_sub(1);
             value[p] = value[p].saturating_sub(v);
+            samples[p] = samples[p].saturating_sub(samples[idx]);
             if alive_children[p] == 0 && p != 0 {
                 heap.push(std::cmp::Reverse((value[p], p)));
             }
@@ -359,6 +381,7 @@ impl TreeBuilder {
         let mut names = Vec::with_capacity(alive_count);
         let mut levels = Vec::with_capacity(alive_count);
         let mut values = Vec::with_capacity(alive_count);
+        let mut sample_counts = Vec::with_capacity(alive_count);
         let mut index_map = vec![u32::MAX; value.len()];
 
         // Iterative DFS, children sorted by value descending.
@@ -378,6 +401,7 @@ impl TreeBuilder {
             names.push(name);
             levels.push(parent_new);
             values.push(value[node] as i64);
+            sample_counts.push(samples[node] as i64);
 
             children_alive[node].sort_unstable_by(|a, b| value[*b].cmp(&value[*a]));
             for &child in children_alive[node].iter().rev() {
@@ -385,14 +409,17 @@ impl TreeBuilder {
             }
         }
 
-        let samples = self.self_value.iter().skip(1).filter(|&&v| v > 0).count() as u64;
+        // The root carries every sample exactly once, which is what the UI
+        // reports as the window's sample count.
+        let total_samples = sample_counts.first().copied().unwrap_or(0).max(0) as u64;
         Flamegraph {
             names,
             levels,
             values,
+            sample_counts,
             total: total as i64,
             unit: Unit::Nanoseconds.as_str().to_string(),
-            samples,
+            samples: total_samples,
             truncated: was_pruned || self.truncated,
         }
     }
@@ -422,7 +449,7 @@ pub fn flamegraph(store: &Store, opts: &QueryOptions) -> Result<Flamegraph> {
             continue;
         };
         map_stack(stack, &remap, &mut stack_buf);
-        builder.add_stack(row.group.as_deref(), &stack_buf, row.value);
+        builder.add_stack(row.group.as_deref(), &stack_buf, row.value, row.samples);
     }
 
     let mut fg = builder.finish(opts.max_nodes);
@@ -923,6 +950,29 @@ mod tests {
         );
         store.append(&b.finish()).unwrap();
         (store, dir)
+    }
+
+    #[test]
+    fn every_node_reports_how_many_samples_it_holds() {
+        let (store, dir) = store_with_data("fg-samples");
+        let opts = QueryOptions::new("cpu", 0, 10_000, Selector::default());
+        let fg = flamegraph(&store, &opts).unwrap();
+        assert_eq!(fg.sample_counts.len(), fg.names.len());
+
+        // Three add_stack calls above, so the root sees three sample rows.
+        assert_eq!(fg.samples, 3);
+        assert_eq!(fg.sample_counts[0], 3);
+
+        let at = |name: &str| fg.names.iter().position(|n| n == name).unwrap();
+        // `serve` is on two of the three stacks and `main` on all three.
+        assert_eq!(fg.sample_counts[at("serve")], 2);
+        assert_eq!(fg.sample_counts[at("main")], 3);
+        // A leaf keeps its own single sample, and its value stays 500: the two
+        // numbers are independent, which is why both are reported.
+        assert_eq!(fg.sample_counts[at("handle")], 1);
+        assert_eq!(fg.values[at("handle")], 500);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

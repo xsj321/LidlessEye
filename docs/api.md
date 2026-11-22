@@ -182,6 +182,7 @@ Flat response:
   "names": ["root", "main", "handle_request", "render_html"],
   "levels": [-1, 0, 1, 2],
   "values": [2850000000, 2850000000, 2850000000, 1700000000],
+  "sample_counts": [6, 6, 6, 3],
   "total": 2850000000,
   "unit": "nanoseconds",
   "samples": 6,
@@ -192,6 +193,11 @@ Flat response:
 `levels[i]` is the **parent index** of node `i` (`-1` for the root), and
 `values[i]` is the inclusive value of the node. Children are emitted before
 their siblings, sorted by value.
+
+`sample_counts[i]` is how many sample rows sit under node `i`, and `samples` is
+the count at the root. It is not `values[i] / weight`: a sample weighs a fixed
+amount, so a frame can hold 10% of the time in 2% of the samples, and the UI
+shows both. Older payloads omit the array.
 
 With `group_by=pod` the children of the root are synthetic frames named
 `pod=<value>`; every stack below them has that label value. The frame names the
