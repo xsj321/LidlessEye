@@ -33,7 +33,6 @@
 // exist is being read, and an edge that happens to be drawn later would strike
 // a line straight through the number.
 
-import { useId } from "react";
 
 import {
   EDGE_DASH,
@@ -171,6 +170,46 @@ export interface EdgeLayerProps {
   testId?: string;
 }
 
+/**
+ * Where the head goes, and where the line has to stop so it does.
+ *
+ * SVG markers can do this, but only with a `strokeWidth`-relative box, they
+ * cannot inherit `stroke-opacity` (the fill stays opaque while the line fades,
+ * which is what made the two halves look glued on), and they are placed at the
+ * path's end rather than aimed at a card.
+ *
+ * This head is a **dart**: the back edge is notched so the line runs *into* the
+ * shape instead of butting against a flat base. A plain triangle shows its base
+ * as a straight cut across the stroke; a notch has no such edge, and the head
+ * reads as the line tapering to a point.
+ */
+function arrowHead(path: EdgePath, width: number) {
+  const dx = path.p3.x - path.c2.x;
+  const dy = path.p3.y - path.c2.y;
+  const norm = Math.hypot(dx, dy) || 1;
+  const ux = dx / norm;
+  const uy = dy / norm;
+  // Longer than it is wide, or it reads as a blob: about 2.2 : 1.
+  const length = Math.min(10, width * 4 + 2);
+  const half = width * 1.4;
+  const notch = length * 0.35;
+  const base = { x: path.p3.x - ux * length, y: path.p3.y - uy * length };
+  const waist = { x: base.x + ux * notch, y: base.y + uy * notch };
+  const nx = -uy;
+  const ny = ux;
+  return {
+    // The line ends at the notch, inside the dart, and the last control point
+    // moves back with it so the arrival angle survives the trim.
+    d: `M${path.p0.x},${path.p0.y} C${path.c1.x},${path.c1.y} ${path.c2.x - ux * (length - notch) * 0.5},${path.c2.y - uy * (length - notch) * 0.5} ${waist.x + ux * 0.5},${waist.y + uy * 0.5}`,
+    // From behind the notch to inside the head: a solid joint the dashes of an
+    // external or retransmitting edge cannot break.
+    // Long enough to span a dash gap (4 px on both dashed styles) no matter
+    // where the phase lands, so the head is never orphaned.
+    neck: `M${waist.x - ux * Math.max(12, length)},${waist.y - uy * Math.max(12, length)} L${waist.x + ux},${waist.y + uy}`,
+    head: `M${path.p3.x},${path.p3.y} L${base.x + nx * half},${base.y + ny * half} L${waist.x},${waist.y} L${base.x - nx * half},${base.y - ny * half} Z`,
+  };
+}
+
 export function EdgeLayer({
   edges,
   boxes,
@@ -234,12 +273,6 @@ export function EdgeLayer({
     return [{ edge, key, path, text, spot, rate, protocol, fullText, width: widthOf(fullText), external }];
   });
 
-  // Marker ids are per-instance: the map and the neighbourhood both render an
-  // EdgeLayer, and a shared id would make the second one silently adopt the
-  // first one's arrow colour and size.
-  const uid = useId().replace(/[:#]/g, "");
-  const marker = (tone: string) => `${uid}-arrow-${tone}`;
-
   const hot = hoveredEdge ? drawn.find((entry) => entry.key === hoveredEdge) : undefined;
 
   return (
@@ -254,28 +287,6 @@ export function EdgeLayer({
       data-testid={testId}
       aria-hidden="true"
     >
-      <defs>
-        {[
-          ["idle", LINE.idle],
-          ["emphasis", LINE.emphasis],
-          ["external", LINE.external],
-          ["warn", LINE.warn],
-        ].map(([tone, fill]) => (
-          <marker
-            key={tone}
-            id={marker(tone)}
-            viewBox="0 0 8 8"
-            refX="6.6"
-            refY="4"
-            markerWidth="4"
-            markerHeight="4"
-            orient="auto"
-          >
-            <path d="M0.4 1 L7 4 L0.4 7 z" fill={fill} />
-          </marker>
-        ))}
-      </defs>
-
       {drawn.map(({ edge, key, path, rate, external }) => {
         const warn = (edge.retransmits ?? 0) > 0;
         const touched = !selected || edge.client === selected || edge.server === selected;
@@ -291,6 +302,9 @@ export function EdgeLayer({
         const stroke =
           tone === "warn" ? LINE.warn : tone === "emphasis" ? LINE.emphasis : external ? LINE.external : LINE.idle;
         const emphasis = Boolean(lit || (selected && touched && !warn));
+        const width = muted ? 1.2 : edgeWidth(rate, edge.tx_bytes ?? 0, emphasis);
+        const alpha = muted ? 0.62 : !context ? 0.16 : touched ? (emphasis ? 1 : 0.9) : 0.4;
+        const head = undirected ? null : arrowHead(path, width);
         return (
           <g key={key}>
             {/* A wide transparent twin of the curve: a 1px line is impossible
@@ -310,7 +324,7 @@ export function EdgeLayer({
               />
             ) : null}
             <path
-              d={path.d}
+              d={head ? head.d : path.d}
               data-protocol={edge.protocol || "tcp"}
               data-from={edge.client}
               data-to={edge.server}
@@ -321,16 +335,11 @@ export function EdgeLayer({
               // 0.9 to 2.6: an edge is a hint at the shape of the traffic, and
               // a fat line competes with the card it points at. The floor is
               // thick enough to see at fit zoom on a dark surface.
-              strokeWidth={
-                muted ? 1.2 : edgeWidth(rate, edge.tx_bytes ?? 0, emphasis)
-              }
-              strokeOpacity={
-                muted ? 0.62 : !context ? 0.16 : touched ? (emphasis ? 1 : 0.9) : 0.4
-              }
-              strokeLinecap="round"
-              markerEnd={
-                undirected ? undefined : `url(#${marker(tone === "warn" ? "warn" : emphasis ? "emphasis" : external ? "external" : "idle")})`
-              }
+              strokeWidth={width}
+              strokeOpacity={alpha}
+              // Butt, not round: the stroke stops at the head's base, and a
+              // round cap would bulge out past it and read as a second shape.
+              strokeLinecap="butt"
               // Two dash patterns, two meanings: a long dash is a retransmit
               // warning, a fine dot says the target is outside the cluster.
               // Selling them as one style would make a healthy outbound call
@@ -344,6 +353,27 @@ export function EdgeLayer({
               }
               style={{ transition: "opacity 150ms ease, stroke 150ms ease" }}
             />
+            {head ? (
+              <path
+                d={head.neck}
+                fill="none"
+                stroke={stroke}
+                strokeWidth={width}
+                strokeOpacity={alpha}
+                strokeLinecap="butt"
+                style={{ transition: "opacity 150ms ease, stroke 150ms ease" }}
+              />
+            ) : null}
+            {head ? (
+              <path
+                d={head.head}
+                data-head={key}
+                fill={stroke}
+                fillOpacity={alpha}
+                stroke="none"
+                style={{ transition: "fill-opacity 150ms ease, fill 150ms ease" }}
+              />
+            ) : null}
           </g>
         );
       })}

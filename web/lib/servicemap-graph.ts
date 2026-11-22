@@ -451,9 +451,10 @@ export function edgePath(a: Box, b: Box, bow?: EdgeBow): EdgePath {
 
   if (forward) {
     const x1 = a.x + a.w;
-    // The arrowhead would otherwise touch the card it points at, so the curve
-    // stops three pixels short and the marker fills the gap.
-    const x2 = b.x - 3;
+    // The curve stops one pixel short of the card: the arrowhead is drawn from
+    // its endpoint back along the tangent, so the tip lands on the border
+    // rather than a head-length away from it.
+    const x2 = b.x - 1;
     const pull = Math.max(28, (x2 - x1) * 0.5);
     return {
       d: `M${x1},${ay} C${x1 + pull},${ay} ${x2 - pull},${by} ${x2},${by}`,
@@ -467,7 +468,7 @@ export function edgePath(a: Box, b: Box, bow?: EdgeBow): EdgePath {
 
   const down = by >= ay;
   const y1 = down ? a.y + a.h : a.y;
-  const y2 = down ? b.y - 3 : b.y + b.h + 3;
+  const y2 = down ? b.y - 1 : b.y + b.h + 1;
   const x1 = a.x + a.w / 2;
   const x2 = b.x + b.w / 2;
   // Bow away from the cards, not into them: by default the loop runs on the
@@ -477,15 +478,23 @@ export function edgePath(a: Box, b: Box, bow?: EdgeBow): EdgePath {
   // where the hops to the selected workload are drawn.
   const depth = bow?.depth ?? Math.max(46, Math.min(140, Math.abs(y2 - y1) * 0.45 + 46));
   const cx = bow?.side === "left" ? Math.min(x1, x2) - depth : Math.max(x1, x2) + depth;
+  // The curve used to arrive flat, on a tangent parallel to the card's edge, so
+  // the arrowhead pointed sideways along the border while the line visibly
+  // dropped into it — a triangle that belonged to nothing. The second control
+  // point therefore sits above (or below) the endpoint, which turns the last
+  // stretch into a hook and makes the arrival direction vertical, into the
+  // card.
+  const hook = Math.max(26, Math.min(90, Math.abs(y2 - y1) * 0.6));
+  const c2 = { x: x2, y: down ? y2 - hook : y2 + hook };
   return {
-    d: `M${x1},${y1} C${cx},${y1} ${cx},${y2} ${x2},${y2}`,
+    d: `M${x1},${y1} C${cx},${y1} ${c2.x},${c2.y} ${x2},${y2}`,
     mid: {
-      x: (x1 + 3 * cx + 3 * cx + x2) / 8,
-      y: (y1 + 3 * y1 + 3 * y2 + y2) / 8,
+      x: (x1 + 3 * cx + 3 * c2.x + x2) / 8,
+      y: (y1 + 3 * y1 + 3 * c2.y + y2) / 8,
     },
     p0: { x: x1, y: y1 },
     c1: { x: cx, y: y1 },
-    c2: { x: cx, y: y2 },
+    c2,
     p3: { x: x2, y: y2 },
   };
 }

@@ -1185,8 +1185,11 @@ async function main() {
     "neighbourhood workload cards never overlap",
     JSON.stringify(cardRects),
   );
+  // The arrowheads are polygons rather than SVG markers (a marker cannot
+  // inherit stroke-opacity and scales with the stroke width), so the count
+  // looks for the head itself.
   check(
-    (await mapPage.locator('[data-testid="map-neighborhood-edges"] path[marker-end]').count()) >= 2,
+    (await mapPage.locator('[data-testid="map-neighborhood-edges"] path[data-head]').count()) >= 2,
     "container rows carry their own edges",
   );
   // Every hop leaves a source port (`@out`) and lands on a target port

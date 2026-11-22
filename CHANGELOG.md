@@ -8,6 +8,17 @@ Rust API follows the same rule.
 
 ## [Unreleased]
 
+### Changed
+
+- Map arrowheads are geometry, not SVG markers. A `marker` cannot inherit
+  `stroke-opacity` — its fill stayed opaque while the line faded to 40 %, which
+  is what made the head look pasted onto the line — its box scales with
+  `stroke-width`, and on a dashed edge it can end up floating a few pixels past
+  the last dash. The head is now a dart with a notched back, drawn in the same
+  ink as its line at the same alpha, with a short solid neck that no dash phase
+  can detach. Backward hops also hook into the card vertically instead of
+  grazing its top edge, so their heads point into the card rather than along it.
+
 ## [0.1.2] - 2026-11-22
 
 The service map becomes something an operator can work with rather than look
