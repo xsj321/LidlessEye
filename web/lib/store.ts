@@ -259,6 +259,14 @@ export class DashboardStore {
     if (this.state.mode === "relative" && !patch.range) {
       this.state = { ...this.state, range: settings.defaultRange };
     }
+    // A link straight into the compare tab skips `setView`, which is where the
+    // two windows are normally prepared. Without this the comparison window is
+    // the whole domain and the baseline is its first half: a diff that
+    // overlaps itself and reads as a 2% change across two different spans.
+    if (this.state.view === "compare") {
+      const prepared = prepareCompare(this.timeState());
+      if (prepared) this.state = { ...this.state, ...prepared };
+    }
     this.lastDomain = this.resolveDomain();
 
     window.addEventListener("hashchange", this.onHashChange);

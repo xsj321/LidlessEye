@@ -341,6 +341,35 @@ async function main() {
   );
   await rootPage.close();
 
+  // A link straight into the compare tab has to prepare the two windows the
+  // same way the tab click does. It used to leave the comparison window as the
+  // whole domain and the baseline as its first half, which is a diff of a span
+  // against a part of itself.
+  const comparePage = await context.newPage();
+  await comparePage.goto(`${BASE}/#/compare?type=cpu&range=1h`, { waitUntil: "load" });
+  await comparePage.waitForFunction(
+    () => window.lidlesseye?.state?.view === "compare" && window.lidlesseye.state.ready,
+    null,
+    { timeout: 20000 },
+  );
+  const direct = await comparePage.evaluate(() => ({
+    domainFrom: window.lidlesseye.state.domainFrom,
+    domainUntil: window.lidlesseye.state.domainUntil,
+    from: window.lidlesseye.state.fromNs,
+    until: window.lidlesseye.state.untilNs,
+    baseFrom: window.lidlesseye.state.baseFromNs,
+    baseUntil: window.lidlesseye.state.baseUntilNs,
+  }));
+  check(
+    direct.from > direct.domainFrom &&
+      direct.until >= direct.domainUntil &&
+      direct.baseFrom >= direct.domainFrom &&
+      direct.baseUntil <= direct.from,
+    "a compare link splits the domain instead of overlapping itself",
+    JSON.stringify(direct),
+  );
+  await comparePage.close();
+
   // ---- flamegraph ------------------------------------------------------
   const navigation = await page.goto(`${BASE}/#/flamegraph`, { waitUntil: "load" });
   check(navigation !== null && navigation.status() === 200, "the dashboard responds with 200", String(navigation && navigation.status()));
