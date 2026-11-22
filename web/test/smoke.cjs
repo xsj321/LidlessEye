@@ -230,6 +230,30 @@ async function seed() {
         rtt_samples: 12,
       },
       {
+        client: "external",
+        server: "shop/cart",
+        protocol: "http",
+        connections: 30,
+        retransmits: 0,
+        rx_bytes: 3_000,
+        tx_bytes: 1_500,
+        rtt_us_sum: 5_000,
+        rtt_samples: 5,
+      },
+      // Two callees of one node that also talk to each other: the neighbourhood
+      // draws that as an arc outside the callee column.
+      {
+        client: "checkout",
+        server: "shop/payments",
+        protocol: "http",
+        connections: 20,
+        retransmits: 0,
+        rx_bytes: 2_000,
+        tx_bytes: 1_000,
+        rtt_us_sum: 4_000,
+        rtt_samples: 4,
+      },
+      {
         client: "shop/cart",
         server: "shop/payments",
         protocol: "grpc",
@@ -1211,6 +1235,132 @@ async function main() {
     "edges are labelled with their application protocol",
     JSON.stringify(protocols),
   );
+
+  // Two peers that talk to each other are drawn as a mesh curve. The star can
+  // only show hops through the selected workload, so without this the cards
+  // looked disconnected even when they were the busiest pair in the picture.
+  const meshHops = await mapPage
+    .locator('[data-testid="map-neighborhood-mesh"] path[data-from]')
+    .evaluateAll((paths) => paths.map((path) => ({ from: path.dataset.from, to: path.dataset.to })));
+  // Both ends lie in one column and on that column's outer edge — a caller arc
+  // brackets the caller column on its left, a callee arc the callee column on
+  // its right. Anything else would draw through the cards.
+  const arcEnd = (anchor) => ({
+    column: String(anchor).split(":")[0],
+    edge: String(anchor).endsWith("@in") ? "in" : "out",
+  });
+  check(
+    meshHops.length > 0 &&
+      meshHops.every((hop) => {
+        const a = arcEnd(hop.from);
+        const b = arcEnd(hop.to);
+        return a.column === b.column && a.edge === b.edge;
+      }),
+    "neighbour-to-neighbour traffic is drawn between the cards",
+    JSON.stringify(meshHops.slice(0, 4)),
+  );
+
+  // Dragging the little map must not select the card labels: the second drag
+  // then becomes a native text drag, which the browser turns into a search.
+  // It has to pan from a card too — cards cover most of the surface. The point
+  // is clamped into the window first: the drawer can be wider than the
+  // viewport, and a drag aimed off-screen does nothing at all.
+  // The drawer slides in, and `data-state="open"` flips before the transition
+  // ends. Measuring a moving panel puts every card at the wrong place, so wait
+  // for its rect to stop changing first.
+  await mapPage.waitForFunction(
+    () => {
+      const el = document.querySelector("#map-panel");
+      if (!el) return false;
+      const x = Math.round(el.getBoundingClientRect().x * 10) / 10;
+      const settled = window.__panelX === x;
+      window.__panelX = x;
+      return settled;
+    },
+    null,
+    { timeout: 5000, polling: 100 },
+  );
+  const grab = await mapPage.evaluate(() => {
+    const surface = document.querySelector('[data-testid="map-neighborhood"] > div[data-zoom]');
+    const panel = document.querySelector("#map-panel");
+    const s = surface.getBoundingClientRect();
+    const p = panel.getBoundingClientRect();
+    const right = Math.min(s.right, innerWidth - 6);
+    const bottom = Math.min(s.bottom, innerHeight - 6);
+    const cards = [
+      ...document.querySelectorAll(
+        '[data-testid="map-neighborhood-self"],[data-testid="map-neighborhood-peer"]',
+      ),
+    ];
+    // A point on a card that is also inside both the surface and the window:
+    // the drawer can be wider than the viewport, and a drag aimed off-screen
+    // does nothing at all.
+    for (const card of cards) {
+      const c = card.getBoundingClientRect();
+      const x = Math.min(Math.max(c.x + 24, s.x + 8), right - 40);
+      const y = Math.min(Math.max(c.y + 16, s.y + 8), bottom - 30);
+      const hit = document.elementFromPoint(x, y);
+      if (hit?.closest("[data-map-card]")) {
+        return {
+          point: { x, y },
+          surface: { x: s.x, y: s.y, w: s.width, h: s.height },
+          panel: { x: p.x, y: p.y, w: p.width },
+          viewport: { w: innerWidth, h: innerHeight },
+          onCard: true,
+        };
+      }
+    }
+    return {
+      point: null,
+      surface: { x: s.x, y: s.y, w: s.width, h: s.height },
+      panel: { x: p.x, y: p.y, w: p.width },
+      viewport: { w: innerWidth, h: innerHeight },
+      cards: cards.map((card) => {
+        const r = card.getBoundingClientRect();
+        return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width) };
+      }),
+    };
+  });
+  check(
+    grab.point !== null,
+    "the drag starts on a card inside the visible part of the surface",
+    JSON.stringify(grab),
+  );
+  // The drawer clamps its width to the window; a panel wider than the viewport
+  // would hide half of the neighbourhood with no way to tell.
+  check(
+    grab.surface.x + grab.surface.w <= grab.viewport.w + 1 &&
+      grab.panel.x >= 0,
+    "the neighbourhood fits inside the window",
+    JSON.stringify({ surface: grab.surface, panel: grab.panel, viewport: grab.viewport }),
+  );
+  const panOf = () =>
+    mapPage
+      .locator('[data-testid="map-neighborhood"] > div[data-zoom] > div')
+      .first()
+      .evaluate((el) => el.style.transform);
+  const panBefore = await panOf();
+  const grabX = grab.point.x;
+  const grabY = grab.point.y;
+  await mapPage.mouse.move(grabX, grabY);
+  await mapPage.mouse.down();
+  await mapPage.mouse.move(grabX + 40, grabY + 28, { steps: 6 });
+  await mapPage.mouse.up();
+  const selectedText = await mapPage.evaluate(() => window.getSelection()?.toString() ?? "");
+  check(selectedText === "", "dragging the neighbourhood selects nothing", selectedText);
+  check(
+    (await panOf()) !== panBefore,
+    "dragging the neighbourhood pans it",
+    `${panBefore} -> ${await panOf()} from ${JSON.stringify(grab.point)}`,
+  );
+  // The pan must not have been read as a click on that card: the drawer still
+  // shows the node it was opened on.
+  check(
+    (await mapPage.locator("#map-panel-title").innerText()).trim() === "cart",
+    "a pan that starts on a card does not open that card",
+    (await mapPage.locator("#map-panel-title").innerText()).trim(),
+  );
+  await mapPage.click('[data-testid="map-neighborhood-fit"]');
   const autoWidth = await mapPage
     .locator('[data-testid="map-panel"]')
     .getAttribute("data-auto-width");

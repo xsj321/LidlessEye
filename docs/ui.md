@@ -323,6 +323,21 @@ Labels clear the workload cards, not the rows inside them, and stay in the
 channel between columns. The hop has its own scroll-to-zoom, drag-to-pan and
 zoom buttons, with a *fit* action that returns to a readable whole-hop view.
 
+**Two cards on the same side that talk to each other get an arc**, drawn
+outside their column. Without it a set of callers that exchange traffic looked
+unrelated. Two rules keep it honest: a caller and a callee are *not* joined by
+an arc — both already connect to the selected workload, and a curve through the
+middle card would read as "both talk to this workload", which is a different
+claim; and the arc is undirected and unlabelled, because it answers "do these
+two talk", not "how fast". The note under the map states the rule, and a
+workload that appears on both sides gets **two cards**, one per direction,
+because "they call you" and "you call them" carry different container rows.
+
+Dragging pans from anywhere on the surface, cards included, and the surface
+selects no text: a pan that selected labels turned the next drag into a native
+text drag, which the browser offers as a search. The pointer is captured only
+after the pointer has moved, so a click on a card still opens that card.
+
 The panel is portalled to `document.body` and positioned `fixed`, so it spans
 the **full window height** rather than stopping at the map card. It opens at
 the width the neighbourhood needs to show that hop at scale 1, clamped to the

@@ -29,9 +29,22 @@ Rust API follows the same rule.
   JSON.
 - The compare view names both windows above the graph — clock times, lengths,
   totals, delta — and **Swap** exchanges them in one click.
+- Two cards on the same side of a neighbourhood that talk to each other are
+  joined by an arc drawn outside their column, so a set of callers no longer
+  looks unrelated. The six heaviest pairs get a lane each and the note under
+  the map counts the rest; a caller and a callee are not joined, because both
+  already connect to the selected workload and a curve through it would claim
+  something else.
+- A workload that both calls and is called now gets **two cards**, one per
+  side. Keying by node id made the second overwrite the first, which left a
+  hole in one column and drew that side's hops to a card across the graph.
 
 ### Changed
 
+- The neighbourhood pans from anywhere on it, cards included, and its surface
+  no longer selects text: dragging used to select the card labels, and the next
+  drag became a native text drag that the browser turns into a search. The
+  pointer is captured only after it moves, so a click on a card still opens it.
 - Payload parsing moved to the agent. The kernel copies the first bytes of a
   request into a perf ring buffer and the agent reads the host and the SQL out
   of them. Protocol naming stays in the kernel, in its own program: the two
@@ -69,18 +82,6 @@ changed since 0.1.0.
   `ui/`, which is what `cargo package` uploads and what `rust-embed` reads.
 - `scripts/publish-crates.sh` publishes them in dependency order, waits for each
   version to reach the index and skips what is already there.
-
-- The flamegraph reports how many samples a frame holds, not just how much
-  time: every node carries its own sample count, shown on hover and in the
-  details panel. The two ratios differ because a sample weighs a fixed amount,
-  so "10% of the time in 2% of the samples" is visible instead of hidden.
-- Hovering the histogram brush shows the bucket's time and sample count under
-  a guide line, and the brush has its own −/+ zoom around the window centre.
-- The flamegraph toolbar zooms in, out and back to the whole graph, and
-  **Export** writes the current view as SVG or the payload plus view state as
-  JSON.
-- The compare view names both windows above the graph — clock times, lengths,
-  totals, delta — and **Swap** exchanges them in one click.
 
 ### Changed
 

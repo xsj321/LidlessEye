@@ -124,6 +124,12 @@ export interface NeighborCardProps {
   cpu: number;
   cpuMax: number;
   selected?: boolean;
+  /**
+   * Which side of the selected workload this card is on. A node can appear on
+   * both sides, and two buttons in one dialog that announce the same name are
+   * indistinguishable to a screen reader.
+   */
+  relation?: "caller" | "callee";
   onSelect?: (id: string) => void;
   testId?: string;
   /**
@@ -159,6 +165,7 @@ export const NeighborCard = memo(function NeighborCard({
   cpu,
   cpuMax,
   selected = false,
+  relation,
   onSelect,
   testId,
   cardPorts,
@@ -215,7 +222,9 @@ export const NeighborCard = memo(function NeighborCard({
       <button
         type="button"
         className="absolute inset-0 z-10 cursor-pointer rounded-[10px] focus-visible:outline-none"
-        aria-label={`Open the neighbourhood of ${label}`}
+        aria-label={`Open the neighbourhood of ${label}${
+          relation ? ` (${relation})` : ""
+        }`}
         aria-expanded={selected}
         aria-controls="map-panel"
         onClick={() => onSelect?.(node.id)}

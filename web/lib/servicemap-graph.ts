@@ -216,7 +216,13 @@ export function pointOnEdge(path: EdgePath, t: number): Point {
  * source, which a retry or a callback produces — leaves the bottom and arrives
  * at the top, bowing sideways so it does not cut through either card.
  */
-export function edgePath(a: Box, b: Box): EdgePath {
+export interface EdgeBow {
+  side: "left" | "right";
+  /** How far out the loop runs. The caller reserves the room. */
+  depth?: number;
+}
+
+export function edgePath(a: Box, b: Box, bow?: EdgeBow): EdgePath {
   const ay = a.y + a.h / 2;
   const by = b.y + b.h / 2;
   const forward = b.x >= a.x + a.w * 0.5;
@@ -242,10 +248,13 @@ export function edgePath(a: Box, b: Box): EdgePath {
   const y2 = down ? b.y - 3 : b.y + b.h + 3;
   const x1 = a.x + a.w / 2;
   const x2 = b.x + b.w / 2;
-  // Bow away from the cards, not into them: the loop runs on the right, where
-  // the next column is, and its depth grows with the distance it has to cover.
-  const bow = Math.max(46, Math.min(140, Math.abs(y2 - y1) * 0.45 + 46));
-  const cx = Math.max(x1, x2) + bow;
+  // Bow away from the cards, not into them: by default the loop runs on the
+  // right, where the next column is, and its depth grows with the distance it
+  // has to cover. A caller `bow` sends it out the other way, which is what two
+  // cards in the same column need — otherwise the arc lands in the channel
+  // where the hops to the selected workload are drawn.
+  const depth = bow?.depth ?? Math.max(46, Math.min(140, Math.abs(y2 - y1) * 0.45 + 46));
+  const cx = bow?.side === "left" ? Math.min(x1, x2) - depth : Math.max(x1, x2) + depth;
   return {
     d: `M${x1},${y1} C${cx},${y1} ${cx},${y2} ${x2},${y2}`,
     mid: {

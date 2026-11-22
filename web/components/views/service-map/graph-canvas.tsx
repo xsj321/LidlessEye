@@ -151,7 +151,9 @@ export function ServiceGraph({
     <div
       ref={attach}
       data-testid={testId}
-      className="relative h-full w-full cursor-grab touch-none overflow-hidden rounded-lg border bg-card/40 active:cursor-grabbing"
+      className="relative h-full w-full cursor-grab touch-none overflow-hidden rounded-lg border bg-card/40 select-none active:cursor-grabbing"
+      draggable={false}
+      onDragStart={(event) => event.preventDefault()}
       onPointerDown={(event) => {
         if (event.button !== 0) return;
         const target = event.target as Element | null;
@@ -159,11 +161,10 @@ export function ServiceGraph({
         // start a pan, and its release must not count as "clicked the
         // background".
         if (target?.closest("[data-map-controls]")) return;
-        // A press on a card belongs to the card: capturing the pointer here
-        // would retarget the compatibility click event to this element and the
-        // card would never see its own click. Panning starts on the background.
-        if (target?.closest("[data-map-card]")) return;
-        (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+        // Cards are draggable too: most of the surface is cards, and a pan that
+        // only works on the gaps reads as broken. The capture waits for the
+        // first real movement, because capturing here would retarget the click
+        // to this element and the card would never see its own click.
         drag.current = {
           x: event.clientX,
           y: event.clientY,
@@ -177,7 +178,15 @@ export function ServiceGraph({
         if (!state) return;
         const dx = event.clientX - state.x;
         const dy = event.clientY - state.y;
-        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) state.moved = true;
+        if (!state.moved) {
+          if (Math.abs(dx) + Math.abs(dy) < 4) return;
+          state.moved = true;
+          try {
+            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+          } catch {
+            /* the pointer may already be gone */
+          }
+        }
         setView((previous) => ({ ...previous, x: state.vx + dx, y: state.vy + dy }));
       }}
       onPointerUp={(event) => {

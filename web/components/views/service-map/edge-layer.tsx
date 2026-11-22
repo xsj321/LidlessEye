@@ -30,7 +30,7 @@ import {
   formatRtt,
   pointOnEdge,
 } from "@/lib/servicemap-graph";
-import type { Box, EdgePath } from "@/lib/servicemap-graph";
+import type { Box, EdgeBow, EdgePath } from "@/lib/servicemap-graph";
 import type { ServiceMapEdge } from "@/lib/types";
 
 export function edgeKey(edge: ServiceMapEdge): string {
@@ -113,6 +113,23 @@ export interface EdgeLayerProps {
    */
   avoid?: Box[];
   /**
+   * Context, not the subject: thinner, dimmer curves. Used for the mesh
+   * between neighbours, which says "these two talk" and would otherwise
+   * compete with the hops to the selected workload.
+   */
+  muted?: boolean;
+  /**
+   * No arrowhead. A mesh curve stands for both directions of one
+   * relationship, so pointing it one way would be a lie.
+   */
+  undirected?: boolean;
+  /**
+   * Which way a same-column curve bows. Two cards in one column need the arc
+   * on the outside of that column; the default (right) would drop it into the
+   * channel where the hops to the selected workload are drawn.
+   */
+  bow?: (edge: ServiceMapEdge) => EdgeBow | undefined;
+  /**
    * Draw the curves above the cards instead of behind them. The neighbourhood
    * anchors a hop on a container row's edge, which sits a few pixels inside the
    * card's border: behind the card, that last stretch would be swallowed by the
@@ -131,6 +148,9 @@ export function EdgeLayer({
   selected,
   showLabels = true,
   avoid,
+  muted = false,
+  undirected = false,
+  bow,
   above = false,
   width,
   height,
@@ -146,7 +166,7 @@ export function EdgeLayer({
     const from = boxes.get(edge.client);
     const to = boxes.get(edge.server);
     if (!from || !to) return [];
-    const path = edgePath(from, to);
+    const path = edgePath(from, to, bow?.(edge));
     const rate = edgeRate(edge, windowSec);
     const rateText = formatRate(rate);
     const protocol = edgeProtocol(edge);
@@ -223,11 +243,23 @@ export function EdgeLayer({
             stroke={warn ? LINE.warn : touched && selected ? LINE.focused : LINE.idle}
             // 0.55 to 1.6: an edge is a hint at the shape of the traffic, and a
             // fat line competes with the card it points at.
-            strokeWidth={0.55 + Math.min(1.05, Math.log10(1 + rate * 20 + (edge.tx_bytes ?? 0) / 8192 + 1) * 0.7)}
-            strokeOpacity={touched ? 0.85 : 0.4}
+            strokeWidth={
+              muted
+                ? 1.2
+                : 0.55 +
+                  Math.min(
+                    1.05,
+                    Math.log10(1 + rate * 20 + (edge.tx_bytes ?? 0) / 8192 + 1) * 0.7,
+                  )
+            }
+            strokeOpacity={muted ? 0.62 : touched ? 0.85 : 0.4}
             strokeLinecap="round"
-            markerEnd={warn ? "url(#se-arrow-warn)" : "url(#se-arrow)"}
-            strokeDasharray={warn ? "5 4" : undefined}
+            markerEnd={
+              undirected ? undefined : warn ? "url(#se-arrow-warn)" : "url(#se-arrow)"
+            }
+            // Solid, not dashed: a dashed line in this map already means
+            // "retransmits", and the mesh is not a warning.
+            strokeDasharray={warn && !muted ? "5 4" : undefined}
             style={{ transition: "opacity 150ms ease" }}
           />
         );

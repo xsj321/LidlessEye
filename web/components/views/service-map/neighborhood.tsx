@@ -28,14 +28,13 @@ import type { Box } from "@/lib/servicemap-graph";
 import type { ServiceMapEdge, ServiceMapNode } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 
-import { EdgeLayer } from "./edge-layer";
+import { EdgeLayer, edgeKey } from "./edge-layer";
 import {
   NEIGHBOR_CARD,
   NeighborCard,
   neighborCardHeight,
   neighborRowCenter,
   neighborRowLeft,
-  neighborRowOffset,
   neighborRowRight,
 } from "./neighbor-card";
 import type { NeighborContainer } from "./neighbor-card";
@@ -57,6 +56,13 @@ const SIZE = {
 };
 
 const ZOOM = { min: 0.5, max: 2.4, step: 1.22 };
+/** Width reserved outside a column for the arcs between two of its cards. */
+const ARC_ROOM = 72;
+/** The first lane's bow, and the gap between lanes. */
+const ARC_DEPTH = 24;
+const ARC_STEP = 7;
+/** How many same-side pairs get an arc before the rest are only counted. */
+const MAX_ARCS = 6;
 const MAX_VIEW_HEIGHT = 440;
 const MIN_VIEW_HEIGHT = 260;
 /** Breathing room kept around the fitted graph, in viewport pixels. */
@@ -83,12 +89,19 @@ interface PeerGroup {
   weight: number;
 }
 
-interface NeighborRow {
+/**
+ * One card in the drawing.
+ *
+ * `key` is what identifies a card, not the node: a workload that both calls and
+ * is called gets one card per side, because "they call you" and "you call them"
+ * carry different container rows and rates. Keying by node id made the second
+ * card overwrite the first, which left a hole in one column and drew that
+ * side's hops to a card on the wrong side of the selected workload.
+ */
+interface Slot {
+  key: string;
   id: string;
-  ownerId: string;
-  name: string;
-  /** Row top, relative to the top of its workload card. */
-  offset: number;
+  side: "up" | "self" | "down";
 }
 
 interface Layout {
@@ -104,14 +117,13 @@ interface Layout {
    * / `<id>@in` on the card's header edge.
    */
   anchors: Map<string, Box>;
-  rows: NeighborRow[];
   rowNames: Map<string, string>;
-  columns: string[][];
+  /** Cards in reading order: callers, the selected workload, callees. */
+  slots: Slot[];
   /** Caption above each side, so "upstream" and "downstream" read at a glance. */
   captions: { x: number; w: number; label: string }[];
   height: number;
   width: number;
-  selfBox: Box;
 }
 
 /** A point-sized box whose centre is (x, y): edgePath reads its edges. */
@@ -234,6 +246,32 @@ export function Neighborhood({
     [node.id, upGroups, downGroups],
   );
 
+  // A card per (side, node). The same node can be on both sides, and each side
+  // owns its own container rows, so the two are separate cards.
+  const slots = useMemo<Slot[]>(() => {
+    const out: Slot[] = [];
+    for (const group of upGroups) {
+      if (nodes.has(group.id)) out.push({ key: `up:${group.id}`, id: group.id, side: "up" });
+    }
+    if (nodes.has(node.id)) out.push({ key: "self", id: node.id, side: "self" });
+    for (const group of downGroups) {
+      if (nodes.has(group.id)) out.push({ key: `down:${group.id}`, id: group.id, side: "down" });
+    }
+    return out;
+  }, [upGroups, downGroups, node.id, nodes]);
+
+  /** The card(s) a node has, so a peer-to-peer line can pick a side. */
+  const slotsOf = useMemo(() => {
+    const map = new Map<string, { up?: string; down?: string }>();
+    for (const slot of slots) {
+      if (slot.side === "self") continue;
+      const entry = map.get(slot.id) ?? {};
+      entry[slot.side] = slot.key;
+      map.set(slot.id, entry);
+    }
+    return map;
+  }, [slots]);
+
   const rowId = useCallback((owner: string, name: string) => `${owner}::${name}`, []);
 
   // Containers worth a row, in reading order: the ones that actually carried
@@ -270,6 +308,22 @@ export function Neighborhood({
     return out;
   }, [edges, nodes, shownIds]);
 
+  // Which columns carry same-side arcs. The layout reserves room outside those
+  // columns for them, so an arc never has to be clipped at the drawing's edge.
+  const arcSides = useMemo(() => {
+    let up = false;
+    let down = false;
+    for (const edge of edges) {
+      if (edge.client === node.id || edge.server === node.id) continue;
+      const a = slotsOf.get(edge.client);
+      const b = slotsOf.get(edge.server);
+      if (!a || !b) continue;
+      if (a.up && b.up) up = true;
+      else if (a.down && b.down) down = true;
+    }
+    return { up, down };
+  }, [edges, node.id, slotsOf]);
+
   const layout = useMemo<Layout>(() => {
     const rowCountOf = (id: string) => {
       const info = containers.get(id);
@@ -296,23 +350,26 @@ export function Neighborhood({
 
     // Only the columns that exist take width: a node with only callees is a
     // two-column drawing, not a three-column one with an empty left edge.
-    const columns: { key: "up" | "self" | "down"; ids: string[] }[] = [];
-    const upIds = upGroups.map((group) => group.id).filter((id) => nodes.has(id));
-    const downIds = downGroups.map((group) => group.id).filter((id) => nodes.has(id));
-    if (upIds.length) columns.push({ key: "up", ids: upIds });
-    if (nodes.has(node.id)) columns.push({ key: "self", ids: [node.id] });
-    if (downIds.length) columns.push({ key: "down", ids: downIds });
+    const columns: Slot[][] = [
+      slots.filter((slot) => slot.side === "up"),
+      slots.filter((slot) => slot.side === "self"),
+      slots.filter((slot) => slot.side === "down"),
+    ].filter((column) => column.length > 0);
 
-    const xOf = (index: number) => SIZE.pad + index * (cardWidth + SIZE.gapX);
+    // Room outside a column for the arcs between two cards on that side.
+    const padLeft = SIZE.pad + (arcSides.up ? ARC_ROOM : 0);
+    const padRight = SIZE.pad + (arcSides.down ? ARC_ROOM : 0);
+    const xOf = (index: number) => padLeft + index * (cardWidth + SIZE.gapX);
     const span =
       columns.length * cardWidth + Math.max(0, columns.length - 1) * SIZE.gapX;
-    const width = span + 2 * SIZE.pad;
+    const width = padLeft + span + padRight;
 
     const selfColumn = Math.max(
       0,
-      columns.findIndex((column) => column.key === "self"),
+      columns.findIndex((column) => column[0]?.side === "self"),
     );
-    const selfH = heightOf(node.id);
+    const selfSlot = slots.find((slot) => slot.side === "self");
+    const selfH = selfSlot ? heightOf(selfSlot.id) : 0;
     // Self is placed at y=0 in a provisional frame; every peer is positioned
     // relative to it and the whole drawing is shifted down afterwards.
     const selfCard: Box = { x: xOf(selfColumn), y: 0, w: cardWidth, h: selfH };
@@ -338,35 +395,35 @@ export function Neighborhood({
       );
 
     const cards = new Map<string, Box>();
-    cards.set(node.id, selfCard);
+    if (selfSlot) cards.set(selfSlot.key, selfCard);
 
     columns.forEach((column, columnIndex) => {
-      if (column.key === "self") return;
-      const fromPeer = column.key === "up";
+      if (column[0]?.side === "self") return;
+      const fromPeer = column[0]?.side === "up";
       const groups = fromPeer ? upGroups : downGroups;
       // Line each peer's connecting container up with the self row it talks to,
       // so the hop is a straight horizontal line between two ports. Peers that
       // target the same row are then pushed apart to keep them from touching.
-      const placed = column.ids
-        .map((id) => {
-          const group = groups.find((candidate) => candidate.id === id);
+      const placed = column
+        .map((slot) => {
+          const group = groups.find((candidate) => candidate.id === slot.id);
           if (!group) return null;
           const edge = heaviest(group);
           const selfContainer = fromPeer ? edge.server_container : edge.client_container;
           const peerContainer = fromPeer ? edge.client_container : edge.server_container;
           return {
-            id,
-            wanted: selfRowY(selfContainer) - peerRowY(id, peerContainer),
-            h: heightOf(id),
+            slot,
+            wanted: selfRowY(selfContainer) - peerRowY(slot.id, peerContainer),
+            h: heightOf(slot.id),
           };
         })
-        .filter((item): item is { id: string; wanted: number; h: number } => item != null)
+        .filter((item): item is { slot: Slot; wanted: number; h: number } => item != null)
         .sort((a, b) => a.wanted - b.wanted);
 
       let bottom = Number.NEGATIVE_INFINITY;
       for (const item of placed) {
         const y = Math.max(item.wanted, bottom + SIZE.cardGapY);
-        cards.set(item.id, { x: xOf(columnIndex), y, w: cardWidth, h: item.h });
+        cards.set(item.slot.key, { x: xOf(columnIndex), y, w: cardWidth, h: item.h });
         bottom = y + item.h;
       }
     });
@@ -379,23 +436,23 @@ export function Neighborhood({
       maxY = Math.max(maxY, card.y + card.h);
     }
     const top = SIZE.pad + SIZE.headerRow;
-    const shift = top - minY;
+    const shift = minY === Number.POSITIVE_INFINITY ? 0 : top - minY;
     for (const card of cards.values()) card.y += shift;
-    const height = maxY - minY + top + SIZE.pad;
+    const height = maxY === Number.NEGATIVE_INFINITY ? top : maxY - minY + top + SIZE.pad;
 
     const anchors = new Map<string, Box>();
-    const rows: NeighborRow[] = [];
     const rowNames = new Map<string, string>();
-    for (const [id, card] of cards) {
+    for (const slot of slots) {
+      const card = cards.get(slot.key);
+      if (!card) continue;
       // Fallback for traffic the agent could not attribute to a container:
       // the header edge, where the workload's name is, not the middle of the
       // body — a curve there would strike through the container rows.
       const mid = card.y + headerMid;
-      anchors.set(`${id}@out`, port(card.x + card.w, mid));
-      anchors.set(`${id}@in`, port(card.x, mid));
-      (containers.get(id)?.names ?? []).forEach((name, index) => {
-        const key = rowId(id, name);
-        const offset = neighborRowOffset(index);
+      anchors.set(`${slot.key}@out`, port(card.x + card.w, mid));
+      anchors.set(`${slot.key}@in`, port(card.x, mid));
+      (containers.get(slot.id)?.names ?? []).forEach((name, index) => {
+        const key = rowId(slot.key, name);
         const centre = card.y + neighborRowCenter(index);
         // A container's endpoints are its **own** pane edges, not the card's
         // borders: the row is what holds the connection, so the line has to
@@ -404,18 +461,17 @@ export function Neighborhood({
         anchors.set(`${key}@out`, port(card.x + neighborRowRight(card.w), centre));
         anchors.set(`${key}@in`, port(card.x + neighborRowLeft(), centre));
         rowNames.set(key, name);
-        rows.push({ id: key, ownerId: id, name, offset });
       });
     }
 
     const captions: Layout["captions"] = columns
       .map((column, index) =>
-        column.key === "self"
+        column[0]?.side === "self" || column.length === 0
           ? null
           : {
               x: xOf(index),
               w: cardWidth,
-              label: column.key === "up" ? "CALLERS" : "CALLEES",
+              label: column[0].side === "up" ? "CALLERS" : "CALLEES",
             },
       )
       .filter((caption): caption is Layout["captions"][number] => caption != null);
@@ -423,44 +479,43 @@ export function Neighborhood({
     return {
       cards,
       anchors,
-      rows,
       rowNames,
-      columns: columns.map((column) => column.ids),
+      slots,
       captions,
       height,
       width,
-      selfBox: cards.get(node.id) ?? selfCard,
     };
-  }, [upGroups, downGroups, node.id, nodes, containers, shownIds, rowId]);
+  }, [upGroups, downGroups, node.id, nodes, containers, shownIds, rowId, slots, arcSides]);
 
   // One line per pair of container rows. A client leaves its row's right port
   // (`@out`) and a server is entered at its row's left port (`@in`), so the
   // curve is drawn from one container to the other rather than from card to
   // card. An edge with no container stays on its workload's card centre.
-  const shown = useMemo(() => {
-    const out: ServiceMapEdge[] = [];
-    const endpoint = (
-      owner: string,
-      container: string | undefined,
-      side: "out" | "in",
-    ) => {
+  const endpoint = useCallback(
+    (owner: string, container: string | undefined, side: "out" | "in") => {
       const candidate = container ? rowId(owner, container) : "";
       // An edge the agent could not attribute down to a container stays on the
       // workload card instead of disappearing from the drawing.
       const base = candidate && layout.anchors.has(`${candidate}@${side}`) ? candidate : owner;
       return `${base}@${side}`;
-    };
-    const emit = (group: PeerGroup, fromPeer: boolean) => {
+    },
+    [layout.anchors, rowId],
+  );
+
+  /** Fold a group of raw edges by the pair of ports they land on. */
+  const foldByPorts = useCallback(
+    (edges: ServiceMapEdge[], clientOf: (edge: ServiceMapEdge) => string, serverOf: (edge: ServiceMapEdge) => string) => {
       const pairs = new Map<string, ServiceMapEdge[]>();
-      for (const edge of group.edges) {
-        const client = endpoint(fromPeer ? group.id : node.id, edge.client_container, "out");
-        const server = endpoint(fromPeer ? node.id : group.id, edge.server_container, "in");
+      for (const edge of edges) {
+        const client = clientOf(edge);
+        const server = serverOf(edge);
         if (!layout.anchors.has(client) || !layout.anchors.has(server)) continue;
         const key = `${client}|${server}`;
         const slot = pairs.get(key) ?? [];
         slot.push(edge);
         pairs.set(key, slot);
       }
+      const out: ServiceMapEdge[] = [];
       for (const [key, matching] of pairs) {
         const [client, server] = key.split("|");
         out.push(
@@ -473,11 +528,102 @@ export function Neighborhood({
           ),
         );
       }
+      return out;
+    },
+    [layout.anchors, layout.rowNames],
+  );
+
+  // The star: what calls the selected workload and what it calls. This is the
+  // question the panel exists to answer, so these hops are labelled and drawn
+  // above the cards.
+  const shown = useMemo(() => {
+    const out: ServiceMapEdge[] = [];
+    const emit = (group: PeerGroup, fromPeer: boolean) => {
+      const peer = `${fromPeer ? "up" : "down"}:${group.id}`;
+      if (!layout.cards.has(peer)) return;
+      out.push(
+        ...foldByPorts(
+          group.edges,
+          (edge) => endpoint(fromPeer ? peer : "self", edge.client_container, "out"),
+          (edge) => endpoint(fromPeer ? "self" : peer, edge.server_container, "in"),
+        ),
+      );
     };
     for (const group of upGroups) emit(group, true);
     for (const group of downGroups) emit(group, false);
     return out;
-  }, [upGroups, downGroups, layout.anchors, layout.rowNames, node.id, rowId]);
+  }, [upGroups, downGroups, layout.cards, endpoint, foldByPorts]);
+
+  // Arcs between two peers on the same side.
+  //
+  // Both are on screen and they talk to each other, so the drawing used to make
+  // them look unrelated. Only same-column pairs are drawn, and they bow outside
+  // the column: a caller→callee pair already has both ends connected to the
+  // middle card, and a curve through it would read as "both talk to the
+  // selected workload" — which is a different, wrong claim.
+  //
+  // The arcs are nested by rank instead of sharing one radius: a dozen curves
+  // at the same distance collapse into a single dark band with no way to tell
+  // which two cards a line joins. The heaviest few get a lane each.
+  const mesh = useMemo(() => {
+    const pairs = new Map<
+      string,
+      { client: string; server: string; edges: ServiceMapEdge[]; weight: number; side: "up" | "down" }
+    >();
+    for (const edge of edges) {
+      if (edge.client === node.id || edge.server === node.id) continue;
+      const a = slotsOf.get(edge.client);
+      const b = slotsOf.get(edge.server);
+      if (!a || !b) continue;
+      const side = a.up && b.up ? "up" : a.down && b.down ? "down" : null;
+      if (!side) continue;
+      const clientSlot = side === "up" ? a.up! : a.down!;
+      const serverSlot = side === "up" ? b.up! : b.down!;
+      if (clientSlot === serverSlot) continue;
+      // One arc per pair: a curve each way would draw over itself, and the arc
+      // is deliberately undirected.
+      const key = [clientSlot, serverSlot].sort().join("|");
+      const weight = edgeWeight(edge);
+      const entry = pairs.get(key);
+      if (!entry) {
+        pairs.set(key, { client: clientSlot, server: serverSlot, edges: [edge], weight, side });
+      } else {
+        entry.edges.push(edge);
+        entry.weight += weight;
+      }
+    }
+
+    const ranked = [...pairs.values()].sort((a, b) => b.weight - a.weight);
+    const drawn = ranked.slice(0, MAX_ARCS);
+    const out: ServiceMapEdge[] = [];
+    const depths = new Map<string, number>();
+    for (const [rank, entry] of drawn.entries()) {
+      // Both ends land on the column's **outer** edge and the curve bows the
+      // same way: a caller column is bracketed on its left, a callee column on
+      // its right. `out` on one end and `in` on the other would draw the arc
+      // straight through the cards it is supposed to connect.
+      const anchorSide = entry.side === "up" ? "in" : "out";
+      const folded = foldByPorts(
+        entry.edges,
+        (edge) => endpoint(entry.client, edge.client_container, anchorSide),
+        (edge) => endpoint(entry.server, edge.server_container, anchorSide),
+      );
+      for (const edge of folded) {
+        depths.set(edgeKey(edge), ARC_DEPTH + rank * ARC_STEP);
+        out.push(edge);
+      }
+    }
+    return { edges: out, depths, hidden: ranked.length - drawn.length };
+  }, [edges, node.id, slotsOf, endpoint, foldByPorts]);
+
+  /** Callers bow left, callees bow right: away from the selected workload. */
+  const bowSide = useCallback(
+    (edge: ServiceMapEdge): { side: "left" | "right"; depth: number } => ({
+      side: anchorBase(edge.client).startsWith("up:") ? "left" : "right",
+      depth: mesh.depths.get(edgeKey(edge)) ?? ARC_DEPTH,
+    }),
+    [mesh.depths],
+  );
 
   /** Connections per row, and which ports actually carry an edge. */
   const { perRow, usedPorts, usedCardPorts } = useMemo(() => {
@@ -500,7 +646,7 @@ export function Neighborhood({
       state[side] = true;
       target.set(base, state);
     };
-    for (const edge of shown) {
+    for (const edge of [...shown, ...mesh.edges]) {
       const client = anchorBase(edge.client);
       const server = anchorBase(edge.server);
       totals.set(client, (totals.get(client) ?? 0) + (edge.connections ?? 0));
@@ -509,7 +655,7 @@ export function Neighborhood({
       mark(edge.server);
     }
     return { perRow: totals, usedPorts: ports, usedCardPorts: cardPorts };
-  }, [shown, layout.rowNames, layout.cards]);
+  }, [shown, mesh, layout.rowNames, layout.cards]);
 
   const reportWidth = useCallback(
     (width: number) => onPreferredWidth?.(width),
@@ -580,34 +726,43 @@ export function Neighborhood({
     });
   };
 
-  const drag = useRef<{ x: number; y: number; vx: number; vy: number } | null>(null);
+  // Panning starts from anywhere on the surface, cards included: most of this
+  // drawing is cards, so "drag the map" and "drag a card" are the same gesture
+  // to the person doing it. The capture is taken only once the pointer has
+  // actually moved, because capturing on pointerdown retargets the click to
+  // this element and the card would never walk the graph.
+  const drag = useRef<{ x: number; y: number; vx: number; vy: number; moved: boolean } | null>(
+    null,
+  );
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     const target = event.target as Element | null;
-    // A press on a card belongs to the card: capturing it here would retarget
-    // the click away from the NeighborCard, and clicking a peer would no longer
-    // walk the graph to that workload's own neighbourhood.
-    if (target?.closest("[data-map-controls]") || target?.closest("[data-map-card]")) {
-      return;
-    }
-    event.currentTarget.setPointerCapture(event.pointerId);
-    drag.current = { x: event.clientX, y: event.clientY, vx: view.x, vy: view.y };
+    if (target?.closest("[data-map-controls]")) return;
+    drag.current = { x: event.clientX, y: event.clientY, vx: view.x, vy: view.y, moved: false };
   };
   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     const state = drag.current;
     if (!state) return;
-    setView((previous) => ({
-      ...previous,
-      x: state.vx + event.clientX - state.x,
-      y: state.vy + event.clientY - state.y,
-    }));
+    const dx = event.clientX - state.x;
+    const dy = event.clientY - state.y;
+    if (!state.moved) {
+      // A few pixels of slop keeps a shaky click a click.
+      if (Math.abs(dx) + Math.abs(dy) < 4) return;
+      state.moved = true;
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        /* the pointer may already be gone */
+      }
+    }
+    setView((previous) => ({ ...previous, x: state.vx + dx, y: state.vy + dy }));
   };
   const onPointerUp = () => {
     drag.current = null;
   };
 
   let cpuMax = 1;
-  for (const id of layout.cards.keys()) cpuMax = Math.max(cpuMax, nodes.get(id)?.cpu_ns ?? 0);
+  for (const slot of layout.slots) cpuMax = Math.max(cpuMax, nodes.get(slot.id)?.cpu_ns ?? 0);
 
   const hiddenIn = allUp.length - upGroups.length;
   const hiddenOut = allDown.length - downGroups.length;
@@ -652,11 +807,18 @@ export function Neighborhood({
           </span>
         </span>
       </div>
+      {/* `select-none` is not cosmetic: dragging the map used to select the
+          card labels, and the second drag started a native text drag, which
+          Chromium turns into a search for the selected words. A pannable
+          surface must not be a text surface. `onDragStart` covers the
+          pointer's own drag gesture (icons, links) for the same reason. */}
       {available > 0 ? (
         <div
-          className="relative cursor-grab touch-none overflow-hidden rounded-md border bg-background/30 active:cursor-grabbing"
+          className="relative cursor-grab touch-none overflow-hidden rounded-md border bg-background/30 select-none active:cursor-grabbing"
           style={{ height: viewHeight }}
           data-zoom={view.k.toFixed(3)}
+          draggable={false}
+          onDragStart={(event) => event.preventDefault()}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
@@ -683,6 +845,22 @@ export function Neighborhood({
                 {caption.label}
               </div>
             ))}
+            {/* Peer-to-peer traffic first, so it sits behind both the cards and
+                the hops to the selected workload: it is context, not the
+                question the panel was opened to answer. */}
+            <EdgeLayer
+              edges={mesh.edges}
+              boxes={layout.anchors}
+              windowSec={windowSec}
+              showLabels={false}
+              muted
+              undirected
+              bow={bowSide}
+              selected={null}
+              width={layout.width}
+              height={layout.height}
+              testId="map-neighborhood-mesh"
+            />
             <EdgeLayer
               edges={shown}
               boxes={layout.anchors}
@@ -703,31 +881,34 @@ export function Neighborhood({
               height={layout.height}
               testId="map-neighborhood-edges"
             />
-            {layout.columns.flat().map((id) => {
-              const peer = nodes.get(id);
-              const box = layout.cards.get(id);
+            {layout.slots.map((slot) => {
+              const peer = nodes.get(slot.id);
+              const box = layout.cards.get(slot.key);
               if (!peer || !box) return null;
-              const info = containers.get(id);
+              const info = containers.get(slot.id);
               const rows: NeighborContainer[] = (info?.names ?? []).map((name) => ({
                 name,
-                rate: rate(perRow.get(rowId(id, name)) ?? 0),
-                ports: usedPorts.get(rowId(id, name)) ?? {},
+                rate: rate(perRow.get(rowId(slot.key, name)) ?? 0),
+                ports: usedPorts.get(rowId(slot.key, name)) ?? {},
               }));
               if (info?.extra) {
                 rows.push({ name: `+${info.extra} more containers`, rate: 0, more: true });
               }
               return (
                 <NeighborCard
-                  key={id}
+                  key={slot.key}
                   node={peer}
                   box={box}
                   containers={rows}
-                  cardPorts={usedCardPorts.get(id)}
+                  cardPorts={usedCardPorts.get(slot.key)}
                   cpu={peer.cpu_ns ?? 0}
                   cpuMax={cpuMax}
-                  selected={id === node.id}
+                  selected={slot.id === node.id}
+                  relation={
+                    slot.side === "up" ? "caller" : slot.side === "down" ? "callee" : undefined
+                  }
                   onSelect={onSelect}
-                  testId={id === node.id ? "map-neighborhood-self" : "map-neighborhood-peer"}
+                  testId={slot.id === node.id ? "map-neighborhood-self" : "map-neighborhood-peer"}
                 />
               );
             })}
@@ -742,6 +923,16 @@ export function Neighborhood({
             drag to pan · scroll to zoom
           </span>
         </div>
+      ) : null}
+      {/* Why a line is missing is a fair question, so the rule is on screen:
+          the hops through the selected workload, plus the arcs between two
+          cards on the same side. */}
+      {mesh.edges.length > 0 ? (
+        <p className="mt-1 text-[10px] text-muted-foreground/80" data-testid="map-mesh-note">
+          Arcs outside a column are traffic between two callers or two callees
+          {mesh.hidden > 0 ? ` (heaviest ${MAX_ARCS} shown, ${mesh.hidden} more)` : ""}; a
+          caller and a callee already meet through {nodeLabel(node)}.
+        </p>
       ) : null}
       {hiddenIn > 0 || hiddenOut > 0 ? (
         <p className="mt-1 text-[10px] text-muted-foreground">
