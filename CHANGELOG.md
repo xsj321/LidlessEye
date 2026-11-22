@@ -10,6 +10,16 @@ Rust API follows the same rule.
 
 ### Changed
 
+- A hop that climbs or falls much further than the column gap now sweeps out
+  and plugs into the card's top or bottom edge instead of being forced into an
+  S-curve with horizontal tangents at both ends — at a 4:1 height-to-width
+  ratio that S collapsed into a near-vertical straight with two short stubs,
+  which is what made the arrow on it look wrong.
+- A hop that climbs or falls much further than the column gap now sweeps out
+  and plugs into the card's top or bottom edge instead of being forced into an
+  S-curve with horizontal tangents at both ends — at a 4:1 height-to-width
+  ratio that S collapsed into a near-vertical straight with two short stubs,
+  which is what made the arrow on it look wrong.
 - Map arrowheads are geometry, not SVG markers. A `marker` cannot inherit
   `stroke-opacity` — its fill stayed opaque while the line faded to 40 %, which
   is what made the head look pasted onto the line — its box scales with
@@ -18,6 +28,12 @@ Rust API follows the same rule.
   ink as its line at the same alpha, with a short solid neck that no dash phase
   can detach. Backward hops also hook into the card vertically instead of
   grazing its top edge, so their heads point into the card rather than along it.
+  The head's axis is the chord of the curve it covers, not the tangent at the
+  last pixel: on a bending line the two differ enough to make the head look
+  rotated against its own stroke.
+  The head's axis is the chord of the curve it covers, not the tangent at the
+  last pixel: on a bending line the two differ enough to make the head look
+  rotated against its own stroke.
 
 ## [0.1.2] - 2026-11-22
 

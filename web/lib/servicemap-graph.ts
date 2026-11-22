@@ -451,6 +451,30 @@ export function edgePath(a: Box, b: Box, bow?: EdgeBow): EdgePath {
 
   if (forward) {
     const x1 = a.x + a.w;
+    const gap = b.x - x1;
+    const rise = by - ay;
+    // A hop that climbs or falls much further than the column gap is not an
+    // S-curve: forcing horizontal tangents at both ends turns 360 px of rise
+    // into a near-vertical straight with two short stubs, which is what made
+    // "curved" arrows look wrong. Such a hop leaves horizontally, sweeps, and
+    // plugs into the card's bottom (or top) edge vertically instead.
+    if (Math.abs(rise) > Math.max(48, gap * 2.2)) {
+      const down = rise > 0;
+      const x2 = b.x + b.w / 2;
+      const y2 = down ? b.y - 1 : b.y + b.h + 1;
+      const sweep = Math.max(40, Math.min(120, gap * 1.1));
+      const hook = Math.max(26, Math.min(90, Math.abs(y2 - ay) * 0.45));
+      const c1 = { x: x1 + sweep, y: ay };
+      const c2 = { x: x2, y: down ? y2 - hook : y2 + hook };
+      return {
+        d: `M${x1},${ay} C${c1.x},${c1.y} ${c2.x},${c2.y} ${x2},${y2}`,
+        mid: { x: (x1 + 3 * c1.x + 3 * c2.x + x2) / 8, y: (ay + 3 * c1.y + 3 * c2.y + y2) / 8 },
+        p0: { x: x1, y: ay },
+        c1,
+        c2,
+        p3: { x: x2, y: y2 },
+      };
+    }
     // The curve stops one pixel short of the card: the arrowhead is drawn from
     // its endpoint back along the tangent, so the tip lands on the border
     // rather than a head-length away from it.

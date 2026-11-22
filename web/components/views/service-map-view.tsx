@@ -59,14 +59,16 @@ function EdgeSample({
         <line
           x1="0"
           y1="4"
-          x2="18"
+          x2="18.5"
           y2="4"
           stroke={color}
           strokeWidth={tone === "emphasis" ? 2.2 : 1.6}
-          strokeLinecap="round"
+          strokeLinecap="butt"
           strokeDasharray={dashed ? EDGE_DASH[tone as "warn" | "external"] : undefined}
         />
-        <path d="M18.4 1.3 L24.4 4 L18.4 6.7 z" fill={color} />
+        {/* The same dart the canvas draws: notched back, so the key shows the
+            shape the map actually strokes rather than a generic triangle. */}
+        <path d="M25,4 L18,6.9 L20.4,4 L18,1.1 Z" fill={color} />
       </svg>
       {label}
     </span>

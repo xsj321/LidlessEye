@@ -184,8 +184,14 @@ export interface EdgeLayerProps {
  * reads as the line tapering to a point.
  */
 function arrowHead(path: EdgePath, width: number) {
-  const dx = path.p3.x - path.c2.x;
-  const dy = path.p3.y - path.c2.y;
+  // Direction from the point one head-length back, not from the endpoint's
+  // tangent. On a curve the two differ: the tangent is the direction at the
+  // last pixel, while the reader's eye takes the direction of the stretch the
+  // head covers. Aiming down the tangent made the head look rotated against
+  // its own line wherever the curve was still bending.
+  const back = cubicBack(path, Math.min(12, width * 4 + 2));
+  const dx = path.p3.x - back.x;
+  const dy = path.p3.y - back.y;
   const norm = Math.hypot(dx, dy) || 1;
   const ux = dx / norm;
   const uy = dy / norm;
@@ -208,6 +214,33 @@ function arrowHead(path: EdgePath, width: number) {
     neck: `M${waist.x - ux * Math.max(12, length)},${waist.y - uy * Math.max(12, length)} L${waist.x + ux},${waist.y + uy}`,
     head: `M${path.p3.x},${path.p3.y} L${base.x + nx * half},${base.y + ny * half} L${waist.x},${waist.y} L${base.x - nx * half},${base.y - ny * half} Z`,
   };
+}
+
+/** The point on the curve a given distance before its end. */
+function cubicBack(path: EdgePath, distance: number) {
+  const at = (t: number) => {
+    const u = 1 - t;
+    const a = u * u * u;
+    const b = 3 * u * u * t;
+    const c = 3 * u * t * t;
+    const d = t * t * t;
+    return {
+      x: a * path.p0.x + b * path.c1.x + c * path.c2.x + d * path.p3.x,
+      y: a * path.p0.y + b * path.c1.y + c * path.c2.y + d * path.p3.y,
+    };
+  };
+  // Bisect on the chord length: monotonic in t, so eight steps land within a
+  // tenth of a pixel and cost less than measuring the path in the DOM.
+  let low = 0;
+  let high = 1;
+  for (let step = 0; step < 8; step += 1) {
+    const mid = (low + high) / 2;
+    const point = at(mid);
+    const chord = Math.hypot(path.p3.x - point.x, path.p3.y - point.y);
+    if (chord > distance) low = mid;
+    else high = mid;
+  }
+  return at((low + high) / 2);
 }
 
 export function EdgeLayer({
