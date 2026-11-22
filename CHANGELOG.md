@@ -18,6 +18,17 @@ Rust API follows the same rule.
   `SSL_write` from every libssl, GnuTLS and NSS it can find, so HTTPS and
   encrypted database traffic contribute the same detail. Off by default: every
   TLS write pays a user-memory read.
+- The flamegraph reports how many samples a frame holds, not just how much
+  time: every node carries its own sample count, shown on hover and in the
+  details panel. The two ratios differ because a sample weighs a fixed amount,
+  so "10% of the time in 2% of the samples" is visible instead of hidden.
+- Hovering the histogram brush shows the bucket's time and sample count under
+  a guide line, and the brush has its own −/+ zoom around the window centre.
+- The flamegraph toolbar zooms in, out and back to the whole graph, and
+  **Export** writes the current view as SVG or the payload plus view state as
+  JSON.
+- The compare view names both windows above the graph — clock times, lengths,
+  totals, delta — and **Swap** exchanges them in one click.
 
 ### Changed
 
@@ -38,6 +49,10 @@ Rust API follows the same rule.
   behaviour on the right, and a line under it saying which window, grouping and
   filter count the server actually queried. The button that said `Apply` now
   says what it does — controls apply on change, so it only re-runs the query.
+- The flamegraph's surroundings are now a `GraphWorkspace`
+  (`components/analysis/`, contract in `lib/analysis/renderer`): search, zoom,
+  breadcrumb, details and export live in one shell behind a renderer interface,
+  so a second profile type reuses them instead of re-implementing analysis.
 
 ## [0.1.1] - 2026-11-18
 
@@ -54,6 +69,18 @@ changed since 0.1.0.
   `ui/`, which is what `cargo package` uploads and what `rust-embed` reads.
 - `scripts/publish-crates.sh` publishes them in dependency order, waits for each
   version to reach the index and skips what is already there.
+
+- The flamegraph reports how many samples a frame holds, not just how much
+  time: every node carries its own sample count, shown on hover and in the
+  details panel. The two ratios differ because a sample weighs a fixed amount,
+  so "10% of the time in 2% of the samples" is visible instead of hidden.
+- Hovering the histogram brush shows the bucket's time and sample count under
+  a guide line, and the brush has its own −/+ zoom around the window centre.
+- The flamegraph toolbar zooms in, out and back to the whole graph, and
+  **Export** writes the current view as SVG or the payload plus view state as
+  JSON.
+- The compare view names both windows above the graph — clock times, lengths,
+  totals, delta — and **Swap** exchanges them in one click.
 
 ### Changed
 

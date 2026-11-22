@@ -14,6 +14,7 @@
 // CommonJS on purpose: the image provides Playwright on `NODE_PATH`, which ESM
 // imports ignore.
 
+const fs = require("node:fs");
 const { chromium } = require("playwright");
 
 const BASE = (process.env.LIDLESSEYE_BASE || "http://127.0.0.1:4040").replace(/\/+$/, "");
@@ -387,7 +388,20 @@ async function main() {
     .first()
     .innerText();
   check(frameName.length > 0, "the details name the frame", frameName);
-  await shot(page, "1a-frame-details");
+
+  // The details report the count that the payload carries per node, not a
+  // value derived from the duration: the two answer different questions.
+  const detailStats = await page.locator('[data-testid="frame-details"] dl dt').allInnerTexts();
+  check(
+    detailStats.map((text) => text.toLowerCase()).includes("samples"),
+    "the details report the frame's own sample count",
+    JSON.stringify(detailStats),
+  );
+
+  // The breadcrumb always names the level, so "how deep am I" has an answer
+  // even before the first zoom.
+  const rootCrumb = (await page.locator('[data-role="crumb-root"]').innerText()).trim();
+  check(/all frames/i.test(rootCrumb), "the breadcrumb names the root", rootCrumb);
   await shot(page, "1a-frame-details");
 
   // Double click zooms, and the breadcrumb carries the way back.
@@ -411,6 +425,58 @@ async function main() {
   check(
     (await page.locator('.fg-legend [data-role="zoom"]').count()) === 0,
     "Escape animates back to the whole graph",
+  );
+
+  // The toolbar can zoom without a pointer round trip, and the export menu
+  // offers the formats a report can carry.
+  await page.click('[aria-label="Zoom in"]');
+  await settle(page);
+  check(
+    (await page.locator('.fg-legend [data-role="zoom"]').count()) === 1,
+    "the toolbar zooms in",
+  );
+  await page.click('[aria-label="Reset zoom"]');
+  await settle(page);
+  check(
+    (await page.locator('.fg-legend [data-role="zoom"]').count()) === 0,
+    "reset returns to the whole graph",
+  );
+
+  await page.click("#flame-export");
+  const exportItems = await page
+    .locator('[data-slot="popover-content"] button')
+    .allInnerTexts();
+  check(
+    exportItems.some((text) => /SVG/.test(text)) && exportItems.some((text) => /JSON/.test(text)),
+    "export offers SVG and JSON",
+    JSON.stringify(exportItems),
+  );
+
+  // The exports are documents, not an empty promise: take the download the
+  // menu triggers and read what actually landed on disk.
+  const [svgDownload] = await Promise.all([
+    page.waitForEvent("download"),
+    page.click('[data-slot="popover-content"] button:has-text("SVG")'),
+  ]);
+  const svg = fs.readFileSync(await svgDownload.path(), "utf8").trim();
+  check(
+    svg.startsWith("<svg") && svg.endsWith("</svg>") && (svg.match(/<rect /g) || []).length > 1,
+    "the SVG export is a complete document with frames",
+    `${svg.length} bytes`,
+  );
+
+  await page.click("#flame-export");
+  const [jsonDownload] = await Promise.all([
+    page.waitForEvent("download"),
+    page.click('[data-slot="popover-content"] button:has-text("JSON")'),
+  ]);
+  const exported = JSON.parse(fs.readFileSync(await jsonDownload.path(), "utf8"));
+  check(
+    Array.isArray(exported.payload?.names) &&
+      typeof exported.view?.x0 === "number" &&
+      Array.isArray(exported.crumbs),
+    "the JSON export carries the payload and the view",
+    Object.keys(exported).join(","),
   );
 
   await shot(page, "1-flamegraph");
@@ -535,7 +601,15 @@ async function main() {
   );
   check((await page.url()).includes("from="), "the absolute domain is in the URL", page.url());
   const domainText = (await page.locator('.brush [data-role="domain"]').innerText()).trim();
-  check(/^of \d\d:\d\d:\d\d–\d\d:\d\d:\d\d$/.test(domainText), "the brush says which range it spans", domainText);
+  // Same-day ranges print clock times; longer ones print dates, and the
+  // separator follows the same rule.
+  check(
+    /^of (\d\d:\d\d:\d\d|\d\d-\d\d \d\d:\d\d)(–| → )(\d\d:\d\d:\d\d|\d\d-\d\d \d\d:\d\d)$/.test(
+      domainText,
+    ),
+    "the brush says which range it spans",
+    domainText,
+  );
 
   const brush = await page.locator("canvas.time-brush").boundingBox();
   check(brush !== null && brush.width > 200, "the histogram brush has a size", JSON.stringify(brush));
@@ -577,6 +651,42 @@ async function main() {
   );
   check((await page.url()).includes("wfrom="), "the window is in the URL alongside the domain", page.url());
 
+  // Hovering reports the bucket under the cursor, so the brush doubles as a
+  // chart: the value is the one the bar represents, not a guess.
+  await page.mouse.move(brush.x + brush.width * 0.6, brush.y + brush.height / 2);
+  const hoverReadout = (await page.locator('[data-testid="brush-hover"]').innerText()).trim();
+  check(
+    /[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/.test(hoverReadout),
+    "the brush reports the bucket under the cursor",
+    hoverReadout,
+  );
+
+  // The brush's own zoom controls halve and double the window around its
+  // centre, which is the only way to adjust it without pixel-hunting handles.
+  const spanBefore = await page.evaluate(
+    () => window.lidlesseye.state.untilNs - window.lidlesseye.state.fromNs,
+  );
+  await page.click('.brush [aria-label="Zoom the window in"]');
+  await page.waitForFunction(
+    (span) => window.lidlesseye.state.untilNs - window.lidlesseye.state.fromNs < span * 0.75,
+    spanBefore,
+    { timeout: 15000 },
+  );
+  const spanIn = await page.evaluate(
+    () => window.lidlesseye.state.untilNs - window.lidlesseye.state.fromNs,
+  );
+  check(spanIn < spanBefore * 0.75, "the brush zoom-in narrows the window", `${spanBefore} → ${spanIn}`);
+  await page.click('.brush [aria-label="Zoom the window out"]');
+  await page.waitForFunction(
+    (span) => window.lidlesseye.state.untilNs - window.lidlesseye.state.fromNs > span,
+    spanIn,
+    { timeout: 15000 },
+  );
+  const spanOut = await page.evaluate(
+    () => window.lidlesseye.state.untilNs - window.lidlesseye.state.fromNs,
+  );
+  check(spanOut > spanIn, "the brush zoom-out widens it again", `${spanIn} → ${spanOut}`);
+
   await page.click('#tabs [data-view="top"]');
   await page.waitForSelector(".tbl-wrap table tbody tr", { timeout: 20000 });
   topText = await page.locator(".tbl-wrap table tbody").innerText();
@@ -598,6 +708,45 @@ async function main() {
       brushLabels.some((text) => text.includes("comparison")),
     "the two brushes are labelled baseline and comparison",
     JSON.stringify(brushLabels),
+  );
+
+  // The strip above the graph names both windows and their totals; without it
+  // the reader has to infer the direction of the diff from the colours.
+  const summary = await page.locator('[data-testid="compare-summary"]').innerText();
+  check(
+    /baseline/i.test(summary) && /comparison/i.test(summary) && /→/.test(summary),
+    "the compare strip names both windows",
+    summary.replace(/\s+/g, " ").slice(0, 120),
+  );
+
+  // Swapping is one click, and it has to actually exchange the two windows.
+  const beforeSwap = await page.evaluate(() => ({
+    from: window.lidlesseye.state.fromNs,
+    base: window.lidlesseye.state.baseFromNs,
+  }));
+  await page.click("#compare-swap");
+  await page.waitForFunction(
+    (before) => window.lidlesseye.state.fromNs === before.base,
+    beforeSwap,
+    { timeout: 15000 },
+  );
+  const afterSwap = await page.evaluate(() => ({
+    from: window.lidlesseye.state.fromNs,
+    base: window.lidlesseye.state.baseFromNs,
+  }));
+  check(
+    afterSwap.from === beforeSwap.base && afterSwap.base === beforeSwap.from,
+    "swap exchanges the baseline and comparison windows",
+    JSON.stringify({ beforeSwap, afterSwap }),
+  );
+
+  // Swap back: the drag assertion below assumes the comparison bracket still
+  // sits where the earlier view left it.
+  await page.click("#compare-swap");
+  await page.waitForFunction(
+    (before) => window.lidlesseye.state.fromNs === before.from,
+    beforeSwap,
+    { timeout: 15000 },
   );
   // Nudge the comparison window (the second brush) to the left. Both brushes
   // share the domain, and the comparison bracket sits at 2–35% of it, so 20%

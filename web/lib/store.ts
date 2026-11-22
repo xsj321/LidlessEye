@@ -510,6 +510,23 @@ export class DashboardStore {
     void this.reload();
   }
 
+  /**
+   * Swap what is compared against what, keeping both windows intact. Reading a
+   * diff backwards is common ("what grew" vs "what shrank"), and the
+   * alternative was dragging two brushes to exchange them.
+   */
+  swapBaseline() {
+    const baseline = this.resolveBaseline();
+    const win = this.resolveWindow();
+    this.commit({
+      fromNs: baseline.from,
+      untilNs: baseline.until,
+      baseFromNs: win.from,
+      baseUntilNs: win.until,
+    });
+    void this.reload();
+  }
+
   resetWindowToDomain() {
     const domain = this.resolveDomain();
     this.setWindow(domain.from, domain.until);

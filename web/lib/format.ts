@@ -23,6 +23,19 @@ export function formatDuration(ns: number): string {
   const sign = ns < 0 ? "-" : "";
   const v = Math.abs(ns);
   if (v === 0) return "0s";
+  // Two units, largest first: a thirty-day window reads "30d", not
+  // "43200m0.0s", and the same rule makes a two-hour CPU total "2h" instead of
+  // "120m0.0s".
+  if (v >= 86_400e9) {
+    const days = Math.floor(v / 86_400e9);
+    const hours = Math.floor((v - days * 86_400e9) / 3600e9);
+    return `${sign}${days}d${hours ? `${hours}h` : ""}`;
+  }
+  if (v >= 3600e9) {
+    const hours = Math.floor(v / 3600e9);
+    const minutes = Math.floor((v - hours * 3600e9) / 60e9);
+    return `${sign}${hours}h${minutes ? `${minutes}m` : ""}`;
+  }
   if (v >= 60e9) {
     const minutes = Math.floor(v / 60e9);
     const seconds = (v - minutes * 60e9) / 1e9;
@@ -88,6 +101,32 @@ export function formatClock(ns: number): string {
   const date = new Date(Number(ns) / 1e6);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/**
+ * `12:04:11`, or `10-23 12:04` when the two ends are not on the same day.
+ *
+ * A range picker that says "14:04:40 → 14:04:40" for a thirty-day window is
+ * not just terse, it is wrong: the two ends look identical. Anything that
+ * prints a window rather than an instant should use this.
+ */
+export function formatClockRange(from: number, until: number): string {
+  const a = new Date(Number(from) / 1e6);
+  const b = new Date(Number(until) / 1e6);
+  if (a.toDateString() === b.toDateString()) {
+    return `${formatClock(from)} → ${formatClock(until)}`;
+  }
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const stamp = (d: Date) =>
+    `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${stamp(a)} → ${stamp(b)}`;
+}
+
+/** `10-23`, for an axis whose span is longer than a day. */
+export function formatDayMonth(ns: number): string {
+  const date = new Date(Number(ns) / 1e6);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 export function formatRelative(ns: number): string {

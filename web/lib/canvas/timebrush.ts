@@ -13,7 +13,12 @@
 // `onPreview` fires during the gesture so the readout above the canvas can
 // follow the handle without a server round-trip.
 
-import { formatClock, formatDuration } from "@/lib/format";
+import {
+  formatClock,
+  formatClockRange,
+  formatDayMonth,
+  formatDuration,
+} from "@/lib/format";
 import type { TimeseriesPayload } from "@/lib/types";
 
 const HEIGHT = 68; // css px: bars + axis labels + head room
@@ -34,9 +39,22 @@ interface Histogram {
   totals: number[];
 }
 
+/**
+ * What the pointer is over: the instant under the cursor plus the bucket that
+ * contains it. `count` is `null` when the histogram has no bars, so the readout
+ * can say "1,204" only when there is a number to say.
+ */
+export interface BrushHover {
+  ns: number;
+  bucketFrom: number;
+  bucketUntil: number;
+  count: number | null;
+}
+
 export interface TimeBrushOptions {
   onChange?: (from: number, until: number) => void;
   onPreview?: (from: number | null, until: number | null) => void;
+  onHover?: (hover: BrushHover | null) => void;
   /** Element whose width drives the canvas. Defaults to the canvas parent. */
   host?: HTMLElement;
 }
@@ -57,11 +75,16 @@ export class TimeBrush {
   private readonly host: HTMLElement;
   private readonly onChange: (from: number, until: number) => void;
   private readonly onPreview: (from: number | null, until: number | null) => void;
+  private readonly onHover: (hover: BrushHover | null) => void;
 
   private domain: Span | null = null;
   private histogram: Histogram | null = null;
   private sel: Span | null = null;
   private drag: Drag | null = null;
+  /** Cursor position in css px, or null when the pointer is elsewhere. */
+  private hoverPx: number | null = null;
+  /** Last bucket reported, so a pixel-wide move does not re-render React. */
+  private lastHover: BrushHover | null = null;
   private resizeObserver: ResizeObserver | null;
 
   constructor(canvas: HTMLCanvasElement, options: TimeBrushOptions = {}) {
@@ -75,6 +98,7 @@ export class TimeBrush {
     this.host = options.host ?? canvas.parentElement ?? canvas;
     this.onChange = options.onChange ?? (() => {});
     this.onPreview = options.onPreview ?? (() => {});
+    this.onHover = options.onHover ?? (() => {});
     const ctx = canvas.getContext("2d");
     if (!ctx) throw new Error("2D canvas context unavailable");
     this.ctx = ctx;
@@ -84,6 +108,10 @@ export class TimeBrush {
     canvas.addEventListener("pointerup", (event) => this.onPointerUp(event));
     canvas.addEventListener("pointerleave", () => {
       if (!this.drag) canvas.style.cursor = "";
+      this.hoverPx = null;
+      this.lastHover = null;
+      this.draw();
+      this.onHover(null);
     });
 
     this.resizeObserver = new ResizeObserver(() => this.draw());
@@ -150,6 +178,28 @@ export class TimeBrush {
     return from + (px / this.plotWidth()) * (until - from);
   }
 
+  /**
+   * The bucket under `px`. Bars are laid out edge to edge over the histogram's
+   * own span, which may be wider than the domain (the server rounds buckets),
+   * so the index is derived from the bar count rather than from the domain.
+   */
+  private hoverAt(px: number): BrushHover | null {
+    if (!this.domain) return null;
+    const width = this.plotWidth();
+    const ns = clamp(this.nsFor(clamp(px, 0, width)), this.domain.from, this.domain.until);
+    const bars = this.histogram?.totals.length ?? 0;
+    if (!bars) return { ns, bucketFrom: ns, bucketUntil: ns, count: null };
+    const index = clamp(Math.floor((px / width) * bars), 0, bars - 1);
+    const hist = this.histogram!;
+    const step = hist.step_ns || (hist.until_ns - hist.from_ns) / bars;
+    return {
+      ns,
+      bucketFrom: hist.from_ns + index * step,
+      bucketUntil: hist.from_ns + (index + 1) * step,
+      count: hist.totals[index] ?? 0,
+    };
+  }
+
   private minSpan() {
     if (!this.domain) return 1e9;
     return Math.max(1e9, (this.domain.until - this.domain.from) * MIN_SPAN_FRACTION);
@@ -192,6 +242,8 @@ export class TimeBrush {
     };
     this.canvas.dataset.drag = mode;
     this.canvas.style.cursor = mode === "create" ? "crosshair" : "ew-resize";
+    this.hoverPx = null;
+    this.onHover(null);
   }
 
   private onPointerMove(event: PointerEvent) {
@@ -203,6 +255,20 @@ export class TimeBrush {
       const near = Math.abs(px - left) <= HANDLE_PX || Math.abs(px - right) <= HANDLE_PX;
       const inside = px > left && px < right && !this.coversDomain();
       this.canvas.style.cursor = near ? "ew-resize" : inside ? "grab" : "crosshair";
+      // A guide line under the cursor turns the brush from a slider into a
+      // chart you can read: the readout above reports the bucket it points at.
+      this.hoverPx = px;
+      this.draw();
+      // Report per bucket, not per pixel: the readout is about the bar under
+      // the cursor, and a new object per mouse move re-renders the row.
+      const hover = this.hoverAt(px);
+      if (hover && hover.bucketFrom !== this.lastHover?.bucketFrom) {
+        this.lastHover = hover;
+        this.onHover(hover);
+      } else if (!hover) {
+        this.lastHover = null;
+        this.onHover(null);
+      }
       return;
     }
     if (Math.abs(px - this.xFor(this.drag.anchorNs)) > 3) this.drag.moved = true;
@@ -322,6 +388,15 @@ export class TimeBrush {
       ctx.textAlign = "left";
     }
 
+    if (this.hoverPx !== null && this.hoverPx >= 0 && this.hoverPx <= width) {
+      ctx.strokeStyle = "rgba(226, 232, 240, 0.35)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(Math.round(this.hoverPx) + 0.5, barTop - 4);
+      ctx.lineTo(Math.round(this.hoverPx) + 0.5, barBottom + 4);
+      ctx.stroke();
+    }
+
     if (!this.sel) return;
 
     // Window: soft fill, hard edges, handles on the edges.
@@ -344,15 +419,25 @@ export class TimeBrush {
       ctx.fillRect(x - 0.5, barBottom - 5, 1, 10);
     }
 
-    // Axis: domain ends plus a mid tick, so the window has landmarks.
+    // Axis: domain ends plus a mid tick, so the window has landmarks. A range
+    // longer than a day would print the same clock three times, so it prints
+    // dates instead.
+    const axisLabel =
+      this.domain.until - this.domain.from > 86_400e9
+        ? formatDayMonth
+        : formatClock;
     ctx.fillStyle = "#6b7585";
     ctx.font = "10px system-ui, sans-serif";
     ctx.textAlign = "left";
-    ctx.fillText(formatClock(this.domain.from), 2, HEIGHT - 6);
+    ctx.fillText(axisLabel(this.domain.from), 2, HEIGHT - 6);
     ctx.textAlign = "right";
-    ctx.fillText(formatClock(this.domain.until), width - 2, HEIGHT - 6);
+    ctx.fillText(axisLabel(this.domain.until), width - 2, HEIGHT - 6);
     ctx.textAlign = "center";
-    ctx.fillText(formatClock((this.domain.from + this.domain.until) / 2), width / 2, HEIGHT - 6);
+    ctx.fillText(
+      axisLabel((this.domain.from + this.domain.until) / 2),
+      width / 2,
+      HEIGHT - 6,
+    );
     ctx.textAlign = "left";
   }
 }
@@ -360,13 +445,13 @@ export class TimeBrush {
 /** `12:04:11 → 12:19:30 · 15m20s`, or an em dash before the first selection. */
 export function selectionText(sel: Span | null): string {
   if (!sel) return "–";
-  return `${formatClock(sel.from)} → ${formatClock(sel.until)} · ${formatDuration(
+  return `${formatClockRange(sel.from, sel.until)} · ${formatDuration(
     sel.until - sel.from,
   )}`;
 }
 
 export function domainText(domain: Span): string {
-  return `of ${formatClock(domain.from)}–${formatClock(domain.until)}`;
+  return `of ${formatClockRange(domain.from, domain.until)}`;
 }
 
 function clamp(v: number, lo: number, hi: number) {

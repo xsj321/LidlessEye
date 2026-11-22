@@ -12,7 +12,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { formatClock } from "@/lib/format";
+import { formatClockRange } from "@/lib/format";
 import { rangeLabel, resolveWindow } from "@/lib/time";
 import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
@@ -174,7 +174,7 @@ export function Toolbar() {
         <span className="text-foreground/80">{type}</span>
         <span aria-hidden="true">·</span>
         <span>
-          {formatClock(window.from)} → {formatClock(window.until)}
+          {formatClockRange(window.from, window.until)}
           {mode === "relative" ? ` (${t(rangeLabel(range))})` : ""}
         </span>
         <span aria-hidden="true">·</span>

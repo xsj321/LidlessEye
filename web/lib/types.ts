@@ -40,6 +40,12 @@ export interface FlamegraphPayload {
   names: string[];
   levels: number[];
   values?: number[];
+  /**
+   * Sample rows under each node, parallel to `names`. Present on new
+   * responses; older servers omit it, and the UI then hides the column
+   * instead of pretending the count is zero.
+   */
+  sample_counts?: number[];
   total?: number;
   samples?: number;
   unit: string;

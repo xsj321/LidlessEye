@@ -65,6 +65,11 @@ const ZH: Record<string, string> = {
   filters: "个筛选",
   "no filters": "无筛选",
 
+  sample: "个样本",
+  samples: "个样本",
+  "Zoom the window in": "放大时间窗口",
+  "Zoom the window out": "缩小时间窗口",
+
   Filters: "筛选",
   "Add filter": "添加筛选",
 
@@ -98,6 +103,9 @@ const ZH: Record<string, string> = {
   Requests: "请求数",
   "A · Baseline": "A · 基线",
   "B · Comparison": "B · 对比",
+  Swap: "交换",
+  "no samples": "无样本",
+  new: "新增",
 
   // Settings
   General: "通用",

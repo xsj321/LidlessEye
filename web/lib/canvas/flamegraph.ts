@@ -31,12 +31,25 @@ const INTRO_STAGGER_MS = 45;
 const INTRO_MAX_MS = 900;
 const ZOOM_MS = 260;
 
-const HUES = [22, 38, 8, 46, 190, 210, 265, 320, 160, 350];
+// Frame hues stay in the cool half of the wheel. Warm hues are the diff
+// palette (orange growth, green shrinkage) and the accent, so a normal frame
+// in that range would read as a finding. Identity is still stable per function
+// name, which is what makes the same frame recognisable across two views.
+const HUES = [190, 200, 210, 220, 232, 245, 258, 270, 285, 300];
 
 const easeOutCubic = (t: number) => 1 - (1 - t) ** 3;
 const easeInOutCubic = (t: number) =>
   t < 0.5 ? 4 * t ** 3 : 1 - (-2 * t + 2) ** 3 / 2;
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
+/** Frame names are symbol paths; `&` and `<` are legal in them. */
+function escapeXml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
 function hashString(text: string): number {
   let h = 0x811c9dc5;
@@ -80,6 +93,9 @@ export interface FlameNodeDetail {
   selfShare: number;
   totalShare: number;
   unit: string;
+  /** Sample rows under this frame, and its share of the window's samples. */
+  samples: number;
+  sampleShare: number;
   /** Root … frame, for the call-stack list. */
   chain: Array<{ index: number; name: string }>;
 }
@@ -97,6 +113,8 @@ export interface FlamegraphCallbacks {
   onZoom?: (fraction: number) => void;
   onHover?: (hover: FlameHover | null, clientX: number, clientY: number) => void;
   onLegend?: (entries: LegendEntry[]) => void;
+  /** `C` was pressed with a frame selected or hovered; React owns the clipboard. */
+  onCopyName?: (name: string) => void;
 }
 
 type Payload = FlamegraphPayload | DiffPayload;
@@ -196,6 +214,15 @@ export class Flamegraph {
       else if (event.key === "+" || event.key === "=") this.zoomAt(0.5, 1.5);
       else if (event.key === "-") this.zoomAt(0.5, 1 / 1.5);
       else if (event.key === "0") this.reset();
+      else if ((event.key === "c" || event.key === "C") && this.data) {
+        // The selection wins over the cursor: it is the frame the details
+        // panel is describing, and it survives the pointer leaving.
+        const index = this.selected >= 0 ? this.selected : this.hovered;
+        if (index >= 0) {
+          event.preventDefault();
+          this.callbacks.onCopyName?.(this.data.names[index]);
+        }
+      }
     };
 
     this.bindPointer();
@@ -543,6 +570,24 @@ export class Flamegraph {
     return color;
   }
 
+  /**
+   * `text` cut to fit `room` px, ending in an ellipsis. A hard clip at the bar
+   * edge reads as a rendering bug; an ellipsis reads as "there is more", and
+   * the tooltip carries the full name either way.
+   */
+  private fitLabel(text: string, room: number): string {
+    const ctx = this.ctx;
+    if (ctx.measureText(text).width <= room) return text;
+    let lo = 0;
+    let hi = text.length;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (ctx.measureText(`${text.slice(0, mid)}…`).width <= room) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo > 0 ? `${text.slice(0, lo)}…` : "";
+  }
+
   // ---- drawing ---------------------------------------------------------
 
   draw() {
@@ -687,21 +732,14 @@ export class Flamegraph {
           ctx.rect(px + 1, y + 1, pw - 2, ROW_HEIGHT - 2);
           ctx.clip();
           ctx.fillStyle = "rgba(12, 10, 8, 0.92)";
-          const text = pw > 220 ? `${name}  ${formatPercent(pct, 0)}` : name;
-          // Fitting the label to the bar instead of letting `clip()` cut it
-          // mid-glyph: a hard cut reads as a rendering bug, an ellipsis reads
-          // as "there is more", and the tooltip has the full name either way.
+          // Fit the name first and add the percentage only when both fit: an
+          // ellipsis in the middle of "checkoutValid…37%" hides which part was
+          // cut. The name is the identity; the share is a bonus.
           const room = pw - 10;
-          let label = text;
-          if (ctx.measureText(label).width > room) {
-            let lo = 0;
-            let hi = label.length;
-            while (lo < hi) {
-              const mid = (lo + hi + 1) >> 1;
-              if (ctx.measureText(`${label.slice(0, mid)}…`).width <= room) lo = mid;
-              else hi = mid - 1;
-            }
-            label = lo > 0 ? `${text.slice(0, lo)}…` : "";
+          let label = this.fitLabel(name, room);
+          if (pw > 220) {
+            const withPct = `${name}  ${formatPercent(pct, 0)}`;
+            if (ctx.measureText(withPct).width <= room) label = withPct;
           }
           if (label) ctx.fillText(label, px + 5, y + ROW_HEIGHT / 2);
           ctx.restore();
@@ -878,9 +916,42 @@ export class Flamegraph {
           this.selfValue[index] / total,
         )}`,
       });
+      const samples = this.sampleCount(index);
+      if (samples > 0) {
+        rows.push({
+          key: "samples",
+          value: `${samples} · ${formatPercent(samples / (this.sampleTotal() || 1))}`,
+        });
+      }
       rows.push({ key: "depth", value: String(this.depth[index]) });
     }
     return { index, title: data.names[index], rows };
+  }
+
+  /** Sample rows under a frame; 0 for a payload that predates the field. */
+  sampleCount(index: number): number {
+    const flame = this.data as FlamegraphPayload | null;
+    return flame?.sample_counts?.[index] ?? 0;
+  }
+
+  /** Every sample in the window, which is the root's own count. */
+  private sampleTotal(): number {
+    const flame = this.data as FlamegraphPayload | null;
+    if (flame?.sample_counts?.length) return flame.sample_counts[0] ?? 0;
+    return flame?.samples ?? 0;
+  }
+
+  /**
+   * One step in: the selected frame if there is one (it is what the details
+   * panel is about), otherwise the middle of the viewport.
+   */
+  zoomIn() {
+    if (!this.data) return;
+    if (this.selected >= 0) {
+      this.zoomTo(this.selected);
+      return;
+    }
+    this.zoomAt(0.5, 1.5);
   }
 
   zoomTo(index: number) {
@@ -932,6 +1003,8 @@ export class Flamegraph {
       selfShare: this.selfValue[index] / total,
       totalShare: this.value[index] / total,
       unit: data.unit,
+      samples: this.sampleCount(index),
+      sampleShare: this.sampleCount(index) / (this.sampleTotal() || 1),
       chain,
     };
   }
@@ -948,12 +1021,17 @@ export class Flamegraph {
     this.emitCrumbs();
   }
 
+  /** One step out: up the breadcrumb, then the whole graph, then the viewport. */
   zoomOut() {
-    if (this.crumbs.length <= 1) {
+    if (this.crumbs.length > 1) {
+      this.focusCrumb(this.crumbs.length - 2);
+      return;
+    }
+    if (this.crumbs.length === 1) {
       this.reset();
       return;
     }
-    this.focusCrumb(this.crumbs.length - 2);
+    this.zoomAt(0.5, 1 / 1.5);
   }
 
   reset() {
@@ -974,6 +1052,92 @@ export class Flamegraph {
     x0 = Math.min(Math.max(x0, 0), 1 - nextSpan);
     this.view = { x0, x1: x0 + nextSpan };
     this.draw();
+  }
+
+  // ---- export ----------------------------------------------------------
+
+  /**
+   * The visible graph as a standalone SVG.
+   *
+   * Drawn from the same layout arrays as the canvas, so what lands in the file
+   * is what is on screen — the current zoom, not the whole profile. Labels are
+   * fitted by character count because SVG has no text measuring here; a mono
+   * font makes that a good approximation, and the full name is still in the
+   * JSON export.
+   */
+  toSvg(title = ""): string {
+    const data = this.data;
+    if (!data) return "";
+    const width = this.width();
+    const rows = Math.max(1, this.byDepth.length);
+    const height = rows * ROW_HEIGHT;
+    const footer = 30;
+    const { x0, x1 } = this.view;
+    const scale = width / (x1 - x0);
+    const out: string[] = [
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height + footer}" ` +
+        `viewBox="0 0 ${width} ${height + footer}" ` +
+        `font-family="ui-monospace, Menlo, Consolas, monospace">`,
+      `<rect width="100%" height="100%" fill="#111318"/>`,
+    ];
+    for (let d = 0; d < rows; d += 1) {
+      const y = d * ROW_HEIGHT;
+      for (const i of this.byDepth[d] ?? []) {
+        const px = (this.x[i] - x0) * scale;
+        const pw = this.w[i] * scale;
+        if (pw < MIN_FRAME_PX || px > width || px + pw < 0) continue;
+        out.push(
+          `<rect x="${px.toFixed(2)}" y="${y + 1}" width="${Math.max(pw - 0.6, 0.6).toFixed(2)}" ` +
+            `height="${ROW_HEIGHT - 2}" fill="${this.color(i)}"/>`,
+        );
+        if (pw < MIN_LABEL_PX) continue;
+        const name = data.names[i];
+        const room = Math.max(1, Math.floor((pw - 10) / 6.2));
+        let label = name.length > room ? `${name.slice(0, Math.max(0, room - 1))}…` : name;
+        if (pw > 220) {
+          const withPct = `${name}  ${formatPercent(this.w[i], 0)}`;
+          if (withPct.length <= room) label = withPct;
+        }
+        if (!label) continue;
+        out.push(
+          `<text x="${(px + 5).toFixed(2)}" y="${(y + ROW_HEIGHT / 2).toFixed(2)}" ` +
+            `fill="#0c0a08" font-size="11" dominant-baseline="middle">${escapeXml(label)}</text>`,
+        );
+      }
+    }
+    const meta = [
+      title,
+      `total ${formatValue(this.total, data.unit)}`,
+      `${this.sampleTotal()} samples`,
+      `${data.names.length} frames`,
+      `${(this.span() * 100).toFixed(1)}% shown`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    out.push(
+      `<text x="8" y="${height + 19}" fill="#96a0b2" font-size="11">${escapeXml(meta)}</text>`,
+    );
+    out.push("</svg>");
+    return out.join("\n");
+  }
+
+  /**
+   * The payload plus where the reader is in it. This is what a bug report
+   * needs: the graph can be replayed without the server.
+   */
+  toJson(): string {
+    const data = this.data;
+    if (!data) return "{}";
+    return JSON.stringify(
+      {
+        view: this.view,
+        crumbs: this.crumbs.map((index) => data.names[index]),
+        selection: this.selected >= 0 ? data.names[this.selected] : null,
+        payload: data,
+      },
+      null,
+      2,
+    );
   }
 
   private pan(deltaPx: number) {

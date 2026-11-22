@@ -1,13 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ChartNoAxesCombined, ChevronDown, ChevronUp } from "lucide-react";
+import { ChartNoAxesCombined, ChevronDown, ChevronUp, ZoomIn, ZoomOut } from "lucide-react";
 
 import { TimeRangePicker } from "@/components/time-range-picker";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { domainText, selectionText, TimeBrush } from "@/lib/canvas/timebrush";
+import type { BrushHover } from "@/lib/canvas/timebrush";
 import { formatClock } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
@@ -50,6 +51,7 @@ function Brush({
   const brushRef = useRef<TimeBrush | null>(null);
   const commitRef = useRef(onCommit);
   const [preview, setPreview] = useState<Window | null>(null);
+  const [hover, setHover] = useState<BrushHover | null>(null);
 
   commitRef.current = onCommit;
 
@@ -64,6 +66,7 @@ function Brush({
       onPreview: (from, until) => {
         setPreview(from !== null && until !== null ? { from, until } : null);
       },
+      onHover: setHover,
     });
     brushRef.current = brush;
     return () => {
@@ -88,6 +91,26 @@ function Brush({
 
   const shown = preview ?? selection;
 
+  // Zooming the brush is the timeline's own control: ±2×, anchored on the
+  // window's centre, clamped to the domain and to the smallest span the brush
+  // will accept. It commits immediately, like dragging does.
+  const zoom = (factor: number) => {
+    const domainSpan = domain.until - domain.from;
+    const min = Math.max(1e9, domainSpan / 300);
+    const span = Math.min(domainSpan, Math.max(min, (selection.until - selection.from) * factor));
+    const centre = (selection.from + selection.until) / 2;
+    const from = Math.min(Math.max(centre - span / 2, domain.from), domain.until - span);
+    onCommit(Math.round(from), Math.round(from + span));
+  };
+
+  const hoverText = hover
+    ? hover.count === null
+      ? formatClock(hover.bucketFrom)
+      : `${formatClock(hover.bucketFrom)} · ${hover.count.toLocaleString()} ${
+          hover.count === 1 ? t("sample") : t("samples")
+        }`
+    : "";
+
   return (
     <div className="space-y-0.5 brush">
       <div className="flex items-center gap-2">
@@ -102,6 +125,35 @@ function Brush({
           {ready ? domainText(domain) : ""}
         </span>
         <span className="flex-1" />
+        {/* Fixed slot: the readout must not shove the controls sideways as the
+            pointer crosses buckets. */}
+        <span
+          className="min-w-[9.5rem] text-right font-mono text-[11px] text-foreground/70 tabular-nums"
+          data-testid="brush-hover"
+          aria-live="off"
+        >
+          {hoverText}
+        </span>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          className="brush-zoom"
+          aria-label={t("Zoom the window out")}
+          title={t("Zoom the window out")}
+          onClick={() => zoom(2)}
+        >
+          <ZoomOut />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          className="brush-zoom"
+          aria-label={t("Zoom the window in")}
+          title={t("Zoom the window in")}
+          onClick={() => zoom(0.5)}
+        >
+          <ZoomIn />
+        </Button>
         <Button
           variant="ghost"
           size="xs"

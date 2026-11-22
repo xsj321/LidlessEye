@@ -91,6 +91,8 @@ analyse*.
 | drag the left or right edge | resize that edge |
 | drag across the histogram | draw a new window |
 | click inside a narrowed bracket | jump there, keeping the span |
+| hover the histogram | a guide line plus the time and sample count of that bucket |
+| **−** / **+** (top right of a bracket) | halve or double the window around its centre |
 | **Full** (top right of a bracket) | back to the whole chosen range |
 | **Hide chart** / **Show chart** | collapse or reopen the histogram row |
 
@@ -154,10 +156,27 @@ rather than dropped, so a pasted deep link keeps filtering the same way.
 ### Flamegraph
 
 Rows are stack depths, width is inclusive value; the leaf is at the bottom of
-each stack. Clicking a frame zooms into it, `Esc` (or *Reset zoom*) goes back
-out, and the breadcrumb above the canvas shows the path. Hovering lights the
-hovered frame together with its ancestors. The search box dims everything that
+each stack. Hovering lights the hovered frame together with its ancestors and
+reports its total, self, samples and depth. The search box dims everything that
 does not match a frame name and reports how many frames matched.
+
+Reading and acting are separate. A **click selects** the frame and opens the
+details panel beside the canvas; it does not move the graph, so the panel stays
+put while its call stack is walked. **Double click zooms** into the frame, and
+`Esc` drops the selection before it zooms out. The panel carries the frame's
+self and total value, its own **sample count**, its depth, the call stack (each
+ancestor is a button) and *Zoom in* / *Copy name*.
+
+The breadcrumb always names the level — *All frames* at the root — so "how deep
+am I" has an answer before the first zoom. The toolbar's −/+ buttons zoom
+one step around the centre (or into the selection), *Reset zoom* returns to the
+whole graph, and **Export** writes what is on screen as SVG or the payload plus
+the current zoom as JSON.
+
+The same shell — search, zoom, breadcrumb, details, export — hosts any renderer
+that implements `lib/analysis/renderer`; the flamegraph is the first. The time
+range stays outside it, in the bar above the views: it is one control for the
+whole page, and every view queries the same window.
 
 With **Group by** set, the first row under the root is one synthetic frame per
 label value (`pod=cart-1`, …), which is the fastest way to see whether one pod
@@ -181,6 +200,11 @@ The compare view has **two** histogram brushes, one per window. Both are
 independent and absolute. B starts as the current window; A starts as the span
 immediately before it. Dragging either one updates the diff; B also becomes the
 window the other tabs use.
+
+Above the graph, a strip names both windows with their clock times, lengths and
+totals, followed by the delta. **Swap** exchanges the two in one click, which is
+what "read this diff backwards" needs and what two brushes cannot do without
+being dragged one by one.
 
 ### Top functions
 
@@ -399,7 +423,10 @@ usually takes.
 | Key | Action |
 | --- | --- |
 | `r` | reload the current view |
-| `Esc` | leave the zoomed frame (flamegraph) |
+| `c` | copy the selected (or hovered) frame name |
+| `+` / `-` | zoom in / out one step |
+| `0` | reset the flamegraph zoom |
+| `Esc` | drop the frame selection, then leave the zoomed frame |
 
 Shortcuts are ignored while a text field has focus, so typing `r` into the
 search box does not reload the page.
@@ -442,6 +469,10 @@ ones this code has already been measured against:
   translucent pane on a translucent card: lighter surface, cast shadow, and
   visible gap. No spine, no connector hairline — the gap and the value
   difference already say which layer the child belongs to.
+- Colour carries one meaning per palette. Flamegraph frames are cool hues
+  keyed by function name, so the same function keeps its colour between views;
+  warm red/green are reserved for the compare view's delta and the accent is
+  reserved for selection and hover, so a warm frame never reads as a finding.
 - The shell has one `<main>` (focusable, `tabIndex={-1}`), a skip link ahead of
   the navigation drawer, and exactly one `<h1>` naming the current view.
 
