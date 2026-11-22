@@ -56,6 +56,49 @@ pub const DB_FILE: &str = "lidlesseye.duckdb";
 /// month of data fails as a truncated answer instead of as an OOM kill.
 pub const MAX_SCAN_ROWS: usize = 2_000_000;
 
+/// The counter the service map's time brush plots.
+///
+/// All three live in the same `net_edges` rows, so switching between them is a
+/// change of aggregate rather than of query: the brush keeps its buckets and
+/// the bars keep their meaning ("how much of this, per bucket"). Requests are
+/// TCP connections opened, because without payload parsing there is no request
+/// count to divide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetMetric {
+    #[default]
+    Connections,
+    Bytes,
+    Retransmits,
+}
+
+impl NetMetric {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "connections" | "requests" | "request" | "conn" => Some(Self::Connections),
+            "bytes" | "traffic" => Some(Self::Bytes),
+            "retransmits" | "retrans" => Some(Self::Retransmits),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connections => "connections",
+            Self::Bytes => "bytes",
+            Self::Retransmits => "retransmits",
+        }
+    }
+
+    /// SQL expression to sum. Constants only — never user input.
+    fn column(self) -> &'static str {
+        match self {
+            Self::Connections => "connections",
+            Self::Bytes => "tx_bytes + rx_bytes",
+            Self::Retransmits => "retransmits",
+        }
+    }
+}
+
 /// How rows are physically stored.
 ///
 /// * [`StorageMode::DuckDb`] keeps everything in one `lidlesseye.duckdb` file.
@@ -1859,6 +1902,24 @@ impl Store {
         step_ns: u64,
         buckets: usize,
     ) -> Result<Vec<u64>> {
+        self.net_histogram_metric(from_ns, until_ns, step_ns, buckets, NetMetric::Connections)
+    }
+
+    /// The same dense bucket array for a chosen counter.
+    ///
+    /// The time brush offers the three quantities the map already stores:
+    /// how many connections were opened, how many bytes moved, and how many
+    /// segments had to be retransmitted. They are summed by the same spreading
+    /// rule as [`Store::net_histogram`], so a bar's height means the same span
+    /// of time whichever metric is drawn.
+    pub fn net_histogram_metric(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+        buckets: usize,
+        metric: NetMetric,
+    ) -> Result<Vec<u64>> {
         let buckets = buckets.max(1);
         let mut out = vec![0u64; buckets];
         if until_ns <= from_ns {
@@ -1872,11 +1933,12 @@ impl Store {
         const LOOKBACK_NS: u64 = 3_600_000_000_000;
         let conn = self.conn.lock();
         let mut stmt = conn
-            .prepare(
-                "SELECT bucket_ns, sum(connections) FROM net_edges \
+            .prepare(&format!(
+                "SELECT bucket_ns, sum({}) FROM net_edges \
                  WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY bucket_ns ORDER BY bucket_ns",
-            )
+                metric.column()
+            ))
             .map_err(db_err)?;
         let mut rows = stmt
             .query(params![
@@ -3031,6 +3093,65 @@ mod tests {
             300,
             "only the visible half of the batch counts"
         );
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The brush's metric switch reads the same batches through a different
+    /// aggregate. Bytes count both directions; retransmits are their own
+    /// counter. Both must spread over the window exactly like connections do,
+    /// or the three views would disagree about when the traffic happened.
+    #[test]
+    fn histogram_offers_bytes_and_retransmits() {
+        use crate::servicemap::ServiceEdge;
+
+        let (store, dir) = temp_store("net-histogram-metrics");
+        let start = 1_700_000_000_000_000_000u64;
+        let batch_ns = 60_000_000_000u64;
+        store
+            .append_servicemap(&ServiceMapBatch {
+                start_ns: start,
+                end_ns: start + batch_ns,
+                edges: vec![ServiceEdge {
+                    client: "shop/a".to_string(),
+                    server: "shop/b".to_string(),
+                    protocol: "http".to_string(),
+                    connections: 60,
+                    tx_bytes: 1_200,
+                    rx_bytes: 3_600,
+                    retransmits: 6,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let bytes = store
+            .net_histogram_metric(start, start + batch_ns, batch_ns / 12, 12, NetMetric::Bytes)
+            .unwrap();
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(
+            bytes.iter().sum::<u64>(),
+            4_800,
+            "bytes are both directions, spread over the batch"
+        );
+
+        let retransmits = store
+            .net_histogram_metric(
+                start,
+                start + batch_ns,
+                batch_ns / 12,
+                12,
+                NetMetric::Retransmits,
+            )
+            .unwrap();
+        assert_eq!(retransmits.iter().sum::<u64>(), 6);
+
+        // An unknown metric name must not silently mean "bytes": parse is the
+        // one place that decides, and the API falls back to connections.
+        assert_eq!(NetMetric::parse("requests"), Some(NetMetric::Connections));
+        assert_eq!(NetMetric::parse("nope"), None);
 
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

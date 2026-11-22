@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::store::Store;
+use crate::store::{NetMetric, Store};
 
 /// Node id for traffic that has no endpoint inside the cluster.
 pub const EXTERNAL_ID: &str = "external";
@@ -510,24 +510,29 @@ pub fn servicemap_history(
 
 /// `GET /api/v1/servicemap/histogram` response.
 ///
-/// The time brush above the map shows how many connections were opened in each
-/// bucket — the map's equivalent of a request count — rather than CPU samples.
-/// `connections` is dense: index `i` covers `[from_ns + i*step_ns, … + step_ns)`.
+/// The time brush above the map shows one counter per bucket — connections
+/// opened, bytes moved, or retransmits — rather than CPU samples. `points` is
+/// dense: index `i` covers `[from_ns + i*step_ns, … + step_ns)`. `metric` names
+/// the counter so the brush can label its bars without trusting its own
+/// request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MapHistogram {
     pub from_ns: u64,
     pub until_ns: u64,
     pub step_ns: u64,
     #[serde(default)]
-    pub connections: Vec<u64>,
+    pub metric: String,
+    #[serde(default)]
+    pub points: Vec<u64>,
 }
 
-/// Per-bucket connection totals over the whole map.
+/// Per-bucket totals of one counter over the whole map.
 pub fn servicemap_histogram(
     store: &Store,
     from_ns: u64,
     until_ns: u64,
     buckets: usize,
+    metric: NetMetric,
 ) -> Result<MapHistogram> {
     let buckets = buckets.max(1);
     let step_ns = ((until_ns.saturating_sub(from_ns)) / buckets as u64).max(1);
@@ -535,7 +540,8 @@ pub fn servicemap_histogram(
         from_ns,
         until_ns,
         step_ns,
-        connections: store.net_histogram(from_ns, until_ns, step_ns, buckets)?,
+        metric: metric.as_str().to_string(),
+        points: store.net_histogram_metric(from_ns, until_ns, step_ns, buckets, metric)?,
     })
 }
 
