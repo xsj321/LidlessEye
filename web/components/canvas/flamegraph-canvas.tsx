@@ -43,6 +43,17 @@ function FrameDetails({
   onCopy: () => void;
   copied: boolean;
 }) {
+  const stackRef = useRef<HTMLOListElement>(null);
+
+  // A deep frame is the common case in a real profile, and its row is at the
+  // bottom of the stack list — off-screen unless the list follows the
+  // selection. `nearest` keeps the page itself from jumping.
+  useEffect(() => {
+    stackRef.current
+      ?.querySelector('[aria-current="true"]')
+      ?.scrollIntoView({ block: "nearest" });
+  }, [detail.index]);
+
   return (
     <aside
       aria-label="Selected frame"
@@ -91,7 +102,7 @@ function FrameDetails({
       </dl>
 
       <div className="mb-1 text-[9px] uppercase tracking-wide text-muted-foreground">Call stack</div>
-      <ol className="mb-2.5 max-h-40 space-y-0.5 overflow-y-auto">
+      <ol ref={stackRef} className="mb-2.5 max-h-40 space-y-0.5 overflow-y-auto">
         {detail.chain.map((node, index) => {
           const current = index === detail.chain.length - 1;
           return (
