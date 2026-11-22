@@ -246,6 +246,7 @@ The browser test seeds two tenants and fails on any console error, so a renderin
 - **Per-host storage**: one server per volume; no clustering or replication.
 - **uprobes are opt-in and narrow**: TLS plaintext capture stays behind `LIDLESSEYE_SSL_UPROBE=1`. Allocation profiling is on by default (`--no-alloc` disables it) and instruments one file per allocator per container — glibc, musl, jemalloc, mimalloc or tcmalloc, whichever the process maps.
 - **User stacks need frame pointers** (`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`). The profiled time is still correct without them.
+- **Memory profiling sees allocations, not memory**: `inuse_*` counts blocks a probe saw allocated and not yet freed, so allocations made before attach, `mmap`-backed arenas and allocators that never call `malloc` are out of scope, and there is no RSS/PSS series to compare a heap level against.
 
 ## Documentation
 

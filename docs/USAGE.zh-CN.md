@@ -35,6 +35,13 @@ agent 同时采集 CPU、off-CPU 和内存。内存有两个读取器，默认�
 
 开关：`--no-alloc` 关掉分配器 uprobe，`--no-heap` 关掉 Go 堆读取器，`--heap-objects` 额外输出两个对象计数。同一个进程只会被一个读取器度量——Go 二进制的 `malloc` 已经由运行时自己的 profile 表示。内存相关的标签回答「谁测的」：`node`、`service_name`、`profile_source`（`go-runtime` 或 `allocator-uprobe`）、`sampling`（`runtime` 或 `uprobe`）、`runtime`（`go`、`c`、`c++`、`rust`……）以及 `allocator`（`glibc`、`musl`、`jemalloc`、`mimalloc`、`tcmalloc`、`static`）。
 
+两个读取器都**不**测量的东西 —— 看数字之前先知道边界：
+
+- **常驻内存。** API 里没有任何 RSS / PSS 序列。`inuse_space` 是「探针看到分配过、且还没释放」的块之和，不是进程的工作集：启动时分配 1 GB 然后就去睡的进程读出来接近 0，页缓存、栈、共享库更是完全不在里面。
+- **探针挂载之前分配的内存。** in-use 从挂载时刻开始算，所以一个一周前就起来的进程，看到的是 agent 启动之后它新分配的量，而不是它整个堆。
+- **`mmap` 以及不经过 `malloc` 的分配器。** 计数发生在分配器的公开入口，所以它底下的 arena 预留（jemalloc 的 extent）、Rust `#[global_allocator]` 里的 bump 分配器、`mmap` 出来的环形缓冲都看不见。Go 进程是例外，它走运行时那条路。
+- **改 Go 的采样率。** 读取器是只读的：从不写 `MemProfileRate`，因为那会改变被测程序的行为，而且只对之后的分配生效。把它设成 `0` 的进程会被跳过，计入 agent 的 `heap_disabled` 统计，而不是报成 0。
+
 打开 <http://localhost:4040>。不带路径的地址会进入**服务地图**。
 
 ---

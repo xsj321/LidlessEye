@@ -241,6 +241,7 @@ cargo fmt --all --check
 - **单机存储**：一个存储卷对应一个服务端，没有集群或复制。
 - **uprobe 需要显式开启且范围有限**：TLS 明文捕获仍在 `LIDLESSEYE_SSL_UPROBE=1` 之后；分配分析默认开启（`--no-alloc` 关闭），每个容器每种分配器只挂一个文件——glibc、musl、jemalloc、mimalloc 或 tcmalloc，取进程实际映射的那一个。
 - **用户态调用栈需要 frame pointers**（`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`）。没有它们时耗时统计依然正确。
+- **内存分析看的是「分配」，不是「内存」**：`inuse_*` 只统计探针看到分配过、且还没释放的块，所以挂载之前分配的内存、`mmap` 出来的 arena、以及完全绕过 `malloc` 的分配器都不在范围内；也没有 RSS / PSS 序列可以拿来跟堆的水平量对照。
 
 ## 文档
 

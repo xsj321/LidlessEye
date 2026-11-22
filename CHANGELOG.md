@@ -6,7 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
-## [Unreleased]
+## [0.1.3] - 2026-11-23
+
+Memory profiling arrives, in two readers that never touch the same process: the
+Go runtime's own heap profile for Go, and the allocator's entry points for
+everything else. The map also stops borrowing a unit per label, and its arrows
+become geometry.
 
 ### Added
 
@@ -49,6 +54,33 @@ Rust API follows the same rule.
   the object counts. A level and a rate are worded differently — "held now"
   against "allocated this interval" — because they answer different questions
   and only one of them adds up over time.
+- Edge latency is printed in milliseconds, one unit for the whole map. A label
+  used to choose its unit per value — `149µs` on one hop, `1.4ms` on the next —
+  which is right in a panel, where the number is the subject, and wrong on a
+  map, where the labels form a column the eye scans: the reader had to convert
+  before seeing which hop was slower. Precision carries the magnitude instead
+  (two decimals below a millisecond, one below a hundred, none above), so a
+  label stays three digits wide, and a hop faster than that precision reads
+  `<0.01ms` rather than `0ms`, because a zero is a claim the measurement cannot
+  make.
+
+### Fixed
+
+- The compatibility table called the Go profile chain `mProf`. The reader walks
+  `runtime.mbuckets` — the symbol the runtime actually exports — and the table
+  no longer says that Go runtime profiles are unsupported while the row above
+  it describes reading one.
+
+### Known limits
+
+- Memory profiling counts allocations, not memory. `inuse_*` is the sum of the
+  blocks a probe saw allocated and not yet freed: allocations made before the
+  probe attached are invisible, `mmap`-backed arenas and allocators that never
+  call `malloc` (a custom `#[global_allocator]`) are out of scope, and there is
+  no RSS/PSS series — so a heap level cannot be read as, or compared against,
+  the process's resident memory. The Go reader is passive and never writes
+  `MemProfileRate`; a process that disabled sampling is skipped and counted in
+  the agent's `heap_disabled` statistic rather than reported as zero.
 
 ## [0.1.2] - 2026-11-22
 
@@ -268,7 +300,8 @@ service map.
 - User stacks need frame pointers; CPU and off-CPU only, no allocation
   profiling yet.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/xsj321/LidlessEye/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/xsj321/LidlessEye/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/xsj321/LidlessEye/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/xsj321/LidlessEye/releases/tag/v0.1.0

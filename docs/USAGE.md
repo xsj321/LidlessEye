@@ -44,6 +44,27 @@ runtime's own profile. Memory labels answer "who measured this": `node`,
 `sampling` (`runtime` or `uprobe`), `runtime` (`go`, `c`, `c++`, `rust`, …) and
 `allocator` (`glibc`, `musl`, `jemalloc`, `mimalloc`, `tcmalloc`, `static`).
 
+What neither reader measures — worth knowing before trusting a number:
+
+- **Resident memory.** There is no RSS or PSS series anywhere in the API.
+  `inuse_space` is the sum of the blocks a probe saw allocated and not yet
+  freed, which is not the process's working set: a program that allocates a
+  gigabyte at startup and then sleeps reads close to zero, and page cache,
+  stacks and shared libraries never appear at all.
+- **Allocations made before the probe attached.** In-use counts from attach
+  time, so a process that has been up for a week shows what it allocated since
+  the agent started — not its total heap.
+- **`mmap`, and allocators that never call `malloc`.** What is counted is the
+  allocator's public entry point, so arena reservations underneath it
+  (jemalloc's extents), a bump allocator behind a Rust `#[global_allocator]`,
+  and `mmap`'d ring buffers are invisible. A Go process is the exception and is
+  read from the runtime instead.
+- **A different sampling rate on Go.** The reader is passive: it never writes
+  `MemProfileRate`, because that would change the behaviour of the program and
+  only applies to allocations made afterwards. A process that set it to `0` is
+  skipped and counted in the agent's `heap_disabled` statistic rather than
+  reported as zero.
+
 Open <http://localhost:4040>. A bare URL opens the **service map**.
 
 ---

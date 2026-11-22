@@ -343,7 +343,9 @@ end_ns)`), because ten consecutive `inuse_space` batches are ten snapshots of
 one quantity, not ten units of it. `inuse_space`/`inuse_objects` are also
 "allocated and not yet freed since the probe was attached" — an allocator
 uprobe cannot see allocations made before it attached, or memory that never
-went through `malloc`.
+went through `malloc`. No profile type carries resident memory: there is no
+RSS or PSS series, so an `inuse_space` level and the kernel's working set are
+different quantities and neither is a baseline of the other.
 
 `batch_count` appears in `/series`, `/profile_types`, `/stats`, `/tenants` and
 the `lidlesseye_batches*` metrics. It counts rows in `batches`, i.e. ingest
