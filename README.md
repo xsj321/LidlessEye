@@ -7,7 +7,6 @@
 [![CI](https://github.com/xsj321/LidlessEye/actions/workflows/ci.yml/badge.svg)](https://github.com/xsj321/LidlessEye/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/xsj321/LidlessEye?sort=semver&color=blue)](https://github.com/xsj321/LidlessEye/releases)
 [![crates.io](https://img.shields.io/crates/v/lidlesseye?logo=rust&color=orange)](https://crates.io/crates/lidlesseye)
-[![docs.rs](https://img.shields.io/docsrs/lidlesseye?logo=docs.rs)](https://docs.rs/lidlesseye)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](crates)
 [![DuckDB](https://img.shields.io/badge/storage-DuckDB%202.0-yellow.svg)](crates/lidlesseye-core)

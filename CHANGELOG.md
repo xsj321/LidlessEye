@@ -18,6 +18,10 @@ well as connections.
 
 ### Added
 
+- The four crates are on crates.io at `0.1.2`: `lidlesseye` (builder and CLI),
+  `lidlesseye-server` (ingest, query API and the embedded dashboard),
+  `lidlesseye-core` (model, DuckDB store, query engine) and `lidlesseye-ebpf`.
+  `cargo install lidlesseye` and `cargo add lidlesseye` now resolve.
 - The service map names the destination a client actually asked for. An HTTP
   request's `Host:` header and the text of a MySQL or PostgreSQL statement now
   travel from the probe to the edge, and the node panel shows them under
@@ -121,15 +125,6 @@ well as connections.
   (`components/analysis/`, contract in `lib/analysis/renderer`): search, zoom,
   breadcrumb, details and export live in one shell behind a renderer interface,
   so a second profile type reuses them instead of re-implementing analysis.
-
-### Pending
-
-- The crates are not on `crates.io` yet. The upload is refused with "a verified
-  email address is required to publish crates": the registry token belongs to an
-  account that has not verified its address, so `crates.io/crates/lidlesseye`
-  answers 404 and `cargo install lidlesseye` does not work. The tag, the image
-  and the chart do not depend on it — `scripts/publish-crates.sh` resumes at
-  whichever crate is still missing once the account is fixed.
 
 ## [0.1.1] - 2026-11-18
 

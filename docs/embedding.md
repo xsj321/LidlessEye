@@ -288,6 +288,13 @@ Two details decide whether the published crate is usable:
   `web/package.json` and the tag. A published version cannot be reused, so a
   mistake costs a patch release rather than a re-upload.
 
+The crate pages on docs.rs will show **failed to build**, and that is not
+something the crates can fix: `libduckdb-sys` downloads `libduckdb.so` in its
+build script and docs.rs runs without network, and all four crates reach it
+transitively (`lidlesseye-ebpf` through `lidlesseye-core`). The crates.io page
+still renders the README; build the API documentation with
+`cargo doc --workspace --no-deps`.
+
 If the upload is refused with `A verified email address is required to publish
 crates to crates.io`, the token is fine and the account is not: crates.io does
 not accept a first publication from an account with an unverified address.
