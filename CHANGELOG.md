@@ -30,6 +30,14 @@ Rust API follows the same rule.
   indexing, which is what made the state count fit.
 - The payload pointer's offset is read from the running kernel's BTF instead of
   a CO-RE field name, because kernel 6.16 renamed `iov_iter.iov` to `__iov`.
+- The flamegraph separates reading from acting. A click selects a frame and
+  opens a details panel beside the canvas (self, total, depth, call stack, copy
+  name, zoom in) instead of moving the viewport; double click zooms. Labels are
+  fitted to their bar with an ellipsis instead of being cut mid-glyph.
+- The query bar is one form: profile, grouping and range on the left, refresh
+  behaviour on the right, and a line under it saying which window, grouping and
+  filter count the server actually queried. The button that said `Apply` now
+  says what it does — controls apply on change, so it only re-runs the query.
 
 ## [0.1.1] - 2026-11-18
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { Play } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -11,6 +11,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { formatClock } from "@/lib/format";
+import { rangeLabel, resolveWindow } from "@/lib/time";
 import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
 import { RANGES } from "@/lib/time";
@@ -41,7 +44,11 @@ function Field({
 }
 
 export function Toolbar() {
-  const { view, type, profileTypes, groupBy, labelNames, range, mode, auto } = useDashboard();
+  const state = useDashboard();
+  const { view, type, profileTypes, groupBy, labelNames, range, mode, auto, filters } = state;
+  // A relative range keeps `fromNs`/`untilNs` at zero until the brush moves;
+  // the window the query actually ran against is what this line reports.
+  const window = resolveWindow(state);
   const t = useT();
 
   // The service map is a network view: profile type, grouping, auto-refresh and
@@ -54,9 +61,19 @@ export function Toolbar() {
   const typeOptions = profileTypes.length ? profileTypes : ["cpu"];
   const groupOptions = ["", "service_name", ...labelNames];
 
+  // Controls apply the moment they change, so there is no commit step and no
+  // "Apply" button: it would only promise something the app never does. The
+  // button that looks like one re-runs the query, which is what a user wants
+  // when a range is stale or an earlier query failed.
+  const scope = groupBy ? `${t("grouped by")} ${groupBy}` : t("every service");
+  const filtered = filters.length
+    ? `${filters.length} ${filters.length === 1 ? t("filter") : t("filters")}`
+    : t("no filters");
+
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b bg-card px-3 py-2">
-      <Field label={t("Profile")}>
+    <div className="border-b bg-card px-3 py-2">
+      <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
+        <Field label={t("Profile")}>
         <Select value={type} onValueChange={(value) => dashboardStore.setType(value)}>
           <SelectTrigger size="sm" id="profile-type" className="w-32" aria-label={t("Profile type")}>
             <SelectValue />
@@ -116,18 +133,55 @@ export function Toolbar() {
         </Select>
       </Field>
 
-      <Field label={t("Auto")} className="gap-1.5">
-        <Switch
-          checked={auto}
-          onCheckedChange={(checked) => dashboardStore.setAuto(checked)}
-          aria-label={t("Auto")}
-        />
-      </Field>
+        <div className="ml-auto flex items-center gap-3">
+          <Field label={t("Auto refresh")} className="gap-1.5">
+            <Switch
+              checked={auto}
+              onCheckedChange={(checked) => dashboardStore.setAuto(checked)}
+              aria-label={t("Auto refresh")}
+            />
+          </Field>
 
-      <Button size="sm" id="apply" onClick={() => void dashboardStore.reload()}>
-        <Play className="size-3.5" />
-        {t("Apply")}
-      </Button>
+          {/* Deliberately quiet: the header already carries a labelled
+              Refresh, and controls apply on change, so this is only a retry.
+              A second orange button would compete with the real primary. */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="outline"
+                size="icon-sm"
+                id="apply"
+                aria-label={t("Re-run the query (R)")}
+                onClick={() => void dashboardStore.reload()}
+              >
+                <RefreshCw className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {t("Controls apply as you change them; this re-runs the query (R)")}
+            </TooltipContent>
+          </Tooltip>
+        </div>
+      </div>
+
+      {/* The summary answers "what am I looking at" without reading three
+          selects: the window the server actually resolved, the grouping, and
+          how many label filters are in force. */}
+      <p
+        className="mt-1.5 flex flex-wrap items-baseline gap-x-1.5 font-mono text-[11px] text-muted-foreground"
+        data-testid="query-summary"
+      >
+        <span className="text-foreground/80">{type}</span>
+        <span aria-hidden="true">·</span>
+        <span>
+          {formatClock(window.from)} → {formatClock(window.until)}
+          {mode === "relative" ? ` (${t(rangeLabel(range))})` : ""}
+        </span>
+        <span aria-hidden="true">·</span>
+        <span>{scope}</span>
+        <span aria-hidden="true">·</span>
+        <span>{filtered}</span>
+      </p>
     </div>
   );
 }

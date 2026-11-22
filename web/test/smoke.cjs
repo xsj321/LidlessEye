@@ -364,18 +364,48 @@ async function main() {
   check(introMotion === "intro", "the flamegraph animates into place", String(introMotion));
   await settle(page);
 
-  // Clicking a child frame must fly to it rather than cut to it. Row 3 at a
-  // quarter of the width is a wide frame in this seed no matter how the old
-  // batch reorders the siblings, so the click lands inside one.
-  await page.mouse.click(box.x + box.width * 0.25, box.y + ROW * 3 + ROW / 2);
+  // A click selects the frame and opens its details; it must not move the
+  // viewport, because a pane that keeps re-laying out is what made the details
+  // unreachable before. Row 3 at a quarter of the width is a wide frame in this
+  // seed no matter how the old batch reorders the siblings.
+  const frameX = box.x + box.width * 0.25;
+  const frameY = box.y + ROW * 3 + ROW / 2;
+  await page.mouse.click(frameX, frameY);
+  await settle(page);
+  check(
+    (await page.locator('[data-testid="frame-details"]').count()) === 1,
+    "clicking a frame opens its details",
+  );
+  check(
+    (await page.evaluate(
+      () => document.querySelector("canvas.fg-canvas")?.dataset.motion ?? null,
+    )) === null,
+    "selecting a frame does not move the viewport",
+  );
+  const frameName = await page
+    .locator('[data-testid="frame-details"] p')
+    .first()
+    .innerText();
+  check(frameName.length > 0, "the details name the frame", frameName);
+  await shot(page, "1a-frame-details");
+  await shot(page, "1a-frame-details");
+
+  // Double click zooms, and the breadcrumb carries the way back.
+  await page.mouse.dblclick(frameX, frameY);
   const zoomMotion = await page.evaluate(
     () => document.querySelector("canvas.fg-canvas")?.dataset.motion ?? null,
   );
-  check(zoomMotion === "zoom", "clicking a frame starts a viewport transition", String(zoomMotion));
+  check(zoomMotion === "zoom", "double clicking a frame starts a viewport transition", String(zoomMotion));
   await settle(page);
   const zoomNote = await page.locator('.fg-legend [data-role="zoom"]').innerText().catch(() => "");
   check(/% of total shown/.test(zoomNote), "the zoom landed on the clicked frame", zoomNote);
 
+  await page.keyboard.press("Escape");
+  await settle(page);
+  check(
+    (await page.locator('[data-testid="frame-details"]').count()) === 0,
+    "Escape drops the selection first",
+  );
   await page.keyboard.press("Escape");
   await settle(page);
   check(

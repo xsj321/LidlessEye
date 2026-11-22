@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { RotateCcw, Search } from "lucide-react";
+import { Check, Copy, Maximize2, RotateCcw, Search, X } from "lucide-react";
 
 import {
   Breadcrumb,
@@ -12,12 +12,120 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Flamegraph } from "@/lib/canvas/flamegraph";
-import type { Crumb, FlameHover, LegendEntry } from "@/lib/canvas/flamegraph";
-import { formatPercent } from "@/lib/format";
+import type { Crumb, FlameHover, FlameNodeDetail, LegendEntry } from "@/lib/canvas/flamegraph";
+import { formatPercent, formatValue } from "@/lib/format";
 import type { DiffPayload, FlamegraphPayload } from "@/lib/types";
 
 function shorten(label: string) {
   return label.length > 40 ? `${label.slice(0, 39)}…` : label;
+}
+
+/**
+ * The selected frame, in words.
+ *
+ * It sits beside the canvas rather than under it: the flamegraph is the thing
+ * being read, and a panel that pushes it up or eats its height makes deep
+ * stacks scroll. Everything here is also available on hover — the panel is
+ * what makes it persistent, selectable and copyable.
+ */
+function FrameDetails({
+  detail,
+  onClose,
+  onZoom,
+  onPick,
+  onCopy,
+  copied,
+}: {
+  detail: FlameNodeDetail;
+  onClose: () => void;
+  onZoom: () => void;
+  onPick: (index: number) => void;
+  onCopy: () => void;
+  copied: boolean;
+}) {
+  return (
+    <aside
+      aria-label="Selected frame"
+      data-testid="frame-details"
+      className="w-full shrink-0 rounded-md bg-card p-2.5 md:w-72"
+    >
+      <div className="mb-1.5 flex items-center gap-2">
+        <h3 className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+          Selected frame
+        </h3>
+        <span className="flex-1" />
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close frame details"
+          className="rounded-sm p-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <X className="size-3.5" />
+        </button>
+      </div>
+
+      <p className="mb-2 font-mono text-[11px] leading-snug break-all text-foreground">
+        {detail.name}
+      </p>
+
+      <dl className="mb-2.5 grid grid-cols-3 gap-1.5 text-center">
+        {[
+          ["Self", detail.selfValue, detail.selfShare],
+          ["Total", detail.totalValue, detail.totalShare],
+        ].map(([label, value, share]) => (
+          <div key={String(label)} className="rounded-sm bg-secondary/50 px-1.5 py-1">
+            <dt className="text-[9px] uppercase text-muted-foreground">{String(label)}</dt>
+            <dd className="font-mono text-[11px]">
+              {formatPercent(Number(share), 1)}
+            </dd>
+            <dd className="font-mono text-[9px] text-muted-foreground">
+              {formatValue(Number(value), detail.unit)}
+            </dd>
+          </div>
+        ))}
+        <div className="rounded-sm bg-secondary/50 px-1.5 py-1">
+          <dt className="text-[9px] uppercase text-muted-foreground">Depth</dt>
+          <dd className="font-mono text-[11px]">{detail.depth}</dd>
+          <dd className="text-[9px] text-muted-foreground">deep</dd>
+        </div>
+      </dl>
+
+      <div className="mb-1 text-[9px] uppercase tracking-wide text-muted-foreground">Call stack</div>
+      <ol className="mb-2.5 max-h-40 space-y-0.5 overflow-y-auto">
+        {detail.chain.map((node, index) => {
+          const current = index === detail.chain.length - 1;
+          return (
+            <li key={`${node.index}-${index}`}>
+              <button
+                type="button"
+                onClick={() => onPick(node.index)}
+                aria-current={current ? "true" : undefined}
+                className={
+                  current
+                    ? "w-full truncate rounded-sm bg-accent px-1 py-0.5 text-left font-mono text-[10px] text-accent-foreground"
+                    : "w-full truncate rounded-sm px-1 py-0.5 text-left font-mono text-[10px] text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+                }
+                title={node.name}
+              >
+                {node.name}
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+
+      <div className="flex items-center gap-1.5">
+        <Button variant="secondary" size="xs" onClick={onZoom}>
+          <Maximize2 />
+          Zoom in
+        </Button>
+        <Button variant="ghost" size="xs" onClick={onCopy}>
+          {copied ? <Check /> : <Copy />}
+          {copied ? "Copied" : "Copy name"}
+        </Button>
+      </div>
+    </aside>
+  );
 }
 
 /**
@@ -47,6 +155,8 @@ export function FlamegraphCanvas({
   const [zoom, setZoom] = useState(1);
   const [search, setSearch] = useState("");
   const [hover, setHover] = useState<FlameHover | null>(null);
+  const [selected, setSelected] = useState<FlameNodeDetail | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const positionTooltip = useCallback(() => {
     const el = tooltipRef.current;
@@ -71,6 +181,7 @@ export function FlamegraphCanvas({
       onMatch: setMatch,
       onLegend: setLegend,
       onZoom: setZoom,
+      onSelectNode: setSelected,
       onHover: (next, clientX, clientY) => {
         posRef.current = { x: clientX, y: clientY };
         const changed = (next?.index ?? -1) !== (hoverRef.current?.index ?? -1);
@@ -150,34 +261,54 @@ export function FlamegraphCanvas({
           </Breadcrumb>
         ) : (
           <span className="text-[11px] text-faint">
-            Click a frame to zoom, Esc to go back.
+            Click a frame for details · double click to zoom · Esc to go back.
           </span>
         )}
       </div>
 
-      <div ref={scrollRef} className="fg-scroll rounded-md border bg-background/40">
-        <canvas ref={canvasRef} className="fg-canvas" />
-      </div>
+      <div className="flex min-h-0 flex-col gap-2 md:flex-row">
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+          <div ref={scrollRef} className="fg-scroll rounded-md border bg-background/40">
+            <canvas ref={canvasRef} className="fg-canvas" />
+          </div>
 
-      <div className="fg-legend flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-        {legend.map((entry, index) => (
-          <span key={`${entry.text}-${index}`} className="flex items-center gap-1.5">
-            {entry.swatch ? (
-              <span
-                className="inline-block size-2 rounded-[2px]"
-                style={{
-                  background:
-                    entry.swatch === "diff-up" ? "hsl(358 60% 42%)" : "hsl(148 60% 42%)",
-                }}
-              />
+          <div className="fg-legend flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+            {legend.map((entry, index) => (
+              <span key={`${entry.text}-${index}`} className="flex items-center gap-1.5">
+                {entry.swatch ? (
+                  <span
+                    className="inline-block size-2 rounded-[2px]"
+                    style={{
+                      background:
+                        entry.swatch === "diff-up" ? "hsl(358 60% 42%)" : "hsl(148 60% 42%)",
+                    }}
+                  />
+                ) : null}
+                {entry.text}
+              </span>
+            ))}
+            {zoom < 1 ? (
+              <span className="text-faint" data-role="zoom">
+                {formatPercent(zoom, 1)} of total shown
+              </span>
             ) : null}
-            {entry.text}
-          </span>
-        ))}
-        {zoom < 1 ? (
-          <span className="text-faint" data-role="zoom">
-            {formatPercent(zoom, 1)} of total shown
-          </span>
+          </div>
+        </div>
+
+        {selected ? (
+          <FrameDetails
+            detail={selected}
+            onClose={() => graphRef.current?.clearSelection()}
+            onZoom={() => graphRef.current?.zoomTo(selected.index)}
+            onPick={(index) => graphRef.current?.select(index)}
+            copied={copied}
+            onCopy={() => {
+              void navigator.clipboard?.writeText(selected.name).then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1400);
+              });
+            }}
+          />
         ) : null}
       </div>
 

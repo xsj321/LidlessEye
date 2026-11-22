@@ -53,8 +53,20 @@ const ZH: Record<string, string> = {
   "Last 30 days": "最近 30 天",
   Auto: "自动",
   "Auto-refresh (interval set in Settings)": "自动刷新（间隔在设置中调整）",
+  "Auto refresh": "自动刷新",
   Apply: "应用",
   "Re-run the query with the current filters": "使用当前筛选条件重新查询",
+  "Re-run the query (R)": "重新执行查询 (R)",
+  "Controls apply as you change them; this re-runs the query (R)":
+    "控件改动即时生效；这里是重新执行当前查询 (R)",
+  "grouped by": "按",
+  "every service": "全部分组",
+  filter: "个筛选",
+  filters: "个筛选",
+  "no filters": "无筛选",
+
+  Filters: "筛选",
+  "Add filter": "添加筛选",
 
   // Time bar
   Relative: "相对时间",

@@ -64,13 +64,33 @@ export interface FlameHover {
   rows: Array<{ key: string; value: string }>;
 }
 
+/**
+ * What the details panel shows for the selected frame. Enough to answer "what
+ * is this, how much of the profile is it, and where does it sit" without
+ * hovering again, and copyable so it can be pasted into a ticket.
+ */
+export interface FlameNodeDetail {
+  index: number;
+  name: string;
+  depth: number;
+  /** Time attributed to the frame itself, and to it plus everything below. */
+  selfValue: number;
+  totalValue: number;
+  /** Shares of the whole window, 0..1. */
+  selfShare: number;
+  totalShare: number;
+  unit: string;
+  /** Root … frame, for the call-stack list. */
+  chain: Array<{ index: number; name: string }>;
+}
+
 export interface LegendEntry {
   text: string;
   swatch?: "diff-up" | "diff-down";
 }
 
 export interface FlamegraphCallbacks {
-  onSelect?: (name: string) => void;
+  onSelectNode?: (detail: FlameNodeDetail | null) => void;
   onCrumbs?: (crumbs: Crumb[]) => void;
   onMatch?: (text: string) => void;
   /** Zoom fraction of the whole graph currently visible, 0..1. */
@@ -111,6 +131,7 @@ export class Flamegraph {
   } | null = null;
   private frame: number | null = null;
   private hovered = -1;
+  private selected = -1;
   private reducedMotion = false;
 
   private n = 0;
@@ -165,7 +186,13 @@ export class Flamegraph {
 
     this.keyHandler = (event: KeyboardEvent) => {
       if ((event.target as HTMLElement | null)?.matches?.("input, select, textarea")) return;
-      if (event.key === "Escape") this.zoomOut();
+      if (event.key === "Escape") {
+        if (this.selected !== -1) {
+          this.clearSelection();
+          return;
+        }
+        this.zoomOut();
+      }
       else if (event.key === "+" || event.key === "=") this.zoomAt(0.5, 1.5);
       else if (event.key === "-") this.zoomAt(0.5, 1 / 1.5);
       else if (event.key === "0") this.reset();
@@ -279,6 +306,10 @@ export class Flamegraph {
     this.data = data;
     this.view = { x0: 0, x1: 1 };
     this.crumbs = [];
+    if (this.selected !== -1) {
+      this.selected = -1;
+      this.callbacks.onSelectNode?.(null);
+    }
     this.zoomAnim = null;
 
     // A diff payload carries two windows per node. The layout is driven by the
@@ -637,6 +668,17 @@ export class Flamegraph {
           ctx.strokeRect(px + 1, y + 2, Math.max(pw - 2, 0.6), ROW_HEIGHT - 4);
         }
 
+        if (i === this.selected) {
+          // Selection outlives the pointer, so it is drawn on top of the
+          // hover ring: a 2px frame in the accent colour plus a tint, which
+          // reads on every band colour without adding a shadow or a radius.
+          ctx.fillStyle = "rgba(255, 255, 255, 0.14)";
+          ctx.fillRect(px, y + 1, Math.max(pw - 0.6, 0.6), ROW_HEIGHT - 2);
+          ctx.strokeStyle = "rgba(242, 166, 90, 1)";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(px + 1, y + 2, Math.max(pw - 2, 0.6), ROW_HEIGHT - 4);
+        }
+
         if (grow >= 1 && pw >= MIN_LABEL_PX) {
           const name = names[i];
           const pct = w[i];
@@ -646,7 +688,22 @@ export class Flamegraph {
           ctx.clip();
           ctx.fillStyle = "rgba(12, 10, 8, 0.92)";
           const text = pw > 220 ? `${name}  ${formatPercent(pct, 0)}` : name;
-          ctx.fillText(text, px + 5, y + ROW_HEIGHT / 2);
+          // Fitting the label to the bar instead of letting `clip()` cut it
+          // mid-glyph: a hard cut reads as a rendering bug, an ellipsis reads
+          // as "there is more", and the tooltip has the full name either way.
+          const room = pw - 10;
+          let label = text;
+          if (ctx.measureText(label).width > room) {
+            let lo = 0;
+            let hi = label.length;
+            while (lo < hi) {
+              const mid = (lo + hi + 1) >> 1;
+              if (ctx.measureText(`${label.slice(0, mid)}…`).width <= room) lo = mid;
+              else hi = mid - 1;
+            }
+            label = lo > 0 ? `${text.slice(0, lo)}…` : "";
+          }
+          if (label) ctx.fillText(label, px + 5, y + ROW_HEIGHT / 2);
           ctx.restore();
         }
       }
@@ -711,14 +768,23 @@ export class Flamegraph {
 
     window.addEventListener("mouseup", this.onWindowMouseUp);
 
+    // Click selects and opens the details panel; double click zooms. Zooming
+    // on single click made the details impossible to reach, and the panel
+    // carries its own "Zoom in" action for anyone who expects it there.
     canvas.addEventListener("click", (event) => {
       if (moved > 4) return;
       const rect = canvas.getBoundingClientRect();
       const index = this.hitTest(event.clientX - rect.left, event.clientY - rect.top);
-      if (index > 0) this.zoomTo(index);
+      if (index > 0) this.select(index);
+      else this.clearSelection();
     });
 
-    canvas.addEventListener("dblclick", () => this.reset());
+    canvas.addEventListener("dblclick", (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const index = this.hitTest(event.clientX - rect.left, event.clientY - rect.top);
+      if (index > 0) this.zoomTo(index);
+      else this.reset();
+    });
 
     canvas.addEventListener("mouseleave", () => {
       this.callbacks.onHover?.(null, 0, 0);
@@ -822,7 +888,52 @@ export class Flamegraph {
     this.crumbs.push(index);
     this.revealFrame(index);
     this.emitCrumbs();
-    this.callbacks.onSelect?.(this.data.names[index]);
+  }
+
+  /** Select a frame: the details panel follows, the viewport does not move. */
+  select(index: number) {
+    if (!this.data || index < 0) {
+      this.clearSelection();
+      return;
+    }
+    if (this.selected === index) return;
+    this.selected = index;
+    this.draw();
+    this.callbacks.onSelectNode?.(this.detail(index));
+  }
+
+  clearSelection() {
+    if (this.selected === -1) return;
+    this.selected = -1;
+    this.draw();
+    this.callbacks.onSelectNode?.(null);
+  }
+
+  /**
+   * Everything the panel needs about one frame. The chain is walked from the
+   * frame up to the root and then reversed, because the call stack reads
+   * outermost-first.
+   */
+  detail(index: number): FlameNodeDetail {
+    const data = this.data!;
+    const total = this.total || 1;
+    const chain: Array<{ index: number; name: string }> = [];
+    for (let at = index; at >= 0; at = this.parent[at]) {
+      chain.push({ index: at, name: data.names[at] });
+      if (this.parent[at] < 0) break;
+    }
+    chain.reverse();
+    return {
+      index,
+      name: data.names[index],
+      depth: this.depth[index],
+      selfValue: this.selfValue[index],
+      totalValue: this.value[index],
+      selfShare: this.selfValue[index] / total,
+      totalShare: this.value[index] / total,
+      unit: data.unit,
+      chain,
+    };
   }
 
   /** Fly to a frame's extent instead of cutting to it. */

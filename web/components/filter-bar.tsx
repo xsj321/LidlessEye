@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useT } from "@/lib/i18n";
 import { composeSelector, OPS } from "@/lib/selector";
 import { dashboardStore } from "@/lib/store";
 import type { LabelFilter } from "@/lib/types";
@@ -216,6 +217,7 @@ function FilterRow({ filter, index }: { filter: LabelFilter; index: number }) {
 
 export function FilterBar() {
   const { filters, labelNames } = useDashboard();
+  const t = useT();
   const selector = composeSelector(filters);
 
   const addFilter = () => {
@@ -230,11 +232,16 @@ export function FilterBar() {
       id="filters"
       data-selector={selector}
     >
+      {/* Without a label this row reads as debris under the query bar; naming
+          it is what makes clear these chips are part of the query. */}
+      <span className="text-[11px] whitespace-nowrap text-muted-foreground">
+        {t("Filters")}
+      </span>
       <Tooltip>
         <TooltipTrigger asChild>
           <Button variant="ghost" size="xs" className="filter-add" onClick={addFilter}>
             <Plus />
-            Filter
+            {t("Add filter")}
           </Button>
         </TooltipTrigger>
         <TooltipContent>Add a label matcher to the selector</TooltipContent>
