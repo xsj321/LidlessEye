@@ -364,6 +364,44 @@ export function searchNodes(
   return scored.slice(0, limit).map((entry) => entry.node);
 }
 
+/**
+ * Ink and dash patterns for the four things one line can say.
+ *
+ * Exported because the legend beside the map has to draw the same ink the map
+ * draws; a second copy of these hex values would drift the first time one of
+ * them is tuned.
+ *
+ *   idle      an ordinary hop, between two nodes the reader is not looking at
+ *   emphasis  a hop of the selected node, or of the card under the pointer
+ *   warn      retransmits on this edge (long dash)
+ *   external  the far end is outside the cluster (fine dot)
+ */
+export const EDGE_STYLE = {
+  idle: "#55657c",
+  emphasis: "#a9c8f2",
+  warn: "#e05c5c",
+  external: "#8d94a8",
+  /** Label pill: a near-black plate, not a card surface, so a number reads
+   *  over a curve without turning into a second card. */
+  label: "#0e1014",
+  labelBorder: "#232b36",
+  labelText: "#a9b4c6",
+} as const;
+
+/** Dash patterns, as SVG `stroke-dasharray`. Two meanings, never one style. */
+export const EDGE_DASH = { warn: "5 4", external: "1.5 3" } as const;
+
+/** Stroke width for an edge, in world pixels.
+ *
+ * Traffic drives it on a log scale — a hub edge with a thousand times the rate
+ * of a health check must not be a thousand times thicker — and a emphasised
+ * hop gets a little extra so it stays ahead of its neighbours.
+ */
+export function edgeWidth(rate: number, bytes: number, emphasis: boolean): number {
+  const base = 0.9 + Math.min(1.7, Math.log10(1 + rate * 20 + bytes / 8192 + 1) * 0.85);
+  return base + (emphasis ? 0.35 : 0);
+}
+
 export interface EdgePath {
   d: string;
   /** Where the label goes: the midpoint of the drawn curve. */

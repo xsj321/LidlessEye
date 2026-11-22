@@ -36,11 +36,14 @@
 import { useId } from "react";
 
 import {
+  EDGE_DASH,
+  EDGE_STYLE,
   edgePath,
   edgeProtocol,
   edgeRate,
   formatRate,
   formatRtt,
+  edgeWidth,
   pointOnEdge,
 } from "@/lib/servicemap-graph";
 import type { Box, EdgeBow, EdgePath } from "@/lib/servicemap-graph";
@@ -52,20 +55,9 @@ export function edgeKey(edge: ServiceMapEdge): string {
   return `${edge.client}->${edge.server}:${edge.protocol}:${edge.client_container ?? ""}:${edge.server_container ?? ""}`;
 }
 
-const LINE = {
-  /** Unselected, ordinary hop. Brighter than the old #3a4553: on a dark card
-   *  surface that value was indistinguishable from the gap between columns. */
-  idle: "#55657c",
-  /** A hop that leaves the cluster: cooler and dotted, so "this call is not
-   *  ours" is visible before reading the label. */
-  external: "#8d94a8",
-  /** Incident to the selected node. */
-  emphasis: "#a9c8f2",
-  warn: "#e05c5c",
-  label: "#0e1014",
-  labelBorder: "#232b36",
-  labelText: "#a9b4c6",
-};
+// Colours and dash patterns live in the shared module so the legend beside the
+// map is drawing the same ink as the map, not a second copy that can drift.
+const LINE = EDGE_STYLE;
 
 // The label has to fit in the channel between two card columns, and that
 // channel is what decides its size: 9px monospace with 10px of padding leaves
@@ -290,10 +282,15 @@ export function EdgeLayer({
         const lit = hoveredNode
           ? edge.client === hoveredNode || edge.server === hoveredNode
           : hoveredEdge === key;
+        // With a card under the pointer, every line that does not touch it
+        // steps back: the map is a hairball at overview zoom, and "what does
+        // this node talk to" is a question the pointer can ask without
+        // selecting anything.
+        const context = hoveredNode ? lit : true;
         const tone = warn ? "warn" : lit || (selected && touched) ? "emphasis" : external ? "external" : "idle";
         const stroke =
           tone === "warn" ? LINE.warn : tone === "emphasis" ? LINE.emphasis : external ? LINE.external : LINE.idle;
-        const emphasis = lit || (selected && touched && !warn);
+        const emphasis = Boolean(lit || (selected && touched && !warn));
         return (
           <g key={key}>
             {/* A wide transparent twin of the curve: a 1px line is impossible
@@ -325,16 +322,11 @@ export function EdgeLayer({
               // a fat line competes with the card it points at. The floor is
               // thick enough to see at fit zoom on a dark surface.
               strokeWidth={
-                muted
-                  ? 1.2
-                  : 0.9 +
-                    Math.min(
-                      1.7,
-                      Math.log10(1 + rate * 20 + (edge.tx_bytes ?? 0) / 8192 + 1) * 0.85,
-                    ) +
-                    (emphasis ? 0.35 : 0)
+                muted ? 1.2 : edgeWidth(rate, edge.tx_bytes ?? 0, emphasis)
               }
-              strokeOpacity={muted ? 0.62 : touched ? (emphasis ? 1 : 0.9) : 0.4}
+              strokeOpacity={
+                muted ? 0.62 : !context ? 0.16 : touched ? (emphasis ? 1 : 0.9) : 0.4
+              }
               strokeLinecap="round"
               markerEnd={
                 undirected ? undefined : `url(#${marker(tone === "warn" ? "warn" : emphasis ? "emphasis" : external ? "external" : "idle")})`
@@ -343,7 +335,13 @@ export function EdgeLayer({
               // warning, a fine dot says the target is outside the cluster.
               // Selling them as one style would make a healthy outbound call
               // look like a broken one.
-              strokeDasharray={warn && !muted ? "5 4" : external && !muted ? "1.5 3" : undefined}
+              strokeDasharray={
+                warn && !muted
+                  ? EDGE_DASH.warn
+                  : external && !muted
+                    ? EDGE_DASH.external
+                    : undefined
+              }
               style={{ transition: "opacity 150ms ease, stroke 150ms ease" }}
             />
           </g>
@@ -361,7 +359,7 @@ export function EdgeLayer({
           <g
             key={key}
             data-protocol={protocol || edge.protocol || "tcp"}
-            opacity={touched ? 1 : 0.1}
+            opacity={hoveredNode && edge.client !== hoveredNode && edge.server !== hoveredNode ? 0.12 : touched ? 1 : 0.1}
             style={{ transition: "opacity 150ms ease" }}
             transform={`translate(${spot.x + spot.w / 2},${spot.y + spot.h / 2})`}
           >

@@ -261,9 +261,15 @@ the selection: unselected hops are a legible steel grey (they used to be so
 dim they disappeared into the card surface), hops of the selected node are a
 bright blue, retransmits are red. **Opacity** separates the subject from the
 context: with a node selected, everything unrelated drops to a hint, and
-hovering a card or a line lifts just that hop. An edge to something outside the
+hovering a card or a line lifts just that hop, and a card under the pointer
+drops every line that does not touch it to a hint — at overview zoom the map is
+a hairball, and "what does this card talk to" is a question the pointer can ask
+without selecting anything. An edge to something outside the
 cluster is dotted and cooler, because "this call leaves the cluster" is a
-different fact from "these two pods talk".
+different fact from "these two pods talk". The row above the map carries a key
+for all four — `call`, `selected`, `retransmit`, `outside` — drawn with the
+same constants the canvas strokes with, so the legend cannot describe a style
+the map no longer draws; `arrow = direction · width = traffic` sits beside it.
 
 Every edge is labelled with the application protocol the payload sniffer saw
 (or the port's fallback), new connections per second and the mean round-trip

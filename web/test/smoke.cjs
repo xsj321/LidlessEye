@@ -1038,6 +1038,21 @@ async function main() {
     "the map never loads the CPU timeseries for its brush",
     mapApiCalls.join(" | "),
   );
+  // The edge key names every ink the canvas draws: a grey hop, a selected hop,
+  // a retransmit, and a call that leaves the cluster. Without it the four
+  // styles are only learnable by hovering each one.
+  const edgeLegend = await mapPage
+    .locator('[data-testid="map-edge-legend"]')
+    .innerText()
+    .catch(() => "");
+  check(
+    ["call", "selected", "retransmit", "outside"].every((word) =>
+      edgeLegend.toLowerCase().includes(word),
+    ),
+    "the map explains what each edge style means",
+    edgeLegend,
+  );
+
   const mapHistResponse = await fetch(
     `${BASE}/api/v1/servicemap/histogram?from=now-1h&buckets=60`,
     { headers: { "x-scope-orgid": "acme" } },

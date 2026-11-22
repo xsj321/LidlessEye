@@ -19,7 +19,7 @@ import { EmptyState } from "@/components/empty-state";
 import { Input } from "@/components/ui/input";
 import { formatCount, formatDuration } from "@/lib/format";
 import { useT } from "@/lib/i18n";
-import { KIND, nodeLabel, searchNodes } from "@/lib/servicemap-graph";
+import { EDGE_DASH, EDGE_STYLE, KIND, nodeLabel, searchNodes } from "@/lib/servicemap-graph";
 import { dashboardStore } from "@/lib/store";
 import type { ServiceMapNode } from "@/lib/types";
 import { useDashboard } from "@/lib/use-dashboard";
@@ -33,6 +33,42 @@ function LegendSwatch({ kind }: { kind: keyof typeof KIND }) {
     <span className="relative inline-flex h-2.5 w-4 overflow-hidden rounded-[3px] border border-white/10">
       <span className="h-full w-[2px]" style={{ background: KIND[kind].bar }} />
       <span className="h-full flex-1" style={{ background: KIND[kind].tint }} />
+    </span>
+  );
+}
+
+/**
+ * One line of the edge key: the stroke the map would draw, and the label.
+ *
+ * A sample is not decoration here — `strokeDasharray` and the colour are read
+ * from the same constants the canvas uses, so tuning the map cannot leave the
+ * legend telling a different story.
+ */
+function EdgeSample({
+  tone,
+  label,
+}: {
+  tone: "idle" | "emphasis" | "warn" | "external";
+  label: string;
+}) {
+  const color = EDGE_STYLE[tone];
+  const dashed = tone === "warn" || tone === "external";
+  return (
+    <span className="flex items-center gap-1">
+      <svg viewBox="0 0 26 8" className="h-2 w-[26px] shrink-0" aria-hidden="true">
+        <line
+          x1="0"
+          y1="4"
+          x2="18"
+          y2="4"
+          stroke={color}
+          strokeWidth={tone === "emphasis" ? 2.2 : 1.6}
+          strokeLinecap="round"
+          strokeDasharray={dashed ? EDGE_DASH[tone as "warn" | "external"] : undefined}
+        />
+        <path d="M18.4 1.3 L24.4 4 L18.4 6.7 z" fill={color} />
+      </svg>
+      {label}
     </span>
   );
 }
@@ -217,23 +253,25 @@ export function ServiceMapView() {
           <LegendSwatch kind="external" />
           {t("external")}
         </span>
-        {/* An outbound hop is the one edge style that is not just "a line":
-            dotted and cooler, so a dependency the cluster does not own is
-            visible without reading its label. */}
-        <span className="flex items-center gap-1">
-          <svg viewBox="0 0 24 8" className="h-2 w-6" aria-hidden="true">
-            <line
-              x1="0"
-              y1="4"
-              x2="17"
-              y2="4"
-              stroke="#8d94a8"
-              strokeWidth="1.2"
-              strokeDasharray="1.5 3"
-            />
-            <path d="M17 1.5 L23 4 L17 6.5 z" fill="#8d94a8" />
-          </svg>
-          {t("external dependency")}
+        {/* A divider, because the swatches before it describe nodes and the
+            samples after it describe the lines between them: two different
+            questions that would otherwise read as one long row. */}
+        <span aria-hidden="true" className="h-3 w-px bg-border" />
+        {/* The edge key. Four inks, in the order a reader meets them: an
+            ordinary hop, the hops of whatever is selected, a retransmit
+            warning, and a call that leaves the cluster. The samples are drawn
+            from the same constants the canvas strokes with, so the legend
+            cannot end up describing a style the map no longer draws. */}
+        <span
+          className="flex items-center gap-2"
+          role="group"
+          aria-label={t("Edge legend")}
+          data-testid="map-edge-legend"
+        >
+          <EdgeSample tone="idle" label={t("call")} />
+          <EdgeSample tone="emphasis" label={t("selected")} />
+          <EdgeSample tone="warn" label={t("retransmit")} />
+          <EdgeSample tone="external" label={t("outside")} />
         </span>
         <span className="flex items-center gap-1">
           <StatusGlyphLegend tone="ok" />
@@ -252,7 +290,7 @@ export function ServiceMapView() {
           CPU
         </span>
         <span className="text-muted-foreground/70">
-          {t("arrow = direction · width = traffic · dotted = outside the cluster")}
+          {t("arrow = direction · width = traffic")}
         </span>
         {map.truncated ? <Badge variant="secondary">{t("clipped to 600 nodes")}</Badge> : null}
         {/* Search: the only way to find one card among sixty without reading

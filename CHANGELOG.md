@@ -50,6 +50,13 @@ Rust API follows the same rule.
   ClusterIPs, external — and sorts each column by kind so a band is possible at
   all. Cards now carry a third line: new connections per second and on-CPU time
   for the window.
+- Hovering a card drops every line that does not touch it to a hint, so the
+  pointer answers "what does this talk to" on a map whose overview is a
+  hairball — without selecting the node first.
+- The row above the map carries an **edge key** — `call`, `selected`,
+  `retransmit`, `outside` — drawn from the same colour and dash constants the
+  canvas strokes with, plus `arrow = direction · width = traffic`. Four line
+  styles used to be learnable only by hovering one.
 - Edges state direction and weight separately: arrowheads on the target end,
   stroke width from traffic, a bright emphasis colour for the selected node's
   hops, and a dotted cooler line for anything that leaves the cluster.
