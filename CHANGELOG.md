@@ -122,19 +122,27 @@ well as connections.
   breadcrumb, details and export live in one shell behind a renderer interface,
   so a second profile type reuses them instead of re-implementing analysis.
 
+### Pending
+
+- The crates are not on `crates.io` yet. The upload is refused with "a verified
+  email address is required to publish crates": the registry token belongs to an
+  account that has not verified its address, so `crates.io/crates/lidlesseye`
+  answers 404 and `cargo install lidlesseye` does not work. The tag, the image
+  and the chart do not depend on it — `scripts/publish-crates.sh` resumes at
+  whichever crate is still missing once the account is fixed.
+
 ## [0.1.1] - 2026-11-18
 
-A packaging release: the image and the chart now ship from the same place, and
-the crates are on crates.io. No collection, storage or dashboard behaviour
-changed since 0.1.0.
+A packaging release: the image and the chart now ship from the same place. No
+collection, storage or dashboard behaviour changed since 0.1.0.
 
 ### Added
 
-- The workspace crates are published: `lidlesseye` (builder and CLI),
-  `lidlesseye-server`, `lidlesseye-core` and `lidlesseye-ebpf`, so
-  `cargo add lidlesseye` is enough to embed the whole stack. The dashboard ships
-  inside `lidlesseye-server` — `build.rs` mirrors `web/dist` into the crate's
-  `ui/`, which is what `cargo package` uploads and what `rust-embed` reads.
+- The workspace crates are packaged for publication: `lidlesseye` (builder and
+  CLI), `lidlesseye-server`, `lidlesseye-core` and `lidlesseye-ebpf`. The
+  dashboard ships inside `lidlesseye-server` — `build.rs` mirrors `web/dist`
+  into the crate's `ui/`, which is what `cargo package` uploads and what
+  `rust-embed` reads.
 - `scripts/publish-crates.sh` publishes them in dependency order, waits for each
   version to reach the index and skips what is already there.
 

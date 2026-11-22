@@ -287,3 +287,12 @@ Two details decide whether the published crate is usable:
   release workflow requires it to match `deploy/helm/lidlesseye/Chart.yaml`,
   `web/package.json` and the tag. A published version cannot be reused, so a
   mistake costs a patch release rather than a re-upload.
+
+If the upload is refused with `A verified email address is required to publish
+crates to crates.io`, the token is fine and the account is not: crates.io does
+not accept a first publication from an account with an unverified address.
+Verify it at <https://crates.io/settings/profile>, enable the two-factor
+authentication the same page offers for publishing, and re-run the script — it
+skips whatever already reached the index. Until then the crate pages answer 404
+and `cargo install lidlesseye` does not work; the image and the chart are
+unaffected.

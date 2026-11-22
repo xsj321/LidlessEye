@@ -15,6 +15,11 @@
 #
 #   ./scripts/dev.sh bash scripts/publish-crates.sh
 #
+# If crates.io answers "a verified email address is required to publish", the
+# token is fine and the account is not: verify the address at
+# https://crates.io/settings/profile, then re-run — this script skips what
+# already reached the index, so a refused run costs nothing.
+#
 # The token comes from `CARGO_REGISTRY_TOKEN`, or from `.tmp/crates-token`
 # (gitignored) when the variable is unset, so it never has to be typed into a
 # command line or written to shell history:
