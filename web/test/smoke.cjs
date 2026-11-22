@@ -1081,11 +1081,15 @@ async function main() {
   const edgeLabelTexts = await mapPage
     .locator('[data-testid="service-map-canvas"] svg text')
     .evaluateAll((nodes) => nodes.map((node) => node.textContent ?? ""));
+  // One unit for every label, so the column of latencies compares at a glance:
+  // milliseconds, with the precision shrinking as the value grows.
+  const latencies = edgeLabelTexts.flatMap((text) => text.match(/[\d.]+(?:ns|µs|ms|s)\b/g) ?? []);
   check(
     edgeLabelTexts.length > 0 &&
-      edgeLabelTexts.some((text) => text.includes("ms")) &&
-      !edgeLabelTexts.some((text) => /1000(ms|µs|s)|0\.00\d*\s*(s|ms|µs)/.test(text)),
-    "edge latencies pick a unit with a digit in the ones place",
+      latencies.length > 0 &&
+      latencies.every((value) => value.endsWith("ms")) &&
+      !latencies.some((value) => /^0ms$|^0\.0+ms$/.test(value)),
+    "edge latencies are printed in milliseconds only",
     edgeLabelTexts.join(" | "),
   );
 

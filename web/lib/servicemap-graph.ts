@@ -594,13 +594,15 @@ export function formatRate(rate: number): string {
 }
 
 /**
- * Microseconds in, a duration on the edge out.
+ * Microseconds in, a duration out, in whichever unit keeps a digit before the
+ * decimal point.
  *
  * The generic formatter is happy to print `0.005s` when a unit two orders of
- * magnitude smaller says `5ms`. An edge label is measured in pixels, so it
- * picks the unit that leaves exactly one non-zero digit in the ones place —
- * never a leading `0.` and never a four-digit `1000ms` that should have
- * carried into `1s`.
+ * magnitude smaller says `5ms`, so this picks the unit that leaves exactly one
+ * non-zero digit in the ones place — never a leading `0.` and never a
+ * four-digit `1000ms` that should have carried into `1s`. That is what the
+ * panels want, where the number is the subject and `149µs` is more informative
+ * than `0.149ms`. Labels do not, and use `formatEdgeRtt`.
  *
  * The subtlety is rounding: `999.6µs` rounds to `1000µs`, which is the same as
  * `1ms` but reads worse and loses the digit. So the value is rounded first and
@@ -641,6 +643,29 @@ export function formatRtt(rttUs: number | undefined): string {
     digits = value >= 100 ? 0 : value >= 10 ? 1 : 2;
   }
   return `${measurement(value, digits)}${RTT_UNITS[index].suffix}`;
+}
+
+/**
+ * Latency as it appears on an edge label: always milliseconds.
+ *
+ * `formatRtt` picks a unit per value, which is right for a panel where the
+ * number is the subject. A label is not a subject, it is a row in a column the
+ * eye scans: `820µs` beside `1.1ms` makes the reader convert before it can see
+ * that the second hop is the slower one. One unit for every label means the
+ * digits compare directly, and milliseconds is the unit the map actually lands
+ * in.
+ *
+ * Precision follows magnitude instead, because the pill is 15px tall: two
+ * decimals below 1ms, one below 100ms, none above. That keeps every label to
+ * three significant digits (four once past a second) — the most that is
+ * legible at 9px — without a trailing `.0` that reads as noise.
+ */
+export function formatEdgeRtt(rttUs: number | undefined): string {
+  if (rttUs == null || !Number.isFinite(rttUs) || rttUs <= 0) return "";
+  const ms = rttUs / 1000;
+  // Below the printing precision the honest label is a bound, not `0ms`.
+  if (ms < 0.01) return "<0.01ms";
+  return `${measurement(ms, ms >= 100 ? 0 : ms >= 10 ? 1 : 2)}ms`;
 }
 
 /** What the edge label calls the protocol, including a payload-based hit. */

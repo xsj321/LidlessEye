@@ -40,8 +40,8 @@ import {
   edgePath,
   edgeProtocol,
   edgeRate,
+  formatEdgeRtt,
   formatRate,
-  formatRtt,
   edgeWidth,
   pointOnEdge,
 } from "@/lib/servicemap-graph";
@@ -277,7 +277,7 @@ export function EdgeLayer({
     const rate = edgeRate(edge, windowSec);
     const rateText = formatRate(rate);
     const protocol = edgeProtocol(edge);
-    const rttText = edge.rtt_us ? formatRtt(edge.rtt_us) : "";
+    const rttText = formatEdgeRtt(edge.rtt_us);
     const fullText = [protocol, rateText, rttText].filter(Boolean).join(" · ");
     const withoutRtt = [protocol, rateText].filter(Boolean).join(" · ");
     const widthOf = (text: string) => Math.round(text.length * LABEL.advance + LABEL.pad);

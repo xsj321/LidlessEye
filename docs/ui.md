@@ -273,10 +273,14 @@ the map no longer draws; `arrow = direction · width = traffic` sits beside it.
 
 Every edge is labelled with the application protocol the payload sniffer saw
 (or the port's fallback), new connections per second and the mean round-trip
-time of the connections that closed in the window (`http · 0.31/s · 149µs`).
-Latency picks the unit that keeps a digit before the decimal point — `8µs`,
-`149µs`, `12ms`, `1.4s` — instead of printing `0.005s`, and a rate below one per
-second switches to per-minute. Labels are *placed*, not dropped at the
+time of the connections that closed in the window (`http · 0.31/s · 1.6ms`).
+Latency on a label is always milliseconds: the labels form a column the eye
+scans, and `820µs` beside `1.1ms` would make the reader convert before seeing
+which hop is slower. Precision follows magnitude instead — two decimals below a
+millisecond, one below a hundred, none above — so every label under a second
+carries three significant digits at most, and a hop faster than that precision
+reads `<0.01ms` rather than `0ms`. A rate below one per second switches to
+per-minute. Labels are *placed*, not dropped at the
 geometric midpoint —
 each is tried at nine points along its curve and seven offsets from each, and
 takes the first spot that clears every card by 4px and every other label by 2px.
