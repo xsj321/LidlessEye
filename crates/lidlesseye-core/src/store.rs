@@ -839,7 +839,27 @@ impl Store {
         // (a full label map repeated per stack), so reading only
         // `stack_id, value` removes most of the I/O on a wide scan.
         let needs_series = !query.selector.is_empty() || query.group_by.is_some();
-        let mut sql = if needs_series {
+        // A gauge is a snapshot, so the window selects *which* snapshot, not how
+        // many to add up: only the newest batch of each series inside the window
+        // is read. Summing the flushes of `inuse_space` would report a heap five
+        // times its size over five flushes.
+        let gauge = query.profile_type.is_gauge();
+        let series_columns = if needs_series {
+            "stack_id, service_name, labels, "
+        } else {
+            "stack_id, "
+        };
+        let mut sql = if gauge {
+            let inner = vec!["?"; types.len()].join(", ");
+            format!(
+                "SELECT {series_columns}SUM(value), COUNT(*) FROM samples \
+                 WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ? \
+                   AND (service_name, labels, end_ns) IN (\
+                        SELECT service_name, labels, MAX(end_ns) FROM samples \
+                        WHERE profile_type IN ({inner}) AND end_ns > ? AND start_ns < ? \
+                        GROUP BY 1, 2)"
+            )
+        } else if needs_series {
             format!(
                 "SELECT stack_id, service_name, labels, SUM(value), COUNT(*) FROM samples \
                  WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ?"
@@ -856,6 +876,15 @@ impl Store {
         }
         args.push(Box::new(ts(query.from_ns)));
         args.push(Box::new(ts(query.until_ns)));
+        if gauge {
+            // The subquery repeats the type and time filters, so it is bound
+            // again rather than referenced by name.
+            for t in &types {
+                args.push(Box::new(t.as_str().to_string()));
+            }
+            args.push(Box::new(ts(query.from_ns)));
+            args.push(Box::new(ts(query.until_ns)));
+        }
 
         let mut clauses: Vec<String> = Vec::new();
         push_selector_sql(query.selector, &mut clauses, &mut args);
@@ -1197,8 +1226,14 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT service_name, profile_type, labels, SUM(total_value), COUNT(*), \
-                        MIN(start_ns), MAX(end_ns) FROM batches \
+                // A gauge is reported as the newest batch of the series, not as
+                // the sum of every batch in the window: `inuse_space` is memory
+                // held at one instant, and adding ten instants multiplies it by
+                // ten. `arg_max` picks the value that belongs to `MAX(end_ns)`.
+                "SELECT service_name, profile_type, labels, \
+                        CASE WHEN profile_type IN ('inuse_space', 'inuse_objects') \
+                             THEN arg_max(total_value, end_ns) ELSE SUM(total_value) END, \
+                        COUNT(*), MIN(start_ns), MAX(end_ns) FROM batches \
                  WHERE end_ns > ? AND start_ns < ? GROUP BY 1, 2, 3",
             )
             .map_err(db_err)?;

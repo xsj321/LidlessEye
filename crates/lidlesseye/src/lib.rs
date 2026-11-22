@@ -126,6 +126,9 @@ pub struct Builder {
     flush_interval: Duration,
     collect_cpu: bool,
     collect_off_cpu: bool,
+    collect_heap: bool,
+    heap_objects: bool,
+    collect_alloc: bool,
     enrich_kubernetes_labels: bool,
     k8s_pod_metadata: bool,
     k8s_pod_refresh: Duration,
@@ -164,6 +167,9 @@ impl Default for Builder {
             flush_interval: Duration::from_secs(10),
             collect_cpu: true,
             collect_off_cpu: true,
+            collect_heap: true,
+            heap_objects: false,
+            collect_alloc: true,
             enrich_kubernetes_labels: true,
             k8s_pod_metadata: true,
             k8s_pod_refresh: Duration::from_secs(30),
@@ -328,6 +334,25 @@ impl Builder {
         self
     }
 
+    /// Read Go heap profiles out of each process's runtime.
+    pub fn collect_heap(mut self, enabled: bool) -> Self {
+        self.collect_heap = enabled;
+        self
+    }
+
+    /// Profile native heaps (C, C++, Rust, ...) by hooking the allocator's
+    /// `malloc`/`free` family with uprobes.
+    pub fn collect_alloc(mut self, enabled: bool) -> Self {
+        self.collect_alloc = enabled;
+        self
+    }
+
+    /// Also store allocation / in-use object counts, not only bytes.
+    pub fn heap_objects(mut self, enabled: bool) -> Self {
+        self.heap_objects = enabled;
+        self
+    }
+
     /// Attach the `k8s_*` labels derived from each process's cgroup.
     pub fn enrich_kubernetes_labels(mut self, enabled: bool) -> Self {
         self.enrich_kubernetes_labels = enabled;
@@ -416,6 +441,9 @@ impl Builder {
                 flush_interval: self.flush_interval,
                 collect_cpu: self.collect_cpu,
                 collect_off_cpu: self.collect_off_cpu,
+                collect_heap: self.collect_heap,
+                heap_objects: self.heap_objects,
+                collect_alloc: self.collect_alloc,
                 enrich_kubernetes_labels: self.enrich_kubernetes_labels,
                 // The pod UID comes from the cgroup labels, so asking the API
                 // without them would be a request per interval and no names.

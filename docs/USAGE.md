@@ -24,6 +24,26 @@ sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 
 For a distributed setup, run `lidlesseye serve` on a storage host and `lidlesseye collect --server http://storage:4040` on every node.
 
+The agent profiles CPU, off-CPU and memory at the same time. Memory has two
+readers and both are on by default: Go heaps are read from the runtime, and
+every other language is counted at the allocator's `malloc`, `calloc`,
+`realloc` and `free` through uprobes. What each one produces:
+
+| Profile type | Unit | Kind | Reads |
+| --- | --- | --- | --- |
+| `alloc_space` | bytes | rate | allocated during the flush interval |
+| `inuse_space` | bytes | level | held at the end of the interval |
+| `alloc_objects` | count | rate | `--heap-objects` |
+| `inuse_objects` | count | level | `--heap-objects` |
+
+Flags: `--no-alloc` drops the allocator uprobes, `--no-heap` drops the Go heap
+reader, `--heap-objects` adds the two object counts. A process is measured by
+one reader, never both — a Go binary's `malloc` is already represented by the
+runtime's own profile. Memory labels answer "who measured this": `node`,
+`service_name`, `profile_source` (`go-runtime` or `allocator-uprobe`),
+`sampling` (`runtime` or `uprobe`), `runtime` (`go`, `c`, `c++`, `rust`, …) and
+`allocator` (`glibc`, `musl`, `jemalloc`, `mimalloc`, `tcmalloc`, `static`).
+
 Open <http://localhost:4040>. A bare URL opens the **service map**.
 
 ---

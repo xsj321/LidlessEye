@@ -47,9 +47,12 @@ typedef long long __s64;
 #define __always_inline inline __attribute__((always_inline))
 
 #define BPF_MAP_TYPE_HASH 1
+#define BPF_MAP_TYPE_ARRAY 2
 #define BPF_MAP_TYPE_STACK_TRACE 7
+#define BPF_MAP_TYPE_LRU_HASH 9
 
 #define BPF_ANY 0
+#define BPF_NOEXIST 1
 #define BPF_F_USER_STACK (1ULL << 8)
 #define BPF_F_FAST_STACK_CMP (1ULL << 9)
 
@@ -57,14 +60,25 @@ typedef long long __s64;
 #define INVALID_STACK_ID 0xffffffffULL
 
 /* ---- helper ABI ------------------------------------------------------- */
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
-static long (*bpf_map_update_elem)(void *map, const void *key, const void *value,
-                                   __u64 flags) = (void *)2;
-static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
-static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
-static long (*bpf_get_stackid)(void *ctx, void *map, __u64 flags) = (void *)27;
-static void *(*bpf_get_current_task)(void) = (void *)35;
-static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *src) = (void *)113;
+/* `const` is not decoration: without it clang keeps the pointer in .data and
+ * emits an indirect call whose target the verifier cannot resolve, which it
+ * rejects as `invalid func unknown#<address>`. `net.bpf.c` carries the same
+ * note; the sampling programs below happened to constant-fold every call until
+ * the allocator programs called a helper twice through one pointer. */
+static void *(*const bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
+static long (*const bpf_map_update_elem)(void *map, const void *key, const void *value,
+                                         __u64 flags) = (void *)2;
+static long (*const bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
+static __u64 (*const bpf_ktime_get_ns)(void) = (void *)5;
+static long (*const bpf_get_stackid)(void *ctx, void *map, __u64 flags) = (void *)27;
+/* Copies frames into a buffer instead of interning them in a stack map, which
+ * is what the allocator needs: the map's 32-bit ids are too narrow to key an
+ * aggregation table (see `alloc_stacks`). */
+static long (*const bpf_get_stack)(void *ctx, void *buf, __u32 size, __u64 flags) = (void *)67;
+static void *(*const bpf_get_current_task)(void) = (void *)35;
+static __u64 (*const bpf_get_current_pid_tgid)(void) = (void *)14;
+static long (*const bpf_probe_read_user)(void *dst, __u32 size, const void *src) = (void *)112;
+static long (*const bpf_probe_read_kernel)(void *dst, __u32 size, const void *src) = (void *)113;
 
 /* ---- CO-RE: the kernel structs this file reads ----------------------- */
 /* Only the fields used below, under the names the kernel gives them.
@@ -404,6 +418,511 @@ int lidlesseye_offcpu_end(struct pt_regs_opaque *ctx) {
         key.kernel_stack = (__u32)INVALID_STACK_ID;
     }
     add_value((void *)&offcpu_totals, &key, delta);
+    return 0;
+}
+
+/* --------------------------------------------------------------------- */
+/* Allocation profiling: allocator uprobes                                */
+/* --------------------------------------------------------------------- */
+/*
+ * Every native process on this node — C, C++, Rust, and anything else that is
+ * not a managed runtime — gets its heap from an allocator, and every allocator
+ * on Linux is reached through the same handful of entry points: `malloc`,
+ * `calloc`, `realloc`, `free`, `aligned_alloc`, `posix_memalign`,
+ * `memalign`. Hooking those is enough to profile memory in all of them without
+ * recompiling anything, which is what makes it a *language-independent* answer
+ * where the Go reader above is a Go-specific one.
+ *
+ * The accounting is split in two because the two questions have different
+ * shapes:
+ *
+ *   * **Allocated** ("how much has this call site allocated?") is a rate, so it
+ *     is counted as a delta and drained every interval, exactly like a CPU
+ *     sample counter.
+ *   * **In use** ("how much is this call site still holding?") is a level. It
+ *     cannot be derived from per-interval deltas without keeping state in user
+ *     space that would go stale the moment a pid is recycled, so it is kept
+ *     here as a balance: `+size` when an allocation is returned and `-size`
+ *     when it is freed. User space reads it as a snapshot and never clears it.
+ *     What a dead process left behind is deleted per tgid on the next scan.
+ *
+ * `alloc_live` is what makes the `-size` possible: `free` receives a pointer
+ * and nothing else, so the size and the allocating stack have to be remembered
+ * from the matching `malloc` return. The map is an LRU so that a workload with
+ * millions of live blocks degrades into under-counted *frees* instead of
+ * exhausting memory — a freed pointer that is no longer in the table simply
+ * leaves its allocation on the books. That direction of error is deliberate:
+ * over-counting in-use memory is visible, whereas silently dropping
+ * allocations is not.
+ *
+ * ## What this does not see
+ *
+ * * Allocations made before the probe was attached. `inuse_*` therefore means
+ *   "allocated and not yet freed since profiling started", not "the process's
+ *   resident heap". A workload that allocates a gigabyte at startup and then
+ *   sleeps reads as zero, which is exactly right about what was observed and
+ *   exactly wrong about the process — hence the separate `profile_source`
+ *   label, so these numbers are never added to a runtime's own numbers.
+ * * `mmap`-backed arenas (jemalloc's extents, Go's heap). The allocator's own
+ *   bookkeeping is at the `malloc` level, which is the level a developer reads.
+ * * Anything that bypasses the public symbols and calls the allocator's
+ *   internals (`_int_malloc` and friends). No application does.
+ */
+
+/* Registers of the probed function's caller, declared with the names the
+ * kernel's BTF uses so that aya can relocate them. The struct has to be called
+ * `pt_regs` and the fields `di`/`si`/`ax`: a CO-RE relocation matches by type
+ * name *and* member name against `/sys/kernel/btf/vmlinux`, and a struct this
+ * file invents a name for matches nothing — aya then poisons the instruction
+ * with `call 0x0bad2310` and the verifier reports `invalid func unknown`. Two architectures cover
+ * every kernel this profiler is built for; elsewhere the programs compile but
+ * record nothing, and the collector refuses to attach them. */
+#if defined(LIDLESSEYE_ARCH_X86_64)
+struct pt_regs {
+    unsigned long r15, r14, r13, r12, bp, bx, r11, r10, r9, r8, ax, cx, dx, si,
+        di, orig_ax, ip, cs, flags, sp, ss;
+} __attribute__((preserve_access_index));
+#define ALLOC_ARG0(ctx) ((ctx)->di)
+#define ALLOC_ARG1(ctx) ((ctx)->si)
+#define ALLOC_ARG2(ctx) ((ctx)->dx)
+#define ALLOC_RET(ctx) ((ctx)->ax)
+#define LIDLESSEYE_ALLOC_SUPPORTED 1
+#elif defined(LIDLESSEYE_ARCH_AARCH64)
+struct user_pt_regs {
+    __u64 regs[31];
+    __u64 sp;
+    __u64 pc;
+    __u64 pstate;
+} __attribute__((preserve_access_index));
+
+struct pt_regs {
+    struct user_pt_regs user_regs;
+} __attribute__((preserve_access_index));
+#define ALLOC_ARG0(ctx) ((ctx)->user_regs.regs[0])
+#define ALLOC_ARG1(ctx) ((ctx)->user_regs.regs[1])
+#define ALLOC_ARG2(ctx) ((ctx)->user_regs.regs[2])
+#define ALLOC_RET(ctx) ((ctx)->user_regs.regs[0])
+#define LIDLESSEYE_ALLOC_SUPPORTED 1
+#else
+struct pt_regs {
+    __u64 unused;
+} __attribute__((preserve_access_index));
+#define ALLOC_ARG0(ctx) 0
+#define ALLOC_ARG1(ctx) 0
+#define ALLOC_ARG2(ctx) 0
+#define ALLOC_RET(ctx) 0
+#endif
+
+/* One aggregation key: a thread group and an allocating stack. */
+struct alloc_key {
+    __u32 tgid;
+    __u32 pad;
+    /* Hash of the frames, see `alloc_stack`. Zero means "no stack". */
+    __u64 stack;
+};
+
+/* Bytes and objects, used for both the drained delta and the in-use balance. */
+struct alloc_counts {
+    __u64 bytes;
+    __u64 objects;
+};
+
+/* A live block: what `free` has to look up from a bare pointer. */
+struct alloc_ptr_key {
+    __u32 tgid;
+    __u32 pad;
+    __u64 ptr;
+};
+
+struct alloc_ptr_val {
+    __u64 size;
+    __u64 stack;
+};
+
+/* The allocation whose return value has not been seen yet, per thread.
+ *
+ * Keyed by tid rather than tgid: two threads of one process can be inside
+ * `malloc` at the same time, and they are about to return two different
+ * pointers. */
+struct alloc_pending {
+    __u64 size;
+    /* `posix_memalign` hands the pointer back through an out parameter. */
+    __u64 out;
+    __u64 stack;
+    __u32 kind;
+    __u32 pad;
+};
+
+#define ALLOC_KIND_MALLOC 1
+#define ALLOC_KIND_CALLOC 2
+#define ALLOC_KIND_REALLOC 3
+#define ALLOC_KIND_ALIGNED 4
+#define ALLOC_KIND_POSIX_MEMALIGN 5
+
+/* Frames behind one allocation stack hash. Sixteen is well past the depth of a
+ * real allocation site; a deeper one is truncated, not lost. */
+#define ALLOC_STACK_FRAMES 16
+
+/* How many frames the hash covers, zero-padded.
+ *
+ * Not the whole captured stack, because the last frames of a capture are not
+ * the caller's: glibc's `malloc` is built without a frame pointer, so the walk
+ * that starts inside it sometimes steps off the real chain and reads whatever
+ * is left on the stack — `32`, `13`, a stale local. Those bytes differ from
+ * call to call, and hashing them turned one allocation site into thousands of
+ * distinct stacks, which filled the table and left most of them unresolvable.
+ * The first four frames are the site: the allocator, its caller, and two
+ * levels of context, which is more than a flame graph needs to attribute a
+ * byte. Anything past them still travels with the entry, for the frames shown
+ * once the stack is symbolized. */
+#define ALLOC_STACK_KEY_FRAMES 4
+
+struct alloc_frames {
+    __u32 nr;
+    __u32 pad;
+    __u64 ips[ALLOC_STACK_FRAMES];
+};
+
+/* Stack hash -> the frames themselves.
+ *
+ * Deliberately *not* a `BPF_MAP_TYPE_STACK_TRACE`. That type hands out 32-bit
+ * ids, but they hold only `log2(max_entries)` bits of entropy: the kernel
+ * takes the stack's hash masked to the table size, and a second stack landing
+ * on a taken slot gets `-EEXIST` instead of an id unless `BPF_F_REUSE_STACKID`
+ * is set — which would then silently point the id at somebody else's stack. A
+ * node with a few hundred allocation sites collides in a 65536-slot table as a
+ * matter of course, and the losing site stays invisible for the lifetime of
+ * the agent: its `malloc` calls all fail, so a whole process's heap disappears
+ * from the report. Hashing here gives 64 bits of key space, where a collision
+ * is not something to design for.
+ *
+ * The map also keeps the frames for symbolization, since the id is no longer
+ * a handle the kernel can resolve. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, struct alloc_frames);
+} alloc_stacks SEC(".maps");
+
+/* pointer -> (size, allocating stack), for `free` and `realloc`. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 262144);
+    __type(key, struct alloc_ptr_key);
+    __type(value, struct alloc_ptr_val);
+} alloc_live SEC(".maps");
+
+/* Drained every interval: bytes and objects allocated in the window. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct alloc_key);
+    __type(value, struct alloc_counts);
+} alloc_totals SEC(".maps");
+
+/* Read as a snapshot, never cleared: bytes and objects still held. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct alloc_key);
+    __type(value, struct alloc_counts);
+} alloc_inuse SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, struct alloc_pending);
+} alloc_pending SEC(".maps");
+
+/* Why the capture failed, by errno.
+ *
+ * From userland every failure looks the same — the row arrives with stack 0
+ * and its bytes are lost — but the causes need opposite fixes: `-ENOMEM` means
+ * `alloc_stacks` is out of entries and wants a bigger table, `-EFAULT` means
+ * the user stack could not be walked and wants a different capture. Counting
+ * them here is what tells the two apart. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16);
+    __type(key, __u32);
+    __type(value, __u64);
+} alloc_errors SEC(".maps");
+
+/* The agent's own thread group, written once at startup.
+ *
+ * Not vanity: the agent allocates thousands of times a second and none of it
+ * belongs in a report, but the capture still runs, and the agent — like most
+ * optimized binaries — has no frame pointer, so the walk off the allocator
+ * lands in whatever is left on the stack and every call hashes differently.
+ * That fills the frames table within seconds, after which real sites cannot
+ * register at all. Cheaper to not look. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} agent_tgid SEC(".maps");
+
+/* The tgid to account this call to, or zero for "not ours".
+ *
+ * Also the single place that decides the agent is out of scope, so the
+ * programs below read the same way. */
+static __always_inline __u32 alloc_tgid(void) {
+    __u32 tgid = current_tgid();
+    if (tgid == 0) {
+        return 0;
+    }
+    __u32 zero = 0;
+    __u32 *self = bpf_map_lookup_elem((void *)&agent_tgid, &zero);
+    if (self && *self == tgid) {
+        return 0;
+    }
+    return tgid;
+}
+
+static __always_inline void alloc_note_error(__u32 failure) {
+    __u64 *hits = bpf_map_lookup_elem((void *)&alloc_errors, &failure);
+    if (hits) {
+        __sync_fetch_and_add(hits, 1);
+        return;
+    }
+    __u64 one = 1;
+    bpf_map_update_elem((void *)&alloc_errors, &failure, &one, BPF_NOEXIST);
+}
+
+/* Capture the allocation stack and return a 64-bit hash of it.
+ *
+ * `bpf_get_stack` copies the frames into a buffer instead of interning them in
+ * a `STACK_TRACE` map, which is what lets the caller keep a key with enough
+ * bits to not collide. Frames are FNV-1a'd in the same pass and the buffer is
+ * stored only when the hash is new, so a repeated allocation site costs one
+ * map lookup.
+ *
+ * Zero is not a valid hash here: it is what "capture failed" is spelled as. */
+static __always_inline __u64 alloc_stack(struct pt_regs *ctx) {
+    __u64 ips[ALLOC_STACK_FRAMES];
+    long read = bpf_get_stack(ctx, ips, (__u32)sizeof(ips), BPF_F_USER_STACK);
+    if (read <= 0) {
+        alloc_note_error(read < 0 ? (__u32)(-read) : 0);
+        return 0;
+    }
+    __u32 nr = (__u32)read / 8;
+    __u64 hash = 0xcbf29ce484222325ULL;
+#pragma unroll
+    for (int i = 0; i < ALLOC_STACK_KEY_FRAMES; i++) {
+        __u64 ip = 0;
+        if (i < nr) {
+            ip = ips[i];
+        }
+        hash ^= ip;
+        hash *= 0x100000001b3ULL;
+    }
+    if (hash == 0) {
+        hash = 1;
+    }
+
+    if (!bpf_map_lookup_elem((void *)&alloc_stacks, &hash)) {
+        struct alloc_frames frames = {};
+        frames.nr = nr;
+#pragma unroll
+        for (int i = 0; i < ALLOC_STACK_FRAMES; i++) {
+            if (i < nr) {
+                frames.ips[i] = ips[i];
+            }
+        }
+        bpf_map_update_elem((void *)&alloc_stacks, &hash, &frames, BPF_NOEXIST);
+    }
+    return hash;
+}
+
+/* `bytes`/`objects` added to, or subtracted from, the balance of one stack.
+ *
+ * The insertion is `BPF_NOEXIST` with a lookup-and-retry on failure rather than
+ * a blind update: two threads allocating on the same stack at the same instant
+ * would otherwise both see "no entry" and the slower one would overwrite the
+ * faster one's counters, losing a window's worth of bytes. */
+static __always_inline void alloc_add(void *map, struct alloc_key *key, __u64 bytes, __u64 objects,
+                                      int negative) {
+    __u64 delta_bytes = negative ? (__u64)(0 - bytes) : bytes;
+    __u64 delta_objects = negative ? (__u64)(0 - objects) : objects;
+
+    struct alloc_counts *slot = bpf_map_lookup_elem(map, key);
+    if (slot) {
+        __sync_fetch_and_add(&slot->bytes, delta_bytes);
+        __sync_fetch_and_add(&slot->objects, delta_objects);
+        return;
+    }
+    struct alloc_counts fresh = {};
+    fresh.bytes = delta_bytes;
+    fresh.objects = delta_objects;
+    if (bpf_map_update_elem(map, key, &fresh, BPF_NOEXIST) == 0) {
+        return;
+    }
+    slot = bpf_map_lookup_elem(map, key);
+    if (slot) {
+        __sync_fetch_and_add(&slot->bytes, delta_bytes);
+        __sync_fetch_and_add(&slot->objects, delta_objects);
+    }
+}
+
+/* Account a pointer that is going away. A pointer this process never allocated
+ * under our watch — or one whose record was evicted — has nothing to release. */
+static __always_inline void alloc_release(__u32 tgid, __u64 ptr) {
+    if (ptr == 0) {
+        return;
+    }
+    struct alloc_ptr_key key = {};
+    key.tgid = tgid;
+    key.ptr = ptr;
+
+    struct alloc_ptr_val *live = bpf_map_lookup_elem((void *)&alloc_live, &key);
+    if (!live) {
+        return;
+    }
+    __u64 size = live->size;
+    __u64 stack = live->stack;
+    bpf_map_delete_elem((void *)&alloc_live, &key);
+
+    struct alloc_key agg = {};
+    agg.tgid = tgid;
+    agg.stack = stack;
+    alloc_add((void *)&alloc_inuse, &agg, size, 1, 1);
+}
+
+/* Record the arguments of an allocation whose return value is still to come. */
+static __always_inline void alloc_begin(struct pt_regs *ctx, __u64 size, __u32 kind, __u64 out) {
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+    struct alloc_pending pending = {};
+    pending.size = size;
+    pending.out = out;
+    pending.kind = kind;
+    pending.stack = alloc_stack(ctx);
+    bpf_map_update_elem((void *)&alloc_pending, &tid, &pending, BPF_ANY);
+}
+
+SEC("uprobe/malloc")
+int lidlesseye_malloc(struct pt_regs *ctx) {
+    if (alloc_tgid() == 0) {
+        return 0;
+    }
+    alloc_begin(ctx, ALLOC_ARG0(ctx), ALLOC_KIND_MALLOC, 0);
+    return 0;
+}
+
+SEC("uprobe/calloc")
+int lidlesseye_calloc(struct pt_regs *ctx) {
+    if (alloc_tgid() == 0) {
+        return 0;
+    }
+    __u64 count = ALLOC_ARG0(ctx);
+    __u64 size = ALLOC_ARG1(ctx);
+    /* The product is what the allocator will serve, and an overflowing request
+     * is rejected by it (NULL) rather than honoured. Refuse the same ones here
+     * so that a garbage register cannot add 2^63 bytes to a balance. */
+    if (count != 0 && size > (1ULL << 44) / count) {
+        return 0;
+    }
+    alloc_begin(ctx, count * size, ALLOC_KIND_CALLOC, 0);
+    return 0;
+}
+
+SEC("uprobe/realloc")
+int lidlesseye_realloc(struct pt_regs *ctx) {
+    __u32 tgid = alloc_tgid();
+    if (tgid == 0) {
+        return 0;
+    }
+    /* `realloc` frees its argument before the new pointer exists, and both
+     * halves have to land in the same window or a balance drifts. */
+    alloc_release(tgid, ALLOC_ARG0(ctx));
+    alloc_begin(ctx, ALLOC_ARG1(ctx), ALLOC_KIND_REALLOC, 0);
+    return 0;
+}
+
+SEC("uprobe/free")
+int lidlesseye_free(struct pt_regs *ctx) {
+    __u32 tgid = alloc_tgid();
+    if (tgid == 0) {
+        return 0;
+    }
+    alloc_release(tgid, ALLOC_ARG0(ctx));
+    return 0;
+}
+
+/* `aligned_alloc(alignment, size)` and the older `memalign(alignment, size)`. */
+SEC("uprobe/aligned_alloc")
+int lidlesseye_aligned_alloc(struct pt_regs *ctx) {
+    if (alloc_tgid() == 0) {
+        return 0;
+    }
+    alloc_begin(ctx, ALLOC_ARG1(ctx), ALLOC_KIND_ALIGNED, 0);
+    return 0;
+}
+
+/* `posix_memalign(void **memptr, alignment, size)` returns a status and writes
+ * the pointer through its first argument, so the pointer is only known at
+ * return time and has to be carried across. */
+SEC("uprobe/posix_memalign")
+int lidlesseye_posix_memalign(struct pt_regs *ctx) {
+    if (alloc_tgid() == 0) {
+        return 0;
+    }
+    alloc_begin(ctx, ALLOC_ARG2(ctx), ALLOC_KIND_POSIX_MEMALIGN, ALLOC_ARG0(ctx));
+    return 0;
+}
+
+/* Shared return probe for every allocating entry point above. */
+SEC("uretprobe/alloc")
+int lidlesseye_alloc_return(struct pt_regs *ctx) {
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+    struct alloc_pending *pending = bpf_map_lookup_elem((void *)&alloc_pending, &tid);
+    if (!pending) {
+        /* A return without a recorded entry: the probe was attached while the
+         * call was already in flight. Not an allocation we can account. */
+        return 0;
+    }
+    __u64 size = pending->size;
+    __u64 out = pending->out;
+    __u64 stack = pending->stack;
+    __u32 kind = pending->kind;
+    bpf_map_delete_elem((void *)&alloc_pending, &tid);
+
+    __u64 ptr = ALLOC_RET(ctx);
+    if (kind == ALLOC_KIND_POSIX_MEMALIGN) {
+        /* Non-zero is an error status; on success the pointer is in `*memptr`. */
+        if (ptr != 0) {
+            return 0;
+        }
+        __u64 written = 0;
+        if (bpf_probe_read_user(&written, sizeof(written), (void *)out) != 0) {
+            return 0;
+        }
+        ptr = written;
+    }
+    if (ptr == 0 || size == 0) {
+        return 0;
+    }
+
+    __u32 tgid = alloc_tgid();
+    if (tgid == 0) {
+        return 0;
+    }
+
+    struct alloc_ptr_key key = {};
+    key.tgid = tgid;
+    key.ptr = ptr;
+    struct alloc_ptr_val val = {};
+    val.size = size;
+    val.stack = stack;
+    bpf_map_update_elem((void *)&alloc_live, &key, &val, BPF_ANY);
+
+    struct alloc_key agg = {};
+    agg.tgid = tgid;
+    agg.stack = stack;
+    alloc_add((void *)&alloc_totals, &agg, size, 1, 0);
+    alloc_add((void *)&alloc_inuse, &agg, size, 1, 0);
     return 0;
 }
 

@@ -120,6 +120,18 @@ impl ProfileType {
         }
     }
 
+    /// Is this a gauge rather than a counter?
+    ///
+    /// `inuse_*` is a snapshot of memory held at one instant, not an amount that
+    /// accrued over the interval. Summing the flushes in a five-minute window
+    /// would report five minutes' worth of samples as one heap — the number
+    /// would grow with the query range, which is the opposite of what a "what is
+    /// held now" view means. Queries therefore keep only the newest batch per
+    /// series for these types.
+    pub fn is_gauge(&self) -> bool {
+        matches!(self.0.as_str(), Self::INUSE_SPACE | Self::INUSE_OBJECTS)
+    }
+
     pub fn unit(&self) -> Unit {
         match self.0.as_str() {
             Self::ALLOC_SPACE | Self::INUSE_SPACE => Unit::Bytes,

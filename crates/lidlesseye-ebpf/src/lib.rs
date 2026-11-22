@@ -20,6 +20,9 @@
 //! `CAP_SYS_ADMIN`) and a Linux kernel >= 4.17. On other platforms the crate
 //! still compiles, but [`start`] returns an error.
 
+/// Go heap profiles, read from the runtime's own bucket chain.
+#[cfg(target_os = "linux")]
+pub mod allocator;
 #[cfg(target_os = "linux")]
 mod collector;
 /// Connection-level accounting from eBPF, for the service map.
@@ -28,6 +31,8 @@ mod collector;
 /// these programs costs the map its counters, not the flamegraph its samples.
 #[cfg(target_os = "linux")]
 pub mod conntrack;
+#[cfg(target_os = "linux")]
+pub mod goheap;
 #[cfg(target_os = "linux")]
 mod gopclntab;
 /// Pod metadata, keyed by UID, that names the series of a pod.

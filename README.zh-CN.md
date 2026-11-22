@@ -59,6 +59,8 @@ sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 
 **采集** —— on-CPU（`PERF_COUNT_SW_CPU_CLOCK`）、off-CPU（`schedule` kprobe），以及把两者合并的虚拟 `wall` profile。聚合发生在内核里，开销不随采样频率增长。任意进程、任意语言：不需要 SDK、不需要 `LD_PRELOAD`、不需要重新编译。
 
+**内存** —— 两个读取器，因为「堆」并不是一件事。Go 进程直接读运行时的 profile 链（`runtime.mbuckets`），数字就是运行时自己的口径、按它自己的采样率；其余语言——C、C++、Rust、jemalloc、mimalloc、tcmalloc、musl——在分配器入口用 uprobe 计数 `malloc`/`calloc`/`realloc`/`free`，覆盖所有走 malloc 的语言。两边都产出 `alloc_space`/`alloc_objects`（区间内分配，速率）与 `inuse_space`/`inuse_objects`（当前持有，水平量），并用 `profile_source`、`runtime` 标签区分来源，避免两种口径被相加。
+
 **探索** —— 服务地图根据每个节点的 TCP 表和 Kubernetes Pod 元数据绘制。连线上实时标注**新建连接数/秒**和**平均 RTT**。点击节点打开非模态滑动检查器，包含一跳邻居和七个选项卡：
 
 | 选项卡 | 回答的问题 |
@@ -66,7 +68,7 @@ sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 | SLO | 可用性是否达到 99.9% 目标、错误率趋势、平均 RTT |
 | Instances | 期望/就绪副本随时间的变化，以及 Pod 列表和所在节点 |
 | CPU | 时间窗内由 on-CPU 样本换算出的核心数 |
-| Memory | agent 实际发送的 heap profile 类型，按单位格式化 |
+| Memory | agent 实际发送的 heap profile 类型——优先 `inuse_space`，其次 `alloc_space`——按单位格式化，并区分「当前持有」与「本区间分配」 |
 | Net | 进出吞吐、往返时延、调用方和被调用方 |
 | DNS | TCP/53 对端、时延和重传 |
 | Profiling | 最热函数、**该节点内嵌的火焰图**，以及跳转到完整视图 |
@@ -215,7 +217,7 @@ lidlesseye fsck     # 校验数据库完整性
 lidlesseye info     # 构建与平台信息
 ```
 
-`collect` 支持 `--frequency`、`--flush`、`--label k=v`、`--service-name`、`--no-cpu`、`--no-offcpu`、`--no-k8s-labels`、`--no-k8s-pod-metadata`、`--k8s-pod-refresh`、`--server`、`--tenant`、`--auth-token` 和 `--duration`。设置 `LIDLESSEYE_NODE_NAME`（Helm chart 传入 `spec.nodeName`）可让 `node` 标签在滚动更新后保持稳定。
+`collect` 支持 `--frequency`、`--flush`、`--label k=v`、`--service-name`、`--no-cpu`、`--no-offcpu`、`--no-heap`、`--no-alloc`、`--heap-objects`、`--no-k8s-labels`、`--no-k8s-pod-metadata`、`--k8s-pod-refresh`、`--server`、`--tenant`、`--auth-token` 和 `--duration`。设置 `LIDLESSEYE_NODE_NAME`（Helm chart 传入 `spec.nodeName`）可让 `node` 标签在滚动更新后保持稳定。
 
 完整参考：[HTTP API](docs/api.md) · [架构](docs/architecture.md) · [部署](docs/deployment.md) · [界面](docs/ui.md)。
 
@@ -237,7 +239,7 @@ cargo fmt --all --check
 - **在导入时符号化**：无法读取模块的帧会显示为 `[unknown]`；agent 需要 `hostPID` 和二进制文件的读权限。
 - **每个 agent 只能覆盖一个 PID namespace**：其他容器中的进程会被计为 `in another PID namespace`，不会被错误归属。
 - **单机存储**：一个存储卷对应一个服务端，没有集群或复制。
-- **uprobe 需要显式开启且范围有限**：目前只有 TLS 明文捕获（`LIDLESSEYE_SSL_UPROBE=1`），分配分析仍是后续工作。
+- **uprobe 需要显式开启且范围有限**：TLS 明文捕获仍在 `LIDLESSEYE_SSL_UPROBE=1` 之后；分配分析默认开启（`--no-alloc` 关闭），每个容器每种分配器只挂一个文件——glibc、musl、jemalloc、mimalloc 或 tcmalloc，取进程实际映射的那一个。
 - **用户态调用栈需要 frame pointers**（`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`）。没有它们时耗时统计依然正确。
 
 ## 文档

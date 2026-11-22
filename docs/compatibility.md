@@ -60,7 +60,7 @@ means it is genuinely absent.
 | Node label | yes | `node_label` |
 | PID exclusion | yes | `exclude_pids` |
 | Container / label based filtering | no | exclusion is by PID only |
-| Heap / allocation profiling | no | needs uprobes on the allocator; out of scope for this release |
+| Heap / allocation profiling | yes | two readers: Go heaps from the runtime's own `mProf` chain, and every other language through uprobes on the allocator (`malloc`/`calloc`/`realloc`/`free` and the jemalloc, mimalloc, tcmalloc and musl equivalents). Emits `alloc_space`/`alloc_objects` (rate) and `inuse_space`/`inuse_objects` (level), labelled `profile_source`, `runtime` and `allocator`. `--no-alloc` and `--no-heap` turn either off, `--heap-objects` adds the object counts |
 | Go/Ruby/Python runtime profiles | no | those are SDK-driven; push them as pprof or folded instead |
 
 ## Operations

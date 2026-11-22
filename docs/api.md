@@ -168,7 +168,7 @@ curl -X POST http://localhost:4040/ingest \
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `profile_type` / `type` | `cpu` | profile type, or `wall` |
+| `profile_type` / `type` | `cpu` | any profile type: `cpu`, `wall`, `off_cpu`, `alloc_space`, `inuse_space`, `alloc_objects`, `inuse_objects` |
 | `from`, `until` | last hour | time range |
 | `selector` | — | label selector |
 | `max_nodes` | `1024` | cap on tree size (clamped to 16…50 000) |
@@ -212,7 +212,7 @@ curl -s 'http://localhost:4040/api/v1/flamegraph?profile_type=wall&from=now-15m'
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `profile_type` / `type` | `cpu` | profile type, or `wall` |
+| `profile_type` / `type` | `cpu` | any profile type: `cpu`, `wall`, `off_cpu`, `alloc_space`, `inuse_space`, `alloc_objects`, `inuse_objects` |
 | `from`, `until` | last hour | time range |
 | `selector` | — | label selector |
 | `limit` | `50` | rows, clamped to 1…1 000 |
@@ -243,7 +243,7 @@ every stack containing it. `total_value` at the top level is the denominator for
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `profile_type` / `type` | `cpu` | profile type, or `wall` |
+| `profile_type` / `type` | `cpu` | any profile type: `cpu`, `wall`, `off_cpu`, `alloc_space`, `inuse_space`, `alloc_objects`, `inuse_objects` |
 | `from`, `until` | last hour | time range |
 | `selector` | — | label selector |
 | `buckets` | `60` | number of buckets (clamped to 1…1 000) |
@@ -318,6 +318,32 @@ there).
 
 `wall` is offered whenever `cpu` or `off_cpu` data exists, and is flagged
 `"virtual": true`.
+
+| `name` | `unit` | Kind | Who sends it |
+| --- | --- | --- | --- |
+| `cpu` | nanoseconds | rate | on-CPU sampling |
+| `off_cpu` | nanoseconds | rate | blocked-time kprobes |
+| `wall` | nanoseconds | rate | virtual: `cpu` or `off_cpu`, whichever exists |
+| `alloc_space` | bytes | rate | memory allocated during the batch |
+| `alloc_objects` | count | rate | objects allocated during the batch |
+| `inuse_space` | bytes | **level** | memory held at the end of the batch |
+| `inuse_objects` | count | **level** | objects held at the end of the batch |
+
+The four memory types arrive from two different readers and are told apart by
+their labels: `profile_source=go-runtime` with `sampling=runtime` for a Go
+process's own heap profile, `profile_source=allocator-uprobe` with
+`sampling=uprobe` plus `runtime` (`c`, `c++`, `rust`, …) and `allocator`
+(`glibc`, `musl`, `jemalloc`, `mimalloc`, `tcmalloc`, `static`) for everything
+counted at the allocator. **Do not add them together**: a runtime's heap
+profile and an allocator's request stream cover different memory.
+
+Rate and level are not interchangeable either. `/series` sums rates over the
+window and reports a level as the newest batch in it (`arg_max(total_value,
+end_ns)`), because ten consecutive `inuse_space` batches are ten snapshots of
+one quantity, not ten units of it. `inuse_space`/`inuse_objects` are also
+"allocated and not yet freed since the probe was attached" — an allocator
+uprobe cannot see allocations made before it attached, or memory that never
+went through `malloc`.
 
 `batch_count` appears in `/series`, `/profile_types`, `/stats`, `/tenants` and
 the `lidlesseye_batches*` metrics. It counts rows in `batches`, i.e. ingest

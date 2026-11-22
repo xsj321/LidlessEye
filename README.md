@@ -59,6 +59,8 @@ The dashboard opens on the **service map**. Click any node to inspect its SLO, r
 
 **Collection** — on-CPU (`PERF_COUNT_SW_CPU_CLOCK`), off-CPU (`schedule` kprobes), and the virtual `wall` profile that merges both. Aggregation happens in the kernel, so overhead does not grow with the sampling rate. Any process, any language: no SDK, no `LD_PRELOAD`, no recompilation.
 
+**Memory** — two readers, because heaps are not one thing. Go processes are read from the runtime's own profile chain (`runtime.mbuckets`), so the numbers are the runtime's, at its own sampling rate. Everything else — C, C++, Rust, jemalloc, mimalloc, tcmalloc, musl — is counted at the allocator's entry points by uprobes on `malloc`/`calloc`/`realloc`/`free`, which covers every language that mallocs. Both report `alloc_space`/`alloc_objects` (allocated per interval, a rate) and `inuse_space`/`inuse_objects` (held live, a level), told apart by `profile_source` and `runtime` labels so the two are never added together.
+
 **Explore** — the service map is built from each node's TCP tables and Kubernetes pod metadata. Edges carry live **connections/s** and **mean RTT**. A click opens a sliding, non-modal inspector with one hop of neighbours and seven tabs:
 
 | Tab | Answers |
@@ -66,7 +68,7 @@ The dashboard opens on the **service map**. Click any node to inspect its SLO, r
 | SLO | availability against a 99.9% objective, error-rate trend, mean RTT |
 | Instances | desired/ready replicas over time and the pod list with their nodes |
 | CPU | cores over the window from on-CPU samples |
-| Memory | the heap profile type the agent actually sent, with unit-aware formatting |
+| Memory | the heap profile type the agent actually sent — `inuse_space` by preference, then `alloc_space` — with unit-aware formatting and level-vs-rate wording |
 | Net | throughput in/out, round-trip time, callers and callees |
 | DNS | TCP/53 peers, latency and retransmits |
 | Profiling | hottest functions, **an embedded flamegraph for this node**, and a jump to the full view |
@@ -220,7 +222,7 @@ lidlesseye fsck     # verify database integrity
 lidlesseye info     # build and platform information
 ```
 
-`collect` accepts `--frequency`, `--flush`, `--label k=v`, `--service-name`, `--no-cpu`, `--no-offcpu`, `--no-k8s-labels`, `--no-k8s-pod-metadata`, `--k8s-pod-refresh`, `--server`, `--tenant`, `--auth-token` and `--duration`. Set `LIDLESSEYE_NODE_NAME` (the Helm chart passes `spec.nodeName`) so the `node` label stays stable across rollouts.
+`collect` accepts `--frequency`, `--flush`, `--label k=v`, `--service-name`, `--no-cpu`, `--no-offcpu`, `--no-heap`, `--no-alloc`, `--heap-objects`, `--no-k8s-labels`, `--no-k8s-pod-metadata`, `--k8s-pod-refresh`, `--server`, `--tenant`, `--auth-token` and `--duration`. Set `LIDLESSEYE_NODE_NAME` (the Helm chart passes `spec.nodeName`) so the `node` label stays stable across rollouts.
 
 Full reference: [HTTP API](docs/api.md) · [Architecture](docs/architecture.md) · [Deployment](docs/deployment.md) · [UI](docs/ui.md).
 
@@ -242,7 +244,7 @@ The browser test seeds two tenants and fails on any console error, so a renderin
 - **Symbolized at ingest**: modules that cannot be opened become `[unknown]` frames; agents need `hostPID` and read access to the binaries.
 - **One PID namespace per agent**: processes in other containers are counted as `in another PID namespace`, never misattributed.
 - **Per-host storage**: one server per volume; no clustering or replication.
-- **uprobes are opt-in and narrow**: the only one today is TLS plaintext capture (`LIDLESSEYE_SSL_UPROBE=1`); allocation profiling is future work.
+- **uprobes are opt-in and narrow**: TLS plaintext capture stays behind `LIDLESSEYE_SSL_UPROBE=1`. Allocation profiling is on by default (`--no-alloc` disables it) and instruments one file per allocator per container — glibc, musl, jemalloc, mimalloc or tcmalloc, whichever the process maps.
 - **User stacks need frame pointers** (`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`). The profiled time is still correct without them.
 
 ## Documentation

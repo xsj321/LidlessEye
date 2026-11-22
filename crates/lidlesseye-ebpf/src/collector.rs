@@ -32,6 +32,8 @@ use lidlesseye_core::now_ns;
 use tracing::{debug, info, warn};
 
 use crate::UnknownReasons;
+use crate::allocator::Allocator;
+use crate::goheap::GoHeap;
 use crate::procfs;
 use crate::symbolizer::FrameResolver;
 
@@ -44,6 +46,14 @@ pub(crate) fn bpf_object() -> &'static [u8] {
     BPF_OBJECT
 }
 const INVALID_STACK_ID: u32 = u32::MAX;
+
+/// Smallest heap that gets a series of its own: 256 KiB, or 256 objects.
+///
+/// Below that a profile describes an implementation detail rather than memory
+/// use, and a node running three hundred processes would otherwise publish a
+/// series per process per metric per flush for heaps nobody will look at.
+const ALLOC_REPORT_BYTES_FLOOR: u64 = 256 * 1024;
+const ALLOC_REPORT_OBJECTS_FLOOR: u64 = 256;
 
 /// Collector configuration.
 #[derive(Debug, Clone)]
@@ -61,6 +71,30 @@ pub struct CollectorConfig {
     pub collect_cpu: bool,
     /// Collect off-CPU (blocked) profiles.
     pub collect_off_cpu: bool,
+    /// Collect Go heap profiles by reading the runtime's own bucket chain.
+    ///
+    /// This is not a sampler of ours: the runtime already samples allocations
+    /// (`MemProfileRate`, 512 KiB by default) and keeps the result in
+    /// `runtime.mbuckets`. Reading that chain costs one pass per interval and no
+    /// instrumentation of the target at all, but it needs `/proc/<pid>/mem`,
+    /// i.e. `CAP_SYS_PTRACE`. Processes that cannot be read are counted, not
+    /// guessed at.
+    pub collect_heap: bool,
+    /// Also store object counts (`alloc_objects`, `inuse_objects`), not only
+    /// bytes. Two extra reports per process per interval is real storage, and
+    /// the bytes are what a heap question is usually about.
+    ///
+    /// Applies to both sources: the Go reader and the allocator probes.
+    pub heap_objects: bool,
+    /// Collect memory profiles for native processes (C, C++, Rust, ...) by
+    /// hooking the allocator's `malloc`/`free` family with uprobes.
+    ///
+    /// Separate from [`Self::collect_heap`] because it is a different
+    /// measurement: the Go reader reports what the runtime itself recorded,
+    /// while these probes only see allocations made after they were attached.
+    /// Their reports carry `profile_source=allocator-uprobe` so the two are
+    /// never added together.
+    pub collect_alloc: bool,
     /// Process ids to ignore.
     pub exclude_pids: Vec<u32>,
     /// Ignore the collector's own process so that the profiler never profiles
@@ -90,6 +124,9 @@ impl Default for CollectorConfig {
             flush_interval: Duration::from_secs(10),
             collect_cpu: true,
             collect_off_cpu: true,
+            collect_heap: true,
+            heap_objects: false,
+            collect_alloc: true,
             exclude_pids: Vec::new(),
             exclude_self: true,
             enrich_kubernetes_labels: true,
@@ -114,9 +151,11 @@ impl CollectorConfig {
         if self.flush_interval > Duration::from_secs(3600) {
             return Err("flush_interval must be at most 1h".to_string());
         }
-        if !self.collect_cpu && !self.collect_off_cpu {
+        if !self.collect_cpu && !self.collect_off_cpu && !self.collect_heap && !self.collect_alloc {
             return Err(
-                "at least one of collect_cpu / collect_off_cpu must be enabled".to_string(),
+                "at least one of collect_cpu / collect_off_cpu / collect_heap / collect_alloc \
+                 must be enabled"
+                    .to_string(),
             );
         }
         if let Some(name) = &self.service_name
@@ -155,6 +194,27 @@ pub struct CollectorStats {
     pub empty_stacks: AtomicU64,
     pub drains: AtomicU64,
     pub errors: AtomicU64,
+    /// Heap samples read out of Go processes, cumulative.
+    pub heap_samples: AtomicU64,
+    /// Reports emitted for those samples, cumulative.
+    pub heap_reports: AtomicU64,
+    /// Go processes that produced a profile on the last scan.
+    pub heap_processes: AtomicU64,
+    /// Processes whose memory could not be read, cumulative (missing
+    /// `CAP_SYS_PTRACE` shows up here).
+    pub heap_unreadable: AtomicU64,
+    /// Processes that turned allocation sampling off (`MemProfileRate = 0`).
+    pub heap_disabled: AtomicU64,
+    /// Buckets that failed validation, cumulative.
+    pub heap_invalid: AtomicU64,
+    /// Allocator samples drained, cumulative.
+    pub alloc_samples: AtomicU64,
+    /// Reports emitted for them, cumulative.
+    pub alloc_reports: AtomicU64,
+    /// Uprobes attached across every allocator file, as of the last discovery.
+    pub alloc_probes: AtomicU64,
+    /// Bytes whose stack could not be captured or was evicted, cumulative.
+    pub alloc_lost: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -194,6 +254,16 @@ pub struct StatsSnapshot {
     pub empty_stacks: u64,
     pub drains: u64,
     pub errors: u64,
+    pub heap_samples: u64,
+    pub heap_reports: u64,
+    pub heap_processes: u64,
+    pub heap_unreadable: u64,
+    pub heap_disabled: u64,
+    pub heap_invalid: u64,
+    pub alloc_samples: u64,
+    pub alloc_reports: u64,
+    pub alloc_probes: u64,
+    pub alloc_lost: u64,
 }
 
 /// Handle to a running collector. Dropping it stops the collector.
@@ -231,6 +301,16 @@ impl CollectorHandle {
             empty_stacks: self.stats.empty_stacks.load(Ordering::Relaxed),
             drains: self.stats.drains.load(Ordering::Relaxed),
             errors: self.stats.errors.load(Ordering::Relaxed),
+            heap_samples: self.stats.heap_samples.load(Ordering::Relaxed),
+            heap_reports: self.stats.heap_reports.load(Ordering::Relaxed),
+            heap_processes: self.stats.heap_processes.load(Ordering::Relaxed),
+            heap_unreadable: self.stats.heap_unreadable.load(Ordering::Relaxed),
+            heap_disabled: self.stats.heap_disabled.load(Ordering::Relaxed),
+            heap_invalid: self.stats.heap_invalid.load(Ordering::Relaxed),
+            alloc_samples: self.stats.alloc_samples.load(Ordering::Relaxed),
+            alloc_reports: self.stats.alloc_reports.load(Ordering::Relaxed),
+            alloc_probes: self.stats.alloc_probes.load(Ordering::Relaxed),
+            alloc_lost: self.stats.alloc_lost.load(Ordering::Relaxed),
         }
     }
 
@@ -408,11 +488,20 @@ where
         }
     }
 
-    if cpu_events == 0 && !offcpu_attached {
+    // The perf-event and kprobe programs are the sampled half; the two memory
+    // readers do not need them, and running memory-only is a supported setup
+    // (it is how a memory question is asked without the sampler's overhead).
+    if cpu_events == 0 && !offcpu_attached && !config.collect_heap && !config.collect_alloc {
         return Err("no eBPF program could be attached".to_string());
     }
 
     let mut resolver = FrameResolver::new();
+    // Heap state lives across flushes: the deltas are differences of cumulative
+    // bucket counters, so the previous scan is part of the next one's answer.
+    let mut heap = GoHeap::new();
+    // Allocator probes are process-wide and long-lived; the state they need
+    // (which files are instrumented, what each pid is) outlives a flush.
+    let mut alloc = Allocator::new();
     let mut last_flush = now_ns();
     let mut ticker = Instant::now();
 
@@ -434,6 +523,8 @@ where
         match flush(
             &mut ebpf,
             &mut resolver,
+            &mut heap,
+            &mut alloc,
             &config,
             last_flush,
             now,
@@ -501,6 +592,8 @@ fn attach_kprobe(ebpf: &mut Ebpf, program: &str, symbols: &[&'static str]) -> Op
 fn flush<F>(
     ebpf: &mut Ebpf,
     resolver: &mut FrameResolver,
+    heap: &mut GoHeap,
+    alloc: &mut Allocator,
     config: &CollectorConfig,
     start_ns: u64,
     end_ns: u64,
@@ -534,7 +627,11 @@ where
     cpu_records.retain(|r| !excluded.contains(&r.tgid) && r.tgid != 0);
     offcpu_records.retain(|r| !excluded.contains(&r.tgid) && r.tgid != 0);
 
-    if cpu_records.is_empty() && offcpu_records.is_empty() {
+    if cpu_records.is_empty()
+        && offcpu_records.is_empty()
+        && !config.collect_heap
+        && !config.collect_alloc
+    {
         return Ok(());
     }
     stats
@@ -646,13 +743,251 @@ where
         emit(on_report, report, stats, &mut emitted);
     }
 
+    // ---- Go heaps ---------------------------------------------------------
+    //
+    // A separate pass, with nothing in common with the perf-event path: no
+    // sample to attribute, no kernel counter to drain. Each Go process already
+    // keeps its own heap profile, and this reads it.
+    let mut heap_alive: Vec<u32> = Vec::new();
+    if config.collect_heap {
+        let mut skip: Vec<u32> = config.exclude_pids.clone();
+        if config.exclude_self {
+            skip.push(std::process::id());
+        }
+        let records = heap.scan(&skip, &mut heap_alive);
+        stats
+            .heap_samples
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        stats
+            .heap_processes
+            .store(heap_alive.len() as u64, Ordering::Relaxed);
+        stats
+            .heap_unreadable
+            .store(heap.unreadable, Ordering::Relaxed);
+        stats.heap_disabled.store(heap.disabled, Ordering::Relaxed);
+        stats
+            .heap_invalid
+            .store(heap.invalid_buckets, Ordering::Relaxed);
+        if !heap.skipped.is_empty() {
+            debug!(skipped = ?heap.skipped, "Go heap targets left out");
+        }
+
+        let mut builders: HashMap<(GroupKey, String), ReportBuilder> = HashMap::new();
+        for record in &records {
+            let Some(group) = resolve_group(config, record.tgid) else {
+                continue;
+            };
+            let frames = resolver.resolve_user(record.tgid, &record.stack);
+            if frames.is_empty() {
+                continue;
+            }
+            let mut metrics: Vec<(&'static str, u64)> = vec![
+                (ProfileType::ALLOC_SPACE, record.alloc_bytes),
+                (ProfileType::INUSE_SPACE, record.inuse_bytes),
+            ];
+            if config.heap_objects {
+                metrics.push((ProfileType::ALLOC_OBJECTS, record.alloc_objects));
+                metrics.push((ProfileType::INUSE_OBJECTS, record.inuse_objects));
+            }
+            for (name, value) in metrics {
+                if value == 0 {
+                    continue;
+                }
+                let builder = builders
+                    .entry((group.clone(), name.to_string()))
+                    .or_insert_with(|| {
+                        ReportBuilder::new(
+                            group.service.clone(),
+                            ProfileType::new(name),
+                            start_ns,
+                            end_ns,
+                        )
+                        // `with_labels` *replaces* the label set, so it has
+                        // to come first or it wipes the ones above.
+                        .with_labels(group.labels.clone())
+                        // Which reader produced this: a runtime's own sampler
+                        // and an allocator uprobe do not cover the same memory,
+                        // and the UI must not add them together.
+                        .label("profile_source", "go-runtime")
+                        .label("sampling", "runtime")
+                        // The same label the allocator path writes, so a
+                        // selector on `runtime` covers both readers instead of
+                        // silently matching only half the memory series.
+                        .label("runtime", "go")
+                    });
+                builder.add_stack(frames.clone(), value);
+            }
+        }
+        for ((_group, name), builder) in builders {
+            if builder.is_empty() {
+                continue;
+            }
+            let mut report = builder.finish();
+            report.profile_type = ProfileType::new(name);
+            stats.heap_reports.fetch_add(1, Ordering::Relaxed);
+            emit(on_report, report, stats, &mut emitted);
+        }
+    }
+
+    // ---- native heaps, through the allocator ------------------------------
+    //
+    // The other half of the memory picture, and a different measurement: no
+    // runtime keeps a record here, so the bytes are counted as they are handed
+    // out by `malloc`. That makes `inuse_*` mean "allocated and not yet freed
+    // since the probe was attached" — not "the resident heap" — which is why
+    // the reports carry `profile_source=allocator-uprobe`.
+    let mut alloc_alive: Vec<u32> = Vec::new();
+    if config.collect_alloc {
+        // New containers come and go; this is a no-op unless the interval has
+        // passed or nothing has been instrumented yet.
+        alloc.discover(ebpf, false);
+        stats
+            .alloc_probes
+            .store(alloc.probes as u64, Ordering::Relaxed);
+        if !alloc.skipped.is_empty() {
+            debug!(skipped = ?alloc.skipped, "allocator targets left out");
+        }
+
+        // A Go process's heap is already reported by the runtime reader. The
+        // probes are process-wide and cannot tell one language from another,
+        // so the classification decides, not the probe.
+        let go_pids = heap.go_pids();
+        let records = alloc.scan(ebpf, &excluded, &go_pids);
+        stats
+            .alloc_samples
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        stats.alloc_lost.store(
+            alloc.no_capture_bytes + alloc.evicted_bytes,
+            Ordering::Relaxed,
+        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            // Per-process totals for the window: the first thing to look at
+            // when a heap reads as too small, because it separates "the probes
+            // did not see it" from "the report was dropped".
+            let mut per: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+            for record in &records {
+                let entry = per
+                    .entry(procfs::read_comm(record.tgid).unwrap_or_default())
+                    .or_default();
+                entry.0 += record.alloc_bytes;
+                entry.1 += record.inuse_bytes;
+            }
+            debug!(rows = records.len(), totals = ?per, "allocator window");
+        }
+        if alloc.lost_stacks > 0 || alloc.capture_failures > 0 {
+            debug!(
+                evicted = alloc.lost_stacks,
+                evicted_bytes = alloc.evicted_bytes,
+                capture_failures = alloc.capture_failures,
+                capture_bytes = alloc.no_capture_bytes,
+                capture_errnos = ?alloc.capture_errnos,
+                "allocation stacks lost"
+            );
+        }
+
+        let mut builders: HashMap<(GroupKey, String, &'static str, &'static str), ReportBuilder> =
+            HashMap::new();
+        // Per-report totals, so that a heap too small to be worth a series can
+        // be left out. A node runs hundreds of processes and most of them hold
+        // a few kilobytes; publishing one series per process per metric per
+        // flush buries the handful of real heaps and costs the store more than
+        // it is worth.
+        let mut totals: HashMap<(GroupKey, String, &'static str, &'static str), u64> =
+            HashMap::new();
+        for record in &records {
+            let Some(group) = resolve_group(config, record.tgid) else {
+                continue;
+            };
+            alloc_alive.push(record.tgid);
+            let mut frames = resolver.resolve_user(record.tgid, &record.stack);
+            // The stack was captured at the allocator's entry point, so its
+            // leaf frame is always the allocator itself — `malloc`,
+            // `je_malloc`, `operator new` — which says the same thing for every
+            // allocation on the node and nothing about this one. Dropping it
+            // leaves the caller's stack, which is what a heap profile is read
+            // for.
+            //
+            // It is dropped only when something remains: a target built without
+            // frame pointers unwinds to that one frame, and it is then the
+            // allocation site's only evidence. Removing it would report zero
+            // bytes for a perfectly healthy program.
+            if frames.len() > 1 {
+                frames.remove(0);
+            }
+
+            let mut metrics: Vec<(&'static str, u64)> = vec![
+                (ProfileType::ALLOC_SPACE, record.alloc_bytes),
+                (ProfileType::INUSE_SPACE, record.inuse_bytes),
+            ];
+            if config.heap_objects {
+                metrics.push((ProfileType::ALLOC_OBJECTS, record.alloc_objects));
+                metrics.push((ProfileType::INUSE_OBJECTS, record.inuse_objects));
+            }
+            for (name, value) in metrics {
+                if value == 0 {
+                    continue;
+                }
+                let key = (
+                    group.clone(),
+                    name.to_string(),
+                    record.runtime,
+                    record.allocator,
+                );
+                let builder = builders.entry(key.clone()).or_insert_with(|| {
+                    ReportBuilder::new(
+                        group.service.clone(),
+                        ProfileType::new(name),
+                        start_ns,
+                        end_ns,
+                    )
+                    .with_labels(group.labels.clone())
+                    .label("profile_source", "allocator-uprobe")
+                    .label("sampling", "uprobe")
+                    .label("runtime", record.runtime)
+                    .label("allocator", record.allocator)
+                });
+                builder.add_stack(frames.clone(), value);
+                *totals.entry(key).or_default() += value;
+            }
+        }
+        for (key, builder) in builders {
+            if builder.is_empty() {
+                continue;
+            }
+            // Below the floor a profile describes an implementation detail
+            // rather than memory use: 256 KiB held, or 256 KiB allocated in one
+            // interval. The floor is per report, so a process that only ever
+            // allocates small amounts in many places still appears once it adds
+            // up.
+            let floor = if key.1.ends_with("objects") {
+                ALLOC_REPORT_OBJECTS_FLOOR
+            } else {
+                ALLOC_REPORT_BYTES_FLOOR
+            };
+            if totals.get(&key).copied().unwrap_or(0) < floor {
+                continue;
+            }
+            let mut report = builder.finish();
+            report.profile_type = ProfileType::new(key.1.clone());
+            stats.alloc_reports.fetch_add(1, Ordering::Relaxed);
+            emit(on_report, report, stats, &mut emitted);
+        }
+    }
+
     // A sampled pid that is gone by now has no usable symbols left, so its
     // cache entry would only serve a future process that recycles the pid.
-    let alive: Vec<u32> = cpu_records
+    let mut alive: Vec<u32> = cpu_records
         .iter()
         .chain(offcpu_records.iter())
         .map(|record| record.tgid)
         .collect();
+    // The heap scan symbolized addresses for processes that may have had no CPU
+    // sample this interval; dropping their module cache would re-parse a binary
+    // every flush.
+    alive.extend(heap_alive);
+    // Same for the allocator samples: a heap report can be the only reason a
+    // pid's modules were parsed this interval.
+    alive.extend(alloc_alive);
     resolver.retain_processes(&alive);
 
     let tally = resolver.tally();

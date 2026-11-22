@@ -63,6 +63,22 @@ const EMPTY: NodeData = {
 /** Profile types that are not CPU but describe the heap. */
 const MEMORY_HINT = /mem|rss|heap|alloc|object|resident/i;
 
+/**
+ * Which heap type the panel shows when a node has several.
+ *
+ * Memory held is the question a node panel is asked ("what is this service
+ * keeping?"), so the in-use level wins over the allocation rate; bytes win over
+ * object counts because the axis is formatted as bytes.
+ */
+const MEMORY_PREFERENCE = ["inuse_space", "alloc_space", "inuse_objects", "alloc_objects"];
+
+function pickMemoryType(units: ProfileUnit[]): string | null {
+  for (const name of MEMORY_PREFERENCE) {
+    if (units.some((unit) => unit.name === name)) return name;
+  }
+  return units.find((unit) => MEMORY_HINT.test(unit.name))?.name ?? null;
+}
+
 const BUCKETS = 72;
 
 const cache = new Map<string, NodeData>();
@@ -150,7 +166,7 @@ export function useNodeData(
         name: row.name,
         unit: row.unit,
       }));
-      const memoryType = units.find((unit) => MEMORY_HINT.test(unit.name))?.name ?? null;
+      const memoryType = pickMemoryType(units);
       const memory = memoryType
         ? await api
             .timeseries({ ...params, profile_type: memoryType, selector })

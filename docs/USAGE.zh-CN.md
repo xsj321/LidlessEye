@@ -24,6 +24,17 @@ sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 
 分布式部署则在存储节点运行 `lidlesseye serve`，在每个节点运行 `lidlesseye collect --server http://storage:4040`。
 
+agent 同时采集 CPU、off-CPU 和内存。内存有两个读取器，默认都开启：Go 堆直接读运行时自己的 profile 链，其余语言则用 uprobe 在分配器的 `malloc`、`calloc`、`realloc`、`free` 上记账。
+
+| profile 类型 | 单位 | 语义 | 采集方式 |
+| --- | --- | --- | --- |
+| `alloc_space` | 字节 | 速率 | 本刷新区间内分配的总量 |
+| `inuse_space` | 字节 | 水平量 | 区间结束时刻仍持有的量 |
+| `alloc_objects` | 个数 | 速率 | 需要 `--heap-objects` |
+| `inuse_objects` | 个数 | 水平量 | 需要 `--heap-objects` |
+
+开关：`--no-alloc` 关掉分配器 uprobe，`--no-heap` 关掉 Go 堆读取器，`--heap-objects` 额外输出两个对象计数。同一个进程只会被一个读取器度量——Go 二进制的 `malloc` 已经由运行时自己的 profile 表示。内存相关的标签回答「谁测的」：`node`、`service_name`、`profile_source`（`go-runtime` 或 `allocator-uprobe`）、`sampling`（`runtime` 或 `uprobe`）、`runtime`（`go`、`c`、`c++`、`rust`……）以及 `allocator`（`glibc`、`musl`、`jemalloc`、`mimalloc`、`tcmalloc`、`static`）。
+
 打开 <http://localhost:4040>。不带路径的地址会进入**服务地图**。
 
 ---

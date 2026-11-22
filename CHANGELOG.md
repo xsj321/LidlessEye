@@ -8,13 +8,26 @@ Rust API follows the same rule.
 
 ## [Unreleased]
 
+### Added
+
+- **Memory profiling, for every language.** Go processes are read from the
+  runtime's own profile chain (`runtime.mbuckets`), so `inuse_space` is the
+  runtime's number at the runtime's sampling rate. Everything else is counted
+  at the allocator: uprobes on `malloc`, `calloc`, `realloc`, `free`,
+  `aligned_alloc` and `posix_memalign` (plus the `je_`, `mi_` and `tc_`
+  prefixed families, so jemalloc, mimalloc and tcmalloc are read through their
+  own names), attributed to the allocating stack. Four profile types —
+  `alloc_space` and `alloc_objects` as rates, `inuse_space` and
+  `inuse_objects` as levels — labelled `profile_source`, `runtime` and
+  `allocator` so a runtime's own profile and an allocator's are never summed
+  together. `--no-alloc` / `--no-heap` turn either reader off, `--heap-objects`
+  adds the object counts. Validated against four programs' own ledgers: a C, a
+  C++ and a Rust fixture match to the byte once their untracked internals
+  (allocator headers, `Rc` boxes, pointer arrays) are accounted for, and a Go
+  fixture agrees with `runtime.MemStats` to within 0.3 %.
+
 ### Changed
 
-- A hop that climbs or falls much further than the column gap now sweeps out
-  and plugs into the card's top or bottom edge instead of being forced into an
-  S-curve with horizontal tangents at both ends — at a 4:1 height-to-width
-  ratio that S collapsed into a near-vertical straight with two short stubs,
-  which is what made the arrow on it look wrong.
 - A hop that climbs or falls much further than the column gap now sweeps out
   and plugs into the card's top or bottom edge instead of being forced into an
   S-curve with horizontal tangents at both ends — at a 4:1 height-to-width
@@ -31,9 +44,11 @@ Rust API follows the same rule.
   The head's axis is the chord of the curve it covers, not the tangent at the
   last pixel: on a bending line the two differ enough to make the head look
   rotated against its own stroke.
-  The head's axis is the chord of the curve it covers, not the tangent at the
-  last pixel: on a bending line the two differ enough to make the head look
-  rotated against its own stroke.
+- The node inspector's Memory tab picks the level to plot instead of the first
+  type whose name contains "memory": `inuse_space`, then `alloc_space`, then
+  the object counts. A level and a rate are worded differently — "held now"
+  against "allocated this interval" — because they answer different questions
+  and only one of them adds up over time.
 
 ## [0.1.2] - 2026-11-22
 

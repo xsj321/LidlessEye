@@ -145,6 +145,15 @@ struct ServeArgs {
     no_cpu: bool,
     #[arg(long)]
     no_offcpu: bool,
+    /// Do not read Go heap profiles out of each process's runtime.
+    #[arg(long)]
+    no_heap: bool,
+    /// Do not profile native heaps (C, C++, Rust) through the allocator.
+    #[arg(long)]
+    no_alloc: bool,
+    /// Also store allocation and in-use object counts, not only bytes.
+    #[arg(long)]
+    heap_objects: bool,
     /// Do not attach the `k8s_*` labels derived from each process's cgroup.
     #[arg(long)]
     no_k8s_labels: bool,
@@ -186,6 +195,15 @@ struct CollectArgs {
     no_cpu: bool,
     #[arg(long)]
     no_offcpu: bool,
+    /// Do not read Go heap profiles out of each process's runtime.
+    #[arg(long)]
+    no_heap: bool,
+    /// Do not profile native heaps (C, C++, Rust) through the allocator.
+    #[arg(long)]
+    no_alloc: bool,
+    /// Also store allocation and in-use object counts, not only bytes.
+    #[arg(long)]
+    heap_objects: bool,
     /// Do not attach the `k8s_*` labels derived from each process's cgroup.
     #[arg(long)]
     no_k8s_labels: bool,
@@ -378,6 +396,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .flush_interval(parse_duration(&args.flush)?)
         .collect_cpu(!args.no_cpu)
         .collect_off_cpu(!args.no_offcpu)
+        .collect_heap(!args.no_heap)
+        .collect_alloc(!args.no_alloc)
+        .heap_objects(args.heap_objects)
         .enrich_kubernetes_labels(!args.no_k8s_labels)
         .k8s_pod_metadata(!args.no_k8s_pod_metadata)
         .k8s_pod_refresh(parse_duration(&args.k8s_pod_refresh)?)
@@ -478,6 +499,9 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
         flush_interval: parse_duration(&args.flush)?,
         collect_cpu: !args.no_cpu,
         collect_off_cpu: !args.no_offcpu,
+        collect_heap: !args.no_heap,
+        collect_alloc: !args.no_alloc,
+        heap_objects: args.heap_objects,
         enrich_kubernetes_labels: !args.no_k8s_labels,
         pods: pods.clone(),
         ..Default::default()

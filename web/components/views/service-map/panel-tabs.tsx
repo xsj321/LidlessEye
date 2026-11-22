@@ -399,13 +399,18 @@ export function MemoryTab({ node, data }: TabProps) {
     return (
       <Missing
         icon={<HardDrive className="size-4" />}
-        title="No memory profile type in this window"
-        hint="The agent collects on-CPU and off-CPU. Send heap profiles with profile_type=memory (pprof upload, an SDK, or a folded file) and this tab fills in."
+        title="No memory profile in this window"
+        hint="The agent reads Go heaps from the runtime and native heaps through the allocator. Neither produced a profile here: the process allocated nothing in the window, or the agent cannot read it."
       />
     );
   }
 
   const unit = data.units.find((entry) => entry.name === data.memoryType)?.unit ?? "bytes";
+  // `inuse_*` is a level and `alloc_*` a rate, so the same three numbers mean
+  // different things: for a level, "latest" is what the process holds now and
+  // the peak is how high it got; for a rate, both describe one bucket's worth
+  // of allocation rather than a running total.
+  const isLevel = data.memoryType.startsWith("inuse");
   const points = profileSeries(data.memory, (value) => value);
   const latest = points.length ? points[points.length - 1][1] : 0;
   const peak = points.reduce((max, [, value]) => Math.max(max, value), 0);
@@ -414,8 +419,16 @@ export function MemoryTab({ node, data }: TabProps) {
   return (
     <div className="space-y-3">
       <StatRow>
-        <Stat label="Latest" value={latest ? format(latest) : "—"} hint={data.memoryType} />
-        <Stat label="Peak" value={peak ? format(peak) : "—"} hint="single bucket" />
+        <Stat
+          label={isLevel ? "Held now" : "Latest bucket"}
+          value={latest ? format(latest) : "—"}
+          hint={data.memoryType}
+        />
+        <Stat
+          label={isLevel ? "Peak held" : "Peak bucket"}
+          value={peak ? format(peak) : "—"}
+          hint="single bucket"
+        />
         <Stat label="Buckets" value={points.length || "—"} hint="with samples" />
       </StatRow>
 
@@ -432,8 +445,9 @@ export function MemoryTab({ node, data }: TabProps) {
       </Section>
 
       <Note>
-        A heap profile type is whatever the emitter chose ({data.memoryType}); the unit comes from the
-        profile metadata, so an allocation-count type would read as a count rather than as bytes.
+        {data.memoryType.startsWith("inuse")
+          ? `${data.memoryType} is a level, not a rate: bytes (or objects) allocated and not yet freed, read from the newest batch. It does not grow with the window.`
+          : `${data.memoryType} is a cumulative counter: the sum of what was allocated in each window bucket.`}
       </Note>
       <Note>{node.id}</Note>
     </div>
