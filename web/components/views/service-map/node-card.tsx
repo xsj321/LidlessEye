@@ -19,7 +19,7 @@
 import { memo } from "react";
 
 import { Card } from "@/components/ui/card";
-import { healthTone, KIND, nodeLabel, nodeMeta } from "@/lib/servicemap-graph";
+import { healthTone, KIND, nodeLabel, nodeMeta, nodeTraffic } from "@/lib/servicemap-graph";
 import type { Box } from "@/lib/servicemap-graph";
 import type { ServiceMapNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -51,11 +51,21 @@ export interface NodeCardProps {
   /** This node's on-CPU time, and the busiest node's, for the heat bar. */
   cpu: number;
   cpuMax: number;
+  /** Window length, so the third line can report a rate instead of a total. */
+  windowSec: number;
   selected?: boolean;
   /** Dimmed because something else is selected. */
   dimmed?: boolean;
+  /** The pointer is over this card or its search hit: lift it, and let the
+   *  edge layer know which lines to brighten. */
+  hovered?: boolean;
+  /** The card matches the search query and the result list is open. */
+  matched?: boolean;
   compact?: boolean;
   onSelect?: (id: string) => void;
+  onHover?: (id: string | null) => void;
+  /** The card's button took focus; the map may have to bring it into view. */
+  onFocusNode?: (id: string) => void;
   testId?: string;
 }
 
@@ -64,10 +74,15 @@ export const NodeCard = memo(function NodeCard({
   box,
   cpu,
   cpuMax,
+  windowSec,
   selected = false,
   dimmed = false,
+  hovered = false,
+  matched = false,
   compact = false,
   onSelect,
+  onHover,
+  onFocusNode,
   testId,
 }: NodeCardProps) {
   const kind = node.kind ?? "workload";
@@ -76,25 +91,35 @@ export const NodeCard = memo(function NodeCard({
   const heat = cpuMax > 0 ? Math.min(1, Math.sqrt(cpu / cpuMax)) : 0;
   const label = nodeLabel(node);
   const meta = nodeMeta(node);
+  const traffic = nodeTraffic(node, windowSec);
 
   return (
     <Card
       data-testid={testId}
+      data-node={node.id}
+      data-node-kind={kind}
       // Every clickable card carries this marker, on the big map and in the
       // neighbourhood alike. A pan surface must not capture the pointer on a
       // card press, or the card's own click never fires — the popup used the
       // big map's test id for this check and silently lost its node jumps.
       data-map-card=""
-      title={`${label}\n${node.id}${meta ? `\n${meta}` : ""}`}
+      title={`${label}\n${node.id}${meta ? `\n${meta}` : ""}${traffic ? `\n${traffic}` : ""}`}
+      onPointerEnter={() => onHover?.(node.id)}
+      onPointerLeave={() => onHover?.(null)}
       className={cn(
-        "absolute select-none flex-row items-center gap-0 overflow-hidden rounded-md border py-0 px-0",
+        "absolute select-none flex-row items-stretch gap-0 overflow-hidden rounded-md border py-0 px-0",
         "shadow-sm transition-[border-color,box-shadow,opacity] duration-150",
         // Focus is drawn on the card, not on the invisible button: the ring
         // must trace the card a sighted keyboard user is actually looking at.
         "has-[>button:focus-visible]:ring-2 has-[>button:focus-visible]:ring-ring/70",
+        // Hover lifts the card over its neighbours: at map scale the three
+        // lines are small, and a card that does not come forward reads as
+        // unresponsive.
+        hovered && !selected && "z-20 border-white/35 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.9)]",
+        matched && !selected && "border-[#6ba7f7]/70 ring-1 ring-[#6ba7f7]/25",
         selected
-          ? "border-primary/80 shadow-[0_0_0_1px_var(--primary),0_6px_20px_-8px_rgba(0,0,0,0.9)]"
-          : "border-white/10 hover:border-white/25",
+          ? "z-20 border-primary/80 shadow-[0_0_0_1px_var(--primary),0_6px_20px_-8px_rgba(0,0,0,0.9)]"
+          : "border-white/10",
         dimmed && !selected && "opacity-35",
       )}
       style={{
@@ -120,6 +145,7 @@ export const NodeCard = memo(function NodeCard({
           event.stopPropagation();
           onSelect?.(node.id);
         }}
+        onFocus={() => onFocusNode?.(node.id)}
       />
       {/* The kind bar: the one colour on the card that never changes with
           state, so "what is this" is answerable before "how is it". */}
@@ -129,7 +155,7 @@ export const NodeCard = memo(function NodeCard({
         style={{ backgroundColor: palette.bar }}
       />
       <div className="flex min-w-0 flex-1 items-center gap-1.5 px-2">
-        <div className="min-w-0 flex-1 leading-none">
+        <div className="min-w-0 flex-1 py-1 leading-tight">
           <div
             className={cn(
               "truncate font-medium text-card-foreground",
@@ -138,13 +164,24 @@ export const NodeCard = memo(function NodeCard({
           >
             {label}
           </div>
+          {/* Identity, then activity: the second line qualifies the name, the
+              third says what the node did in this window. Three is the most a
+              56px card can hold without turning into a table. */}
           <div
             className={cn(
-              "mt-1 truncate font-mono text-muted-foreground",
+              "mt-0.5 truncate font-mono text-muted-foreground",
               compact ? "text-[8.5px]" : "text-[9px]",
             )}
           >
             {meta}
+          </div>
+          <div
+            className={cn(
+              "mt-0.5 truncate font-mono text-foreground/55",
+              compact ? "text-[8.5px]" : "text-[9px]",
+            )}
+          >
+            {traffic}
           </div>
         </div>
         <StatusGlyph tone={tone} />

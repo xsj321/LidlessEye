@@ -44,7 +44,11 @@ export const DEFAULT_SETTINGS: Settings = {
   defaultRange: "1h",
   autoRefreshMs: 30_000,
   edgeLabels: true,
-  labelZoom: 0.62,
+  // Labels are the third layer of information on an edge, after direction and
+  // width. At the automatic fit of a wide map (around 0.72) there can be two
+  // hundred of them, and they turn the drawing into a wall of pills: keep them
+  // for the zoom level where a reader is actually reading one.
+  labelZoom: 0.85,
   flamegraphMaxNodes: 50_000,
   histogramBuckets: 120,
 };

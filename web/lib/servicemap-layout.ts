@@ -40,6 +40,16 @@ export interface LayoutNode {
   id: string;
   /** Used to order a column before the barycenter passes. */
   connections: number;
+  /**
+   * Kind rank (workload, ClusterIP, external).
+   *
+   * Columns are ranked by dependency depth, so a single column can hold all
+   * three kinds — a namespace's workloads that everything calls sit next to
+   * the ClusterIP in front of them. Sorting each column by this *after* the
+   * barycenter passes keeps same-kind nodes adjacent, which is what lets the
+   * canvas draw one background band per kind instead of a striped graph.
+   */
+  group?: number;
 }
 
 export interface LayoutEdge {
@@ -147,6 +157,21 @@ export function layeredLayout(
   for (let pass = 0; pass < 2; pass += 1) {
     for (let c = 1; c < columns.length; c += 1) orderBy(columns[c], incoming);
     for (let c = columns.length - 2; c >= 0; c -= 1) orderBy(columns[c], out);
+  }
+
+  // Kind pass, last on purpose: the barycenter decides where a node sits
+  // relative to its peers, and this only breaks that order into kind blocks.
+  // Within a block the barycenter order is kept, so two workloads that share a
+  // caller stay neighbours. Without this pass a column alternates
+  // workload/ClusterIP/external and no band can be drawn around either group.
+  for (const column of columns) {
+    const keyed = column.map((node, index) => ({ node, group: nodes[node].group ?? 0, index }));
+    keyed.sort((a, b) => (a.group !== b.group ? a.group - b.group : a.index - b.index));
+    column.splice(
+      0,
+      column.length,
+      ...keyed.map((entry) => entry.node),
+    );
   }
 
   const tallest = Math.max(...columns.map((column) => column.length));

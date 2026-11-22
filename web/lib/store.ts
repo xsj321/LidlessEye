@@ -33,6 +33,7 @@ import type {
   FlamegraphPayload,
   LabelFilter,
   LabelValueRow,
+  MapMetric,
   ProfileType,
   SeriesRow,
   ServiceMapPayload,
@@ -76,6 +77,8 @@ export interface DashboardState {
   tenant: string;
   auto: boolean;
   unit: string;
+  /** Which counter the service map's time brush draws. */
+  mapMetric: MapMetric;
 
   ready: boolean;
   loading: boolean;
@@ -129,6 +132,7 @@ function initialState(): DashboardState {
     tenant: "",
     auto: false,
     unit: "nanoseconds",
+    mapMetric: "connections",
 
     ready: false,
     loading: false,
@@ -414,6 +418,19 @@ export class DashboardStore {
   setGroupBy(groupBy: string) {
     this.commit({ groupBy });
     void this.reload();
+    void this.loadHistogram();
+  }
+
+  /**
+   * Switch what the map's time brush plots.
+   *
+   * Only the brush changes, not the map: the three counters describe the same
+   * connections, and asking the server for a new bucket array is cheaper than
+   * re-fetching the topology that has not changed.
+   */
+  setMapMetric(mapMetric: MapMetric) {
+    if (mapMetric === this.state.mapMetric) return;
+    this.commit({ mapMetric });
     void this.loadHistogram();
   }
 
@@ -872,22 +889,25 @@ export class DashboardStore {
 
     // The map describes connections, not CPU samples. Drawing the CPU
     // timeseries underneath it made the height of each bar mean something
-    // unrelated to the nodes above, so this view asks for total request counts
-    // instead. The timeseries envelope is reused so the brush has one format.
+    // unrelated to the nodes above, so this view asks for the map's own
+    // counters instead. The timeseries envelope is reused so the brush has one
+    // format.
     if (this.state.view === "servicemap") {
       try {
+        const metric = this.state.mapMetric;
         const payload = await api.serviceMapHistogram({
           from: iso(domain.from),
           until: iso(domain.until),
           buckets,
+          metric,
         }, signal);
         if (token !== this.histToken) return;
-        const points = payload.connections ?? [];
+        const points = payload.points ?? [];
         const data: TimeseriesPayload = {
           from_ns: payload.from_ns,
           until_ns: payload.until_ns,
           step_ns: payload.step_ns,
-          series: [{ service_name: "requests", points }],
+          series: [{ service_name: payload.metric ?? metric, points }],
         };
         this.commit({ histData: data, histEmpty: points.every((point) => !point) });
       } catch {

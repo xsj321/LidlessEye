@@ -81,14 +81,16 @@ Once the window is set, click **Hide chart** at the right of the time bar to col
 
 The map is a left-to-right graph: entry points on the left, what they call on the right.
 
-- **Card colour bar** — workload (blue), ClusterIP service (violet), external endpoint (amber).
+- **Card colour bar** — workload (blue), ClusterIP service (violet), external endpoint (grey). A dashed band around a run of columns names the kind and counts it.
+- **Three lines** — the name, the namespace and ready replicas, then the node's own traffic: new connections per second and total on-CPU time in the window.
 - **Status glyph** — green dot: all replicas ready; amber triangle: degraded; hollow circle: no replicas reported.
 - **CPU heat bar** — a thin strip on each card shows on-CPU time relative to the busiest node.
-- **Edge label** — `connections/s · mean RTT`. Labels are placed to avoid cards and each other; on a crowded wire only the rate survives. They appear once the map is zoomed in past the threshold in Settings (default 62 %). Red dashed edges are retransmitting.
+- **Edges** — an arrowhead points at the callee, the stroke thickens with traffic, hops of the selected node turn blue, and anything leaving the cluster is dotted and cooler. Red dashed edges are retransmitting. Hover a line to read its full `protocol · connections/s · mean RTT`.
+- **Labels** appear once the map is zoomed in past the threshold in Settings (default 85 %); at the whole-graph scale, direction and width carry the structure.
 
-The histogram above the map is labelled **Requests**: its bars count new connections opened across all edges in each bucket, not CPU samples. It answers "when was the system busy" for the topology you are looking at.
+The histogram above the map plots one of three counters — **Requests** (new connections), **Bytes** or **Retransmits** — across all edges in each bucket, not CPU samples. It answers "when was the system busy, and was it more calls, more data or more retries" for the topology you are looking at.
 
-Use the `+` / `−` buttons to zoom, the fit button to frame the whole graph, and drag the background to pan.
+Use the `+` / `−` buttons to zoom, the fit button to frame the whole graph, reset to clear everything and refit, and drag anywhere to pan. The automatic fit keeps a readable scale, so a very wide graph runs off the edge — press `/` (or Ctrl/Cmd-K) and type a name to jump to a node; the result is centred and selected. With a node open, **Focus** in its panel redraws the map as that node and its one-hop neighbours.
 
 ![Service map](images/servicemap.png)
 

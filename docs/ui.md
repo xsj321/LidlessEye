@@ -235,9 +235,12 @@ range. This is the view that answers "is anything arriving at all?".
 
 The network graph of the selected window: nodes are workloads, ClusterIP
 Services and the outside world; edges are TCP connections between them. A node
-is a real `Card` — a small rounded rectangle, not a dot — with two lines inside
-it: the service name, then its namespace and, for a workload, how many replicas
-are ready. Three signals share the card without competing:
+is a real `Card` — a small rounded rectangle, not a dot — with three lines
+inside it: the service name, then its namespace and how many replicas are
+ready, then what it did in the window — new connections per second and total
+on-CPU time (`0.31/s · 4.2s`). Three is the most a 56 px card holds before it
+becomes a table; the rest is one click away in the panel. Four signals share
+the card without competing:
 
 - **colour** — a bar on the left edge, and a faint tint, say what the node is:
   blue for a workload, purple for a ClusterIP, grey for the outside world;
@@ -245,7 +248,22 @@ are ready. Three signals share the card without competing:
   every replica is ready, a triangle when one is not, a hollow ring when the
   cluster reported no replicas at all;
 - **a hairline at the bottom** — the share of on-CPU time of the busiest node on
-  the map, so cost is a bar rather than a fourth colour.
+  the map, so cost is a bar rather than a fourth colour;
+- **position** — cards of one kind cluster inside a dashed **band** with a
+  title (`Workloads · 33`), so "these are the ClusterIPs, that is the outside
+  world" survives a screenshot instead of depending on a memorised legend.
+
+Edges carry direction, weight and meaning on separate channels. An **arrowhead**
+on the target end makes the drawing a flow rather than a set of "connected"
+pairs. **Stroke width** grows with traffic, so the main call chain is a thick
+line and a health check is a hairline. **Colour** says what the hop means to
+the selection: unselected hops are a legible steel grey (they used to be so
+dim they disappeared into the card surface), hops of the selected node are a
+bright blue, retransmits are red. **Opacity** separates the subject from the
+context: with a node selected, everything unrelated drops to a hint, and
+hovering a card or a line lifts just that hop. An edge to something outside the
+cluster is dotted and cooler, because "this call leaves the cluster" is a
+different fact from "these two pods talk".
 
 Every edge is labelled with the application protocol the payload sniffer saw
 (or the port's fallback), new connections per second and the mean round-trip
@@ -261,17 +279,54 @@ the protocol as long as it can; only when none of them fit does the edge keep
 its curve and lose its text. Overlapping digits are not information,
 so nothing is drawn on top of anything else: paths go in one pass and labels in
 a second, or the edge drawn last would strike a line through the number.
+Labels are placed only for edges whose midpoint is on screen, so panning a
+ten-thousand-pixel map does not carry two hundred invisible text nodes along
+with it. Hovering a line reveals its full numbers — protocol, rate and RTT — in
+a brighter pill above everything else, even when the resting label had to
+shorten itself.
 Retransmits turn an edge red and dashed; an edge that runs against the column
 flow (a callback, a retry) bends out and arrives on the far side.
 
 The graph is laid out in columns, one per dependency depth: an entry point sits
 in the leftmost column and everything it calls sits to its right. Cycles are
-condensed first, so a pair of services that call each other share a column
-instead of stacking up. Within a column, cards are ordered to reduce crossings
-against the column before them, and the busiest node is highest. Cards in one
-column share a width, which is what makes a column read as a stack. Scroll to
-zoom, drag the background to pan, double the button group at the top right to
-fit the graph back.
+broken first, so a pair of services that call each other do not collapse into
+one column and lose their direction. Within a column, cards are ordered to
+reduce crossings against the column before them, and then grouped by kind, so a
+column that holds a ClusterIP and the workloads behind it reads as two blocks
+and can be banded. Cards in one column share a width, which is what makes a
+column read as a stack.
+
+A layered graph of a real cluster can be forty columns wide. Scaling that into
+the canvas leaves a ribbon of unreadable slivers, so the **automatic fit stops
+at 72 %** and lets the map run off the edge; the entry points stay on the left,
+where the reading starts. The toolbar's *fit* still shows the whole drawing —
+at that scale the cards are shapes and the map is an overview — and `/` or the
+search box is how you get back to a node. Scroll to zoom, drag anywhere
+(background or cards) to pan. Zoom in, zoom out, fit and reset are the four
+buttons at the top right; **reset** clears the selection, the search and the
+focus and refits.
+
+**Search** (`/` or Ctrl/Cmd-K) is the map's address bar: a ranked list over
+names, ids and namespaces, arrow keys and Enter to pick. A hit is outlined on
+the canvas while the list is open, then selected, centred — in the part of the
+canvas the drawer leaves visible — and zoomed to at least 85 %, because a
+centred card at 40 % is not the answer to "where is payments". Results close
+as soon as the pointer goes anywhere else.
+
+**Focus** is the other half of the same problem. Selecting a node and pressing
+*Focus* in the panel redraws the map as that node and its one-hop neighbours
+(including the edges between the neighbours), laid out on its own so the hop is
+not scattered across the whole graph. While focus is on, the drawer narrows to
+38 % of the window to give the map room, and restores its previous width when
+the lens is dropped; a pill at the bottom left says which node is in focus and
+closes it. Losing the selection also ends focus — a lens with nothing behind it
+is just a smaller map.
+
+The canvas clips with `overflow: clip`, not `overflow: hidden`: a hidden box is
+still a scroll container, and focusing a card would scroll the layer inside it,
+sliding the whole drawing sideways with the transform unchanged. Clipping also
+means the browser cannot scroll an off-screen card into view on Tab, so a card
+that takes focus pans the map to itself instead.
 
 Clicking a card slides a panel in from the right — the map stays visible behind
 it, because the numbers are about the topology that is still on screen. The
@@ -375,15 +430,20 @@ flamegraph view* replaces the filter bar with the same selector and switches
 pages. The time range is the one chosen above: dragging the bracket re-queries
 the map exactly as it re-queries a flamegraph.
 
-Edge labels appear once the map is zoomed past a threshold (62 % by default),
-both to keep the initial whole-graph view readable and because the pills do not
-scale with the canvas transform. Both the switch and the threshold are in
-[Settings](#settings).
+Edge labels appear once the map is zoomed past a threshold (85 % by default):
+at the automatic fit of a wide map there can be two hundred of them, and a wall
+of pills is not a drawing. Direction and width still carry the structure at
+that scale, and hovering a line shows its numbers. Both the switch and the
+threshold are in [Settings](#settings).
 
 The protocol on an edge comes from the server port; the map does not parse
-payloads, so the rate is *new connections* per second, not requests. *External*
-collects everything the map cannot name — traffic that really does come from
-outside the cluster — so an edge to it is worth a second look. See
+payloads, so the rate is *new connections* per second, not requests.
+*External* collects everything the map cannot name — traffic that really does
+come from outside the cluster — so an edge to it is worth a second look. The
+time chart above the map plots one of the three counters the agent records —
+new connections, bytes, or retransmits — because which one matters depends on
+the incident. The range itself is the same one the flamegraph uses: *Relative*
+or *Absolute* beside the chart, with the brush to narrow it. See
 [architecture.md](architecture.md#service-map) for what the agent reads and why.
 
 ## Settings
@@ -400,7 +460,7 @@ explicit view or range picks up the start-up values.
 | Default range | `1h` | Relative range on a fresh load. |
 | Auto-refresh interval | 30 s | 10 s / 30 s / 1 min / 5 min; re-arms an active Auto timer immediately. |
 | Edge labels | on | The rate/RTT pills on service-map edges. |
-| Label zoom threshold | 62 % | Zoom level at which those pills appear. |
+| Label zoom threshold | 85 % | Zoom level at which those pills appear. |
 | Flamegraph frame cap | 50 000 | `max_nodes` on `/flamegraph` and `/diff`, including the panel's embedded graph. |
 | Histogram buckets | 120 | 60 / 120 / 240 buckets in the time brush. |
 
@@ -554,11 +614,12 @@ one field, and each view is a component that draws from the store's payload.
 
 Profile histograms are filled from `/api/v1/timeseries` over the extent,
 bucketed 120 ways, and summed across series. The service map asks
-`/api/v1/servicemap/histogram` instead: it sums `net_edges.connections` per
-bucket over the whole map, so the brush shows request density rather than CPU
-samples. Both are converted to the same `TimeseriesPayload` envelope before
-reaching `TimeBrush`; the window itself is client state until it lands in the
-URL.
+`/api/v1/servicemap/histogram` instead: it sums one of the map's own counters —
+`connections` (the default), `bytes` or `retransmits` — per bucket over the
+whole map, so the brush shows traffic density rather than CPU samples, and the
+three buttons beside the range picker switch which one. Both are converted to
+the same `TimeseriesPayload` envelope before reaching `TimeBrush`; the window
+itself is client state until it lands in the URL.
 
 ### Testing it
 

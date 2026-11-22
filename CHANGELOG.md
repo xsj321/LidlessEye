@@ -39,6 +39,40 @@ Rust API follows the same rule.
   side. Keying by node id made the second overwrite the first, which left a
   hole in one column and drew that side's hops to a card across the graph.
 
+- The service map has a **node search** (`/` or Ctrl/Cmd-K): a ranked list over
+  names, ids and namespaces; a hit is centred in the part of the canvas the
+  drawer leaves visible, selected, and zoomed to a readable scale. Results
+  close when the pointer goes anywhere else.
+- A **focus mode** on the map: the selected node and its one-hop neighbours are
+  relaid out on their own, the drawer narrows to give the map room, and a pill
+  names the node in focus. Losing the selection ends the mode.
+- The map groups its drawing into labelled **bands** by kind — workloads,
+  ClusterIPs, external — and sorts each column by kind so a band is possible at
+  all. Cards now carry a third line: new connections per second and on-CPU time
+  for the window.
+- Edges state direction and weight separately: arrowheads on the target end,
+  stroke width from traffic, a bright emphasis colour for the selected node's
+  hops, and a dotted cooler line for anything that leaves the cluster.
+  Hovering a line reveals its full protocol, rate and RTT.
+- The map's time chart plots one of three counters — connections, bytes or
+  retransmits — from `/api/v1/servicemap/histogram?metric=…`, so the brush can
+  answer "was it more calls, more data, or more retries?".
+- The map has fit, zoom and reset controls. The automatic fit keeps a readable
+  scale instead of shrinking a forty-column graph to a ribbon; *fit* still
+  shows the whole drawing, and a card that takes keyboard focus pans into view.
+
+### Changed
+
+- `MapHistogram` returns `points` plus the `metric` it holds, instead of a
+  `connections` array. The field named the counter, which stopped being true
+  once the brush could plot bytes.
+- The map canvas clips with `overflow: clip`. A hidden box is still a scroll
+  container, so focusing a card scrolled the layer inside it and slid the whole
+  drawing sideways with the transform unchanged.
+- Edge labels default to appearing at 85 % zoom rather than 62 %: at the
+  automatic fit of a large map they turned the drawing into a wall of pills,
+  and direction plus width still carry the structure.
+
 ### Changed
 
 - The neighbourhood pans from anywhere on it, cards included, and its surface

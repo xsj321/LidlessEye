@@ -814,7 +814,7 @@ export function Neighborhood({
           pointer's own drag gesture (icons, links) for the same reason. */}
       {available > 0 ? (
         <div
-          className="relative cursor-grab touch-none overflow-hidden rounded-md border bg-background/30 select-none active:cursor-grabbing"
+          className="relative cursor-grab touch-none overflow-clip rounded-md border bg-background/30 select-none active:cursor-grabbing"
           style={{ height: viewHeight }}
           data-zoom={view.k.toFixed(3)}
           draggable={false}

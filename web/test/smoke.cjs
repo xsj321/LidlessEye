@@ -1045,11 +1045,23 @@ async function main() {
   const mapHist = await mapHistResponse.json();
   check(
     mapHistResponse.ok &&
-      Array.isArray(mapHist.connections) &&
-      mapHist.connections.length === 60 &&
-      mapHist.connections.some((value) => value > 0),
+      Array.isArray(mapHist.points) &&
+      mapHist.points.length === 60 &&
+      mapHist.points.some((value) => value > 0),
     "the histogram endpoint returns per-bucket request counts",
     JSON.stringify(mapHist).slice(0, 200),
+  );
+  const bytesHist = await (
+    await fetch(`${BASE}/api/v1/servicemap/histogram?from=now-1h&buckets=30&metric=bytes`, {
+      headers: { "x-scope-orgid": "acme" },
+    })
+  ).json();
+  check(
+    bytesHist.metric === "bytes" &&
+      Array.isArray(bytesHist.points) &&
+      bytesHist.points.length === 30,
+    "the brush can ask for a different counter",
+    JSON.stringify(bytesHist).slice(0, 200),
   );
   const edgeLabelTexts = await mapPage
     .locator('[data-testid="service-map-canvas"] svg text')
@@ -1472,9 +1484,62 @@ async function main() {
     `${widthBefore} -> ${widthAfter}`,
   );
 
+  // ---- search, focus, metric -------------------------------------------
+  // A map of sixty cards has no address bar; search is it. A hit is selected,
+  // centred and opens its panel, which is what "locate this node" means.
+  await mapPage.click('[data-testid="map-panel-close"]');
+  const totalCards = await mapPage.locator('[data-testid="map-node"]').count();
+  await mapPage.fill('[data-testid="map-search"]', "cart");
+  await mapPage.waitForSelector('[data-testid="map-search-hit"]', { timeout: 5000 });
+  check(
+    (await mapPage.locator('[data-testid="map-search-hit"]').count()) >= 1,
+    "the map search lists matching nodes",
+  );
+  await mapPage.keyboard.press("Enter");
+  await mapPage.waitForSelector('[data-testid="map-panel"][data-state="open"]', { timeout: 10000 });
+  check(
+    (await mapPage.locator("#map-panel-title").innerText()).trim() === "cart",
+    "a search hit selects that node",
+    await mapPage.locator("#map-panel-title").innerText(),
+  );
+
+  // Focus is the other half: the graph is context, the one-hop subgraph is the
+  // answer, and it is laid out on its own.
+  await mapPage.click('[data-testid="map-focus"]');
+  await mapPage.waitForTimeout(700);
+  const focusedCards = await mapPage.locator('[data-testid="map-node"]').count();
+  // The seeded map is four nodes, so the one-hop drawing may legitimately be
+  // all of them: the assertion is that focus reports itself and never grows
+  // the drawing.
+  check(
+    focusedCards >= 2 && focusedCards <= totalCards,
+    "focus keeps the node and its neighbours",
+    `${totalCards} -> ${focusedCards}`,
+  );
+  check(
+    (await mapPage.getAttribute('[data-testid="map-focus"]', "aria-pressed")) === "true",
+    "the focus toggle reports its state",
+  );
+  await mapPage.click('[data-testid="map-focus"]');
+  await mapPage.waitForTimeout(600);
+  check(
+    (await mapPage.locator('[data-testid="map-node"]').count()) === totalCards,
+    "leaving focus restores the whole map",
+  );
+  await mapPage.click('[data-testid="map-panel-close"]');
+
+  // The brush above the map plots one of three counters the agent records.
+  await mapPage.click('[data-testid="map-metric"] button:nth-child(2)');
+  await mapPage.waitForTimeout(600);
+  check(
+    (await mapPage.locator(".brush-label").innerText()).trim() === "Bytes",
+    "the map's time chart can plot another counter",
+    await mapPage.locator(".brush-label").innerText(),
+  );
+  await mapPage.click('[data-testid="map-metric"] button:nth-child(1)');
+
   // The node drawer spans the full window height and overlaps the time bar;
   // close it before reaching for the range control behind it.
-  await mapPage.click('[data-testid="map-panel-close"]');
   // The relative range is now a purpose-built time picker: a popover with a
   // grid of shortcuts rather than a generic Select with role=option items.
   await mapPage.click("#relative-range");

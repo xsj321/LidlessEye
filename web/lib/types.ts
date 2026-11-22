@@ -184,15 +184,19 @@ export interface MapHistoryPayload {
 /**
  * Whole-map request counts over the brush domain.
  *
- * `connections` is the number of TCP connections opened in each bucket across
+ * `points` is the counter named by `metric` in each bucket, summed across
  * every edge — the map's closest equivalent of a request rate. It is returned
  * as a dense array so the brush can draw bucket index i at time from + i*step.
  */
+export type MapMetric = "connections" | "bytes" | "retransmits";
+
 export interface MapHistogramPayload {
   from_ns: number;
   until_ns: number;
   step_ns: number;
-  connections: number[];
+  /** Echoes the requested counter, so the brush labels bars from the answer. */
+  metric?: MapMetric;
+  points: number[];
 }
 
 export interface ProfileType {  name: string;

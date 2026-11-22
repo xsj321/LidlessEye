@@ -13,20 +13,23 @@
 // reading as a stack instead of a ragged edge.
 
 import { layeredLayout } from "./servicemap-layout";
-import { formatCount } from "./format";
-import type { LabelFilter, ServiceMapEdge, ServiceMapNode } from "./types";
+import { formatCount, formatDuration } from "./format";
+import type { LabelFilter, NodeKind, ServiceMapEdge, ServiceMapNode } from "./types";
 
 /** Card geometry, in pixels. */
 export const CARD = {
-  height: 46,
-  minWidth: 138,
-  maxWidth: 214,
+  /** Three lines of text — name, namespace/replicas, traffic — plus the CPU
+   *  hairline. 46 fitted two lines; a third needs the extra ten pixels, and
+   *  every card shares the height so a column stays a stack. */
+  height: 56,
+  minWidth: 148,
+  maxWidth: 232,
   /** Space taken by the kind bar, the padding and the status glyph. */
   chrome: 40,
   /** Horizontal room between two columns, for the edge label to sit in. */
   gapX: 104,
   /** Vertical room between two cards. */
-  gapY: 14,
+  gapY: 16,
 };
 
 export interface Box {
@@ -80,6 +83,34 @@ export function nodeMeta(node: ServiceMapNode): string {
   return `${where} · ${Math.min(node.ready ?? 0, pods)}/${pods}`;
 }
 
+/**
+ * Third line of a card: what the node is doing, in two numbers.
+ *
+ * Name, then identity, then activity: the first two lines answer "what is
+ * this" and this one answers "is it busy". Both values are window-scoped, so
+ * they read as *measurements of the range on screen* rather than as live
+ * gauges — which is the only honest thing a payload fetched once can say.
+ *
+ * The rate is new connections per second, the same quantity the edge labels
+ * carry, because without payload parsing there is no request count to divide.
+ * On-CPU time is the total over the window, the same number the node panel's
+ * CPU tab headlines.
+ */
+export function nodeTraffic(node: ServiceMapNode, windowSec: number): string {
+  const parts: string[] = [];
+  const connections = node.connections ?? 0;
+  if (connections > 0 && windowSec > 0) parts.push(formatRate(connections / windowSec));
+  if ((node.cpu_ns ?? 0) > 0) parts.push(formatDuration(node.cpu_ns ?? 0));
+  return parts.join(" · ") || "—";
+}
+
+/** Order of the kinds in a column and in the legend, and the band order. */
+export const KIND_ORDER: Record<string, number> = {
+  workload: 0,
+  service: 1,
+  external: 2,
+};
+
 /** Colours of a node by kind. The left bar and the card tint read from these.
  *
  * The tint is a mix of the card surface and the bar colour at ~8%: enough to
@@ -117,7 +148,11 @@ export function placeNodes(
   const widest = Math.max(CARD.minWidth, ...nodes.map((node) => widths.get(node.id) ?? 0));
 
   const positions = layeredLayout(
-    nodes.map((node) => ({ id: node.id, connections: node.connections ?? 0 })),
+    nodes.map((node) => ({
+      id: node.id,
+      connections: node.connections ?? 0,
+      group: KIND_ORDER[node.kind ?? "workload"] ?? 9,
+    })),
     edges.map((edge) => ({ client: edge.client, server: edge.server })),
     {
       width: Math.max(520, viewport.width - 120),
@@ -155,7 +190,8 @@ export function placeNodes(
   // The layout puts the centre of the first column at x = 0, so the leftmost
   // cards start at a negative coordinate and would be clipped by the canvas.
   // Shifting the whole drawing into positive space costs one pass and removes
-  // the class of "why is the first column cut in half" bugs.
+  // the class of "why is the first column cut in half" bugs. The top margin
+  // leaves room for a zone band's title, which is drawn above its first card.
   let minX = Number.POSITIVE_INFINITY;
   let minY = Number.POSITIVE_INFINITY;
   for (const box of boxes.values()) {
@@ -164,7 +200,7 @@ export function placeNodes(
   }
   if (Number.isFinite(minX)) {
     const dx = 32 - minX;
-    const dy = 24 - minY;
+    const dy = ZONE_PAD.top + 14 - minY;
     for (const [id, box] of boxes) {
       boxes.set(id, { ...box, x: box.x + dx, y: box.y + dy });
     }
@@ -181,6 +217,151 @@ export function worldBounds(boxes: Iterable<Box>, pad = 56): { width: number; he
     maxY = Math.max(maxY, box.y + box.h);
   }
   return { width: maxX + pad, height: maxY + pad };
+}
+
+/**
+ * A background band around a run of columns that hold the same kind.
+ *
+ * Colour already distinguishes a workload from a ClusterIP on the card's kind
+ * bar, but colour alone is a key you have to memorise. A band says it with
+ * area and a title, which survives a screenshot and a projector. Bands are
+ * derived from the layout rather than from a hand-written layout mode: the
+ * columns are already ranked by dependency depth, so the kind that dominates
+ * a column is the kind that region of the graph is about.
+ *
+ * Rectangles never overlap because each one covers a disjoint run of columns.
+ */
+export interface MapZone {
+  kind: NodeKind;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  count: number;
+  columns: number;
+}
+
+/** Inset of a band around the cards it contains, and the room for its title. */
+const ZONE_PAD = { x: 14, top: 26, bottom: 16 };
+
+export function mapZones(nodes: ServiceMapNode[], boxes: Map<string, Box>): MapZone[] {
+  type Column = { x: number; kinds: Map<NodeKind, number>; count: number; boxes: Box[] };
+  const columns = new Map<number, Column>();
+
+  for (const node of nodes) {
+    const box = boxes.get(node.id);
+    if (!box) continue;
+    const column: Column =
+      columns.get(box.x) ?? { x: box.x, kinds: new Map<NodeKind, number>(), count: 0, boxes: [] };
+    const kind = (node.kind ?? "workload") as NodeKind;
+    column.kinds.set(kind, (column.kinds.get(kind) ?? 0) + 1);
+    column.count += 1;
+    column.boxes.push(box);
+    columns.set(box.x, column);
+  }
+
+  const ordered = [...columns.values()].sort((a, b) => a.x - b.x);
+  const dominant = (column: Column): NodeKind => {
+    let best: NodeKind = "workload";
+    let bestCount = -1;
+    for (const [kind, count] of column.kinds) {
+      const rank = KIND_ORDER[kind] ?? 9;
+      const bestRank = KIND_ORDER[best] ?? 9;
+      if (count > bestCount || (count === bestCount && rank < bestRank)) {
+        best = kind;
+        bestCount = count;
+      }
+    }
+    return best;
+  };
+
+  const zones: MapZone[] = [];
+  let run: { kind: NodeKind; columns: Column[] } | null = null;
+  const flush = () => {
+    if (!run) return;
+    const { kind, columns: members } = run;
+    let minX = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    let count = 0;
+    for (const column of members) {
+      count += column.count;
+      for (const box of column.boxes) {
+        minX = Math.min(minX, box.x);
+        maxX = Math.max(maxX, box.x + box.w);
+        minY = Math.min(minY, box.y);
+        maxY = Math.max(maxY, box.y + box.h);
+      }
+    }
+    // One column of three cards is a stack, not a region: a band around it
+    // would just be a second border around the cards. Two adjacent columns, or
+    // one that is tall enough to read as a region, earn a band.
+    if (members.length >= 2 || count >= 6) {
+      zones.push({
+        kind,
+        x: minX - ZONE_PAD.x,
+        y: minY - ZONE_PAD.top,
+        w: maxX - minX + ZONE_PAD.x * 2,
+        h: maxY - minY + ZONE_PAD.top + ZONE_PAD.bottom,
+        count,
+        columns: members.length,
+      });
+    }
+    run = null;
+  };
+
+  for (const column of ordered) {
+    const kind = dominant(column);
+    if (run && run.kind === kind) {
+      run.columns.push(column);
+    } else {
+      flush();
+      run = { kind, columns: [column] };
+    }
+  }
+  flush();
+  return zones;
+}
+
+/**
+ * Nodes matching a search query, best first.
+ *
+ * The map is the only view with no address bar for a specific service: at
+ * sixty nodes finding `payments` means reading sixty cards. Ranking prefers an
+ * exact id or name over a prefix and a prefix over a substring, and breaks
+ * ties by traffic so the busiest `payments` wins when several share a name.
+ */
+export function searchNodes(
+  nodes: ServiceMapNode[],
+  query: string,
+  limit = 8,
+): ServiceMapNode[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+
+  const scored: { node: ServiceMapNode; score: number }[] = [];
+  for (const node of nodes) {
+    const label = nodeLabel(node).toLowerCase();
+    const id = node.id.toLowerCase();
+    const namespace = (node.namespace ?? "").toLowerCase();
+    let score = Number.POSITIVE_INFINITY;
+    if (label === needle || id === needle) score = 0;
+    else if (label.startsWith(needle)) score = 1;
+    else if (id.startsWith(needle)) score = 2;
+    else if (label.includes(needle)) score = 3;
+    else if (id.includes(needle)) score = 4;
+    else if (namespace.includes(needle)) score = 5;
+    if (Number.isFinite(score)) scored.push({ node, score });
+  }
+
+  scored.sort((a, b) => {
+    if (a.score !== b.score) return a.score - b.score;
+    const traffic = (b.node.connections ?? 0) - (a.node.connections ?? 0);
+    if (traffic !== 0) return traffic;
+    return nodeLabel(a.node).localeCompare(nodeLabel(b.node));
+  });
+  return scored.slice(0, limit).map((entry) => entry.node);
 }
 
 export interface EdgePath {

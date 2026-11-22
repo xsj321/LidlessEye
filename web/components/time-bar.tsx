@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { domainText, selectionText, TimeBrush } from "@/lib/canvas/timebrush";
 import type { BrushHover } from "@/lib/canvas/timebrush";
-import { formatClock } from "@/lib/format";
+import { formatBytes, formatClock } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
 import {
@@ -21,9 +21,16 @@ import {
   toLocalInput,
 } from "@/lib/time";
 import type { Window } from "@/lib/time";
-import type { TimeseriesPayload } from "@/lib/types";
+import type { MapMetric, TimeseriesPayload } from "@/lib/types";
 import { useDashboard } from "@/lib/use-dashboard";
 import { cn } from "@/lib/utils";
+
+/** The map's brush plots one of three counters the agent already records. */
+const MAP_METRICS: ReadonlyArray<{ value: MapMetric; label: string; noun: string }> = [
+  { value: "connections", label: "Requests", noun: "connections" },
+  { value: "bytes", label: "Bytes", noun: "bytes" },
+  { value: "retransmits", label: "Retransmits", noun: "retransmits" },
+];
 
 /**
  * One histogram brush. The class owns the canvas; React owns the readout, and
@@ -32,6 +39,8 @@ import { cn } from "@/lib/utils";
  */
 function Brush({
   label,
+  noun,
+  bytes = false,
   domain,
   selection,
   histogram,
@@ -40,6 +49,10 @@ function Brush({
   t,
 }: {
   label: string;
+  /** What one bar counts, for the hover readout. */
+  noun: string;
+  /** Format the bucket total as a byte count rather than a plain number. */
+  bytes?: boolean;
   domain: Window;
   selection: Window;
   histogram: TimeseriesPayload | null;
@@ -106,8 +119,8 @@ function Brush({
   const hoverText = hover
     ? hover.count === null
       ? formatClock(hover.bucketFrom)
-      : `${formatClock(hover.bucketFrom)} · ${hover.count.toLocaleString()} ${
-          hover.count === 1 ? t("sample") : t("samples")
+      : `${formatClock(hover.bucketFrom)} · ${
+          bytes ? formatBytes(hover.count) : `${hover.count.toLocaleString()} ${noun}`
         }`
     : "";
 
@@ -323,6 +336,35 @@ export function TimeBar() {
 
         {state.mode === "absolute" ? <AbsoluteRangeInputs domain={domain} t={t} /> : null}
 
+        {/* The map's brush used to answer one question — "when was there
+            traffic?" — with one number. The agent records three counters per
+            edge, and which one matters depends on the incident: a drop in
+            connections, a spike in bytes, or retransmits that explain both. */}
+        {state.view === "servicemap" ? (
+          <ToggleGroup
+            id="map-metric"
+            data-testid="map-metric"
+            type="single"
+            size="sm"
+            variant="outline"
+            value={state.mapMetric}
+            onValueChange={(value) => {
+              if (value) dashboardStore.setMapMetric(value as MapMetric);
+            }}
+            aria-label={t("What the time chart counts")}
+          >
+            {MAP_METRICS.map((metric) => (
+              <ToggleGroupItem
+                key={metric.value}
+                value={metric.value}
+                className="h-7 px-2 text-xs"
+              >
+                {t(metric.label)}
+              </ToggleGroupItem>
+            ))}
+          </ToggleGroup>
+        ) : null}
+
         <span className="flex-1" />
 
         {hint ? <span className="text-[11px] text-muted-foreground">{hint}</span> : null}
@@ -373,6 +415,7 @@ export function TimeBar() {
                   brushes in one row would fight over the same width. */}
               <Brush
                 label={t("A · Baseline")}
+                noun={t("samples")}
                 domain={domain}
                 selection={baseline}
                 histogram={state.histData}
@@ -382,6 +425,7 @@ export function TimeBar() {
               />
               <Brush
                 label={t("B · Comparison")}
+                noun={t("samples")}
                 domain={domain}
                 selection={win}
                 histogram={state.histData}
@@ -393,7 +437,19 @@ export function TimeBar() {
           ) : (
             <div className="pt-1">
               <Brush
-                label={t(state.view === "servicemap" ? "Requests" : "Time range")}
+                label={t(
+                  state.view === "servicemap"
+                    ? (MAP_METRICS.find((metric) => metric.value === state.mapMetric)?.label ??
+                        "Requests")
+                    : "Time range",
+                )}
+                noun={t(
+                  state.view === "servicemap"
+                    ? (MAP_METRICS.find((metric) => metric.value === state.mapMetric)?.noun ??
+                        "connections")
+                    : "samples",
+                )}
+                bytes={state.view === "servicemap" && state.mapMetric === "bytes"}
                 domain={domain}
                 selection={win}
                 histogram={state.histData}

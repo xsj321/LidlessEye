@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import { GripVertical, X } from "lucide-react";
+import { Crosshair, GripVertical, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -82,9 +82,28 @@ export interface NodePanelProps {
   range: { from: number; until: number };
   onSelect: (id: string) => void;
   onClose: () => void;
+  /** The map behind the drawer is limited to this node and its neighbours. */
+  focus: boolean;
+  onFocusChange: (focus: boolean) => void;
+  /**
+   * How much of the window the drawer covers, and whether it is open. The map
+   * centres and fits against the part it can actually be seen in; without
+   * this, a search hit lands under the panel.
+   */
+  onLayout?: (width: number, open: boolean) => void;
 }
 
-export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: NodePanelProps) {
+export function NodePanel({
+  node,
+  nodes,
+  edges,
+  range,
+  onSelect,
+  onClose,
+  focus,
+  onFocusChange,
+  onLayout,
+}: NodePanelProps) {
   const t = useT();
   // The last node stays mounted while the panel slides out, so the drawer does
   // not empty itself in the middle of its own animation.
@@ -148,6 +167,36 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
     if (!open || !autoWidth || preferredWidth <= 0) return;
     applyWidth(preferredWidth);
   }, [open, autoWidth, preferredWidth, width]);
+
+  // Focus is a request to look at the map: while it is on, the drawer gives
+  // most of the window back, and it returns to the width it had when the lens
+  // is dropped. A hand-dragged width is restored too — the toggle is a mode,
+  // not a resize.
+  const restoreWidth = useRef<number | null>(null);
+  useEffect(() => {
+    if (!open) {
+      restoreWidth.current = null;
+      return;
+    }
+    if (focus && restoreWidth.current === null) {
+      restoreWidth.current = widthRef.current;
+      setAutoWidth(false);
+      const room = Math.round(window.innerWidth * 0.38);
+      applyWidth(Math.max(MIN_WIDTH, Math.min(widthRef.current, room)));
+    } else if (!focus && restoreWidth.current !== null) {
+      applyWidth(restoreWidth.current);
+      restoreWidth.current = null;
+      setAutoWidth(true);
+    }
+    // Width is read through a ref on purpose: including it would re-run this
+    // effect on every resize and undo the drag.
+  }, [focus, open]);
+
+  // Reported once per change rather than per frame: the map only needs the
+  // final width to know which part of itself is visible.
+  useEffect(() => {
+    onLayout?.(width, open);
+  }, [onLayout, width, open]);
 
   const persistWidth = () => {
     try {
@@ -335,6 +384,22 @@ export function NodePanel({ node, nodes, edges, range, onSelect, onClose }: Node
                 {current.id}
               </div>
             </div>
+            {/* Focus lives here rather than on the map: selecting a node is
+                what opens this drawer, and the drawer covers the corner of the
+                map where a floating control would sit. */}
+            <Button
+              variant={focus ? "secondary" : "ghost"}
+              size="xs"
+              data-testid="map-focus"
+              aria-pressed={focus}
+              aria-label={t("Focus on the selected node")}
+              title={t("Focus: show only this node's neighbours")}
+              onClick={() => onFocusChange(!focus)}
+              className="shrink-0 gap-1"
+            >
+              <Crosshair />
+              <span className="hidden sm:inline">{t("Focus")}</span>
+            </Button>
             <Button
               variant="ghost"
               size="xs"

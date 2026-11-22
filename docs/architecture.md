@@ -469,14 +469,20 @@ is what makes a URL reproduce a view exactly. Routing stays hash-based
 (`#/flamegraph?…`), so the single exported `index.html` serves every view and
 pre-existing deep links keep working.
 
-The service map is the one view that is not drawn by hand: it uses ECharts'
-canvas `graph` series (pan/zoom and hit testing in the library), because a few
-hundred nodes is exactly where a React node-per-service diagram stops being
-smooth. The positions are not ECharts' force layout, though — they come from
-`lib/servicemap-layout.ts`, which ranks the graph by dependency depth so entry
-points sit on the left and what they call sits to their right. The node colour
-is the on-CPU time of the profiles behind it, so the map and the flamegraph are
-two views of the same window.
+The service map is DOM, not canvas: one absolutely positioned `Card` per node,
+one SVG for every edge, both inside a single transformed layer so pan and zoom
+are one CSS transform and no element is re-measured while dragging. A few dozen
+cards are cheap to lay out and can hold real components — a card with three
+lines of text, a status glyph, a heat bar — which a canvas would have to
+re-implement. Positions come from `lib/servicemap-layout.ts`, which ranks the
+graph by dependency depth so entry points sit on the left and what they call
+sits to their right, then groups each column by kind so the canvas can draw a
+labelled band per region. Ranking is the honest metric for a call graph and it
+is also why a large cluster produces a wide drawing: the automatic fit keeps a
+readable scale and lets the map overflow, and search plus one-hop focus are how
+a reader moves around it. The kind bar and the faint tint say what a node is, and
+the hairline along the bottom of the card is the on-CPU time of the profiles
+behind it, so the map and the flamegraph are two views of the same window.
 
 ## Service map
 
