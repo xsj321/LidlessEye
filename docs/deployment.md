@@ -246,9 +246,9 @@ released chart therefore installs the image built from that same version, not
 whatever tag the last person happened to set.
 
 ```bash
-docker pull docker.io/xsj321/lidlesseye:0.1.2
+docker pull docker.io/xsj321/lidlesseye:0.1.3
 # the same manifest, copied by digest rather than rebuilt:
-docker pull ghcr.io/xsj321/lidlesseye:0.1.2
+docker pull ghcr.io/xsj321/lidlesseye:0.1.3
 ```
 
 Both names come out of one build: the release workflow pushes the image to GHCR
@@ -258,12 +258,23 @@ maintainer, Docker Hub publishing needs `DOCKERHUB_USERNAME` and
 `DOCKERHUB_TOKEN` as repository secrets; without them the workflow warns and
 publishes to GHCR only.
 
+The tag the chart asks for is the version **without** the `v` (`0.1.3`, not
+`v0.1.3`), because that is what `appVersion` holds. Publishing is only half of a
+release: after a tag push, check that tag exists in both registries, since a
+missing one is an `ImagePullBackOff` on a fresh install rather than a warning
+anywhere:
+
+```bash
+docker buildx imagetools inspect docker.io/xsj321/lidlesseye:0.1.3
+docker buildx imagetools inspect ghcr.io/xsj321/lidlesseye:0.1.3
+```
+
 Point a cluster at the mirror, or at a private copy, with two values:
 
 ```bash
 helm install lidlesseye deploy/helm/lidlesseye \
   --set image.repository=ghcr.io/xsj321/lidlesseye \
-  --set image.tag=0.1.2
+  --set image.tag=0.1.3
 ```
 
 ### Local clusters (Docker Desktop, kind, minikube)
@@ -273,9 +284,9 @@ build a **distinct tag**. A cluster caches the image by tag at pod creation, and
 `imagePullPolicy: IfNotPresent` will happily keep running the previous build:
 
 ```bash
-docker build -f deploy/docker/Dockerfile -t docker.io/xsj321/lidlesseye:0.1.2-dev1 .
+docker build -f deploy/docker/Dockerfile -t docker.io/xsj321/lidlesseye:0.1.3-dev1 .
 helm install lidlesseye deploy/helm/lidlesseye -n lidlesseye --create-namespace \
-  --set image.tag=0.1.2-dev1 \
+  --set image.tag=0.1.3-dev1 \
   --set server.persistence.size=5Gi
 ```
 
@@ -293,7 +304,7 @@ pushing, because `docker push` exits 0 on some transport failures and a progress
 line is not a verdict:
 
 ```bash
-scripts/push-image.sh xsj321/lidlesseye:0.1.2 --save /tmp/lidlesseye.tar
+scripts/push-image.sh xsj321/lidlesseye:0.1.3 --save /tmp/lidlesseye.tar
 ```
 
 Then, on the node (or on a machine that can reach the nodes):
@@ -303,7 +314,7 @@ Then, on the node (or on a machine that can reach the nodes):
 ctr -n k8s.io images import /tmp/lidlesseye.tar
 
 # CRI-based node, no shell into containerd's namespace
-crictl pull docker.io/xsj321/lidlesseye:0.1.2   # only if a registry is reachable
+crictl pull docker.io/xsj321/lidlesseye:0.1.3   # only if a registry is reachable
 crictl images | grep lidlesseye
 
 # kind: the tar goes through the host daemon, kind copies it into every node
@@ -343,7 +354,7 @@ For a private registry, the chart already supports both halves:
 ```bash
 helm upgrade lidlesseye deploy/helm/lidlesseye -n lidlesseye --reuse-values \
   --set image.repository=harbor.example.com/observability/lidlesseye \
-  --set image.tag=0.1.2 \
+  --set image.tag=0.1.3 \
   --set-json 'imagePullSecrets=[{"name":"harbor-creds"}]'
 ```
 

@@ -69,6 +69,12 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/lidlesseye
           tags: |
             type=ref,event=tag
+            # `v0.1.3` is what the release notes tell people to `docker run`,
+            # but the chart's `image.tag` defaults to `appVersion`, which has no
+            # `v` — so `0.1.3` has to exist as well. Without this line a tag
+            # publishes only `v0.1.3`, `0.1` and `latest`, and a fresh
+            # `helm install` asks the registry for a tag nothing ever created.
+            type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             # `latest` follows the newest stable tag only; a prerelease tag
             # such as v0.2.0-rc.1 must not move it.

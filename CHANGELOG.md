@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [Unreleased]
+
+### Fixed
+
+- A tag published the image as `v0.1.3` and `0.1`, while the chart's
+  `image.tag` resolves to `appVersion` — `0.1.3`, with no `v` — so a fresh
+  `helm install` asked the registry for a tag nothing had created. The release
+  workflow now publishes the bare version as well, and `docs/deployment.md`
+  says to check both registries for it after a tag push, since a missing tag
+  there is an `ImagePullBackOff` rather than a warning.
+
 ## [0.1.3] - 2026-11-23
 
 Memory profiling arrives, in two readers that never touch the same process: the
