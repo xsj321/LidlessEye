@@ -430,10 +430,10 @@ volume provisioning.
 
 | Endpoint | Response |
 | --- | --- |
-| `GET /api/v1/health` | `{"status":"ok","version":"0.1.0","uptime_seconds":42}`, always 200 |
+| `GET /api/v1/health` | `{"status":"ok","version":"0.1.2","uptime_seconds":42}`, always 200 |
 | `GET /api/v1/ready` | `204` when the store holds no batches yet, `200` otherwise — both mean "ready to serve" |
 | `GET /api/v1/stats` | store counters (batches, physical/logical bytes, value, earliest/latest), series count, tenant count, and ingest/query counters — all for the caller's tenant |
-| `GET /api/v1/version` | `{"name":"lidlesseye","version":"0.1.0","multi_tenant":true,"tenant_header":"X-Scope-OrgID"}` |
+| `GET /api/v1/version` | `{"name":"lidlesseye","version":"0.1.2","multi_tenant":true,"tenant_header":"X-Scope-OrgID"}` |
 | `GET /metrics` | Prometheus text format |
 
 ### Metrics

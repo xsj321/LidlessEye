@@ -246,9 +246,9 @@ released chart therefore installs the image built from that same version, not
 whatever tag the last person happened to set.
 
 ```bash
-docker pull docker.io/xsj321/lidlesseye:0.1.1
+docker pull docker.io/xsj321/lidlesseye:0.1.2
 # the same manifest, copied by digest rather than rebuilt:
-docker pull ghcr.io/xsj321/lidlesseye:0.1.1
+docker pull ghcr.io/xsj321/lidlesseye:0.1.2
 ```
 
 Both names come out of one build: the release workflow pushes the image to GHCR
@@ -263,7 +263,7 @@ Point a cluster at the mirror, or at a private copy, with two values:
 ```bash
 helm install lidlesseye deploy/helm/lidlesseye \
   --set image.repository=ghcr.io/xsj321/lidlesseye \
-  --set image.tag=0.1.1
+  --set image.tag=0.1.2
 ```
 
 ### Local clusters (Docker Desktop, kind, minikube)
@@ -273,9 +273,9 @@ build a **distinct tag**. A cluster caches the image by tag at pod creation, and
 `imagePullPolicy: IfNotPresent` will happily keep running the previous build:
 
 ```bash
-docker build -f deploy/docker/Dockerfile -t docker.io/xsj321/lidlesseye:0.1.1-dev1 .
+docker build -f deploy/docker/Dockerfile -t docker.io/xsj321/lidlesseye:0.1.2-dev1 .
 helm install lidlesseye deploy/helm/lidlesseye -n lidlesseye --create-namespace \
-  --set image.tag=0.1.1-dev1 \
+  --set image.tag=0.1.2-dev1 \
   --set server.persistence.size=5Gi
 ```
 
@@ -293,7 +293,7 @@ pushing, because `docker push` exits 0 on some transport failures and a progress
 line is not a verdict:
 
 ```bash
-scripts/push-image.sh xsj321/lidlesseye:0.1.1 --save /tmp/lidlesseye.tar
+scripts/push-image.sh xsj321/lidlesseye:0.1.2 --save /tmp/lidlesseye.tar
 ```
 
 Then, on the node (or on a machine that can reach the nodes):
@@ -303,7 +303,7 @@ Then, on the node (or on a machine that can reach the nodes):
 ctr -n k8s.io images import /tmp/lidlesseye.tar
 
 # CRI-based node, no shell into containerd's namespace
-crictl pull docker.io/xsj321/lidlesseye:0.1.1   # only if a registry is reachable
+crictl pull docker.io/xsj321/lidlesseye:0.1.2   # only if a registry is reachable
 crictl images | grep lidlesseye
 
 # kind: the tar goes through the host daemon, kind copies it into every node
@@ -343,7 +343,7 @@ For a private registry, the chart already supports both halves:
 ```bash
 helm upgrade lidlesseye deploy/helm/lidlesseye -n lidlesseye --reuse-values \
   --set image.repository=harbor.example.com/observability/lidlesseye \
-  --set image.tag=0.1.1 \
+  --set image.tag=0.1.2 \
   --set-json 'imagePullSecrets=[{"name":"harbor-creds"}]'
 ```
 

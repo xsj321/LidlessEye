@@ -8,6 +8,14 @@ Rust API follows the same rule.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-22
+
+The service map becomes something an operator can work with rather than look
+at: search, a one-hop focus, a layout that stays readable when the graph is
+forty columns wide, a key for the four edge styles, external traffic split by
+the destination host, and a time chart that can plot bytes and retransmits as
+well as connections.
+
 ### Added
 
 - The service map names the destination a client actually asked for. An HTTP
@@ -38,7 +46,6 @@ Rust API follows the same rule.
 - A workload that both calls and is called now gets **two cards**, one per
   side. Keying by node id made the second overwrite the first, which left a
   hole in one column and drew that side's hops to a card across the graph.
-
 - The service map has a **node search** (`/` or Ctrl/Cmd-K): a ranked list over
   names, ids and namespaces; a hit is centred in the part of the canvas the
   drawer leaves visible, selected, and zoomed to a readable scale. Results
@@ -89,9 +96,6 @@ Rust API follows the same rule.
 - Edge labels default to appearing at 85 % zoom rather than 62 %: at the
   automatic fit of a large map they turned the drawing into a wall of pills,
   and direction plus width still carry the structure.
-
-### Changed
-
 - The neighbourhood pans from anywhere on it, cards included, and its surface
   no longer selects text: dragging used to select the card labels, and the next
   drag became a native text drag that the browser turns into a search. The
@@ -219,6 +223,7 @@ service map.
 - User stacks need frame pointers; CPU and off-CPU only, no allocation
   profiling yet.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/xsj321/LidlessEye/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/xsj321/LidlessEye/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/xsj321/LidlessEye/releases/tag/v0.1.0

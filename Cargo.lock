@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "lidlesseye"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1351,7 +1351,7 @@ dependencies = [
 
 [[package]]
 name = "lidlesseye-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duckdb",
  "flate2",
@@ -1365,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "lidlesseye-ebpf"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aya",
  "blazesym",
@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "lidlesseye-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "bytes",
