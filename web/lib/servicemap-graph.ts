@@ -540,7 +540,13 @@ export function mergeParallelEdges(edges: ServiceMapEdge[]): ServiceMapEdge[] {
     const key = `${edge.client}\u0000${edge.server}`;
     const current = groups.get(key);
     if (!current) {
-      groups.set(key, { ...edge, client_container: "", server_container: "" });
+      groups.set(key, {
+        ...edge,
+        client_container: "",
+        server_container: "",
+        client_pod: "",
+        server_pod: "",
+      });
       continue;
     }
     const before = current.connections;

@@ -872,7 +872,7 @@ impl Scanner {
             .cloned()
             .unwrap_or_default();
 
-        let (client_node, server_node, server_port, server_container) = match peer {
+        let (client_node, server_node, server_port, server_container, server_pod) = match peer {
             Peer::Pod(meta) => {
                 let node = pod_node(&meta);
                 if local_is_server {
@@ -888,7 +888,13 @@ impl Scanner {
                     .map(|info| info.name.clone())
                     .unwrap_or_default();
                 peers.entry(id.clone()).or_insert(node);
-                (this.id, id, socket.key.remote.1, container)
+                (
+                    this.id,
+                    id,
+                    socket.key.remote.1,
+                    container,
+                    meta.uid.clone(),
+                )
             }
             Peer::Service(service) => {
                 if local_is_server {
@@ -896,7 +902,13 @@ impl Scanner {
                 }
                 let node = service_node(&service);
                 peers.entry(node.id.clone()).or_insert(node);
-                (this.id, service.id(), socket.key.remote.1, String::new())
+                (
+                    this.id,
+                    service.id(),
+                    socket.key.remote.1,
+                    String::new(),
+                    String::new(),
+                )
             }
             Peer::External => {
                 unnamed.insert((socket.key.remote.0, socket.key.remote.1));
@@ -904,10 +916,22 @@ impl Scanner {
                 peers.entry(id.clone()).or_insert_with(external_node);
                 if local_is_server {
                     // Inbound from outside the cluster: the pod is the server.
-                    (id, this.id, socket.key.local.1, String::new())
+                    (
+                        id,
+                        this.id,
+                        socket.key.local.1,
+                        String::new(),
+                        String::new(),
+                    )
                 } else {
                     // Outbound to something the map cannot name.
-                    (this.id, id, socket.key.remote.1, String::new())
+                    (
+                        this.id,
+                        id,
+                        socket.key.remote.1,
+                        String::new(),
+                        String::new(),
+                    )
                 }
             }
         };
@@ -919,6 +943,15 @@ impl Scanner {
         } else {
             (local_container, server_container)
         };
+        // The local pod is the only one this agent can identify without a
+        // cluster-wide lookup. A peer pod was resolved by the socket address,
+        // so its UID travels with the edge too; services and the outside world
+        // have no pod to name.
+        let (client_pod, server_pod) = if local_is_server {
+            (String::new(), pod.meta.uid.clone())
+        } else {
+            (pod.meta.uid.clone(), server_pod)
+        };
 
         Some(ServiceEdge {
             client: client_node,
@@ -926,6 +959,8 @@ impl Scanner {
             protocol: protocol_for_port(server_port).to_string(),
             client_container,
             server_container,
+            client_pod,
+            server_pod,
             connections: u64::from(counted),
             retransmits: u64::from(retrans),
             ..Default::default()
@@ -1067,6 +1102,7 @@ fn health_by_node(pods: &PodIndex) -> HashMap<String, NodeHealth> {
         if slot.instances.len() < MAX_INSTANCES {
             slot.instances.push(InstanceInfo {
                 name: meta.name.clone(),
+                uid: meta.uid.clone(),
                 node: meta.host.clone(),
                 ready: meta.ready,
                 phase: meta.phase.clone(),

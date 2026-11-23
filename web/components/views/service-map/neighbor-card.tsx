@@ -130,6 +130,12 @@ export interface NeighborCardProps {
    * indistinguishable to a screen reader.
    */
   relation?: "caller" | "callee";
+  /** A pod card shows the replica name, but still walks to its workload. */
+  title?: string;
+  subtitle?: string;
+  selectId?: string;
+  /** Stable replica id, so the panel can be tested and debugged per pod. */
+  podUid?: string;
   onSelect?: (id: string) => void;
   testId?: string;
   /**
@@ -166,6 +172,10 @@ export const NeighborCard = memo(function NeighborCard({
   cpuMax,
   selected = false,
   relation,
+  title,
+  subtitle,
+  selectId,
+  podUid,
   onSelect,
   testId,
   cardPorts,
@@ -174,8 +184,8 @@ export const NeighborCard = memo(function NeighborCard({
   const palette = KIND[kind] ?? KIND.workload;
   const tone = healthTone(node);
   const heat = cpuMax > 0 ? Math.min(1, Math.sqrt(cpu / cpuMax)) : 0;
-  const label = nodeLabel(node);
-  const rawMeta = nodeMeta(node);
+  const label = title ?? nodeLabel(node);
+  const rawMeta = subtitle ?? nodeMeta(node);
   // A workload with no namespace would title its second line with a bare
   // dash; the kind is the more useful thing to say there.
   const meta = rawMeta === "—" || rawMeta === "-" ? kind : rawMeta;
@@ -188,6 +198,7 @@ export const NeighborCard = memo(function NeighborCard({
   return (
     <article
       data-testid={testId}
+      data-pod-uid={podUid || undefined}
       // The pan surface checks this marker before capturing the pointer:
       // without it a press on a card never reaches its button.
       data-map-card=""
@@ -227,7 +238,7 @@ export const NeighborCard = memo(function NeighborCard({
         }`}
         aria-expanded={selected}
         aria-controls="map-panel"
-        onClick={() => onSelect?.(node.id)}
+        onClick={() => onSelect?.(selectId ?? node.id)}
       />
 
       {/* No rule under the header: the container rows below are indented and
@@ -305,6 +316,7 @@ export const NeighborCard = memo(function NeighborCard({
                       data-container-port="in"
                       data-node={node.id}
                       data-container={container.name}
+                      data-pod-uid={podUid || undefined}
                       className="absolute rounded-full border-[1.5px]"
                       style={{
                         left: neighborRowLeft() - NEIGHBOR_CARD.portRadius,
@@ -320,6 +332,7 @@ export const NeighborCard = memo(function NeighborCard({
                       data-container-port="out"
                       data-node={node.id}
                       data-container={container.name}
+                      data-pod-uid={podUid || undefined}
                       className="absolute rounded-full border-[1.5px]"
                       style={{
                         right:
@@ -368,6 +381,7 @@ export const NeighborCard = memo(function NeighborCard({
                 data-testid="map-container-row"
                 data-node={node.id}
                 data-container={container.name}
+                data-pod-uid={podUid || undefined}
                 // A pane of glass resting on the card, not a box drawn in it:
                 // a translucent surface with a shadow underneath. The lift
                 // says "part of the workload above", which is more than the

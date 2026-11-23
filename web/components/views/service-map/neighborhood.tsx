@@ -3,11 +3,11 @@
 // The neighbourhood of the selected node: what calls it, what it calls.
 //
 // This is a different drawing from the big map, not a crop of it. The big map
-// answers "what exists"; this one answers "which part of this workload holds
-// the connection", so each workload is a single card that owns its container
-// rows rather than a card and a second set of loose boxes underneath it. One
-// DOM subtree per workload means a long workload name or a third container can
-// no longer push a row on top of its neighbour: the browser stacks them.
+// answers "what exists"; this one answers "which replica holds the
+// connection", so every pod is its own card and owns its container rows rather
+// than a workload card hiding its replicas behind a gauge. One DOM subtree per
+// pod means a long pod name or a third container can no longer push a row on
+// top of its neighbour: the browser stacks them.
 //
 // Direction is fixed: callers on the left, the selected workload in the
 // middle, callees on the right. Every card carries the same rate, protocol and
@@ -41,8 +41,10 @@ import type { NeighborContainer } from "./neighbor-card";
 
 /** How many peers a column shows before it says "+n more". */
 const MAX_PEERS = 6;
-/** Containers drawn inside one workload card, before a "+n more" row. */
+/** Containers drawn inside one pod card, before a "+n more" row. */
 const MAX_CONTAINERS = 6;
+/** Pods drawn for one workload; the rest collapse into an overflow card. */
+const MAX_PODS = 6;
 
 const SIZE = {
   pad: 20,
@@ -100,8 +102,14 @@ interface PeerGroup {
  */
 interface Slot {
   key: string;
+  /** Workload id, kept so a pod card still walks the graph to its workload. */
   id: string;
   side: "up" | "self" | "down";
+  /** UID of one replica; empty for traffic that could not be pinned to a pod. */
+  podUid?: string;
+  podName?: string;
+  /** Count of replicas hidden behind this overflow card. */
+  morePods?: number;
 }
 
 interface Layout {
@@ -134,6 +142,34 @@ function port(x: number, y: number): Box {
 /** Strip the `@in` / `@out` suffix back to a row or workload key. */
 function anchorBase(key: string): string {
   return key.replace(/@(in|out)$/, "");
+}
+
+/** Pod UID carried by an edge end, or empty when the agent could not tell. */
+function podUidOf(edge: ServiceMapEdge, end: "client" | "server"): string {
+  return (end === "client" ? edge.client_pod : edge.server_pod) ?? "";
+}
+
+/** Which end of an edge is the pod that owns `id` on a given side. */
+function podUidForCard(edge: ServiceMapEdge, id: string, side: Slot["side"]): string {
+  if (side === "up") return podUidOf(edge, "client");
+  if (side === "down") return podUidOf(edge, "server");
+  return edge.server === id ? podUidOf(edge, "server") : podUidOf(edge, "client");
+}
+
+function instanceName(node: ServiceMapNode | undefined, uid: string): string {
+  const instance = node?.instances?.find((item) => item.uid === uid);
+  return instance?.name ?? uid;
+}
+
+function slotLabel(node: ServiceMapNode | undefined, slot: Slot): string {
+  if (slot.morePods) return `+${slot.morePods} more pods`;
+  return slot.podName ?? (node ? nodeLabel(node) : slot.id);
+}
+
+function slotMeta(node: ServiceMapNode | undefined, slot: Slot): string {
+  if (!slot.podName) return node ? nodeMeta(node) : "";
+  const owner = node?.workload || node?.service || node?.id || "";
+  return [node?.namespace, owner].filter(Boolean).join(" · ") || "pod";
 }
 
 function groupPeers(edges: ServiceMapEdge[], peerOf: (edge: ServiceMapEdge) => string): PeerGroup[] {
@@ -241,38 +277,97 @@ export function Neighborhood({
   const allDown = useMemo(() => groupPeers(outbound, (edge) => edge.server), [outbound]);
   const upGroups = useMemo(() => allUp.slice(0, MAX_PEERS), [allUp]);
   const downGroups = useMemo(() => allDown.slice(0, MAX_PEERS), [allDown]);
-  const shownIds = useMemo(
-    () => [node.id, ...upGroups.map((group) => group.id), ...downGroups.map((group) => group.id)],
-    [node.id, upGroups, downGroups],
-  );
-
-  // A card per (side, node). The same node can be on both sides, and each side
-  // owns its own container rows, so the two are separate cards.
+  // A card per pod, not per workload. The agent's edge list used to carry only
+  // the workload id, so a two-replica deployment drew one card and the traffic
+  // of both pods was folded into it. Edges now carry pod UIDs; each replica gets
+  // its own card and container rows. A fallback card remains for traffic the
+  // agent could not attribute (services, external peers, old data).
   const slots = useMemo<Slot[]>(() => {
+    const pushFor = (out: Slot[], id: string, side: Slot["side"], related: ServiceMapEdge[]) => {
+      const info = nodes.get(id);
+      if (!info) return;
+      const instances = (info.instances ?? []).filter((item) => item.uid);
+      const known = new Set(instances.map((item) => item.uid));
+      const prefix = side === "self" ? "self" : `${side}:${id}`;
+      const unattributed = related.some((edge) => {
+        const uid = podUidForCard(edge, id, side);
+        return !uid || !known.has(uid);
+      });
+      if (instances.length === 0 || unattributed) {
+        out.push({ key: prefix, id, side });
+      }
+      for (const instance of instances.slice(0, MAX_PODS)) {
+        out.push({
+          key: `${prefix}::pod:${instance.uid}`,
+          id,
+          side,
+          podUid: instance.uid,
+          podName: instance.name,
+        });
+      }
+      if (instances.length > MAX_PODS) {
+        out.push({
+          key: `${prefix}::more`,
+          id,
+          side,
+          morePods: instances.length - MAX_PODS,
+        });
+      }
+    };
+
     const out: Slot[] = [];
-    for (const group of upGroups) {
-      if (nodes.has(group.id)) out.push({ key: `up:${group.id}`, id: group.id, side: "up" });
-    }
-    if (nodes.has(node.id)) out.push({ key: "self", id: node.id, side: "self" });
-    for (const group of downGroups) {
-      if (nodes.has(group.id)) out.push({ key: `down:${group.id}`, id: group.id, side: "down" });
-    }
+    for (const group of upGroups) pushFor(out, group.id, "up", group.edges);
+    pushFor(out, node.id, "self", [...inbound, ...outbound]);
+    for (const group of downGroups) pushFor(out, group.id, "down", group.edges);
     return out;
-  }, [upGroups, downGroups, node.id, nodes]);
+  }, [upGroups, downGroups, node.id, nodes, inbound, outbound]);
 
   /** The card(s) a node has, so a peer-to-peer line can pick a side. */
   const slotsOf = useMemo(() => {
     const map = new Map<string, { up?: string; down?: string }>();
     for (const slot of slots) {
-      if (slot.side === "self") continue;
+      if (slot.side === "self" || slot.morePods) continue;
       const entry = map.get(slot.id) ?? {};
-      entry[slot.side] = slot.key;
+      // One representative per side is enough for same-side arcs; the first
+      // slot is the fallback (or the busiest pod) and stays stable.
+      entry[slot.side] ??= slot.key;
       map.set(slot.id, entry);
     }
     return map;
   }, [slots]);
 
+  /** Pick the card an edge end lands on, falling back when it has no pod UID. */
+  const slotKeyOf = useCallback(
+    (owner: string, side: Slot["side"], podUid: string) => {
+      const prefix = side === "self" ? "self" : `${side}:${owner}`;
+      if (podUid) {
+        const match = slots.find((slot) => slot.podUid === podUid && slot.side === side);
+        if (match) return match.key;
+      }
+      return prefix;
+    },
+    [slots],
+  );
+
   const rowId = useCallback((owner: string, name: string) => `${owner}::${name}`, []);
+
+  /** Which column an edge end belongs to, including peer-to-peer arcs. */
+  const cardSideOf = useCallback(
+    (edge: ServiceMapEdge, end: "client" | "server"): Slot["side"] => {
+      const owner = end === "client" ? edge.client : edge.server;
+      if (owner === node.id) return "self";
+      if (edge.server === node.id && end === "client") return "up";
+      if (edge.client === node.id && end === "server") return "down";
+      const entry = slotsOf.get(owner);
+      if (entry?.up && !entry?.down) return "up";
+      if (entry?.down && !entry?.up) return "down";
+      // A same-side arc: the other end has the same column, and is the only
+      // way to tell an upstream pair from a downstream one.
+      const other = slotsOf.get(end === "client" ? edge.server : edge.client);
+      return other?.up ? "up" : "down";
+    },
+    [node.id, slotsOf],
+  );
 
   // Containers worth a row, in reading order: the ones that actually carried
   // traffic in this window first (heaviest at the top), then the rest of what
@@ -280,33 +375,61 @@ export function Neighborhood({
   // than making a single card taller than the viewport.
   const containers = useMemo(() => {
     const traffic = new Map<string, Map<string, number>>();
-    const add = (owner: string, name: string | undefined, weight: number) => {
-      if (!name || !shownIds.includes(owner)) return;
+    const cardOf = (id: string, podUid: string, side: Slot["side"]) => {
+      const match = podUid
+        ? slots.find((slot) => slot.id === id && slot.side === side && slot.podUid === podUid)
+        : undefined;
+      return (
+        match?.key ??
+        slots.find((slot) => slot.id === id && slot.side === side && !slot.podUid)?.key
+      );
+    };
+    const add = (
+      id: string,
+      podUid: string,
+      side: Slot["side"],
+      name: string | undefined,
+      weight: number,
+    ) => {
+      const owner = cardOf(id, podUid, side);
+      if (!name || !owner) return;
       const slot = traffic.get(owner) ?? new Map<string, number>();
       slot.set(name, (slot.get(name) ?? 0) + weight);
       traffic.set(owner, slot);
     };
     for (const edge of edges) {
       const weight = edgeWeight(edge);
-      add(edge.client, edge.client_container, weight);
-      add(edge.server, edge.server_container, weight);
+      add(
+        edge.client,
+        podUidOf(edge, "client"),
+        cardSideOf(edge, "client"),
+        edge.client_container,
+        weight,
+      );
+      add(
+        edge.server,
+        podUidOf(edge, "server"),
+        cardSideOf(edge, "server"),
+        edge.server_container,
+        weight,
+      );
     }
     const out = new Map<string, { names: string[]; extra: number }>();
-    for (const id of shownIds) {
-      const active = [...(traffic.get(id)?.entries() ?? [])]
+    for (const slot of slots) {
+      const active = [...(traffic.get(slot.key)?.entries() ?? [])]
         .sort((a, b) => b[1] - a[1])
         .map(([name]) => name);
-      const declared = (nodes.get(id)?.containers ?? []).filter(
+      const declared = (nodes.get(slot.id)?.containers ?? []).filter(
         (name) => name && !active.includes(name),
       );
       const all = [...active, ...declared];
-      out.set(id, {
+      out.set(slot.key, {
         names: all.slice(0, MAX_CONTAINERS),
         extra: Math.max(0, all.length - MAX_CONTAINERS),
       });
     }
     return out;
-  }, [edges, nodes, shownIds]);
+  }, [edges, nodes, slots, cardSideOf]);
 
   // Which columns carry same-side arcs. The layout reserves room outside those
   // columns for them, so an arc never has to be clipped at the drawing's edge.
@@ -337,12 +460,12 @@ export function Neighborhood({
 
     const textWidth = Math.max(
       12,
-      ...shownIds.flatMap((id) => {
-        const meta = nodes.get(id);
+      ...slots.flatMap((slot) => {
+        const meta = nodes.get(slot.id);
         return [
-          nodeLabel(meta).length * 6.6,
-          (meta ? nodeMeta(meta) : "").length * 5.4,
-          ...(containers.get(id)?.names ?? []).map((name) => name.length * 6.1 + 46),
+          slotLabel(meta, slot).length * 6.6,
+          slotMeta(meta, slot).length * 5.4,
+          ...(containers.get(slot.key)?.names ?? []).map((name) => name.length * 6.1 + 46),
         ];
       }),
     );
@@ -368,34 +491,46 @@ export function Neighborhood({
       0,
       columns.findIndex((column) => column[0]?.side === "self"),
     );
-    const selfSlot = slots.find((slot) => slot.side === "self");
-    const selfH = selfSlot ? heightOf(selfSlot.id) : 0;
-    // Self is placed at y=0 in a provisional frame; every peer is positioned
-    // relative to it and the whole drawing is shifted down afterwards.
-    const selfCard: Box = { x: xOf(selfColumn), y: 0, w: cardWidth, h: selfH };
+    const selfSlots = slots.filter((slot) => slot.side === "self");
+    // Self pods are placed first, stacked in the middle column. Every peer is
+    // then positioned relative to the row of the replica it actually talked
+    // to, and the whole drawing is shifted down afterwards.
+    const selfY = new Map<string, number>();
+    let selfBottom = 0;
+    for (const slot of selfSlots) {
+      selfY.set(slot.key, selfBottom);
+      selfBottom += heightOf(slot.key) + SIZE.cardGapY;
+    }
 
     // Traffic with no container attribution attaches to the header edge, so
     // both the alignment and the anchor use that same height.
     const headerMid = NEIGHBOR_CARD.header / 2;
     /** Y (in the provisional frame) of the self row a peer should line up to. */
-    const selfRowY = (container: string | undefined) => {
-      const index = rowIndexOf(node.id, container);
+    const selfRowY = (slotKey: string, container: string | undefined) => {
+      const index = rowIndexOf(slotKey, container);
       return index >= 0 ? neighborRowCenter(index) : headerMid;
     };
     /** Y of the peer row that carries the edge, relative to the peer's card. */
-    const peerRowY = (id: string, container: string | undefined) => {
-      const index = rowIndexOf(id, container);
+    const peerRowY = (slotKey: string, container: string | undefined) => {
+      const index = rowIndexOf(slotKey, container);
       return index >= 0 ? neighborRowCenter(index) : headerMid;
     };
 
-    const heaviest = (group: PeerGroup) =>
-      group.edges.reduce(
+    const heaviest = (candidates: ServiceMapEdge[]) =>
+      candidates.reduce(
         (best, edge) => (edgeWeight(edge) > edgeWeight(best) ? edge : best),
-        group.edges[0],
+        candidates[0],
       );
 
     const cards = new Map<string, Box>();
-    if (selfSlot) cards.set(selfSlot.key, selfCard);
+    for (const slot of selfSlots) {
+      cards.set(slot.key, {
+        x: xOf(selfColumn),
+        y: selfY.get(slot.key) ?? 0,
+        w: cardWidth,
+        h: heightOf(slot.key),
+      });
+    }
 
     columns.forEach((column, columnIndex) => {
       if (column[0]?.side === "self") return;
@@ -408,13 +543,28 @@ export function Neighborhood({
         .map((slot) => {
           const group = groups.find((candidate) => candidate.id === slot.id);
           if (!group) return null;
-          const edge = heaviest(group);
+          // Align this replica to the row it actually used. Using the busiest
+          // edge of the whole workload put every pod card on the same row when
+          // a sidecar and the app carried different connections.
+          const side = fromPeer ? "up" : "down";
+          const ownEdges = group.edges.filter(
+            (candidate) => podUidForCard(candidate, slot.id, side) === (slot.podUid ?? ""),
+          );
+          const edge = heaviest(ownEdges.length > 0 ? ownEdges : group.edges);
           const selfContainer = fromPeer ? edge.server_container : edge.client_container;
           const peerContainer = fromPeer ? edge.client_container : edge.server_container;
+          const selfKey = slotKeyOf(
+            node.id,
+            "self",
+            podUidOf(edge, fromPeer ? "server" : "client"),
+          );
           return {
             slot,
-            wanted: selfRowY(selfContainer) - peerRowY(slot.id, peerContainer),
-            h: heightOf(slot.id),
+            wanted:
+              (selfY.get(selfKey) ?? 0) +
+              selfRowY(selfKey, selfContainer) -
+              peerRowY(slot.key, peerContainer),
+            h: heightOf(slot.key),
           };
         })
         .filter((item): item is { slot: Slot; wanted: number; h: number } => item != null)
@@ -451,7 +601,7 @@ export function Neighborhood({
       const mid = card.y + headerMid;
       anchors.set(`${slot.key}@out`, port(card.x + card.w, mid));
       anchors.set(`${slot.key}@in`, port(card.x, mid));
-      (containers.get(slot.id)?.names ?? []).forEach((name, index) => {
+      (containers.get(slot.key)?.names ?? []).forEach((name, index) => {
         const key = rowId(slot.key, name);
         const centre = card.y + neighborRowCenter(index);
         // A container's endpoints are its **own** pane edges, not the card's
@@ -485,7 +635,7 @@ export function Neighborhood({
       height,
       width,
     };
-  }, [upGroups, downGroups, node.id, nodes, containers, shownIds, rowId, slots, arcSides]);
+  }, [upGroups, downGroups, node.id, nodes, containers, rowId, slots, slotKeyOf, arcSides]);
 
   // One line per pair of container rows. A client leaves its row's right port
   // (`@out`) and a server is entered at its row's left port (`@in`), so the
@@ -539,20 +689,24 @@ export function Neighborhood({
   const shown = useMemo(() => {
     const out: ServiceMapEdge[] = [];
     const emit = (group: PeerGroup, fromPeer: boolean) => {
-      const peer = `${fromPeer ? "up" : "down"}:${group.id}`;
-      if (!layout.cards.has(peer)) return;
-      out.push(
-        ...foldByPorts(
-          group.edges,
-          (edge) => endpoint(fromPeer ? peer : "self", edge.client_container, "out"),
-          (edge) => endpoint(fromPeer ? "self" : peer, edge.server_container, "in"),
-        ),
-      );
+      const side = fromPeer ? "up" : "down";
+      for (const edge of group.edges) {
+        const peer = slotKeyOf(group.id, side, podUidOf(edge, fromPeer ? "client" : "server"));
+        const self = slotKeyOf(node.id, "self", podUidOf(edge, fromPeer ? "server" : "client"));
+        if (!layout.cards.has(peer) || !layout.cards.has(self)) continue;
+        out.push(
+          ...foldByPorts(
+            [edge],
+            () => endpoint(fromPeer ? peer : self, edge.client_container, "out"),
+            () => endpoint(fromPeer ? self : peer, edge.server_container, "in"),
+          ),
+        );
+      }
     };
     for (const group of upGroups) emit(group, true);
     for (const group of downGroups) emit(group, false);
     return out;
-  }, [upGroups, downGroups, layout.cards, endpoint, foldByPorts]);
+  }, [upGroups, downGroups, layout.cards, endpoint, foldByPorts, slotKeyOf, node.id]);
 
   // Arcs between two peers on the same side.
   //
@@ -577,8 +731,8 @@ export function Neighborhood({
       if (!a || !b) continue;
       const side = a.up && b.up ? "up" : a.down && b.down ? "down" : null;
       if (!side) continue;
-      const clientSlot = side === "up" ? a.up! : a.down!;
-      const serverSlot = side === "up" ? b.up! : b.down!;
+      const clientSlot = slotKeyOf(edge.client, side, podUidOf(edge, "client"));
+      const serverSlot = slotKeyOf(edge.server, side, podUidOf(edge, "server"));
       if (clientSlot === serverSlot) continue;
       // One arc per pair: a curve each way would draw over itself, and the arc
       // is deliberately undirected.
@@ -614,7 +768,7 @@ export function Neighborhood({
       }
     }
     return { edges: out, depths, hidden: ranked.length - drawn.length };
-  }, [edges, node.id, slotsOf, endpoint, foldByPorts]);
+  }, [edges, node.id, slotsOf, slotKeyOf, endpoint, foldByPorts]);
 
   /** Callers bow left, callees bow right: away from the selected workload. */
   const bowSide = useCallback(
@@ -885,7 +1039,7 @@ export function Neighborhood({
               const peer = nodes.get(slot.id);
               const box = layout.cards.get(slot.key);
               if (!peer || !box) return null;
-              const info = containers.get(slot.id);
+              const info = containers.get(slot.key);
               const rows: NeighborContainer[] = (info?.names ?? []).map((name) => ({
                 name,
                 rate: rate(perRow.get(rowId(slot.key, name)) ?? 0),
@@ -903,10 +1057,14 @@ export function Neighborhood({
                   cardPorts={usedCardPorts.get(slot.key)}
                   cpu={peer.cpu_ns ?? 0}
                   cpuMax={cpuMax}
-                  selected={slot.id === node.id}
+                  selected={slot.side === "self"}
                   relation={
                     slot.side === "up" ? "caller" : slot.side === "down" ? "callee" : undefined
                   }
+                  title={slotLabel(peer, slot)}
+                  subtitle={slotMeta(peer, slot)}
+                  selectId={slot.id}
+                  podUid={slot.podUid}
                   onSelect={onSelect}
                   testId={slot.id === node.id ? "map-neighborhood-self" : "map-neighborhood-peer"}
                 />

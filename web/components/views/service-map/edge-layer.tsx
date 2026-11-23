@@ -51,7 +51,7 @@ import type { ServiceMapEdge } from "@/lib/types";
 export function edgeKey(edge: ServiceMapEdge): string {
   // Two containers of one pod can carry the same protocol to one peer. Without
   // their names both edges get the same React key and one of them disappears.
-  return `${edge.client}->${edge.server}:${edge.protocol}:${edge.client_container ?? ""}:${edge.server_container ?? ""}`;
+  return `${edge.client}->${edge.server}:${edge.protocol}:${edge.client_container ?? ""}:${edge.server_container ?? ""}:${edge.client_pod ?? ""}:${edge.server_pod ?? ""}`;
 }
 
 // Colours and dash patterns live in the shared module so the legend beside the

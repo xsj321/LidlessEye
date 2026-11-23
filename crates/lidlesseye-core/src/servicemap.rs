@@ -138,6 +138,9 @@ pub struct ServiceNode {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceInfo {
     pub name: String,
+    /// Stable Kubernetes UID, used to line an edge up with this replica.
+    #[serde(default)]
+    pub uid: String,
     /// Kubernetes node the pod is scheduled on.
     #[serde(default)]
     pub node: String,
@@ -182,6 +185,13 @@ pub struct ServiceEdge {
     pub client_container: String,
     #[serde(default)]
     pub server_container: String,
+    /// UIDs of the concrete pods that opened/accepted the connections. Empty
+    /// when the peer is a service or an external address, or when the data
+    /// predates pod-level attribution.
+    #[serde(default)]
+    pub client_pod: String,
+    #[serde(default)]
+    pub server_pod: String,
     #[serde(default)]
     pub connections: u64,
     #[serde(default)]
@@ -388,6 +398,11 @@ pub struct MapEdge {
     /// the peer declares. Empty when no container claims that port.
     #[serde(default)]
     pub server_container: String,
+    /// Pod UID behind each end, when the agent could attribute the traffic.
+    #[serde(default)]
+    pub client_pod: String,
+    #[serde(default)]
+    pub server_pod: String,
     pub connections: u64,
     pub retransmits: u64,
     /// Bytes the client sent to the server over the window.

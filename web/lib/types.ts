@@ -97,6 +97,8 @@ export type NodeKind = "workload" | "service" | "external";
 /** One replica behind a workload, as the cluster reports it. */
 export interface ServiceInstance {
   name: string;
+  /** Stable Kubernetes UID, used to match an edge to this replica. */
+  uid?: string;
   /** Kubernetes node the pod runs on; empty when the API did not say. */
   node?: string;
   ready?: boolean;
@@ -132,6 +134,9 @@ export interface ServiceMapEdge {
   client_container?: string;
   /** Container of the server pod that accepted them, when known. */
   server_container?: string;
+  /** UIDs of the concrete pods on each end; empty for old data or non-pods. */
+  client_pod?: string;
+  server_pod?: string;
   connections: number;
   retransmits?: number;
   /** Bytes the client sent to the server over the window. */

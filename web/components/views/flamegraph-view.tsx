@@ -9,7 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { formatClockRange, formatDuration, formatValue } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
-import { rangeLabel, resolveBaseline, resolveWindow } from "@/lib/time";
+import { rangeLabel, resolveCompareWindows } from "@/lib/time";
 import type { DiffPayload, FlamegraphPayload } from "@/lib/types";
 import { useDashboard } from "@/lib/use-dashboard";
 
@@ -24,8 +24,9 @@ function CompareHeader() {
   const state = useDashboard();
   const t = useT();
   const payload = state.flamegraph as DiffPayload | null;
-  const baseline = resolveBaseline(state);
-  const win = resolveWindow(state);
+  // Same snapshot as the request, so the strip cannot claim "same window"
+  // while the API was given two slightly different ones.
+  const { window: win, baseline } = resolveCompareWindows(state);
   const left = payload?.total_left ?? 0;
   const right = payload?.total_right ?? 0;
   // Profiles do not all count time: an allocation profile's totals are bytes.

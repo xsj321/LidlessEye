@@ -70,9 +70,16 @@ export function resolveDomain(state: TimeState): Window {
   return { from: until - durationNs(state.range), until };
 }
 
-/** The bracket, clamped into the domain; falls back to the whole domain. */
-export function resolveWindow(state: TimeState): Window {
-  const domain = resolveDomain(state);
+/**
+ * The bracket, clamped into the domain; falls back to the whole domain.
+ *
+ * `domain` is passed in by callers that need two windows based on the *same*
+ * instant. Relative time is defined against "now", and asking for it twice is
+ * enough to make two brushes that look identical differ by a few milliseconds;
+ * the store counts a whole batch if a window merely overlaps it, so that tiny
+ * drift used to show up as a large fake diff.
+ */
+export function resolveWindow(state: TimeState, domain: Window = resolveDomain(state)): Window {
   if (!state.fromNs || !state.untilNs || state.untilNs <= state.fromNs) return domain;
   const span = Math.min(state.untilNs - state.fromNs, domain.until - domain.from);
   let from = state.fromNs;
@@ -102,9 +109,11 @@ export function fromLocalInput(value: string): number | null {
 }
 
 /** The window the baseline brush starts with, always inside the domain. */
-export function defaultBaseline(state: TimeState): Window & { split: number | null } {
-  const domain = resolveDomain(state);
-  const win = resolveWindow(state);
+export function defaultBaseline(
+  state: TimeState,
+  domain: Window = resolveDomain(state),
+  win: Window = resolveWindow(state, domain),
+): Window & { split: number | null } {
   const span = win.until - win.from;
   const full = span >= (domain.until - domain.from) * 0.999;
   if (full) {
@@ -122,15 +131,35 @@ export function defaultBaseline(state: TimeState): Window & { split: number | nu
   return { from, until, split: null };
 }
 
-export function resolveBaseline(state: TimeState): Window {
-  const domain = resolveDomain(state);
+export function resolveBaseline(
+  state: TimeState,
+  domain: Window = resolveDomain(state),
+  win: Window = resolveWindow(state, domain),
+): Window {
   if (state.baseFromNs && state.baseUntilNs > state.baseFromNs) {
     const span = Math.min(state.baseUntilNs - state.baseFromNs, domain.until - domain.from);
     let from = Math.max(domain.from, state.baseFromNs);
     if (from + span > domain.until) from = domain.until - span;
     return { from, until: Math.round(from + span) };
   }
-  return defaultBaseline(state);
+  return defaultBaseline(state, domain, win);
+}
+
+/**
+ * Resolve both sides of a comparison against one domain snapshot.
+ *
+ * Everything that sends or displays a diff must use this: two independent
+ * `resolveDomain()` calls in relative mode are enough to move a boundary past
+ * a batch and turn "same window" into a non-zero delta.
+ */
+export function resolveCompareWindows(state: TimeState): {
+  domain: Window;
+  window: Window;
+  baseline: Window;
+} {
+  const domain = resolveDomain(state);
+  const window = resolveWindow(state, domain);
+  return { domain, window, baseline: resolveBaseline(state, domain, window) };
 }
 
 export function domainSpanText(domain: Window): string {

@@ -48,7 +48,7 @@ use crate::servicemap::{MapEdge, MapHistoryPoint, MapNode, NodeKind, ServiceMapB
 use crate::time::now_ns;
 
 /// Version of the table layout. Bumped when a change needs a migration.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// File name of the database inside a store root.
 pub const DB_FILE: &str = "lidlesseye.duckdb";
@@ -1835,9 +1835,10 @@ impl Store {
                 let mut stmt = conn
                     .prepare(&format!(
                         "INSERT INTO {edges_t} (bucket_ns, client_id, server_id, protocol, \
-                         client_container, server_container, connections, retransmits, \
-                         tx_bytes, rx_bytes, rtt_us_sum, rtt_samples, host, sql) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                         client_container, server_container, client_pod, server_pod, \
+                         connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples, \
+                         host, sql) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     ))
                     .map_err(db_err)?;
                 for edge in &batch.edges {
@@ -1848,6 +1849,8 @@ impl Store {
                         edge.protocol,
                         edge.client_container,
                         edge.server_container,
+                        edge.client_pod,
+                        edge.server_pod,
                         edge.connections as i64,
                         edge.retransmits as i64,
                         edge.tx_bytes as i64,
@@ -1933,12 +1936,14 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT client_id, server_id, protocol, client_container, server_container, \
+                        client_pod, server_pod, \
                         sum(connections), sum(retransmits), \
                         sum(tx_bytes), sum(rx_bytes), sum(rtt_us_sum), sum(rtt_samples), \
                         arg_max(nullif(host, ''), bucket_ns), \
                         arg_max(nullif(sql, ''), bucket_ns) \
                  FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY client_id, server_id, protocol, client_container, server_container, \
+                          client_pod, server_pod, \
                           CASE WHEN server_id = 'external' THEN coalesce(host, '') ELSE '' END \
                  HAVING sum(connections) + sum(tx_bytes) + sum(rx_bytes) > 0 \
                  ORDER BY sum(connections) + sum(tx_bytes) / 1024 DESC LIMIT 4000",
@@ -1949,29 +1954,40 @@ impl Store {
             .map_err(db_err)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(db_err)? {
-            let rtt_us_sum = row.get::<_, i64>(9).unwrap_or(0).max(0) as u64;
-            let rtt_samples = row.get::<_, i64>(10).unwrap_or(0).max(0) as u64;
+            let rtt_us_sum = row.get::<_, i64>(11).unwrap_or(0).max(0) as u64;
+            let rtt_samples = row.get::<_, i64>(12).unwrap_or(0).max(0) as u64;
             out.push(MapEdge {
                 client: row.get(0).map_err(db_err)?,
                 server: row.get(1).map_err(db_err)?,
                 protocol: row.get(2).map_err(db_err)?,
                 client_container: row.get(3).unwrap_or_default(),
                 server_container: row.get(4).unwrap_or_default(),
-                connections: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
-                retransmits: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
-                tx_bytes: row.get::<_, i64>(7).unwrap_or(0).max(0) as u64,
-                rx_bytes: row.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
+                // Old files read these as NULL; an empty id means "unknown pod".
+                client_pod: row
+                    .get::<_, Option<String>>(5)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                server_pod: row
+                    .get::<_, Option<String>>(6)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                connections: row.get::<_, i64>(7).unwrap_or(0).max(0) as u64,
+                retransmits: row.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
+                tx_bytes: row.get::<_, i64>(9).unwrap_or(0).max(0) as u64,
+                rx_bytes: row.get::<_, i64>(10).unwrap_or(0).max(0) as u64,
                 // Mean round-trip time over the connections that closed inside
                 // the window; zero when none did.
                 rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
                 // Old Parquet files predate these columns and read as NULL.
                 host: row
-                    .get::<_, Option<String>>(11)
+                    .get::<_, Option<String>>(13)
                     .ok()
                     .flatten()
                     .unwrap_or_default(),
                 sql: row
-                    .get::<_, Option<String>>(12)
+                    .get::<_, Option<String>>(14)
                     .ok()
                     .flatten()
                     .unwrap_or_default(),
@@ -2478,6 +2494,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
             protocol VARCHAR NOT NULL,
             client_container VARCHAR DEFAULT '' NOT NULL,
             server_container VARCHAR DEFAULT '' NOT NULL,
+            client_pod VARCHAR DEFAULT '' NOT NULL,
+            server_pod VARCHAR DEFAULT '' NOT NULL,
             connections BIGINT NOT NULL,
             retransmits BIGINT NOT NULL,
             tx_bytes BIGINT NOT NULL,
@@ -2532,6 +2550,8 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
             ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
             ("client_container", "VARCHAR DEFAULT '' NOT NULL"),
             ("server_container", "VARCHAR DEFAULT '' NOT NULL"),
+            ("client_pod", "VARCHAR DEFAULT '' NOT NULL"),
+            ("server_pod", "VARCHAR DEFAULT '' NOT NULL"),
             ("host", "VARCHAR DEFAULT '' NOT NULL"),
             ("sql", "VARCHAR DEFAULT '' NOT NULL"),
         ],

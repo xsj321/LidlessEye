@@ -24,6 +24,35 @@ A failed write no longer wedges the tenant's DuckDB connection.
   inside an ingest transaction and abort it. Interrupts are now scoped to a
   live read and are inert once that read has released the connection.
 
+## [0.1.7] - 2026-11-23
+
+The neighbourhood is per replica, a comparison against itself is exactly zero,
+and the multi-language symbolization routes are exercised in one cluster.
+
+### Fixed
+
+- The context/upstream/downstream view used to draw one card per workload, so a
+  three-replica Deployment looked like a single box and all of its pods' edges
+  landed on the same container rows. Edges now carry the client and server pod
+  UIDs through eBPF collection, storage (including schema migration and Parquet
+  columns) and the API, and the neighbourhood draws one card per pod. Container
+  rows and edge anchors belong to the specific replica that carried the
+  traffic, with a fallback card for service/external peers and old data.
+- Selecting the same absolute or relative window for both sides of a
+  comparison could still produce a large increase or decrease. Relative time
+  was resolved twice — once for the request and once for the header — and the
+  few milliseconds of drift crossed a batch boundary, which the store counts as
+  a whole sample. Both sides now come from one clock snapshot; identical
+  windows are covered by a backend regression test and a browser assertion on
+  the four API time parameters.
+- The perf-map fallback was already able to name JIT frames, but the
+  documented support matrix and the shipped fixtures did not cover the routes
+  that produce those maps. `deploy/test/multilang/k8s.yaml` now starts Go, Node,
+  C, C++, Rust, Python 3.12 (with the perf trampoline) and Java (with
+  `-XX:+PreserveFramePointer` and perf-map-agent)
+  pods from one ConfigMap. `docs/compatibility.md` records which routes are
+  native and which need the runtime to publish symbols.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -408,10 +437,11 @@ service map.
 - Collection is Linux-only (≥ 5.5 with BTF); storage and the query API are
   portable Rust.
 - One server per volume — no clustering or replication.
-- User stacks need frame pointers; CPU and off-CPU only, no allocation
-  profiling yet.
+- User stacks need frame pointers; heap profiling covers Go's own buckets and
+  native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/xsj321/LidlessEye/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/xsj321/LidlessEye/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/xsj321/LidlessEye/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/xsj321/LidlessEye/compare/v0.1.3...v0.1.4

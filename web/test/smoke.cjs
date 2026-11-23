@@ -43,6 +43,26 @@ function localInput(date) {
   )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+/**
+ * Set a datetime-local input through the native setter. `locator.fill()` is
+ * strict about the browser's serialisation of seconds and can report
+ * "Malformed value" for a perfectly valid `:00`; firing the same events React
+ * listens for keeps the test independent of that browser quirk.
+ */
+async function fillLocalInput(page, selector, date) {
+  const value = localInput(date);
+  await page.$eval(
+    selector,
+    (element, next) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(element, next);
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      element.dispatchEvent(new Event("change", { bubbles: true }));
+    },
+    value,
+  );
+}
+
 /** Wait until the flamegraph stops moving (load-in or zoom transition). */
 async function settle(page, timeout = 4000) {
   await page
@@ -181,16 +201,22 @@ async function seed() {
         rx_bytes: 48_000,
         tx_bytes: 24_000,
       },
-      // A workload with a sidecar: the node's title must be the workload name,
-      // and the panel must give each container its own row.
+      // A workload with three replicas and a sidecar: the big map still shows
+      // one workload, but the neighbourhood must draw one card per pod and give
+      // each card its own container rows.
       {
         id: "shop/cart",
         namespace: "shop",
         workload: "cart",
         service: "cart",
         kind: "workload",
-        pods: 1,
-        ready: 1,
+        pods: 3,
+        ready: 3,
+        instances: [
+          { name: "cart-6f8c9d4b7d-2x9pq", uid: "uid-cart-1", ready: true, phase: "Running" },
+          { name: "cart-6f8c9d4b7d-7b4nt", uid: "uid-cart-2", ready: true, phase: "Running" },
+          { name: "cart-6f8c9d4b7d-k8m2s", uid: "uid-cart-3", ready: true, phase: "Running" },
+        ],
         containers: ["app", "istio-proxy"],
       },
       {
@@ -201,6 +227,9 @@ async function seed() {
         kind: "workload",
         pods: 1,
         ready: 1,
+        instances: [
+          { name: "payments-7c4d8f6b5-9p2lx", uid: "uid-payments-1", ready: true, phase: "Running" },
+        ],
         containers: ["app"],
       },
       { id: "external", service: "external", kind: "external" },
@@ -222,17 +251,33 @@ async function seed() {
         server: "checkout",
         protocol: "http",
         client_container: "istio-proxy",
-        connections: 120,
+        client_pod: "uid-cart-1",
+        connections: 80,
         retransmits: 0,
-        rx_bytes: 12_000,
-        tx_bytes: 6_000,
-        rtt_us_sum: 24_000,
-        rtt_samples: 12,
+        rx_bytes: 8_000,
+        tx_bytes: 4_000,
+        rtt_us_sum: 16_000,
+        rtt_samples: 8,
+      },
+      {
+        client: "shop/cart",
+        server: "checkout",
+        protocol: "http",
+        client_container: "istio-proxy",
+        client_pod: "uid-cart-2",
+        connections: 40,
+        retransmits: 0,
+        rx_bytes: 4_000,
+        tx_bytes: 2_000,
+        rtt_us_sum: 8_000,
+        rtt_samples: 4,
       },
       {
         client: "external",
         server: "shop/cart",
         protocol: "http",
+        server_container: "istio-proxy",
+        server_pod: "uid-cart-3",
         connections: 30,
         retransmits: 0,
         rx_bytes: 3_000,
@@ -246,6 +291,8 @@ async function seed() {
         client: "checkout",
         server: "shop/payments",
         protocol: "http",
+        server_container: "app",
+        server_pod: "uid-payments-1",
         connections: 20,
         retransmits: 0,
         rx_bytes: 2_000,
@@ -259,6 +306,8 @@ async function seed() {
         protocol: "grpc",
         client_container: "app",
         server_container: "app",
+        client_pod: "uid-cart-3",
+        server_pod: "uid-payments-1",
         connections: 60,
         retransmits: 0,
         rx_bytes: 9_000,
@@ -636,8 +685,8 @@ async function main() {
   await page.waitForFunction(() => document.getElementById("abs-range") !== null, null, {
     timeout: 5000,
   });
-  await page.fill("#abs-from", localInput(pickFrom));
-  await page.fill("#abs-until", localInput(pickUntil));
+  await fillLocalInput(page, "#abs-from", pickFrom);
+  await fillLocalInput(page, "#abs-until", pickUntil);
   await page.click("#abs-apply");
   await page.waitForFunction(() => window.lidlesseye.state.mode === "absolute", null, {
     timeout: 10000,
@@ -801,6 +850,35 @@ async function main() {
     beforeSwap,
     { timeout: 15000 },
   );
+
+  // Selecting the same window on both sides must be an actual zero diff. The
+  // bug was a second `now()` for the two relative windows: the brushes looked
+  // identical, but one boundary crossed a batch and the delta was large.
+  apiCalls.length = 0;
+  const identical = await page.evaluate(() => {
+    const s = window.lidlesseye.state;
+    window.lidlesseye.setBaseline(s.fromNs, s.untilNs);
+    return { from: s.fromNs, until: s.untilNs };
+  });
+  await settle(page);
+  const diffCall = apiCalls.filter((entry) => entry.includes("/api/v1/diff?")).at(-1);
+  check(diffCall !== undefined, "setting an identical baseline refetches the diff", String(diffCall));
+  if (diffCall) {
+    const params = new URL(diffCall.split(" ")[1]).searchParams;
+    check(
+      params.get("from") === params.get("baseline_from") &&
+        params.get("until") === params.get("baseline_until"),
+      "identical brushes send identical diff parameters",
+      `${params.get("from")}..${params.get("until")} vs ${params.get("baseline_from")}..${params.get("baseline_until")}`,
+    );
+  }
+  const zeroSummary = await page.locator('[data-testid="compare-summary"]').innerText();
+  check(
+    /Δ\s*0(?:\D|$)/.test(zeroSummary),
+    "an identical comparison window has no increase or decrease",
+    `${zeroSummary.replace(/\s+/g, " ").slice(0, 160)} (expected ${identical.from}..${identical.until})`,
+  );
+
   // Nudge the comparison window (the second brush) to the left. Both brushes
   // share the domain, and the comparison bracket sits at 2–35% of it, so 20%
   // is inside and a small move stays within the domain.
@@ -972,8 +1050,8 @@ async function main() {
   await page.goto(`${BASE}/?tenant=zeta#/flamegraph`, { waitUntil: "load" });
   await page.waitForSelector("canvas.time-brush", { timeout: 20000 });
   await page.click('#range-mode [data-mode="absolute"]');
-  await page.fill("#abs-from", localInput(new Date(emptyNow - 10 * 3_600_000)));
-  await page.fill("#abs-until", localInput(new Date(emptyNow - 9 * 3_600_000)));
+  await fillLocalInput(page, "#abs-from", new Date(emptyNow - 10 * 3_600_000));
+  await fillLocalInput(page, "#abs-until", new Date(emptyNow - 9 * 3_600_000));
   await page.click("#abs-apply");
   await page.waitForFunction(() => window.lidlesseye.state.mode === "absolute", null, {
     timeout: 10000,
@@ -1106,17 +1184,36 @@ async function main() {
     .filter(Boolean);
   check(cartLines[0] === "cart", "a workload card is titled with the workload name", cartLines[0]);
   check(
-    cartLines[1] === "shop · 1/1",
+    cartLines[1] === "shop · 3/3",
     "the namespace and replica count stay on the second line",
     cartLines[1],
   );
 
-  // Clicking it opens the panel. Every workload in the one-hop drawing gets
-  // container rows now — not just the node that was clicked — and each edge is
-  // anchored to the container that actually opened it.
+  // Clicking it opens the panel. Every pod in the one-hop drawing gets its own
+  // card and container rows now — not just the workload that was clicked — and
+  // each edge is anchored to the replica and container that actually opened it.
   await cartCard.click();
   await mapPage.waitForSelector('[data-testid="map-panel"][data-state="open"]', { timeout: 10000 });
   await mapPage.waitForSelector('[data-testid="map-container-row"]', { timeout: 10000 });
+  const selfUids = await mapPage
+    .locator('[data-testid="map-neighborhood-self"]')
+    .evaluateAll((cards) => cards.map((card) => card.getAttribute("data-pod-uid")));
+  check(
+    selfUids.length === 3 && new Set(selfUids).size === 3 && !selfUids.includes(null),
+    "one neighbourhood card is drawn per selected pod",
+    JSON.stringify(selfUids),
+  );
+  const selfTitles = await mapPage
+    .locator('[data-testid="map-neighborhood-self"] h3')
+    .allInnerTexts();
+  check(
+    selfTitles.length === 3 &&
+      ["cart-6f8c9d4b7d-2x9pq", "cart-6f8c9d4b7d-7b4nt", "cart-6f8c9d4b7d-k8m2s"].every(
+        (name) => selfTitles.includes(name),
+      ),
+    "each pod card is named after its replica, not the workload",
+    JSON.stringify(selfTitles),
+  );
   const cartRows = await mapPage
     .locator('[data-testid="map-container-row"][data-node="shop/cart"]')
     .allInnerTexts();
@@ -1124,15 +1221,15 @@ async function main() {
     .locator('[data-testid="map-container-row"][data-node="shop/payments"]')
     .allInnerTexts();
   check(
-    cartRows.length === 2 &&
-      cartRows.some((row) => row.includes("istio-proxy")) &&
-      cartRows.some((row) => row.includes("app")),
-    "the clicked workload draws one row per container",
+    cartRows.length === 6 &&
+      cartRows.filter((row) => row.includes("istio-proxy")).length === 3 &&
+      cartRows.filter((row) => row.includes("app")).length === 3,
+    "each pod card draws its own container rows",
     JSON.stringify(cartRows),
   );
   check(
     paymentRows.length === 1 && paymentRows[0].includes("app"),
-    "peer workloads draw their containers too",
+    "peer pod cards draw their containers too",
     JSON.stringify(paymentRows),
   );
   // A container is a row *inside* its workload card: nested, indented, and
@@ -1228,8 +1325,14 @@ async function main() {
       const portRect = el.getBoundingClientRect();
       const node = el.dataset.node ?? "";
       const container = el.dataset.container ?? "";
-      const row = document.querySelector(
-        `[data-testid="map-container-row"][data-node="${CSS.escape(node)}"][data-container="${CSS.escape(container)}"]`,
+      // Several replicas can carry the same workload/container pair. Match
+      // the port's pod too, or a port on replica B is compared with replica A's
+      // row and appears to sit hundreds of pixels away.
+      const row = [...document.querySelectorAll('[data-testid="map-container-row"]')].find(
+        (candidate) =>
+          (candidate.dataset.node ?? "") === node &&
+          (candidate.dataset.container ?? "") === container &&
+          (candidate.dataset.podUid ?? "") === (el.dataset.podUid ?? ""),
       );
       const card = el.closest("article");
       const rowRect = row?.getBoundingClientRect();

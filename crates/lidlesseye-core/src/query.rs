@@ -1210,6 +1210,34 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A comparison against itself must be exactly zero, with no rounding or
+    /// frame-dictionary drift. The UI can only promise that if both windows
+    /// arrive identical; this test pins the other half of the contract.
+    #[test]
+    fn diff_of_identical_windows_is_zero() {
+        let (store, dir) = store_with_data("diff-same");
+        let result = diff(
+            &store,
+            &DiffOptions {
+                profile_type: ProfileType::cpu(),
+                baseline_from_ns: 0,
+                baseline_until_ns: 7_000,
+                from_ns: 0,
+                until_ns: 7_000,
+                selector: Selector::default(),
+                max_nodes: 1000,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.total_left, result.total_right);
+        assert!(
+            result.diff.iter().all(|delta| *delta == 0),
+            "identical windows produced a delta: {:?}",
+            result.diff
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn timeseries_group_by_splits_series() {
         let (store, dir) = store_with_data("ts-group");

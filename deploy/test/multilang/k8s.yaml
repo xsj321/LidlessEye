@@ -1,0 +1,406 @@
+# CPU-burning pods for every symbolization route the agent supports.
+#
+# Each pod compiles its fixture at start-up from a ConfigMap, so the manifest
+# is self-contained and needs no private image build. The Go pod exercises
+# .gopclntab + ELF, Node and Java exercise /tmp/perf-<pid>.map, Python 3.12
+# exercises the perf trampoline, and C/C++/Rust exercise native symbols with
+# frame pointers. The agent must be running with hostPID/privileged to see
+# these processes; that is the chart default.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multilang-sources
+  namespace: lidlesseye
+data:
+  hot.c: |
+    #include <math.h>
+    volatile double c_sink;
+    __attribute__((noinline)) double c_hot_leaf(double value) {
+      return sqrt(value) + sin(value) + cos(value);
+    }
+    __attribute__((noinline)) double c_hot_mid(double value) {
+      double total = 0;
+      for (int i = 0; i < 64; i += 1) total += c_hot_leaf(value + i);
+      return total;
+    }
+    __attribute__((noinline)) double c_hot_top(double value) {
+      double total = 0;
+      for (int i = 0; i < 8; i += 1) total += c_hot_mid(value + i * 64);
+      return total;
+    }
+    int main(void) { for (;;) c_sink = c_hot_top(c_sink + 1); }
+  hot.cpp: |
+    #include <cmath>
+    volatile double cpp_sink;
+    struct CppHot {
+      __attribute__((noinline)) static double leaf(double value) {
+        return std::sqrt(value) + std::sin(value) + std::cos(value);
+      }
+      __attribute__((noinline)) static double mid(double value) {
+        double total = 0;
+        for (int i = 0; i < 64; ++i) total += leaf(value + i);
+        return total;
+      }
+      __attribute__((noinline)) static double top(double value) {
+        double total = 0;
+        for (int i = 0; i < 8; ++i) total += mid(value + i * 64);
+        return total;
+      }
+    };
+    int main() { for (;;) cpp_sink = CppHot::top(cpp_sink + 1); }
+  hot.rs: |
+    use std::hint::black_box;
+    #[inline(never)] #[no_mangle]
+    pub extern "C" fn rust_hot_leaf(value: f64) -> f64 {
+      value.sqrt() + value.sin() + value.cos()
+    }
+    #[inline(never)] #[no_mangle]
+    pub extern "C" fn rust_hot_mid(value: f64) -> f64 {
+      let mut total = 0.0;
+      for i in 0..64 { total += rust_hot_leaf(black_box(value + i as f64)); }
+      total
+    }
+    #[inline(never)] #[no_mangle]
+    pub extern "C" fn rust_hot_top(value: f64) -> f64 {
+      let mut total = 0.0;
+      for i in 0..8 { total += rust_hot_mid(black_box(value + i as f64 * 64.0)); }
+      total
+    }
+    fn main() {
+      let mut sink = 0.0f64;
+      loop { sink = rust_hot_top(black_box(sink + 1.0)); black_box(sink); }
+    }
+  Hot.java: |
+    public final class Hot {
+      private static volatile double sink = 0.0;
+      public static double javaHotLeaf(double value) {
+        return Math.sqrt(value) + Math.sin(value) + Math.cos(value);
+      }
+      public static double javaHotMid(double value) {
+        double total = 0;
+        for (int i = 0; i < 64; i++) total += javaHotLeaf(value + i);
+        return total;
+      }
+      public static double javaHotTop(double value) {
+        double total = 0;
+        for (int i = 0; i < 8; i++) total += javaHotMid(value + i * 64);
+        return total;
+      }
+      public static void main(String[] args) {
+        for (;;) sink = javaHotTop(sink + 1);
+      }
+    }
+  hot.py: |
+    import math
+
+    def py_hot_leaf(value):
+      return math.sqrt(value) + math.sin(value) + math.cos(value)
+
+    def py_hot_mid(value):
+      total = 0.0
+      for i in range(64):
+        total += py_hot_leaf(value + i)
+      return total
+
+    def py_hot_top(value):
+      total = 0.0
+      for i in range(8):
+        total += py_hot_mid(value + i * 64)
+      return total
+
+    sink = 0.0
+    while True:
+      sink = py_hot_top(sink + 1)
+  hot.js: |
+    function nodeHotLeaf(n) {
+      let total = 0;
+      for (let i = 0; i < n; i += 1) total += Math.sqrt(i) * Math.sin(i);
+      return total;
+    }
+    function nodeHotMid(n) {
+      let total = 0;
+      for (let i = 0; i < 8; i += 1) total += nodeHotLeaf(n);
+      return total;
+    }
+    function nodeHotTop(n) {
+      let total = 0;
+      for (let i = 0; i < 4; i += 1) total += nodeHotMid(n);
+      return total;
+    }
+    let sink = 0;
+    for (;;) {
+      sink += nodeHotTop(100_000);
+      if (!Number.isFinite(sink)) sink = 0;
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multilang-go
+  namespace: lidlesseye
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multilang-go
+  template:
+    metadata:
+      labels:
+        app: multilang-go
+        lidlesseye-fixture: multilang
+    spec:
+      containers:
+        - name: app
+          image: lidlesseye-gotest:1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/app-default"]
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multilang-node
+  namespace: lidlesseye
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multilang-node
+  template:
+    metadata:
+      labels:
+        app: multilang-node
+        lidlesseye-fixture: multilang
+    spec:
+      containers:
+        - name: app
+          image: node:22-bookworm-slim
+          command: ["node", "--perf-basic-prof", "/src/hot.js"]
+          volumeMounts:
+            - name: sources
+              mountPath: /src
+              readOnly: true
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { cpu: 200m, memory: 256Mi }
+      volumes:
+        - name: sources
+          configMap:
+            name: multilang-sources
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multilang-c
+  namespace: lidlesseye
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multilang-c
+  template:
+    metadata:
+      labels:
+        app: multilang-c
+        lidlesseye-fixture: multilang
+    spec:
+      containers:
+        - name: app
+          image: gcc:bookworm
+          command: ["sh", "-c"]
+          args:
+            - gcc -O2 -g -fno-omit-frame-pointer -fno-inline -o /tmp/hot /src/hot.c -lm && exec /tmp/hot
+          volumeMounts:
+            - name: sources
+              mountPath: /src
+              readOnly: true
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+      volumes:
+        - name: sources
+          configMap:
+            name: multilang-sources
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multilang-cpp
+  namespace: lidlesseye
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multilang-cpp
+  template:
+    metadata:
+      labels:
+        app: multilang-cpp
+        lidlesseye-fixture: multilang
+    spec:
+      containers:
+        - name: app
+          image: gcc:bookworm
+          command: ["sh", "-c"]
+          args:
+            - g++ -O2 -g -fno-omit-frame-pointer -fno-inline -o /tmp/hot /src/hot.cpp && exec /tmp/hot
+          volumeMounts:
+            - name: sources
+              mountPath: /src
+              readOnly: true
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+      volumes:
+        - name: sources
+          configMap:
+            name: multilang-sources
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multilang-rust
+  namespace: lidlesseye
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multilang-rust
+  template:
+    metadata:
+      labels:
+        app: multilang-rust
+        lidlesseye-fixture: multilang
+    spec:
+      containers:
+        - name: app
+          image: rust:1.98-bookworm
+          command: ["sh", "-c"]
+          args:
+            - RUSTFLAGS="-C force-frame-pointers=yes" rustc -O -C debuginfo=2 -o /tmp/hot /src/hot.rs && exec /tmp/hot
+          volumeMounts:
+            - name: sources
+              mountPath: /src
+              readOnly: true
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { cpu: 200m, memory: 256Mi }
+      volumes:
+        - name: sources
+          configMap:
+            name: multilang-sources
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multilang-python
+  namespace: lidlesseye
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multilang-python
+  template:
+    metadata:
+      labels:
+        app: multilang-python
+        lidlesseye-fixture: multilang
+    spec:
+      containers:
+        - name: app
+          image: python:3.12-slim
+          command: ["python", "-X", "perf", "/src/hot.py"]
+          env:
+            - name: PYTHONPERFSUPPORT
+              value: "1"
+          volumeMounts:
+            - name: sources
+              mountPath: /src
+              readOnly: true
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { cpu: 200m, memory: 256Mi }
+      volumes:
+        - name: sources
+          configMap:
+            name: multilang-sources
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multilang-java
+  namespace: lidlesseye
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multilang-java
+  template:
+    metadata:
+      labels:
+        app: multilang-java
+        lidlesseye-fixture: multilang
+    spec:
+      initContainers:
+        - name: jdk-headers
+          image: eclipse-temurin:21-jdk
+          command: ["sh", "-c"]
+          args:
+            - cp -r /opt/java/openjdk/include /agent/ && mkdir -p /agent/out
+          volumeMounts:
+            - name: agent
+              mountPath: /agent
+        - name: build-perfmap
+          image: gcc:bookworm
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              git -c http.sslVerify=false clone --depth 1 \
+                https://github.com/jvm-profiling-tools/perf-map-agent.git /tmp/perf-map-agent
+              gcc -shared -fPIC \
+                -I/agent/include -I/agent/include/linux \
+                -o /agent/out/libperfmap.so \
+                /tmp/perf-map-agent/src/c/perf-map-agent.c \
+                /tmp/perf-map-agent/src/c/perf-map-file.c
+              cp -r /tmp/perf-map-agent/src /agent/src
+          volumeMounts:
+            - name: agent
+              mountPath: /agent
+      containers:
+        - name: app
+          image: eclipse-temurin:21-jdk
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              javac -d /tmp/attach /agent/src/java/AttachOnce.java
+              jar cfe /agent/out/attach-main.jar net.virtualvoid.perf.AttachOnce -C /tmp/attach .
+              javac -g -d /app /src/Hot.java
+              cd /agent/out
+              java -XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions \
+                -XX:+DebugNonSafepoints -cp /app Hot &
+              pid=$!
+              trap 'kill "$pid" 2>/dev/null || true' EXIT
+              while kill -0 "$pid" 2>/dev/null; do
+                java -cp attach-main.jar net.virtualvoid.perf.AttachOnce "$pid" >/dev/null 2>&1 || true
+                sleep 5
+              done
+              wait "$pid"
+          volumeMounts:
+            - name: sources
+              mountPath: /src
+              readOnly: true
+            - name: agent
+              mountPath: /agent
+          resources:
+            requests: { cpu: 20m, memory: 128Mi }
+            limits: { cpu: 250m, memory: 512Mi }
+      volumes:
+        - name: sources
+          configMap:
+            name: multilang-sources
+        - name: agent
+          emptyDir: {}

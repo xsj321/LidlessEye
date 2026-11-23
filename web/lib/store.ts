@@ -23,6 +23,7 @@ import {
   prepareCompare,
   rangeLabel,
   resolveBaseline,
+  resolveCompareWindows,
   resolveDomain,
   resolveWindow,
   durationNs,
@@ -218,12 +219,17 @@ export class DashboardStore {
     return resolveDomain(this.timeState());
   }
 
-  resolveWindow(): Window {
-    return resolveWindow(this.timeState());
+  resolveWindow(domain?: Window): Window {
+    return resolveWindow(this.timeState(), domain);
   }
 
-  resolveBaseline(): Window {
-    return resolveBaseline(this.timeState());
+  resolveBaseline(domain?: Window, win?: Window): Window {
+    return resolveBaseline(this.timeState(), domain, win);
+  }
+
+  /** Both diff windows from one clock reading, for requests and the header. */
+  resolveCompareWindows() {
+    return resolveCompareWindows(this.timeState());
   }
 
   defaultBaseline() {
@@ -691,8 +697,8 @@ export class DashboardStore {
 
   // ---- loading ----------------------------------------------------------
 
-  private queryParams() {
-    const win = this.resolveWindow();
+  private queryParams(domain?: Window) {
+    const win = this.resolveWindow(domain);
     const params: Record<string, string> = {
       profile_type: this.state.type,
       from: iso(win.from),
@@ -707,8 +713,16 @@ export class DashboardStore {
   }
 
   private diffParams() {
-    const params = this.queryParams();
-    const baseline = this.resolveBaseline();
+    // One domain snapshot for both windows. With relative time, resolving the
+    // comparison and the baseline separately moved their boundaries by a few
+    // milliseconds; because a batch counts when it merely overlaps a window,
+    // that showed up as a large, fictitious increase or decrease even when the
+    // two brushes were dragged onto the same spot.
+    const { window, baseline } = this.resolveCompareWindows();
+    const params = this.queryParams({
+      from: window.from,
+      until: window.until,
+    });
     params.baseline_from = iso(baseline.from);
     params.baseline_until = iso(baseline.until);
     return params;

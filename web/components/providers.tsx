@@ -22,6 +22,8 @@ function installDebugHandle() {
     setAbsoluteDomain: (from: number, until: number) =>
       dashboardStore.setAbsoluteDomain(from, until),
     setRelativeRange: (preset: string) => dashboardStore.setRelativeRange(preset),
+    setWindow: (from: number, until: number) => dashboardStore.setWindow(from, until),
+    setBaseline: (from: number, until: number) => dashboardStore.setBaseline(from, until),
   };
   (window as unknown as { lidlesseye: typeof handle }).lidlesseye = handle;
 }
