@@ -36,6 +36,12 @@ pub enum Error {
     #[error("time range is invalid: from={from} until={until}")]
     InvalidRange { from: u64, until: u64 },
 
+    /// The store's single connection stayed busy for longer than a reader is
+    /// willing to wait. Distinct from [`Error::Db`] because it means "nothing
+    /// is wrong, try again or narrow the query", not "this query is broken".
+    #[error("store is busy: {0}")]
+    Busy(String),
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 

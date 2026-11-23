@@ -383,9 +383,19 @@ so nothing is duplicated on disk.
   separate `Database` handle, and opening the same file twice inside one
   process is a lock conflict rather than a second reader — so serializing
   access is the only option, not a design choice. Queries still run in
-  parallel *inside* DuckDB (`threads`, all cores by default; `--duckdb-threads`
-  caps it per connection and applies to every tenant); what the mutex
-  serializes is the short per-query setup and the aggregation call itself.
+  parallel *inside* DuckDB (`--duckdb-threads`, four by default, applies to
+  every tenant); what the mutex serializes is the short per-query setup and the
+  aggregation call itself.
+- Every store read runs on `spawn_blocking`, including the ones that look too
+  cheap to bother (`/series`, `/profile-types`, `/stats`). A blocking call in
+  an async handler does not just slow that request down — it removes one of the
+  runtime's four worker threads, and four of them take the whole process with
+  them, liveness probe included.
+- `--query-concurrency` (default 4) caps how many reads are in flight. The
+  extra requests wait as futures, which costs nothing, rather than as parked
+  threads, which cost a stack each and queue on the same mutex anyway. A caller
+  that waits longer than 15 s is told `503 server is busy` instead of being
+  left to hit the 60 s request timeout.
 - Ingestion is `spawn_blocking` (file I/O and the transaction), queries are
   `spawn_blocking` too, so a slow flamegraph cannot stall the accept loop.
 - The collector runs on its own OS thread; it captures a `tokio::runtime::Handle`

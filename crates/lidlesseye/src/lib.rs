@@ -105,6 +105,7 @@ pub struct Builder {
     retention: Option<Duration>,
     max_disk_bytes: Option<u64>,
     duckdb_threads: Option<usize>,
+    query_concurrency: Option<usize>,
     storage_mode: Option<lidlesseye_core::StorageMode>,
     s3: Option<lidlesseye_core::S3Config>,
     parquet_local_ttl: Option<Duration>,
@@ -148,6 +149,7 @@ impl Default for Builder {
             retention: Some(Duration::from_secs(7 * 24 * 3600)),
             max_disk_bytes: Some(50 * 1024 * 1024 * 1024),
             duckdb_threads: None,
+            query_concurrency: None,
             storage_mode: None,
             s3: None,
             parquet_local_ttl: None,
@@ -211,6 +213,12 @@ impl Builder {
     /// `None` (the default) lets DuckDB use every core.
     pub fn duckdb_threads(mut self, threads: Option<usize>) -> Self {
         self.duckdb_threads = threads;
+        self
+    }
+
+    /// How many store reads may run at once (`None` leaves it uncapped).
+    pub fn query_concurrency(mut self, limit: Option<usize>) -> Self {
+        self.query_concurrency = limit;
         self
     }
 
@@ -401,6 +409,7 @@ impl Builder {
             retention: self.retention,
             max_disk_bytes: self.max_disk_bytes,
             duckdb_threads: self.duckdb_threads,
+            query_concurrency: self.query_concurrency,
             storage_mode: self.storage_mode,
             s3: self.s3.clone(),
             parquet_local_ttl_ns: self.parquet_local_ttl.map(|d| d.as_nanos() as u64),

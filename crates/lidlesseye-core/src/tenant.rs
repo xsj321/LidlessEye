@@ -346,7 +346,7 @@ impl TenantStore {
             let Some(store) = self.tenant(&id) else {
                 continue;
             };
-            let flushed = match store.flush_hot() {
+            let flushed = match store.flush_hot_when_idle() {
                 Ok(n) => n,
                 Err(err) => {
                     warn!(tenant = %id, error = %err, "parquet hot flush failed");
@@ -612,6 +612,7 @@ mod tests {
         assert_eq!(
             store
                 .select(&ProfileType::cpu(), 0, 10_000, &Selector::default())
+                .unwrap()
                 .len(),
             1
         );

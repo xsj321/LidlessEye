@@ -427,6 +427,7 @@ tenant isolation, the diff endpoint, and that `/metrics` carries no tenant ids.
 | `--service-name` | process name | set it to aggregate a node under one service; the process name stays as a `process_name` label |
 | `--max-disk` | 50GB | soft cap on retained data; oldest batches are dropped first |
 | `--duckdb-threads` | all cores | threads DuckDB may use per query. All tenants share this process-wide setting |
+| `--query-concurrency` | 4 | how many queries may read the store at once. Each one holds its tenant's DuckDB connection while it runs, so this is a queue depth, not a CPU count. `0` removes the cap |
 | `--read-only` | off | rejects ingest, useful for a query-only server with its own copy of the data directory |
 
 ## Monitoring
@@ -483,7 +484,31 @@ cardinality cannot create files — but it does create distinct label strings in
 `samples`, which cost dictionary space. Set `--service-name` to aggregate, or
 lower `--retention`. If the resident set grows with the number of distinct
 frames, that is the `frames` dictionary plus the in-memory frame cache;
-`--duckdb-threads` bounds DuckDB's own worker memory.
+`--duckdb-threads` bounds DuckDB's own worker memory, and
+`--query-concurrency` bounds how many of those workers exist at once. Spill
+files under `<data dir>/tenants/<tenant>/.duckdb-tmp` are deleted when the
+process opens the store, so that directory is only large while a wide scan is
+running — a persistent multi-gigabyte `.duckdb-tmp` means the scans are wider
+than `--duckdb-memory-limit` allows, not that cleanup is broken.
+
+**Requests return `408` or `503`, and the pod keeps restarting**
+Both mean the server was asked for more scans than it could run at once.
+`503 server is busy` is the honest one: every read slot was occupied for longer
+than 15 s, so the request was refused instead of queued indefinitely.
+`408` is the 60 s request timeout firing, which is the last resort.
+
+The failure this replaces was worse than a slow response: query endpoints used
+to run their DuckDB call inside the async handler, so four concurrent panel
+refreshes could occupy the whole runtime, `/api/v1/health` would not be
+answered, and kubelet would restart the container (`exitCode 137`) while the
+browser saw 408s. If you are on a release that predates the fix, upgrading is
+the fix.
+
+To make the work cheaper rather than more parallel: narrow the dashboard's
+range, lower `--retention` (fewer files to open per query), and check that
+`--duckdb-threads` is not set to `0`/unset on a many-core host. Each of the
+`parquet` store's queries opens every archived object's footer, so the number
+of *files*, not the number of rows, is what the per-query cost tracks.
 
 **`database is locked` / `Could not set lock on file …`**
 Another process has the tenant database open. DuckDB allows one writer per

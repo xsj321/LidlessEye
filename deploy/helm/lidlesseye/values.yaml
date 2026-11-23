@@ -50,6 +50,14 @@ server:
   retention: 7d
   maxDisk: 40GB
 
+  # How many queries may read the store at once. Each read holds one DuckDB
+  # connection while it runs, so a larger number mostly deepens the queue while
+  # the scans wait their turn. Set it to roughly the number of dashboard panels
+  # plus one, not to the CPU count: the point of the cap is that waiting costs
+  # no thread, which is what keeps the liveness probe answerable during a wide
+  # scan. `0` removes the cap (not recommended).
+  queryConcurrency: 4
+
   # Physical storage backend.
   #   duckdb  - single lidlesseye.duckdb file per tenant (original, default)
   #   parquet - in-memory hot tier + local Parquet, merged hourly to S3.

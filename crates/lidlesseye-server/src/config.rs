@@ -57,6 +57,16 @@ pub struct ServerConfig {
     /// instead of OOM-killing the pod. `None` uses a conservative 1 GiB.
     #[serde(default)]
     pub duckdb_memory_limit: Option<String>,
+    /// How many store reads may be in flight at once.
+    ///
+    /// Reads are handed to blocking threads, so an unbounded number of them
+    /// costs a blocking thread each while they queue on the one DuckDB
+    /// connection, and the pile answers nothing. Bounding the number keeps the
+    /// queue in async land, where waiting is nearly free and the runtime stays
+    /// able to accept connections and answer `/api/v1/health` — the probe
+    /// kubelet kills the process over when it cannot be served.
+    #[serde(default)]
+    pub query_concurrency: Option<usize>,
     /// Physical storage backend: the original DuckDB file, or Parquet with
     /// hourly S3 archival. `None` means DuckDB (the default).
     #[serde(default)]
@@ -73,6 +83,14 @@ fn default_duckdb_threads() -> Option<usize> {
     // Four threads scan a 30-day, 40M-row Parquet set about twice as fast as
     // two. It needs a 4 GiB pod: each thread keeps its own decode buffers.
     // Small deployments can lower it with `--duckdb-threads=2`.
+    Some(4)
+}
+
+fn default_query_concurrency() -> Option<usize> {
+    // A DuckDB connection is single-writer and serialises its own readers, so
+    // more than a handful of concurrent reads buys nothing but queue depth.
+    // The dashboard asks for about six things at once; four lets the cheap
+    // ones through while the slow one runs.
     Some(4)
 }
 
@@ -95,6 +113,7 @@ impl Default for ServerConfig {
             prune_interval: Duration::from_secs(60),
             duckdb_threads: default_duckdb_threads(),
             duckdb_memory_limit: None,
+            query_concurrency: default_query_concurrency(),
             storage_mode: None,
             s3: None,
             parquet_local_ttl_ns: None,
@@ -144,5 +163,14 @@ impl ServerConfig {
                 .filter_map(|id| TenantId::parse(id).ok())
                 .collect()
         })
+    }
+
+    /// Number of store reads allowed to run at once.
+    ///
+    /// `0` is treated as "no limit" rather than "no reads": a zero-sized
+    /// semaphore would reject every query, which is never what an operator
+    /// means by disabling the cap.
+    pub fn query_concurrency(&self) -> Option<usize> {
+        self.query_concurrency.filter(|value| *value > 0)
     }
 }

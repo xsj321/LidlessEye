@@ -58,6 +58,14 @@ struct ServeArgs {
     /// Worker threads DuckDB may use per tenant (default: all cores).
     #[arg(long)]
     duckdb_threads: Option<usize>,
+    /// How many store reads may run at once (default 4, `0` for no limit).
+    ///
+    /// Reads run on blocking threads, so an uncapped number of them turns a
+    /// burst of dashboard queries into a burst of threads that all queue on
+    /// one DuckDB connection. Keeping the queue in async land is what lets the
+    /// process keep answering `/api/v1/health` while a wide scan runs.
+    #[arg(long, env = "LIDLESSEYE_QUERY_CONCURRENCY", default_value = "4")]
+    query_concurrency: usize,
     /// Physical storage backend: `duckdb` (single file, default) or `parquet`
     /// (hot memory tier + local Parquet + hourly S3 archive).
     #[arg(long, env = "LIDLESSEYE_STORAGE_MODE", default_value = "duckdb")]
@@ -308,6 +316,14 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(4)
+        // Blocking work is bounded on purpose. Rust's default is 512 threads,
+        // and every one of them held a DuckDB read while the per-tenant
+        // connection could only serve them one at a time; a real cluster
+        // reached 1500 threads and then could not fork at all. Reads are now
+        // also capped at the HTTP layer (`--query-concurrency`), so this is
+        // the backstop rather than the mechanism.
+        .max_blocking_threads(64)
+        .thread_name("lidlesseye")
         .build()
         .context("failed to start the tokio runtime")?;
     runtime.block_on(run(cli))
@@ -379,6 +395,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .retention(retention)
         .max_disk_bytes(max_disk)
         .duckdb_threads(args.duckdb_threads)
+        .query_concurrency(Some(args.query_concurrency))
         .storage_mode(storage_mode);
     if let Some(s3) = s3 {
         builder = builder.s3(s3);

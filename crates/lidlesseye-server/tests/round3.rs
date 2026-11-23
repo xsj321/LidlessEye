@@ -492,7 +492,7 @@ async fn the_disk_cap_evicts_oldest_first() {
     );
 
     // Eviction removes the oldest batches, so the newest one survives.
-    let rows = store.series(0, u64::MAX, &Selector::default());
+    let rows = store.series(0, u64::MAX, &Selector::default()).unwrap();
     let earliest = rows.iter().map(|r| r.start_ns).min().unwrap();
     assert!(
         earliest >= now - 20 * 60_000_000_000,

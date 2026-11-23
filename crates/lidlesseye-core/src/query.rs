@@ -591,7 +591,7 @@ pub fn timeseries(store: &Store, opts: &TimeSeriesOptions) -> Result<TimeSeries>
         opts.from_ns,
         opts.until_ns,
         &opts.selector,
-    );
+    )?;
     type Key = (
         Option<String>,
         String,

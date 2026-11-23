@@ -40,7 +40,11 @@ async fn embedded_ingest_and_query_agree() {
 
     // The library path and the storage path must agree.
     let mut totals = BTreeMap::new();
-    for row in eye.store().series(0, u64::MAX, &Selector::default()) {
+    for row in eye
+        .store()
+        .series(0, u64::MAX, &Selector::default())
+        .unwrap()
+    {
         totals.insert(row.service_name.clone(), row.total_value);
     }
     assert_eq!(totals.get("embedded").copied(), Some(4_000));

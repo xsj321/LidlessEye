@@ -49,6 +49,11 @@ spec:
             {{- end }}
             - --tenant-header={{ .Values.server.tenants.header }}
             - --max-tenants={{ .Values.server.tenants.maxTenants }}
+            {{- /* `hasKey`, not `default`: 0 is a meaningful value here (no
+                   cap), and `default` would rewrite it. A release upgraded
+                   with --reuse-values predates this key, so it must fall back
+                   to the flag's own default rather than render empty. */}}
+            - --query-concurrency={{ ternary .Values.server.queryConcurrency 4 (hasKey .Values.server "queryConcurrency") }}
             - --storage-mode={{ .Values.server.storage.mode }}
             {{- if eq .Values.server.storage.mode "parquet" }}
             - --s3-bucket={{ .Values.server.storage.s3.bucket }}
@@ -116,6 +121,18 @@ spec:
             - name: http
               containerPort: {{ .Values.server.service.port }}
               protocol: TCP
+          # A slow start must not look like a crash. Opening a tenant's store
+          # in Parquet mode lists its S3 prefix, so a server with a dozen
+          # tenants and a large archive can take a minute or two before it
+          # serves its first request. The startup probe gives it that time;
+          # only after it passes does liveness judge the running process.
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /api/v1/health

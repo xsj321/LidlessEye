@@ -220,6 +220,7 @@ pub async fn flamegraph(
     let Some(store) = maybe_store(&state, &caller) else {
         return Ok(Json(Flamegraph::empty(profile_type.unit())).into_response());
     };
+    let _slot = state.read_slot().await?;
     let started = Instant::now();
     let result = state
         .query_guard(store.clone())
@@ -284,6 +285,7 @@ pub async fn diff(
         })
         .into_response());
     };
+    let _slot = state.read_slot().await?;
     let started = Instant::now();
     let result = state
         .query_guard(store.clone())
@@ -318,6 +320,7 @@ pub async fn top(
         }))
         .into_response());
     };
+    let _slot = state.read_slot().await?;
     let started = Instant::now();
     let result = state
         .query_guard(store.clone())
@@ -371,6 +374,7 @@ pub async fn timeseries(
         })
         .into_response());
     };
+    let _slot = state.read_slot().await?;
     let started = Instant::now();
     let series = state
         .query_guard(store.clone())
@@ -392,7 +396,15 @@ pub async fn series(
     let (from, until) = params.range(now)?;
     let selector = params.selector()?;
     let rows = match maybe_store(&state, &caller) {
-        Some(store) => store.series(from, until, &selector),
+        Some(store) => {
+            let slot = state.read_slot().await?;
+            let rows = state
+                .query_guard(store.clone())
+                .run(move || store.series(from, until, &selector))
+                .await;
+            drop(slot);
+            rows?
+        }
         None => Vec::new(),
     };
     Ok(Json(json!({
@@ -413,7 +425,15 @@ pub async fn label_names(
     let (from, until) = params.range(now)?;
     let selector = params.selector()?;
     let names = match maybe_store(&state, &caller) {
-        Some(store) => store.label_names(from, until, &selector),
+        Some(store) => {
+            let slot = state.read_slot().await?;
+            let names = state
+                .query_guard(store.clone())
+                .run(move || store.label_names(from, until, &selector))
+                .await;
+            drop(slot);
+            names?
+        }
         None => vec![lidlesseye_core::SERVICE_NAME_LABEL.to_string()],
     };
     Ok(Json(json!({ "label_names": names, "labels": names })).into_response())
@@ -431,11 +451,19 @@ pub async fn label_values(
     let (from, until) = params.range(now)?;
     let selector = params.selector()?;
     let values: Vec<Value> = match maybe_store(&state, &caller) {
-        Some(store) => store
-            .label_values(&name, from, until, &selector)
-            .into_iter()
-            .map(|(value, total)| json!({ "value": value, "total": total }))
-            .collect(),
+        Some(store) => {
+            let label = name.clone();
+            let slot = state.read_slot().await?;
+            let pairs = state
+                .query_guard(store.clone())
+                .run(move || store.label_values(&label, from, until, &selector))
+                .await;
+            drop(slot);
+            pairs?
+                .into_iter()
+                .map(|(value, total)| json!({ "value": value, "total": total }))
+                .collect()
+        }
         None => Vec::new(),
     };
     Ok(Json(json!({ "label": name, "values": values })).into_response())
@@ -451,13 +479,23 @@ pub async fn profile_types(
     let now = now_ns();
     let (from, until) = params.range(now)?;
     let selector: Selector = params.selector()?;
-    let mut totals: BTreeMap<String, (u64, usize)> = Default::default();
-    if let Some(store) = maybe_store(&state, &caller) {
-        for row in store.series(from, until, &selector) {
-            let entry = totals.entry(row.profile_type.clone()).or_insert((0, 0));
-            entry.0 += row.total_value;
-            entry.1 += row.batch_count;
+    let rows = match maybe_store(&state, &caller) {
+        Some(store) => {
+            let slot = state.read_slot().await?;
+            let rows = state
+                .query_guard(store.clone())
+                .run(move || store.series(from, until, &selector))
+                .await;
+            drop(slot);
+            rows?
         }
+        None => Vec::new(),
+    };
+    let mut totals: BTreeMap<String, (u64, usize)> = Default::default();
+    for row in rows {
+        let entry = totals.entry(row.profile_type.clone()).or_insert((0, 0));
+        entry.0 += row.total_value;
+        entry.1 += row.batch_count;
     }
     let mut out: Vec<Value> = totals
         .iter()
@@ -504,28 +542,38 @@ pub async fn tenants(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let scope = state.authorize_catalog(&headers)?;
-    if let Some(scope) = scope {
-        return Ok(Json(json!({
-            "tenants": [describe_tenant(&state, &scope)]
-        }))
-        .into_response());
-    }
+    let allowed = state.inner.allowed_tenants.clone();
 
-    let mut out = state.registry().tenants();
-    if let Some(allowed) = &state.inner.allowed_tenants {
-        out.retain(|tenant| allowed.iter().any(|id| id.to_string() == tenant.id));
-        // An allowed tenant that has not been written to yet is still part of
-        // the catalogue. Leaving it out would give the dashboard an empty
-        // picker on a fresh install, and the first upload would have nowhere
-        // to go — the tenant exists as configuration, not as a directory.
-        for id in allowed {
-            if !out.iter().any(|tenant| tenant.id == id.to_string()) {
-                out.push(describe_tenant(&state, id));
-            }
+    // Every row reads its tenant's store, and a store read is two scans over
+    // `batches`. Tenants are cheap to list but expensive to describe, so the
+    // description runs off the runtime behind a read slot: as a plain call it
+    // pinned a worker for the sum of every tenant's scans, which is the last
+    // thing the dashboard's very first request should do.
+    let _slot = state.read_slot().await?;
+    let rows = tokio::task::spawn_blocking(move || {
+        if let Some(scope) = scope {
+            return vec![describe_tenant(&state, &scope)];
         }
-        out.sort_by(|a, b| a.id.cmp(&b.id));
-    }
-    Ok(Json(json!({ "tenants": out })).into_response())
+        let mut out = state.registry().tenants();
+        if let Some(allowed) = &allowed {
+            out.retain(|tenant| allowed.iter().any(|id| id.to_string() == tenant.id));
+            // An allowed tenant that has not been written to yet is still part
+            // of the catalogue. Leaving it out would give the dashboard an
+            // empty picker on a fresh install, and the first upload would have
+            // nowhere to go — the tenant exists as configuration, not as a
+            // directory.
+            for id in allowed {
+                if !out.iter().any(|tenant| tenant.id == id.to_string()) {
+                    out.push(describe_tenant(&state, id));
+                }
+            }
+            out.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        out
+    })
+    .await
+    .map_err(|err| ApiError::internal(format!("tenant catalogue task failed: {err}")))?;
+    Ok(Json(json!({ "tenants": rows })).into_response())
 }
 
 /// One row of the tenant catalogue, with empty stats when nothing is stored.
@@ -566,8 +614,19 @@ pub async fn stats(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let caller = state.authorize(&headers)?;
-    let store = match maybe_store(&state, &caller) {
-        Some(store) => (store.stats(), store.series_count()),
+    let store = maybe_store(&state, &caller);
+    // Both numbers are full scans of `batches`, and the dashboard polls this
+    // every few seconds. They share one read slot and one blocking task.
+    let (summary, series_count) = match store {
+        Some(store) => {
+            let _slot = state.read_slot().await?;
+            // `stats_checked`, not `stats`: a busy store must be a 503, not
+            // "0 batches", which a dashboard renders as an empty install.
+            state
+                .query_guard(store.clone())
+                .run(move || store.stats_checked())
+                .await?
+        }
         None => (Default::default(), 0),
     };
     let activity = state.activity(&caller.tenant);
@@ -575,8 +634,8 @@ pub async fn stats(
         version: VERSION,
         tenant: caller.tenant.to_string(),
         uptime_seconds: state.uptime().as_secs(),
-        store: store.0,
-        series: store.1,
+        store: summary,
+        series: series_count,
         tenants: state.registry().tenant_ids().len(),
         // Per tenant, not per process: a token scoped to one tenant must not
         // learn how much another tenant ingests. The process-wide totals stay
@@ -690,6 +749,7 @@ pub async fn servicemap(
             ..Default::default()
         }));
     };
+    let _slot = state.read_slot().await?;
     let started = Instant::now();
     let map = state
         .query_guard(store.clone())
@@ -729,6 +789,7 @@ pub async fn servicemap_history(
             ..Default::default()
         }));
     };
+    let _slot = state.read_slot().await?;
     let started = Instant::now();
     let history = state
         .query_guard(store.clone())
@@ -771,6 +832,7 @@ pub async fn servicemap_histogram(
             points: vec![0; buckets],
         }));
     };
+    let _slot = state.read_slot().await?;
     let started = Instant::now();
     let histogram = state
         .query_guard(store.clone())

@@ -64,6 +64,11 @@ struct Inner {
     /// stats, however, must not be handed another tenant's ingest volume, so
     /// the numbers it sees are kept per tenant.
     activity: Mutex<BTreeMap<String, TenantActivity>>,
+    /// Caps how many store reads are running (or waiting to run) at once.
+    ///
+    /// `None` disables the cap. See [`ServerConfig::query_concurrency`] for
+    /// why a cap exists at all.
+    reads: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Ingestion and query counters for a single tenant.
@@ -314,6 +319,40 @@ impl AppState {
         }
     }
 
+    /// Take one of the slots a store read is allowed to occupy.
+    ///
+    /// The guard must be held until the read returns. Waiting happens in async
+    /// land, so a queue of callers costs no threads; without the cap, each
+    /// caller took a blocking thread with it and the queue became thousands of
+    /// parked threads all contending for the single DuckDB connection.
+    ///
+    /// Bounded waiting is deliberate. A caller that has queued behind a slow
+    /// scan for longer than [`READ_QUEUE_TIMEOUT`] is better served by a 503 it
+    /// can retry than by the 60 s request timeout, which looks exactly like a
+    /// broken server from the browser.
+    pub async fn read_slot(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ApiError> {
+        const READ_QUEUE_TIMEOUT: Duration = Duration::from_secs(15);
+        let Some(semaphore) = &self.inner.reads else {
+            return Ok(None);
+        };
+        match tokio::time::timeout(READ_QUEUE_TIMEOUT, semaphore.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            Ok(Err(_)) => Err(ApiError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "server is shutting down",
+            )),
+            Err(_) => Err(ApiError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "server is busy: every read slot was in use for {}s. Narrow the time \
+                     range, or raise `--query-concurrency` if this deployment has the CPU \
+                     and memory for more parallel scans.",
+                    READ_QUEUE_TIMEOUT.as_secs()
+                ),
+            )),
+        }
+    }
+
     /// Persist several reports of one tenant in a single blocking task.
     pub async fn ingest_many(
         &self,
@@ -325,26 +364,30 @@ impl AppState {
         }
         let store = self.writable_tenant(tenant)?;
         let limits = self.inner.registry.limits(tenant);
-
-        // Enforce the per-tenant series limit before writing anything, so a
-        // rejected batch leaves no partial state behind.
-        if let Some(max_series) = limits.max_series {
-            let current = store.series_count();
-            let fresh = distinct_new_series(&store, &reports);
-            if current.saturating_add(fresh) > max_series {
-                return Err(ApiError::new(
-                    axum::http::StatusCode::TOO_MANY_REQUESTS,
-                    format!(
-                        "tenant `{tenant}` is at its series limit ({max_series}); \
-                         raise `tenant_limits.{tenant}.max_series` to accept more"
-                    ),
-                ));
-            }
-        }
+        let max_series = limits.max_series;
+        let tenant_label = tenant.to_string();
 
         let metrics = self.inner.metrics.clone();
         let samples: u64 = reports.iter().map(|r| r.stacks.len() as u64).sum();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+            // Enforce the per-tenant series limit before writing anything, so a
+            // rejected batch leaves no partial state behind. This lives in the
+            // blocking task with the writes: `contains_series` is one query per
+            // report, and running it on the handler's thread put a batch of
+            // fifty reports between the runtime and its next poll.
+            if let Some(max_series) = max_series {
+                let current = store.series_count();
+                let fresh = distinct_new_series(&store, &reports);
+                if current.saturating_add(fresh) > max_series {
+                    return Err(ApiError::new(
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        format!(
+                            "tenant `{tenant_label}` is at its series limit ({max_series}); \
+                             raise `tenant_limits.{tenant_label}.max_series` to accept more"
+                        ),
+                    ));
+                }
+            }
             let mut metas = Vec::with_capacity(reports.len());
             let mut errors = Vec::new();
             for report in &reports {
@@ -356,10 +399,10 @@ impl AppState {
                     Err(err) => errors.push(err.to_string()),
                 }
             }
-            (metas, errors)
+            Ok((metas, errors))
         })
         .await
-        .map_err(|err| ApiError::internal(format!("ingest task failed: {err}")))?;
+        .map_err(|err| ApiError::internal(format!("ingest task failed: {err}")))??;
 
         let (metas, errors) = result;
         if !metas.is_empty() {
@@ -478,10 +521,17 @@ impl LidlessEye {
             cfg.max_tenants,
         )
         .map_err(|err| format!("failed to open tenant registry: {err}"))?;
+        // Read every tenant's totals *before* the socket exists. In Parquet
+        // mode that walks each tenant's S3 prefix, which on a real
+        // installation takes tens of seconds; a listener that is bound but not
+        // yet served accepts the connection and then answers nothing, and a
+        // liveness probe reports that as a timeout. Kubelet kills the process
+        // over it, so the container ends up restarting exactly when it was
+        // still starting up.
+        let stats = registry.total_stats();
         let listener = TcpListener::bind(cfg.listen)
             .await
             .map_err(|err| format!("failed to bind {}: {err}", cfg.listen))?;
-        let stats = registry.total_stats();
         info!(
             addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             data_dir = %cfg.data_dir.display(),
@@ -511,6 +561,9 @@ impl LidlessEye {
         listener: TcpListener,
     ) -> Self {
         let allowed_tenants = cfg.parsed_allowed_tenants();
+        let reads = cfg
+            .query_concurrency()
+            .map(|limit| Arc::new(tokio::sync::Semaphore::new(limit)));
         LidlessEye {
             state: AppState {
                 inner: Arc::new(Inner {
@@ -520,6 +573,7 @@ impl LidlessEye {
                     started: Instant::now(),
                     allowed_tenants,
                     activity: Mutex::new(BTreeMap::new()),
+                    reads,
                 }),
             },
             listener,

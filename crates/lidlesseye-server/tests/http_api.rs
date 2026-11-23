@@ -1141,3 +1141,53 @@ async fn tenants_endpoint_lists_every_tenant() {
     assert_eq!(ids, vec!["acme", "beta"]);
     assert_eq!(list[1]["stats"]["batch_count"], 1);
 }
+
+#[tokio::test]
+async fn read_slots_cap_parallel_reads_and_never_block_the_health_probe() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = LidlessEye::bind(ServerConfig {
+        query_concurrency: Some(2),
+        ..config(dir.path())
+    })
+    .await
+    .unwrap();
+    let app = server.router();
+    let state = server.state();
+
+    // Occupying every slot must leave the probe answerable. The probe reads no
+    // store, and on a real cluster it was the *only* request that still had to
+    // be served while four blocked handlers owned the runtime: kubelet killed
+    // the pod when it could not be.
+    let first = state.read_slot().await.unwrap();
+    let second = state.read_slot().await.unwrap();
+    assert!(first.is_some() && second.is_some());
+    let (status, body) = call(&app, "GET", "/api/v1/health", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A third read waits instead of taking a slot, which is the whole point:
+    // the queue lives in async land, where waiting costs no thread.
+    let queued = tokio::time::timeout(Duration::from_millis(150), state.read_slot()).await;
+    assert!(queued.is_err(), "a third read took a slot past the cap");
+
+    // Releasing one slot lets the next reader through.
+    drop(first);
+    let third = tokio::time::timeout(Duration::from_secs(2), state.read_slot())
+        .await
+        .expect("released slot was never handed to the next reader");
+    assert!(third.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_uncapped_server_hands_out_free_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = LidlessEye::bind(ServerConfig {
+        query_concurrency: None,
+        ..config(dir.path())
+    })
+    .await
+    .unwrap();
+    // `None` means "no cap", and callers must not have to care.
+    assert!(server.state().read_slot().await.unwrap().is_none());
+}

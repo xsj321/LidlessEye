@@ -38,9 +38,13 @@
 //!    local files; older windows read S3.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
 
 use duckdb::Connection;
+use tracing::warn;
 
 use crate::error::{Error, Result};
 use crate::store::S3Config;
@@ -110,6 +114,26 @@ pub(crate) struct ParquetState {
     pub local_ttl_ns: u64,
     /// Path of the on-disk manifest JSON.
     manifest_path: PathBuf,
+    /// When the next S3 archive attempt is allowed, after a failure.
+    ///
+    /// An archive attempt is not cheap and it is not local: it re-reads and
+    /// re-compresses a whole hour and holds the tenant's only DuckDB
+    /// connection while it does. Retrying on the next tick — ten seconds
+    /// later — turned a bucket that rejects multipart uploads into a permanent
+    /// full-time scan: the pass never succeeded, so the local files were never
+    /// reclaimed, so the next pass had even more to read. Worse, every query
+    /// queued behind the connection it was holding, so the dashboard saw 408s
+    /// while the server was busy failing at something else.
+    ///
+    /// The backoff is global rather than per hour because a failure is almost
+    /// never about *one* hour: an unreachable endpoint, a bad credential and a
+    /// refused multipart upload all fail every hour the same way.
+    ///
+    /// It doubles on every consecutive failure up to [`ARCHIVE_MAX_BACKOFF`],
+    /// so a bucket that is broken for a day costs one failed merge every hour
+    /// rather than twelve every minute, and a bucket that was merely rate
+    /// limited is retried within minutes.
+    archive_retry: Arc<Mutex<ArchiveRetry>>,
 }
 
 impl ParquetState {
@@ -121,6 +145,7 @@ impl ParquetState {
             prefix: s3.prefix.trim_matches('/').to_string(),
             local_ttl_ns,
             manifest_path: dir.join("manifest.json"),
+            archive_retry: Arc::new(Mutex::new(ArchiveRetry::default())),
         }
     }
 
@@ -195,6 +220,14 @@ pub(crate) fn configure_s3(conn: &Connection, s3: &S3Config) -> Result<()> {
     ))?;
     let style = s3.url_style.as_deref().unwrap_or("path");
     set(format!("SET s3_url_style='{}'", esc(style)))?;
+    // Without a bound, one stalled object read holds the tenant's only
+    // connection forever: the query never finishes, so it never releases the
+    // mutex, so every request after it is refused. DuckDB's own default is
+    // longer than any dashboard is willing to wait, and a request that errors
+    // in fifteen seconds is recoverable while a wedged connection is not.
+    // Best-effort: an older httpfs may not expose these.
+    let _ = conn.execute_batch("SET http_timeout=15000");
+    let _ = conn.execute_batch("SET http_retries=2");
     Ok(())
 }
 
@@ -412,6 +445,66 @@ pub(crate) fn flush_hot(conn: &Connection, state: &ParquetState) -> Result<usize
 pub struct ArchiveStats {
     pub files_uploaded: usize,
     pub bytes_reclaimed: usize,
+    /// Hours whose upload failed on this pass. They are skipped for
+    /// [`ARCHIVE_RETRY_AFTER`] instead of being retried on the next tick.
+    pub failed: usize,
+}
+
+/// First backoff after a failed archive attempt.
+///
+/// Ten minutes, not ten seconds: an attempt that fails has already paid for a
+/// full-hour merge, and that merge holds the tenant's only connection. Retrying
+/// eagerly cannot succeed — the failure is the endpoint, not the hour — and it
+/// costs the dashboard every query that arrives meanwhile.
+const ARCHIVE_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// Ceiling for that backoff, so a permanently broken bucket still gets retried.
+const ARCHIVE_MAX_BACKOFF: Duration = Duration::from_secs(3_600);
+
+/// Circuit-breaker state for the S3 archive.
+#[derive(Debug, Default)]
+struct ArchiveRetry {
+    /// Earliest instant the next attempt may run.
+    until: Option<Instant>,
+    /// Duration applied by the most recent failure, doubled on the next one.
+    backoff: Duration,
+}
+
+impl ArchiveRetry {
+    fn blocked(&self, now: Instant) -> bool {
+        self.until.is_some_and(|until| now < until)
+    }
+
+    fn record_failure(&mut self, now: Instant, first: Duration, cap: Duration) -> Duration {
+        self.backoff = if self.backoff.is_zero() {
+            first
+        } else {
+            (self.backoff * 2).min(cap)
+        };
+        self.until = Some(now + self.backoff);
+        self.backoff
+    }
+
+    fn record_success(&mut self) {
+        self.backoff = Duration::ZERO;
+        self.until = None;
+    }
+}
+
+/// Write a single-row Parquet object to the archive prefix.
+///
+/// Cheap enough to run on every archival pass and decisive: it exercises the
+/// same code path as the merge (`COPY ... TO 's3://...'`, multipart upload and
+/// all) without reading or compressing anything worth waiting for. An endpoint
+/// that is unreachable, denies the credentials, or refuses multipart uploads
+/// fails here in milliseconds instead of after a full-hour merge.
+fn probe_archive_target(conn: &Connection, state: &ParquetState) -> Result<()> {
+    // No `.parquet` suffix: the object is a write probe, not a table file, and
+    // nothing should ever glob it back in as one.
+    let key = format!("{}/.archive-probe", state.s3_base());
+    conn.execute_batch(&format!(
+        "COPY (SELECT 1::BIGINT AS ok) TO '{key}' (FORMAT PARQUET)"
+    ))
+    .map_err(|e| Error::Db(format!("archive probe to {key}: {e}")))
 }
 
 /// Archive local Parquet files that are older than the local TTL: merge the
@@ -427,6 +520,34 @@ pub(crate) fn archive_local(
     let cutoff_hour = (now_ns.saturating_sub(state.local_ttl_ns) / 1_000_000_000) / 3600;
     let mut stats = ArchiveStats::default();
     let mut manifest = state.load_manifest();
+    let now = Instant::now();
+    // One failed endpoint must not be retried per table per hour: see the
+    // field comment. Skipping the whole pass keeps the connection free for
+    // queries, which is the only thing the user can actually see.
+    if state.archive_retry.lock().blocked(now) {
+        return Ok(stats);
+    }
+    // Ask the bucket whether it accepts writes before merging an hour for it.
+    // The probe is one row: milliseconds when the endpoint is healthy, and it
+    // fails immediately when it is not — which is the whole point, because the
+    // merge it guards re-reads and re-compresses tens of megabytes while
+    // holding the connection every query is queued on. Without it, a bucket
+    // that rejects multipart uploads costs a full merge per retry, and the
+    // only visible symptom is queries that time out.
+    if let Err(err) = probe_archive_target(conn, state) {
+        let backoff = state.archive_retry.lock().record_failure(
+            now,
+            ARCHIVE_RETRY_AFTER,
+            ARCHIVE_MAX_BACKOFF,
+        );
+        warn!(
+            error = %err,
+            retry_in_secs = backoff.as_secs(),
+            "parquet archive target is not writable; pausing archival"
+        );
+        stats.failed += 1;
+        return Ok(stats);
+    }
 
     for def in TABLES {
         let dir = state.table_dir(def.name);
@@ -455,7 +576,7 @@ pub(crate) fn archive_local(
                 .map(|p| format!("'{}'", p.to_string_lossy().replace('\\', "/")))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let key = format!("{}/{}/hour={}.parquet", state.s3_base(), def.name, hour);
+            let key_url = format!("{}/{}/hour={}.parquet", state.s3_base(), def.name, hour);
             // `SELECT *` with `union_by_name` is deliberate here, for the same
             // reason the VIEWs use it: an hour's local files can span an
             // upgrade, and the older ones predate columns such as `containers`.
@@ -464,11 +585,32 @@ pub(crate) fn archive_local(
             // never reclaimed. A missing column reads as NULL instead, which
             // is how the read path already treats it.
             let sql = format!(
-                "COPY ({}) TO '{key}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
+                "COPY ({}) TO '{key_url}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
                 merge_projection(&list),
             );
-            conn.execute_batch(&sql)
-                .map_err(|e| Error::Db(format!("uploading {} to S3: {e}", def.name)))?;
+            // One failing hour must not stop the rest of the pass: an hour of
+            // `samples` that S3 refuses used to abort before `stacks` was even
+            // looked at, so nothing else was ever archived either.
+            if let Err(err) = conn.execute_batch(&sql) {
+                let backoff = state.archive_retry.lock().record_failure(
+                    now,
+                    ARCHIVE_RETRY_AFTER,
+                    ARCHIVE_MAX_BACKOFF,
+                );
+                warn!(
+                    table = def.name,
+                    hour,
+                    error = %err,
+                    retry_in_secs = backoff.as_secs(),
+                    "parquet archive attempt failed; pausing archival"
+                );
+                stats.failed += 1;
+                // Nothing else in this pass can succeed either, and each
+                // attempt costs a full merge on the connection every query is
+                // waiting for.
+                return Ok(stats);
+            }
+            state.archive_retry.lock().record_success();
 
             // A successful COPY is our commit marker: record the object in the
             // manifest first, then drop the local copies. Order matters — a
@@ -478,7 +620,7 @@ pub(crate) fn archive_local(
                 .objects
                 .entry(def.name.to_string())
                 .or_default()
-                .push(key.clone());
+                .push(key_url.clone());
             state.save_manifest(&manifest)?;
 
             for file in &files {
@@ -527,7 +669,12 @@ pub(crate) fn compact_local(
     // A first run against months of history would otherwise rewrite thousands
     // of hours in one tick, holding the connection and spiking memory. Bound
     // each pass; the tick runs again in ten minutes and works through the rest.
-    const MAX_MERGES_PER_PASS: usize = 48;
+    //
+    // One, not forty-eight: each merge rewrites a whole hour of Parquet while
+    // holding the tenant's only connection, and queries wait behind it. A pass
+    // that runs for minutes is indistinguishable from a hung server, and the
+    // tick comes round again in ten minutes.
+    const MAX_MERGES_PER_PASS: usize = 1;
     let mut stats = CompactStats::default();
     let mut changed = false;
     'tables: for def in TABLES {
@@ -853,15 +1000,24 @@ mod tests {
             "two flushes in one hour leave two files"
         );
 
-        let stats = store.compact_all_for_test().unwrap();
+        // A pass merges one hour of one table and stops: the work is done on
+        // the same connection queries use, so the tick is deliberately small.
+        // Run passes until the backlog is gone.
+        let mut written = 0;
+        let mut merged = 0;
+        for _ in 0..8 {
+            let stats = store.compact_all_for_test().unwrap();
+            if stats.files_written == 0 {
+                break;
+            }
+            written += stats.files_written;
+            merged += stats.files_merged;
+        }
         // samples, batches and stacks each had two parts; frames is a shared
         // dictionary and may already be a single file, so assert the lower
         // bound rather than a table count that can change with the schema.
-        assert!(
-            stats.files_written >= 3,
-            "one merged file per multi-part table"
-        );
-        assert!(stats.files_merged >= 6);
+        assert!(written >= 3, "one merged file per multi-part table");
+        assert!(merged >= 6);
         assert_eq!(
             samples.read_dir().unwrap().count(),
             1,
@@ -913,6 +1069,7 @@ mod tests {
             prefix: "test".into(),
             local_ttl_ns: u64::MAX,
             manifest_path: dir.join("parquet").join("manifest.json"),
+            archive_retry: Arc::new(Mutex::new(ArchiveRetry::default())),
         };
         state.save_manifest(&Manifest::default()).unwrap();
         create_schema(&conn, &state).unwrap();

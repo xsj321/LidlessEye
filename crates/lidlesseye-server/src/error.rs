@@ -54,6 +54,10 @@ impl From<CoreError> for ApiError {
             // A limit is a temporary state the caller can fix by dropping data
             // or asking an operator to raise it: 429, not 500.
             CoreError::LimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            // The store held its connection for longer than a reader waits.
+            // Nothing is wrong with the query, so it must not look like a 500:
+            // 503 with a retry hint is what a dashboard can act on.
+            CoreError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
             CoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

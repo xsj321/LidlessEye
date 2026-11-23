@@ -6,10 +6,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
-## [Unreleased]
+## [0.1.5] - 2026-11-23
+
+A busy server stays alive and answers, instead of getting killed by its own
+liveness probe.
 
 ### Fixed
 
+- **A busy server stopped answering entirely, and kubelet killed it.** Five
+  endpoints (`/api/v1/stats`, `/api/v1/series`, `/api/v1/profile-types`,
+  `/api/v1/labels`, `/api/v1/label/{name}/values`) ran their DuckDB query as a
+  plain blocking call inside the async handler. The runtime has four worker
+  threads, so four concurrent panel refreshes owned all of them and nothing
+  else could be polled — including `/api/v1/health`, which reads no store at
+  all. The probe timed out, kubelet restarted the container (`exitCode 137`),
+  and every request that had been waiting came back as the 60 s request
+  timeout. All store reads now run off the runtime like the other query
+  endpoints, and a request that cannot get a read slot within 15 s gets a 503
+  that says so instead of a 408 that looks like a broken server.
+- The number of in-flight store reads is capped (`--query-concurrency`,
+  default 4, `server.queryConcurrency` in the chart). Uncapped, each waiting
+  request held a blocking thread while it queued on the single DuckDB
+  connection; a 12-hour-old pod had 1507 threads, could no longer fork, and had
+  grown to 1.2 GB of RSS. The queue now lives in async land, where waiting
+  costs no thread, and the blocking pool is capped at 64 as a backstop.
+- A read that cannot get its tenant's single DuckDB connection within 45 s now
+  fails with `503 store is busy`, rather than joining an unbounded queue that
+  the request timeout would eventually turn into a 408. A busy store is an
+  error, not zero rows: `/api/v1/stats` no longer reports an empty install when
+  it was simply refused.
+- Parquet mode ignored `--duckdb-threads`. It opens an in-memory database and
+  called `Connection::open_in_memory()`, which has no config argument, so the
+  configured value never reached DuckDB and every scan ran on one thread per
+  core (20 on the machine that reported this) instead of 4.
+- Leftover DuckDB spill files are deleted at open. They belong to the pid that
+  wrote them and nothing reclaims them afterwards; one deployment carried 11 GB
+  of `.duckdb-tmp` on the volume that also holds its tenants.
+- A failed S3 archive no longer retries every ten seconds. Each attempt
+  re-read and re-compressed the whole hour before failing identically, so a
+  bucket that rejects multipart uploads turned the compaction tick into a
+  permanent full-time scan. Failures now trip a per-tenant circuit breaker with
+  exponential backoff (10 min → 20 min → 1 h), one failed hour no longer aborts
+  the rest of the pass, and the log names the table, hour and retry delay.
+- Background maintenance (hot flush, local compaction, S3 archive, retention)
+  yields to queries: it waits at most half a second for the connection and
+  starts only after the store has been unread for five minutes. A merge that
+  took minutes on the single connection used to make every dashboard poll
+  wait behind it. Passes are bounded to one hour of one table.
+- The server bound its socket before opening every tenant store. In Parquet
+  mode that lists each tenant's S3 prefix, which can take minutes on a large
+  installation; a bound but unserved socket accepts connections and answers
+  nothing, so the liveness probe timed out during startup and kubelet killed a
+  process that was merely starting. Totals are now read before the socket is
+  opened, and the chart has a startup probe with a five-minute budget.
+- `/api/v1/stats` computes its row counts and distinct-series count in one
+  cached snapshot instead of two uncached scans per poll.
 - The tenant control is always on screen, seeded with `default`. It used to be
   hidden whenever the tenant list came back empty or had not loaded yet, which
   is the state a brand-new server is in — every query was being answered by
@@ -340,7 +391,8 @@ service map.
 - User stacks need frame pointers; CPU and off-CPU only, no allocation
   profiling yet.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/xsj321/LidlessEye/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/xsj321/LidlessEye/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/xsj321/LidlessEye/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/xsj321/LidlessEye/compare/v0.1.1...v0.1.2
