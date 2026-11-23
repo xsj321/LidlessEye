@@ -19,7 +19,8 @@ use lidlesseye_core::pprof::PprofOptions;
 use lidlesseye_core::servicemap::ServiceMapBatch;
 use lidlesseye_core::{
     DiffFlamegraph, DiffOptions, Flamegraph, MapHistogram, MapHistory, ProfileType, QueryOptions,
-    Selector, ServiceMap, Store, TimeSeries, TimeSeriesOptions, TopResult, now_ns,
+    Selector, ServiceMap, Store, TenantId, TenantInfo, TimeSeries, TimeSeriesOptions, TopResult,
+    now_ns,
 };
 
 use crate::error::ApiError;
@@ -489,33 +490,56 @@ pub async fn profile_types(
 
 /// `GET /api/v1/tenants`
 ///
-/// Administration endpoint: a tenant-scoped token cannot enumerate other
-/// tenants, and never sees them either.
+/// The catalogue of tenants. It answers "which tenants exist", so it must not
+/// require the caller to already name a valid one: on a server started with
+/// `--allowed-tenant`, the dashboard's first request has no tenant at all, and
+/// resolving one anyway made this endpoint answer 403 to the only request that
+/// could have told the UI which tenants it may use — an empty picker, forever.
+///
+/// The tenant header is therefore ignored here; only the token is checked. A
+/// tenant-scoped token still sees itself and nothing else, and an allowlist
+/// still bounds what an unscoped caller is offered.
 pub async fn tenants(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let caller = state.authorize(&headers)?;
-    if caller.scoped {
+    let scope = state.authorize_catalog(&headers)?;
+    if let Some(scope) = scope {
         return Ok(Json(json!({
-            "tenants": [{
-                "id": caller.tenant.to_string(),
-                "stats": state
-                    .registry()
-                    .tenant(&caller.tenant)
-                    .map(|store| store.stats())
-                    .unwrap_or_default(),
-                "series": state
-                    .registry()
-                    .tenant(&caller.tenant)
-                    .map(|store| store.series_count())
-                    .unwrap_or(0),
-                "limits": state.registry().limits(&caller.tenant),
-            }]
+            "tenants": [describe_tenant(&state, &scope)]
         }))
         .into_response());
     }
-    Ok(Json(json!({ "tenants": state.registry().tenants() })).into_response())
+
+    let mut out = state.registry().tenants();
+    if let Some(allowed) = &state.inner.allowed_tenants {
+        out.retain(|tenant| allowed.iter().any(|id| id.to_string() == tenant.id));
+        // An allowed tenant that has not been written to yet is still part of
+        // the catalogue. Leaving it out would give the dashboard an empty
+        // picker on a fresh install, and the first upload would have nowhere
+        // to go — the tenant exists as configuration, not as a directory.
+        for id in allowed {
+            if !out.iter().any(|tenant| tenant.id == id.to_string()) {
+                out.push(describe_tenant(&state, id));
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    Ok(Json(json!({ "tenants": out })).into_response())
+}
+
+/// One row of the tenant catalogue, with empty stats when nothing is stored.
+fn describe_tenant(state: &AppState, tenant: &TenantId) -> TenantInfo {
+    let store = state.registry().tenant(tenant);
+    TenantInfo {
+        id: tenant.to_string(),
+        stats: store
+            .as_ref()
+            .map(|store| store.stats())
+            .unwrap_or_default(),
+        series: store.map(|store| store.series_count()).unwrap_or(0),
+        limits: state.registry().limits(tenant),
+    }
 }
 
 /// `GET /api/v1/health`

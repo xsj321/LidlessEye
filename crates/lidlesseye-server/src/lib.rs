@@ -127,33 +127,7 @@ impl AppState {
     ///   is rejected, so a tenant can never read another one.
     pub fn authorize(&self, headers: &HeaderMap) -> Result<Caller, ApiError> {
         let cfg = &self.inner.cfg;
-        let token = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .unwrap_or_default()
-            .trim();
-
-        let mut bound: Option<TenantId> = None;
-        if cfg.auth_token.is_none() && cfg.tenant_tokens.is_empty() {
-            // Open server.
-        } else {
-            for (candidate, tenant) in &cfg.tenant_tokens {
-                if constant_time_eq(token, candidate) {
-                    bound =
-                        Some(TenantId::parse(tenant).map_err(|err| {
-                            ApiError::internal(format!("bad tenant token: {err}"))
-                        })?);
-                }
-            }
-            let global = cfg
-                .auth_token
-                .as_deref()
-                .is_some_and(|expected| constant_time_eq(token, expected));
-            if bound.is_none() && !global {
-                return Err(ApiError::unauthorized());
-            }
-        }
+        let bound = self.bound_tenant(headers)?;
 
         // An explicitly empty header is a malformed request, not "use the
         // default tenant": silently writing into `default` is exactly the kind
@@ -217,6 +191,50 @@ impl AppState {
             tenant,
             scoped: bound.is_some(),
         })
+    }
+
+    /// Authenticate without resolving a tenant.
+    ///
+    /// Returns the tenant a bearer token pins the caller to, if any, and does
+    /// nothing else: no tenant header is read and `--allowed-tenant` is not
+    /// applied. This exists for the one endpoint that is about *which* tenants
+    /// exist — a catalogue that demanded the caller name a valid tenant first
+    /// could not be read at all on a server whose allowlist does not contain
+    /// the caller's default, which is exactly the state the dashboard starts in.
+    pub fn authorize_catalog(&self, headers: &HeaderMap) -> Result<Option<TenantId>, ApiError> {
+        self.bound_tenant(headers)
+    }
+
+    /// The token check alone: `None` for an open or globally-tokened server,
+    /// `Some(tenant)` when a per-tenant token matched.
+    fn bound_tenant(&self, headers: &HeaderMap) -> Result<Option<TenantId>, ApiError> {
+        let cfg = &self.inner.cfg;
+        if cfg.auth_token.is_none() && cfg.tenant_tokens.is_empty() {
+            return Ok(None);
+        }
+        let token = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default()
+            .trim();
+
+        for (candidate, tenant) in &cfg.tenant_tokens {
+            if constant_time_eq(token, candidate) {
+                let tenant = TenantId::parse(tenant)
+                    .map_err(|err| ApiError::internal(format!("bad tenant token: {err}")))?;
+                return Ok(Some(tenant));
+            }
+        }
+        let global = cfg
+            .auth_token
+            .as_deref()
+            .is_some_and(|expected| constant_time_eq(token, expected));
+        if global {
+            Ok(None)
+        } else {
+            Err(ApiError::unauthorized())
+        }
     }
 
     /// Store of a tenant that must already exist (read path).

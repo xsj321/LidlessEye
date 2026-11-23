@@ -10,6 +10,22 @@ Rust API follows the same rule.
 
 ### Fixed
 
+- **A fresh install with `--allowed-tenant` had an unusable dashboard.**
+  `GET /api/v1/tenants` resolved a tenant before answering, and the caller is a
+  browser that does not know one yet, so a server whose allowlist excluded
+  `default` refused the one request that could have named a usable tenant —
+  403 on the catalogue, an empty picker, and no way to recover from the UI. The
+  catalogue now checks only the token, ignores the tenant header, and filters
+  its *rows* by the allowlist. An allowed tenant that has not been written to
+  yet is listed with zero counts, because it exists as configuration and the
+  first upload needs somewhere to go.
+- A browser that stored a tenant id could get every request refused with 403
+  after a tenant-scoped token was configured: the token pins the tenant and the
+  persisted header named a different one. The dashboard now drops the header
+  and retries once when the server says the token is scoped, instead of needing
+  localStorage cleared by hand.
+- `docs/api.md` showed `count` and `max_tenants` in the `/api/v1/tenants`
+  response; the handler has never returned either.
 - A tag published the image as `v0.1.3` and `0.1`, while the chart's
   `image.tag` resolves to `appVersion` — `0.1.3`, with no `v` — so a fresh
   `helm install` asked the registry for a tag nothing had created. The release

@@ -736,6 +736,49 @@ async fn allowed_tenants_and_the_tenant_cap_are_enforced() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
 }
 
+/// The catalogue has to answer before the caller names a tenant.
+///
+/// A fresh browser has no tenant stored, and on a server started with
+/// `--allowed-tenant` the default tenant is not one of the allowed ones. If the
+/// listing applied the allowlist to the *request* (instead of to its rows), the
+/// dashboard's first call came back 403 and its picker stayed empty forever —
+/// the one request that could have named a usable tenant was the one being
+/// refused.
+#[tokio::test]
+async fn the_tenant_catalogue_lists_what_is_allowed_before_anything_is_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.allowed_tenants = Some(vec!["beta".to_string(), "acme".to_string()]);
+    let app = router_with(dir.path(), cfg).await;
+
+    // No tenant header at all, and nothing written yet.
+    let (status, body) = call(&app, "GET", "/api/v1/tenants", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["tenants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tenant| tenant["id"].as_str().unwrap())
+        .collect();
+    // Allowed tenants exist as configuration, so they are listed before they
+    // hold any data, and in a stable order.
+    assert_eq!(ids, ["acme", "beta"]);
+
+    // Naming a tenant outside the allowlist is still refused where it matters.
+    let (status, body) = call_as(&app, "GET", "/api/v1/stats", None, "default").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Once a tenant has data, its row keeps its place and gains numbers.
+    let (status, body) =
+        call_as(&app, "POST", "/ingest", Some(report("a", "cpu", 3)), "acme").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&app, "GET", "/api/v1/tenants", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["tenants"].as_array().unwrap();
+    assert_eq!(rows[0]["id"], "acme");
+    assert!(rows[0]["series"].as_u64().unwrap() > 0);
+}
+
 #[tokio::test]
 async fn the_series_limit_rejects_new_series_only() {
     let dir = tempfile::tempdir().unwrap();

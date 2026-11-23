@@ -97,14 +97,30 @@ async function request<T>(
   if (tenant) headers.set("X-Tenant-Id", tenant);
 
   let response: Response;
-  try {
-    response = await fetch(path + buildQuery(params), { ...init, headers });
-  } catch (err) {
-    // A deliberate abort (a superseded query) must stay distinguishable from a
-    // real network failure, so callers can ignore it instead of showing an
-    // error banner.
-    if (err instanceof Error && err.name === "AbortError") throw err;
-    throw new ApiError(`network error: ${(err as Error).message}`, 0);
+  const send = async (): Promise<Response> => {
+    try {
+      return await fetch(path + buildQuery(params), { ...init, headers });
+    } catch (err) {
+      // A deliberate abort (a superseded query) must stay distinguishable from a
+      // real network failure, so callers can ignore it instead of showing an
+      // error banner.
+      if (err instanceof Error && err.name === "AbortError") throw err;
+      throw new ApiError(`network error: ${(err as Error).message}`, 0);
+    }
+  };
+  response = await send();
+  // A token that is scoped to one tenant rejects any tenant named in the
+  // header, and this browser persists that name in localStorage. A stale one —
+  // say `default`, saved before the token was configured — would keep every
+  // request 403 until storage is cleared by hand, with no way out from the UI.
+  // The token already decides the tenant, so drop the header and ask again.
+  if (response.status === 403 && tenant) {
+    const refusal = await response.clone().text();
+    if (refusal.includes("is scoped to tenant")) {
+      setTenant("");
+      headers.delete("X-Tenant-Id");
+      response = await send();
+    }
   }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;

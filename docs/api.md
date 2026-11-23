@@ -399,7 +399,23 @@ unchanged.
 
 ## `GET /api/v1/tenants`
 
-Administration endpoint. A tenant-scoped token only ever sees its own tenant.
+The tenant catalogue: which tenants this server has, and what each one costs.
+
+It is the one endpoint that does **not** resolve a tenant from the request. The
+`X-Scope-OrgID` / `X-Tenant-Id` header is ignored and only the bearer token is
+checked, because a caller asking what tenants exist cannot be required to name
+a valid one first: on a server started with `--allowed-tenant`, resolving the
+caller's default tenant here made this endpoint answer 403 to the very request
+that could have told the dashboard which tenant to use, leaving its picker
+empty with no way back.
+
+Rows are bounded by what the caller may use:
+
+- a tenant-scoped token gets its own row and nothing else;
+- `--allowed-tenant` filters the rows, and an allowed tenant that has not been
+  written to yet is listed with zero counts — it exists as configuration, and
+  the first upload needs somewhere to go;
+- otherwise every tenant on disk is listed.
 
 ```json
 {
@@ -412,14 +428,11 @@ Administration endpoint. A tenant-scoped token only ever sees its own tenant.
                  "earliest_ns": 1700000000000000000, "latest_ns": 1700003600000000000 },
       "limits": { "retention_ns": 604800000000000, "max_disk_bytes": null, "max_series": 5000 }
     }
-  ],
-  "count": 1,
-  "max_tenants": 1000
+  ]
 }
 ```
 
-Reading this endpoint never creates a tenant; a tenant appears once something
-has been written to it.
+Reading this endpoint never creates a tenant; the first write does.
 
 ## `GET /api/v1/stats`
 

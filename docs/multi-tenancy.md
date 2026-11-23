@@ -141,7 +141,10 @@ curl -s -H 'X-Scope-OrgID: acme' \
 ```
 
 `GET /api/v1/tenants` lists tenants with their size and limits — an operator
-tool. A tenant-scoped token sees only its own entry.
+tool, and the dashboard's picker. A tenant-scoped token sees only its own entry.
+The request's tenant header is ignored here, and an `--allowed-tenant` that has
+not been written to yet is listed with zero counts: a fresh install has to be
+able to see the tenants it may write to before it has written anything.
 
 `lidlesseye query --tenant acme`, `lidlesseye ingest --tenant acme` and
 `lidlesseye fsck --tenant acme` do the same from the CLI.
