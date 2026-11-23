@@ -6,7 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
-## [Unreleased]
+## [0.1.4] - 2026-11-23
+
+A fresh install is usable again: the tenant catalogue can be read before a
+tenant is named, which is the state every dashboard starts in.
 
 ### Fixed
 
@@ -327,7 +330,8 @@ service map.
 - User stacks need frame pointers; CPU and off-CPU only, no allocation
   profiling yet.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/xsj321/LidlessEye/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/xsj321/LidlessEye/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/xsj321/LidlessEye/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/xsj321/LidlessEye/compare/v0.1.0...v0.1.1
