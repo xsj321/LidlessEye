@@ -177,7 +177,11 @@ spec:
       containers:
         - name: app
           image: node:22-bookworm-slim
-          command: ["node", "--perf-basic-prof", "/src/hot.js"]
+          command:
+            - node
+            - --perf-basic-prof-only-functions
+            - --interpreted-frames-native-stack
+            - /src/hot.js
           volumeMounts:
             - name: sources
               mountPath: /src
@@ -381,7 +385,7 @@ spec:
               javac -g -d /app /src/Hot.java
               cd /agent/out
               java -XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions \
-                -XX:+DebugNonSafepoints -cp /app Hot &
+                -XX:+DebugNonSafepoints -XX:-Inline -cp /app Hot &
               pid=$!
               trap 'kill "$pid" 2>/dev/null || true' EXIT
               while kill -0 "$pid" 2>/dev/null; do

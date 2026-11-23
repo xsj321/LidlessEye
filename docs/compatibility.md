@@ -62,7 +62,7 @@ means it is genuinely absent.
 | Container / label based filtering | no | exclusion is by PID only |
 | Heap / allocation profiling | yes | two readers: Go heaps read (never written) from the runtime's own bucket chain, `runtime.mbuckets`, and every other language through uprobes on the allocator (`malloc`/`calloc`/`realloc`/`free` and the jemalloc, mimalloc, tcmalloc and musl equivalents). Emits `alloc_space`/`alloc_objects` (rate) and `inuse_space`/`inuse_objects` (level), labelled `profile_source`, `runtime` and `allocator`. `--no-alloc` and `--no-heap` turn either off, `--heap-objects` adds the object counts. Not covered: `mmap`-backed arenas, allocators that never call `malloc` (a custom `#[global_allocator]`), allocations made before the probe attached, and RSS/PSS — `inuse_*` is the sum of live blocks seen, not resident memory |
 | Python 3.12+ CPU frames (perf trampoline) | yes | `PYTHONPERFSUPPORT=1` or `python -X perf` publishes `/tmp/perf-<pid>.map`, which the agent already reads; the official `python:3.12-*` image is enough to see Python frames. Build the interpreter with `CFLAGS=-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer` for deeper stacks through CPython itself. Ruby remains SDK-driven |
-| JVM JIT CPU frames (perf map) | yes | run with `-XX:+PreserveFramePointer` and have perf-map-agent refresh `/tmp/perf-<pid>.map`; those JIT addresses then use the same perf-map reader as V8. JFR itself is still not decoded — push it through an SDK as pprof/folded instead |
+| JVM JIT CPU frames (perf map) | yes | run with `-XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -XX:-Inline` and have perf-map-agent refresh `/tmp/perf-<pid>.map`; those JIT addresses then use the same perf-map reader as V8. JFR itself is still not decoded — push it through an SDK as pprof/folded instead |
 | JVM / Python / Ruby heap profiles | no | no runtime heap reader except Go's; use an SDK that emits pprof or folded text. Native allocator uprobes do see `malloc` calls made by these runtimes, but that is not a language-level heap profile |
 
 ## Operations
@@ -96,7 +96,7 @@ this order, and each one closes a hole the previous one cannot:
 | ELF symbol tables | native code | `.symtab`, `.dynsym`, split debug info under `/usr/lib/debug/.build-id` |
 | DWARF `.debug_info` | inlined frames | a release build inlines aggressively, so the leaf often exists only as an inlined copy; those frames are expanded and emitted leaf first |
 | Go `.gopclntab` | stripped Go binaries | survives `-ldflags="-s -w"`, because the Go runtime needs it to unwind and to print panics |
-| JIT / trampoline perf maps | JVM, V8/Node, CPython 3.12+ | `/tmp/perf-<pid>.map`, found through `/proc/<pid>/root` and `NSpid` so it works across mount and PID namespaces. Producers are `node --perf-basic-prof`, perf-map-agent with `-XX:+PreserveFramePointer`, and `PYTHONPERFSUPPORT=1` / `python -X perf` |
+| JIT / trampoline perf maps | JVM, V8/Node, CPython 3.12+ | `/tmp/perf-<pid>.map`, found through `/proc/<pid>/root` and `NSpid` so it works across mount and PID namespaces. Producers are `node --perf-basic-prof-only-functions --interpreted-frames-native-stack`, perf-map-agent with `-XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -XX:-Inline`, and `PYTHONPERFSUPPORT=1` / `python -X perf` |
 | `kallsyms` / `vmlinux` | kernel | read live; `vmlinux` is preferred when it is installed |
 
 Two details decide whether a stack looks complete or full of holes:
@@ -192,8 +192,11 @@ number as `in another PID namespace`.
 Addresses in **anonymous memory** are a separate bucket, reported as
 `[anonymous]`. That is where a JIT runtime puts its code: without a perf map
 there is no symbol table to consult, and the address is emitted as-is. The
-producer is runtime-specific — `node --perf-basic-prof`, perf-map-agent with
-`-XX:+PreserveFramePointer`, or CPython 3.12+ with `PYTHONPERFSUPPORT=1` — and
+producer is runtime-specific — `node --perf-basic-prof-only-functions
+--interpreted-frames-native-stack`, perf-map-agent with
+`-XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions
+-XX:+DebugNonSafepoints -XX:-Inline`, or CPython 3.12+ with
+`PYTHONPERFSUPPORT=1` — and
 the agent always reads the resulting `/tmp/perf-<pid>.map` through
 `/proc/<pid>/root`. When none is published, `[anonymous]` is the honest answer:
 it means "ask the runtime to publish its symbols", not "install debuginfo".
@@ -258,12 +261,12 @@ and look for these frames in `/api/v1/flamegraph` (or `/api/v1/top`):
 | Pod | Runtime setup | Frames that must be named |
 | --- | --- | --- |
 | `multilang-go` | plain Go binary | `main.hotA` / `main.hotB` (pclntab and `.symtab`) |
-| `multilang-node` | `node --perf-basic-prof` | `nodeHotLeaf` / `nodeHotMid` / `nodeHotTop` (perf map) |
+| `multilang-node` | `node --perf-basic-prof-only-functions --interpreted-frames-native-stack` | `nodeHotLeaf` / `nodeHotMid` / `nodeHotTop` (perf map) |
 | `multilang-c` | `-fno-omit-frame-pointer` | `c_hot_leaf` / `c_hot_mid` / `c_hot_top` (ELF) |
 | `multilang-cpp` | `-fno-omit-frame-pointer` | `CppHot::leaf` / `CppHot::mid` / `CppHot::top` (ELF, mangled) |
 | `multilang-rust` | `-C force-frame-pointers=yes` | `rust_hot_leaf` / `rust_hot_mid` / `rust_hot_top` (ELF) |
 | `multilang-python` | `python:3.12-slim`, `PYTHONPERFSUPPORT=1`, `-X perf` | `py_hot_leaf` / `py_hot_mid` / `py_hot_top` (perf trampoline) |
-| `multilang-java` | `-XX:+PreserveFramePointer` + perf-map-agent | `javaHotLeaf` / `javaHotMid` / `javaHotTop` (perf map) |
+| `multilang-java` | `-XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -XX:-Inline` + perf-map-agent | `javaHotLeaf` / `javaHotMid` / `javaHotTop` (perf map) |
 
 The agent's `symbol coverage` line is the second oracle: `go=` counts pclntab
 names and `unnamed` must not grow while these pods are running. Perf-map names

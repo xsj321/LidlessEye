@@ -53,6 +53,24 @@ and the multi-language symbolization routes are exercised in one cluster.
   pods from one ConfigMap. `docs/compatibility.md` records which routes are
   native and which need the runtime to publish symbols.
 
+## [0.1.8] - 2026-11-23
+
+The multi-language fixture now exercises the symbol routes that actually name
+Node and JIT-compiled Java frames.
+
+### Fixed
+
+- `multilang-node` starts with `--perf-basic-prof-only-functions
+  --interpreted-frames-native-stack` instead of plain `--perf-basic-prof`; the
+  fixture now yields `nodeHotLeaf`, `nodeHotMid` and `nodeHotTop` in the
+  flamegraph, not just V8 builtins and a generic `JS:*` frame.
+- `multilang-java` adds `-XX:-Inline` alongside `-XX:+PreserveFramePointer`,
+  `-XX:+UnlockDiagnosticVMOptions` and `-XX:+DebugNonSafepoints`, so
+  perf-map-agent's map contains `javaHotLeaf`, `javaHotMid` and `javaHotTop`
+  and all three appear in the flamegraph.
+- `docs/compatibility.md` records the exact runtime flags for Node and JVM
+  JIT frames, matching the fixture and the verified commands.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -441,6 +459,7 @@ service map.
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
 [Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.7...HEAD
+[0.1.8]: https://github.com/xsj321/LidlessEye/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/xsj321/LidlessEye/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/xsj321/LidlessEye/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/xsj321/LidlessEye/compare/v0.1.4...v0.1.5
