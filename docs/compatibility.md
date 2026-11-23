@@ -252,26 +252,42 @@ cargo test -p lidlesseye --test embedded        # the crate API, in-process
 
 ### Every language, in one cluster
 
-`deploy/test/multilang/k8s.yaml` starts one CPU-burning pod per symbolization
-route. Each pod compiles its fixture from a ConfigMap at start-up, so no private
-image build is needed; the agent still needs its chart defaults of `hostPID` and
-`privileged`. Apply it with `kubectl apply -f deploy/test/multilang/k8s.yaml`
-and look for these frames in `/api/v1/flamegraph` (or `/api/v1/top`):
+`deploy/test/multilang/k8s.yaml` starts long-running Deployments — one per
+symbolization route — so they can be left in the cluster as a permanent test
+fixture. Each pod compiles its fixture from a ConfigMap at start-up, so no
+private image build is needed; the agent still needs its chart defaults of
+`hostPID` and `privileged`. Apply it with `kubectl apply -f
+deploy/test/multilang/k8s.yaml`, leave the pods running, and query
+`/api/v1/flamegraph` or `/api/v1/top` with `profile_type=cpu`,
+`alloc_space` or `inuse_space`.
 
-| Pod | Runtime setup | Frames that must be named |
-| --- | --- | --- |
-| `multilang-go` | plain Go binary | `main.hotA` / `main.hotB` (pclntab and `.symtab`) |
-| `multilang-node` | `node --perf-basic-prof-only-functions --interpreted-frames-native-stack` | `nodeHotLeaf` / `nodeHotMid` / `nodeHotTop` (perf map) |
-| `multilang-c` | `-fno-omit-frame-pointer` | `c_hot_leaf` / `c_hot_mid` / `c_hot_top` (ELF) |
-| `multilang-cpp` | `-fno-omit-frame-pointer` | `CppHot::leaf` / `CppHot::mid` / `CppHot::top` (ELF, mangled) |
-| `multilang-rust` | `-C force-frame-pointers=yes` | `rust_hot_leaf` / `rust_hot_mid` / `rust_hot_top` (ELF) |
-| `multilang-python` | `python:3.12-slim`, `PYTHONPERFSUPPORT=1`, `-X perf` | `py_hot_leaf` / `py_hot_mid` / `py_hot_top` (perf trampoline) |
-| `multilang-java` | `-XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -XX:-Inline` + perf-map-agent | `javaHotLeaf` / `javaHotMid` / `javaHotTop` (perf map) |
+The fixtures deliberately burn CPU **and** allocate: Go through `make`/`new`,
+C/C++/Rust through `malloc`/`Box`, Python through large `bytes` objects and
+Node through `Buffer.allocUnsafe`. That gives every supported memory reader
+something to see. Java stays CPU-only on purpose.
 
-The agent's `symbol coverage` line is the second oracle: `go=` counts pclntab
-names and `unnamed` must not grow while these pods are running. Perf-map names
-arrive with module `[jit]` in the flamegraph; they are tallied internally but
-are not broken out on that log line yet.
+| Pod | CPU frames | Memory route | Memory | Notes |
+| --- | --- | --- | --- | --- |
+| `multilang-go` | `main.hotA` / `main.hotB` (pclntab + ELF) | Go runtime heap (`runtime.mbuckets`) | yes | `alloc_space` / `inuse_space`, plus object counts with `--heap-objects`. The reader is verified against Go processes already in the cluster (`/app/goheap`, Prometheus with `runtime.mallocgc`); use a wide enough window to catch the fixture's ~4 KiB allocations. Go 1.23 is used because that is the reader's validated layout. |
+| `multilang-c` | `c_hot_leaf` / `c_hot_mid` / `c_hot_top` (ELF) | allocator uprobes on `malloc`/`free` | yes | `alloc_space` / `inuse_space`; 256 live 4 KiB blocks cover the level metric. |
+| `multilang-cpp` | `CppHot::leaf` / `CppHot::mid` / `CppHot::top` (mangled ELF) | allocator uprobes on `malloc`/`free` | yes | `CppHot::mid` / `CppHot::top` were observed in `alloc_space` during the cluster run. |
+| `multilang-rust` | `rust_hot_leaf` / `rust_hot_mid` / `rust_hot_top` (`-C force-frame-pointers=yes`) | allocator uprobes via `Box<[u8; 4096]>` → system malloc | yes | 256 live boxes. `rust_hot_top` is often absent from a short top-N sample, not a symbolization failure. |
+| `multilang-python` | `py_hot_leaf` / `py_hot_mid` / `py_hot_top` (perf trampoline) | allocator uprobes, large allocations only | partial | `bytes(4096)` goes through `malloc`; CPython's small-object `pymalloc` arenas come from `mmap` and are invisible. No runtime-level Python heap reader. |
+| `multilang-node` | `nodeHotLeaf` / `nodeHotMid` / `nodeHotTop` (perf map) | allocator uprobes, external buffers only | partial | `Buffer.allocUnsafe` allocates outside V8; the V8 managed heap is `mmap`-backed and not read. No runtime-level Node heap reader. |
+| `multilang-java` | `javaHotLeaf` / `javaHotMid` / `javaHotTop` (perf map) | — | no | JVM TLAB/heap allocations never call `malloc` per object, and JFR is not decoded. Native `malloc` from JVM internals may appear, but that is not a Java heap profile; use an SDK that emits pprof/folded. |
+
+"Memory = yes" means `alloc_space` / `inuse_space` frames carry the language's
+own function names. "Partial" means only the malloc-backed part is visible.
+The table describes each route's capability; a short top-N window will not
+always contain every fixture's leaf frames. None of these columns is RSS or
+PSS; see
+[USAGE.md](USAGE.md#memory-and-allocation-profiling) for why `inuse_space` is a
+level, not a working set.
+
+The agent's `symbol coverage` line is the second CPU oracle: `go=` counts
+pclntab names and `unnamed` must not grow while these pods are running.
+Perf-map names arrive with module `[jit]` in the flamegraph; they are tallied
+internally but are not broken out on that log line yet.
 
 The eBPF programs are tested against a real kernel, not a mock, which needs a
 Linux host and root. Docker is enough:

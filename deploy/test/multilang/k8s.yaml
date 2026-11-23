@@ -1,22 +1,63 @@
-# CPU-burning pods for every symbolization route the agent supports.
+# Long-running pods for every symbolization and memory route the agent supports.
 #
 # Each pod compiles its fixture at start-up from a ConfigMap, so the manifest
 # is self-contained and needs no private image build. The Go pod exercises
-# .gopclntab + ELF, Node and Java exercise /tmp/perf-<pid>.map, Python 3.12
-# exercises the perf trampoline, and C/C++/Rust exercise native symbols with
-# frame pointers. The agent must be running with hostPID/privileged to see
-# these processes; that is the chart default.
+# .gopclntab + ELF and the runtime heap, Node and Java exercise
+# /tmp/perf-<pid>.map, Python 3.12 exercises the perf trampoline, and
+# C/C++/Rust exercise native symbols with frame pointers. Every native
+# fixture also allocates through malloc so alloc_space/inuse_space have
+# something to report; Java is deliberately CPU-only because the agent does
+# not read JVM heap. The agent must run with hostPID/privileged to see these
+# processes; that is the chart default.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: multilang-sources
   namespace: lidlesseye
 data:
+  app.go: |
+    package main
+
+    import "math"
+
+    var sink float64
+    var keep = make([][]byte, 256)
+    var next int
+
+    func remember(block []byte) {
+      keep[next] = block
+      next = (next + 1) % len(keep)
+    }
+
+    func hotA(value float64) float64 {
+      block := make([]byte, 4096)
+      block[0] = byte(int(value) & 255)
+      remember(block)
+      return math.Sin(value) + math.Cos(value) + float64(block[0])
+    }
+
+    func hotB(value float64) float64 {
+      page := new([512]byte)
+      page[0] = byte(int(value) & 255)
+      return math.Sqrt(value) + hotA(value+float64(page[0]))
+    }
+
+    func main() {
+      for {
+        sink = hotB(sink + 1)
+      }
+    }
   hot.c: |
     #include <math.h>
+    #include <stdlib.h>
     volatile double c_sink;
+    static void *c_live[256];
+    static int c_live_len = 0;
     __attribute__((noinline)) double c_hot_leaf(double value) {
-      return sqrt(value) + sin(value) + cos(value);
+      char *block = malloc(4096);
+      block[0] = (char)value;
+      if (c_live_len < 256) c_live[c_live_len++] = block; else free(block);
+      return sqrt(value) + sin(value) + cos(value) + block[0];
     }
     __attribute__((noinline)) double c_hot_mid(double value) {
       double total = 0;
@@ -31,10 +72,16 @@ data:
     int main(void) { for (;;) c_sink = c_hot_top(c_sink + 1); }
   hot.cpp: |
     #include <cmath>
+    #include <cstdlib>
     volatile double cpp_sink;
+    static void *cpp_live[256];
+    static int cpp_live_len = 0;
     struct CppHot {
       __attribute__((noinline)) static double leaf(double value) {
-        return std::sqrt(value) + std::sin(value) + std::cos(value);
+        char *block = static_cast<char *>(malloc(4096));
+        block[0] = static_cast<char>(value);
+        if (cpp_live_len < 256) cpp_live[cpp_live_len++] = block; else free(block);
+        return std::sqrt(value) + std::sin(value) + std::cos(value) + block[0];
       }
       __attribute__((noinline)) static double mid(double value) {
         double total = 0;
@@ -50,9 +97,27 @@ data:
     int main() { for (;;) cpp_sink = CppHot::top(cpp_sink + 1); }
   hot.rs: |
     use std::hint::black_box;
+    use std::sync::{Mutex, OnceLock};
+
+    static KEEP: OnceLock<Mutex<Vec<Box<[u8; 4096]>>>> = OnceLock::new();
+
+    fn keep(block: Box<[u8; 4096]>) {
+      let mut held = KEEP
+        .get_or_init(|| Mutex::new(Vec::with_capacity(256)))
+        .lock()
+        .unwrap();
+      if held.len() < 256 {
+        held.push(block);
+      }
+    }
+
     #[inline(never)] #[no_mangle]
     pub extern "C" fn rust_hot_leaf(value: f64) -> f64 {
-      value.sqrt() + value.sin() + value.cos()
+      let tag = value as u8;
+      let mut block = Box::new([0u8; 4096]);
+      block[0] = tag;
+      keep(block);
+      value.sqrt() + value.sin() + value.cos() + black_box(tag) as f64
     }
     #[inline(never)] #[no_mangle]
     pub extern "C" fn rust_hot_mid(value: f64) -> f64 {
@@ -93,8 +158,14 @@ data:
   hot.py: |
     import math
 
+    keep = []
+
     def py_hot_leaf(value):
-      return math.sqrt(value) + math.sin(value) + math.cos(value)
+      block = bytes(4096)
+      keep.append(block)
+      if len(keep) > 256:
+        del keep[0]
+      return math.sqrt(value) + math.sin(value) + math.cos(value) + block[0]
 
     def py_hot_mid(value):
       total = 0.0
@@ -112,9 +183,15 @@ data:
     while True:
       sink = py_hot_top(sink + 1)
   hot.js: |
+    const keep = [];
+
     function nodeHotLeaf(n) {
+      const block = Buffer.allocUnsafe(4096);
+      block[0] = n & 255;
+      keep.push(block);
+      if (keep.length > 256) keep.shift();
       let total = 0;
-      for (let i = 0; i < n; i += 1) total += Math.sqrt(i) * Math.sin(i);
+      for (let i = 0; i < n; i += 1) total += Math.sqrt(i) * Math.sin(i) + block[0];
       return total;
     }
     function nodeHotMid(n) {
@@ -151,12 +228,22 @@ spec:
     spec:
       containers:
         - name: app
-          image: lidlesseye-gotest:1
+          image: golang:1.23-alpine
           imagePullPolicy: IfNotPresent
-          command: ["/bin/app-default"]
+          command: ["sh", "-c"]
+          args:
+            - 'cd /src && CGO_ENABLED=0 go build -trimpath -o /tmp/hot app.go && exec /tmp/hot'
+          volumeMounts:
+            - name: sources
+              mountPath: /src
+              readOnly: true
           resources:
-            requests: { cpu: 20m, memory: 32Mi }
-            limits: { cpu: 200m, memory: 128Mi }
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: sources
+          configMap:
+            name: multilang-sources
 ---
 apiVersion: apps/v1
 kind: Deployment

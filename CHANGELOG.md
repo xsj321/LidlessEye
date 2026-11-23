@@ -71,6 +71,38 @@ Node and JIT-compiled Java frames.
 - `docs/compatibility.md` records the exact runtime flags for Node and JVM
   JIT frames, matching the fixture and the verified commands.
 
+## [0.1.9] - 2026-11-23
+
+The multi-language fixtures are permanent cluster residents and now exercise
+memory as well as CPU, with the support matrix stating exactly what each
+runtime's memory route can see.
+
+### Changed
+
+- `deploy/test/multilang/k8s.yaml` now describes long-running Deployments for
+  Go, Node, C, C++, Rust, Python 3.12 and Java. Every fixture is compiled by the
+  pod from a ConfigMap, so the set can be left in a test cluster without a
+  private image build. The Go fixture also moved from a prebuilt image to
+  `golang:1.23-alpine`, the Go version whose heap layout the reader is
+  validated against.
+- All fixtures except Java now allocate as well as burn CPU: Go through
+  `make`/`new`, C/C++ through `malloc`, Rust through `Box<[u8; 4096]>`, Python
+  through large `bytes` objects and Node through `Buffer.allocUnsafe`. Java
+  stays CPU-only because the agent does not read JVM heap or TLABs. This gives
+  `alloc_space` and `inuse_space` real, sustained input on every supported
+  memory route.
+- `docs/compatibility.md` replaces the CPU-only frame list with a CPU/memory
+  capability table. It records Go runtime heap and native allocator uprobes as
+  fully supported, Python and Node as partial (only malloc-backed allocations),
+  and Java as unsupported for memory. It also states that `inuse_space` is the
+  sum of blocks seen by the probes, not RSS or PSS.
+
+### Fixed
+
+- The fixture documentation no longer implies that every fixture leaf appears
+  in a short top-N window; the reader capability and an individual sample are
+  now described separately.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -458,7 +490,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/xsj321/LidlessEye/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/xsj321/LidlessEye/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/xsj321/LidlessEye/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/xsj321/LidlessEye/compare/v0.1.5...v0.1.6
