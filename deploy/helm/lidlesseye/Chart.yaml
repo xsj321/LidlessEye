@@ -2,8 +2,8 @@ apiVersion: v2
 name: lidlesseye
 description: Continuous eBPF profiling - storage/query server plus a per-node agent
 type: application
-version: 0.1.5
-appVersion: "0.1.5"
+version: 0.1.6
+appVersion: "0.1.6"
 kubeVersion: ">=1.24.0-0"
 keywords:
   - profiling

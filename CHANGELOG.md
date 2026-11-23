@@ -6,7 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
-## [Unreleased]
+## [0.1.6] - 2026-11-23
+
+A failed write no longer wedges the tenant's DuckDB connection.
 
 ### Fixed
 
@@ -21,6 +23,8 @@ Rust API follows the same rule.
   executing, not at the read that started it. A late tick could therefore land
   inside an ingest transaction and abort it. Interrupts are now scoped to a
   live read and are inert once that read has released the connection.
+
+## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
 
@@ -407,7 +411,8 @@ service map.
 - User stacks need frame pointers; CPU and off-CPU only, no allocation
   profiling yet.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/xsj321/LidlessEye/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/xsj321/LidlessEye/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/xsj321/LidlessEye/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/xsj321/LidlessEye/compare/v0.1.2...v0.1.3
