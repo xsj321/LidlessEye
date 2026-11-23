@@ -31,6 +31,7 @@
 //! how many batches reference it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -360,6 +361,11 @@ pub struct Store {
     /// soon as the client goes away or a newer query supersedes it, instead of
     /// holding the single connection hostage until it finishes.
     interrupt: Arc<InterruptHandle>,
+    /// Held for exactly as long as a read owns `conn`. `interrupt()` consults
+    /// this before signalling DuckDB: an interrupt aimed at a finished read
+    /// must not land on a write that is now inside an explicit transaction,
+    /// which would leave the shared connection aborted.
+    read_active: Mutex<()>,
     /// `(module, symbol, file, line)` -> frame id, for the write path only.
     frame_cache: Mutex<HashMap<FrameKey, u32>>,
     ids: Mutex<Ids>,
@@ -381,6 +387,32 @@ pub struct Store {
     /// computed. Every open dashboard polls `stats`, and in Parquet mode that
     /// query opens every file's footer just to count rows.
     stats_cache: Mutex<Option<(u64, StoreStats, usize)>>,
+}
+
+/// A read's exclusive hold on the store connection.
+///
+/// The second guard is what makes [`Store::interrupt`] safe: it is locked only
+/// while a read is actually on the connection, so a late watchdog tick cannot
+/// abort an ingest that acquired `conn` immediately after the read finished.
+/// `_active` is declared first so it is dropped first; that ordering keeps the
+/// "interrupt" window strictly inside the "connection is held" window.
+struct ReadConn<'a> {
+    _active: parking_lot::MutexGuard<'a, ()>,
+    conn: parking_lot::MutexGuard<'a, Connection>,
+}
+
+impl Deref for ReadConn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl DerefMut for ReadConn<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
 }
 
 /// How long a read waits for the connection before reporting the store busy.
@@ -432,15 +464,23 @@ impl Store {
     /// query that is *running*, not the one still waiting), so each of them
     /// kept a worker and a slot until the request timeout, and the dashboard
     /// showed 408s for a server that was merely busy.
-    fn read_conn(&self) -> Result<parking_lot::MutexGuard<'_, Connection>> {
+    fn read_conn(&self) -> Result<ReadConn<'_>> {
         self.last_read_ns
             .store(now_ns(), std::sync::atomic::Ordering::Relaxed);
-        self.conn.try_lock_for(READ_LOCK_WAIT).ok_or_else(|| {
+        // Acquire the connection first: while a read is merely *waiting* for
+        // it, a watchdog interrupt must be a no-op rather than hitting the
+        // transaction that currently owns the connection.
+        let conn = self.conn.try_lock_for(READ_LOCK_WAIT).ok_or_else(|| {
             Error::Busy(format!(
                 "the store was busy for {}s; a wide scan is running. Narrow the \
                  time range or retry",
                 READ_LOCK_WAIT.as_secs()
             ))
+        })?;
+        let active = self.read_active.lock();
+        Ok(ReadConn {
+            _active: active,
+            conn,
         })
     }
 
@@ -553,6 +593,7 @@ impl Store {
             cfg,
             conn: Mutex::new(conn),
             interrupt,
+            read_active: Mutex::new(()),
             frame_cache: Mutex::new(HashMap::new()),
             ids: Mutex::new(ids),
             parquet: parquet_state,
@@ -567,11 +608,21 @@ impl Store {
         Ok(store)
     }
 
-    /// Interrupt the query currently running on this store's connection.
-    /// Safe to call from any thread; a no-op when nothing is in flight. This is
+    /// Interrupt the read currently running on this store's connection.
+    /// Safe to call from any thread; a no-op when no read is in flight. This is
     /// what lets the HTTP layer stop a long scan the moment it is superseded.
+    ///
+    /// The guard matters: `InterruptHandle` targets *whatever* DuckDB is
+    /// executing at that instant. An unguarded late tick used to land during
+    /// `append`'s transaction; DuckDB then failed the INSERT, and a second
+    /// unlucky tick during `ROLLBACK` stranded the connection in the aborted
+    /// state that made every later ingest fail with the same error.
     pub fn interrupt(&self) {
-        self.interrupt.interrupt();
+        let Some(_guard) = self.read_active.try_lock() else {
+            self.interrupt.interrupt();
+            return;
+        };
+        drop(_guard);
     }
 
     pub fn config(&self) -> &StoreConfig {
@@ -706,8 +757,7 @@ impl Store {
         let batches_t = self.wtable("batches");
         {
             let conn = self.conn.lock();
-            conn.execute_batch("BEGIN TRANSACTION").map_err(db_err)?;
-            let result = (|| -> Result<()> {
+            in_transaction(&conn, "COMMIT", |conn| -> Result<()> {
                 if !pending.frames.is_empty() {
                     let mut stmt = conn
                         .prepare(&format!(
@@ -777,17 +827,7 @@ impl Store {
                 )
                 .map_err(db_err)?;
                 Ok(())
-            })();
-
-            match result {
-                Ok(()) => {
-                    conn.execute_batch("COMMIT").map_err(db_err)?;
-                }
-                Err(err) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(err);
-                }
-            }
+            })?;
         }
 
         debug!(
@@ -1675,9 +1715,7 @@ impl Store {
     pub fn repair(&self) -> Result<usize> {
         let conn = self.conn.lock();
         let (broken, _) = self.dangling_stacks(&conn)?;
-        conn.execute_batch("BEGIN TRANSACTION").map_err(db_err)?;
-
-        let deleted = (|| -> Result<usize> {
+        let removed = in_transaction(&conn, "COMMIT", |conn| -> Result<usize> {
             let mut removed = 0usize;
             for stack_id in broken {
                 let id = stack_id as i64;
@@ -1698,19 +1736,12 @@ impl Store {
                 )
                 .map_err(db_err)?;
             Ok(removed)
-        })();
-
-        match deleted {
-            Ok(removed) => {
-                conn.execute_batch("COMMIT; CHECKPOINT").map_err(db_err)?;
-                Ok(removed)
-            }
-            Err(err) => {
-                // Never leave the shared connection inside an open transaction.
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
+        })?;
+        // CHECKPOINT after the commit, not inside it: a failed checkpoint must
+        // not be mistaken for a failed transaction and trigger a ROLLBACK of
+        // work DuckDB already made durable.
+        conn.execute_batch("CHECKPOINT").map_err(db_err)?;
+        Ok(removed)
     }
 
     /// Stacks that cannot be decoded against the frame dictionary, and the
@@ -1769,8 +1800,7 @@ impl Store {
         let nodes_t = self.wtable("net_nodes");
         let edges_t = self.wtable("net_edges");
         let conn = self.conn.lock();
-        conn.execute_batch("BEGIN TRANSACTION").map_err(db_err)?;
-        let result = (|| -> Result<()> {
+        in_transaction(&conn, "COMMIT", |conn| -> Result<()> {
             if !batch.nodes.is_empty() {
                 let mut stmt = conn
                     .prepare(&format!(
@@ -1831,21 +1861,11 @@ impl Store {
                 }
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.execute_batch("COMMIT").map_err(db_err)?;
-                // The map contributes to `total_bytes`; a cached stats value
-                // from before this window would undercount it.
-                *self.stats_cache.lock() = None;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
+        })?;
+        // The map contributes to `total_bytes`; a cached stats value from
+        // before this window would undercount it.
+        *self.stats_cache.lock() = None;
+        Ok(())
     }
 
     /// Nodes of the map, busiest first.
@@ -2610,6 +2630,45 @@ fn glob_to_like(pattern: &str) -> String {
 
 fn db_err(err: duckdb::Error) -> Error {
     Error::Db(err.to_string())
+}
+
+/// Run `f` as one explicit transaction on the shared connection.
+///
+/// DuckDB aborts a transaction on *any* statement failure — including a
+/// failing `COMMIT` — and afterwards accepts only `ROLLBACK`. Leaving that
+/// state behind is why one bad ingest made every later upload fail with
+/// `Current transaction is aborted`. This helper clears a stale transaction
+/// before `BEGIN` and rolls back on every error path, including commit.
+fn in_transaction<T>(
+    conn: &Connection,
+    commit_sql: &str,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    // `ROLLBACK` on an idle connection is an expected error; it is the only
+    // statement DuckDB permits while a transaction is aborted, so it is also
+    // the recovery step for a transaction poisoned by an earlier failure.
+    let _ = conn.execute_batch("ROLLBACK");
+    if conn
+        .execute_batch("BEGIN TRANSACTION")
+        .map_err(db_err)
+        .is_err()
+    {
+        // The recovery ROLLBACK itself may have been interrupted. One retry is
+        // enough; after that the write fails cleanly instead of poisoning the
+        // connection for the next caller too.
+        let _ = conn.execute_batch("ROLLBACK");
+        conn.execute_batch("BEGIN TRANSACTION").map_err(db_err)?;
+    }
+
+    let result = (|| -> Result<T> {
+        let value = f(conn)?;
+        conn.execute_batch(commit_sql).map_err(db_err)?;
+        Ok(value)
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
 }
 
 /// Clamp a nanosecond timestamp into DuckDB's `BIGINT`.
@@ -3661,5 +3720,95 @@ mod tests {
         assert!(!stale.exists(), "stale spill file was not removed");
         assert!(keep.exists(), "unrelated files must not be touched");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A failed statement or a failing COMMIT must never leave the shared
+    /// connection inside an aborted transaction: DuckDB then rejects every
+    /// later statement, which is exactly the upload storm reported in disk mode.
+    #[test]
+    fn failed_transaction_does_not_poison_later_writes() {
+        let (store, dir) = temp_store("tx-failure");
+        {
+            let conn = store.conn.lock();
+            let err = in_transaction(&conn, "COMMIT", |conn| -> Result<()> {
+                conn.execute_batch("CREATE TABLE tx_probe (id INTEGER)")
+                    .map_err(db_err)?;
+                Err(Error::Db("injected failure".into()))
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("injected failure"));
+
+            // The failed CREATE was rolled back, so it can be created again.
+            // The commit string fails *after* COMMIT succeeds; that used to
+            // return before ROLLBACK and strand the connection.
+            let err = in_transaction(
+                &conn,
+                "COMMIT; INSERT INTO no_such_tx_table VALUES (1)",
+                |conn| {
+                    conn.execute_batch("CREATE TABLE tx_probe (id INTEGER)")
+                        .map_err(db_err)
+                },
+            )
+            .unwrap_err();
+            assert!(!err.to_string().is_empty());
+        }
+        store
+            .append(&report("api", 1_000, "a", &["hot"], 10))
+            .expect("store must be writable after failed transactions");
+        assert_eq!(store.stats().batch_count, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Recovery must also work when the aborted transaction was left behind by
+    /// an earlier process state, not by a failure this helper observed.
+    #[test]
+    fn stale_aborted_transaction_is_recovered_before_the_next_write() {
+        let (store, dir) = temp_store("tx-stale");
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch("BEGIN TRANSACTION").unwrap();
+            assert!(
+                conn.execute_batch("INSERT INTO no_such_tx_table VALUES (1)")
+                    .is_err()
+            );
+            // DuckDB now refuses even a harmless read until ROLLBACK.
+            assert!(conn.execute_batch("SELECT 1").is_err());
+        }
+        store
+            .append(&report("api", 1_000, "a", &["hot"], 10))
+            .expect("next write must clear the stale transaction");
+        assert_eq!(store.stats().batch_count, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The watchdog handle must interrupt a live read, but be inert once that
+    /// read has finished — otherwise a late tick lands on the next ingest.
+    #[test]
+    fn interrupt_is_scoped_to_a_live_read() {
+        let (store, dir) = temp_store("interrupt-scope");
+        let store = Arc::new(store);
+        let reader = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let conn = store.read_conn().expect("read slot");
+                conn.execute_batch(
+                    "SELECT count(*) FROM range(1000000000) t(x) CROSS JOIN range(20) u(y);",
+                )
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        store.interrupt();
+        assert!(
+            reader.join().unwrap().is_err(),
+            "a live read must remain interruptible"
+        );
+
+        // No read is on the connection now, so the same call must be a no-op.
+        store.interrupt();
+        store
+            .append(&report("api", 1_000, "a", &["hot"], 10))
+            .expect("a late interrupt must not poison an ingest");
+        assert_eq!(store.stats().batch_count, 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

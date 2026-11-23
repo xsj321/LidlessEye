@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [Unreleased]
+
+### Fixed
+
+- A failed write in disk DuckDB mode could leave the tenant's only connection
+  inside an aborted transaction. DuckDB then rejected every later statement —
+  including reads — with `Current transaction is aborted (please ROLLBACK)`, so
+  one bad ingest turned into a continuous stream of upload failures and
+  `report queue full` drops. All write transactions now clear a stale aborted
+  state before `BEGIN` and roll back on every error path, including a failing
+  `COMMIT`.
+- The query watchdog's interrupt was aimed at whatever DuckDB happened to be
+  executing, not at the read that started it. A late tick could therefore land
+  inside an ingest transaction and abort it. Interrupts are now scoped to a
+  live read and are inert once that read has released the connection.
+
 ## [0.1.5] - 2026-11-23
 
 A busy server stays alive and answers, instead of getting killed by its own
