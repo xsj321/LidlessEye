@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -22,11 +22,11 @@ keywords = ["profiling", "ebpf", "flamegraph", "observability"]
 categories = ["development-tools::profiling", "network-programming"]
 
 [workspace.dependencies]
-lidlesseye-core = { path = "crates/lidlesseye-core", version = "0.1.10" }
-lidlesseye-ebpf = { path = "crates/lidlesseye-ebpf", version = "0.1.10" }
-lidlesseye-server = { path = "crates/lidlesseye-server", version = "0.1.10" }
-lidlesseye-servicemap = { path = "crates/lidlesseye-servicemap", version = "0.1.10" }
-lidlesseye-mcp = { path = "crates/lidlesseye-mcp", version = "0.1.10" }
+lidlesseye-core = { path = "crates/lidlesseye-core", version = "0.1.11" }
+lidlesseye-ebpf = { path = "crates/lidlesseye-ebpf", version = "0.1.11" }
+lidlesseye-server = { path = "crates/lidlesseye-server", version = "0.1.11" }
+lidlesseye-servicemap = { path = "crates/lidlesseye-servicemap", version = "0.1.11" }
+lidlesseye-mcp = { path = "crates/lidlesseye-mcp", version = "0.1.11" }
 
 anyhow = "1.0.104"
 async-stream = "0.3.6"

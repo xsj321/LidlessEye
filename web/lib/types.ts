@@ -145,6 +145,8 @@ export interface ServiceMapEdge {
   rx_bytes?: number;
   /** Average round-trip time in microseconds; 0 when nothing closed. */
   rtt_us?: number;
+  /** Number of closed connections behind `rtt_us`, for correct averaging. */
+  rtt_samples?: number;
   /** `Host:` header of the last HTTP request on this edge. */
   host?: string;
   /** Last MySQL/PostgreSQL statement on this edge. */
@@ -173,6 +175,8 @@ export interface MapHistoryPoint {
   connections?: number;
   retransmits?: number;
   rtt_us?: number;
+  /** How many closed connections produced `rtt_us`. */
+  rtt_samples?: number;
   pods?: number;
   ready?: number;
 }
@@ -182,6 +186,8 @@ export interface MapHistoryPayload {
   from_ns: number;
   until_ns: number;
   step_ns: number;
+  /** Optional application-protocol filter echoed by the server. */
+  protocol?: string;
   points: MapHistoryPoint[];
   edges: MapHistoryPoint[];
 }

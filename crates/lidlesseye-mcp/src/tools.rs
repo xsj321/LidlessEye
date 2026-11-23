@@ -169,6 +169,10 @@ struct TimeseriesQuery {
 struct MapHistoryQuery {
     /// Node id from `get_service_map`, for example `default/checkout`.
     node: String,
+    /// Restrict the buckets to one application protocol, for example `dns`.
+    /// Omit it for all incident traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<String>,
     /// Number of buckets in the window, 1-600.
     #[serde(default = "default_buckets")]
     buckets: usize,
@@ -386,6 +390,14 @@ impl LidlessEyeTools {
         let mut query = params.query.params();
         query.push(("node".to_string(), params.node.clone()));
         query.push(("buckets".to_string(), buckets.to_string()));
+        if let Some(protocol) = params
+            .protocol
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 64)
+        {
+            query.push(("protocol".to_string(), protocol.to_string()));
+        }
         let context = self.client.context("/api/v1/servicemap/history", &query);
         let raw = self
             .client

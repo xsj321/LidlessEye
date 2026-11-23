@@ -416,20 +416,23 @@ Below the neighbourhood are seven tabs:
 
 | tab | what it answers | where the numbers come from |
 | --- | --- | --- |
-| SLO | how much of the traffic failed, against a 99.9% objective | retransmits as the error signal (no L7 status codes are collected) |
-| Instances | which replicas exist, whether they are ready, where they run | the cluster's pod list, per bucket |
-| CPU | how much on-CPU time, in cores, over the window | the `cpu` profiles behind the node's labels |
-| Memory | the same shape for a heap profile type | whatever memory type the emitters ship, if any |
-| Net | bytes per second in and out, RTT, per-peer rates | the node's counters and its edges |
-| DNS | lookup latency per nameserver | edges on TCP/53 |
-| Profiling | the hottest functions, the node's own flamegraph, and the jump to the full view | `/api/v1/top` and `/api/v1/flamegraph` for the same selector |
+| SLO | success proxy and error-budget burn against a 99.9 % objective, callers and callees | retransmits as the error signal; RTT weighted by closed-connection samples |
+| Instances | desired vs ready replicas, concrete pods and their node, click-through to one pod's profiles | the cluster's pod list, per bucket; `k8s_pod` for drill-down |
+| CPU | selectable `cpu` / `off_cpu` / `wall` cores, with a per-series breakdown | the profile types behind the node's labels |
+| Memory | selectable heap type, held level or allocated rate in its declared unit | the memory types actually present behind the node |
+| Net | throughput, sample-weighted RTT, protocols, containers, hosts and redacted SQL | the node's counters and edges, `/api/v1/servicemap/history` |
+| DNS | lookup rate and latency per bucket, plus latency by resolver | `/api/v1/servicemap/history?protocol=dns` and TCP/53 edges |
+| Profiling | selectable profile type, top 12 functions, series count, node flamegraph and the jump to the full view | `/api/v1/top` and `/api/v1/flamegraph` for the same selector and type |
 
 Charts follow what the data means rather than one house style: a line with an
 area fill for anything that moves over time, a step line where the value is a
 gauge (replicas), a sorted bar for a ranking, and an error rate — not an
 availability percentage — where the interesting variation is in the last
-fraction of a percent. When a tab has no data it says which measurement is
-missing and what would produce it, instead of drawing an empty chart.
+fraction of a percent. Every chart has a long description and a collapsible
+semantic data table with the same values. When a tab has no data it says which
+measurement is missing and what would produce it, instead of drawing an empty
+chart. Pod rows in **Instances** open the full profile view with `k8s_pod` added
+to the node's selector.
 
 The **Profiling** tab embeds the real `FlamegraphCanvas` below the ranking: it
 runs `/api/v1/flamegraph` with the node's selector and the same window, so

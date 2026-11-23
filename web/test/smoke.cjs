@@ -1195,6 +1195,15 @@ async function main() {
   await cartCard.click();
   await mapPage.waitForSelector('[data-testid="map-panel"][data-state="open"]', { timeout: 10000 });
   await mapPage.waitForSelector('[data-testid="map-container-row"]', { timeout: 10000 });
+  // A workload's Instances tab lists concrete pods; selecting a pod carries a
+  // `k8s_pod` matcher into the full profile view.
+  await mapPage.click('[data-testid="map-tab-instances"]');
+  await mapPage.waitForSelector('[data-testid="map-instance-row"]', { timeout: 10000 });
+  check(
+    (await mapPage.locator('[data-testid="map-instance-row"]').count()) === 3,
+    "the instances tab lists the seeded pods",
+  );
+  await mapPage.click('[data-testid="map-tab-slo"]');
   const selfUids = await mapPage
     .locator('[data-testid="map-neighborhood-self"]')
     .evaluateAll((cards) => cards.map((card) => card.getAttribute("data-pod-uid")));
@@ -1568,7 +1577,64 @@ async function main() {
     .first()
     .click();
   await mapPage.waitForSelector('[data-testid="map-panel"][data-state="open"]', { timeout: 10000 });
+
+  // Every tab is a real question with a real answer. Walk all seven: a chart
+  // must be present where the fixture has data, and a missing state must say
+  // why the measurement does not exist instead of drawing an empty line.
+  const panelTabs = [
+    { value: "slo", chart: "map-chart-slo", allowEmpty: false },
+    { value: "instances", chart: "map-chart-instances", alternate: "map-instances-endpoints", allowEmpty: false },
+    { value: "cpu", chart: "map-chart-cpu", allowEmpty: false },
+    { value: "memory", chart: "map-chart-memory", allowEmpty: true },
+    { value: "net", chart: "map-chart-throughput", allowEmpty: false },
+    { value: "dns", chart: "map-chart-dns-rate", allowEmpty: true },
+    { value: "profiling", chart: "map-chart-top", allowEmpty: false },
+  ];
+  for (const item of panelTabs) {
+    await mapPage.click(`[data-testid="map-tab-${item.value}"]`);
+    const state = await mapPage
+      .locator(`[data-testid="map-tab-${item.value}"]`)
+      .getAttribute("data-state");
+    check(state === "active", `the ${item.value} tab opens`, String(state));
+    await mapPage.waitForFunction(
+      (item) =>
+        Boolean(
+          document.querySelector(`[data-testid="${item.chart}"]`) ||
+            (item.alternate && document.querySelector(`[data-testid="${item.alternate}"]`)) ||
+            document.querySelector('[data-testid="map-panel-empty"]'),
+        ),
+      item,
+      { timeout: 20000 },
+    );
+    const chartCount = await mapPage.locator(`[data-testid="${item.chart}"]`).count();
+    const alternateCount = item.alternate
+      ? await mapPage.locator(`[data-testid="${item.alternate}"]`).count()
+      : 0;
+    const emptyCount = await mapPage.locator('[data-testid="map-panel-empty"]').count();
+    check(
+      chartCount > 0 || alternateCount > 0 || (item.allowEmpty && emptyCount > 0),
+      `the ${item.value} tab renders data or an honest gap`,
+      `chart=${chartCount} alternate=${alternateCount} empty=${emptyCount}`,
+    );
+    if (chartCount > 0) {
+      check(
+        (await mapPage.locator(`[data-testid="${item.chart}-table"]`).count()) > 0,
+        `the ${item.value} chart has a semantic data table`,
+      );
+    }
+  }
+  // Reopening a tab keeps the same window; the profile selectors must still be
+  // there after walking through every other tab.
+  await mapPage.click('[data-testid="map-tab-cpu"]');
+  check(
+    (await mapPage.locator('[data-testid="map-cpu-profile-type"]').count()) === 1,
+    "the CPU tab exposes a profile type selector",
+  );
   await mapPage.click('[data-testid="map-tab-profiling"]');
+  check(
+    (await mapPage.locator('[data-testid="map-profiling-profile-type"]').count()) === 1,
+    "the profiling tab exposes a profile type selector",
+  );
   await mapPage.waitForSelector(
     '[data-testid="map-profile-flamegraph"] canvas.fg-canvas',
     { timeout: 20000 },

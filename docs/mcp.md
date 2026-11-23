@@ -85,7 +85,7 @@ Do not run the binary bare in a terminal and wait for output: a stdio MCP server
 | `list_series` | services, profile types and label sets | `from`, `until`, selectors |
 | `list_label_values` | most common values of one label | `name`, `limit`, window |
 | `get_service_map` | top nodes and edges, connections/bytes/retransmits, RTT in milliseconds | `from`, `until` |
-| `get_service_map_history` | one node's own and incident-edge counters over time | `node`, `buckets`, window |
+| `get_service_map_history` | one node's own and incident-edge counters over time | `node`, `buckets`, optional `protocol` (for example `dns`), window |
 | `get_service_map_histogram` | per-bucket traffic total and peak position | `metric`, `buckets`, window |
 | `get_flamegraph_summary` | total, sample count and hottest inclusive frames | `profile_type`, `max_frames`, window |
 | `get_top` | hottest functions by self value with share of total | `profile_type`, `limit`, window |

@@ -133,6 +133,48 @@ map and profiles through a read-only MCP server.
   `lidlesseye-core` and includes `lidlesseye-mcp`, so the new crates are
   available from crates.io in dependency order.
 
+## [0.1.11] - 2026-11-23
+
+All seven node-panel tabs now answer their question from the data that exists,
+and every chart exposes the same numbers as a semantic table.
+
+### Added
+
+- `GET /api/v1/servicemap/history` accepts an optional `protocol` filter and
+  echoes it in the response. The DNS tab uses it for its own per-bucket lookup
+  and latency series instead of ranking peers alone; the MCP history tool
+  accepts the same parameter.
+- Map edges and history buckets carry `rtt_samples`. Panel averages are now
+  weighted by closed-connection samples, so a one-sample edge cannot outweigh
+  a busy one.
+- CPU, Memory and Profiling tabs expose native profile-type selectors over the
+  types actually present behind the node. CPU also shows a per-series
+  breakdown, Profiling shows the real top 12 and the series count, and opening
+  the full flamegraph keeps the selected type and selector.
+- Instances uses pod UIDs as stable keys and opens a pod's profiles with a
+  `k8s_pod` matcher. Service and external nodes show backing endpoints instead
+  of a "replicas belong to workloads" placeholder.
+- Net adds a protocol ranking, container-aware peer rows and SQL statements
+  with literals redacted. DNS explains exactly which fields the agent does not
+  collect (qname, rcode, UDP).
+- Every chart has a long description and a collapsible data table; browser
+  smoke now walks all seven tabs and checks the table alternative.
+
+### Fixed
+
+- The Memory tab no longer prints the raw node id, and the Profiling tab no
+  longer labels a series count as "Samples" or claims top 12 while drawing
+  eight. The SLO tab has both callers and callees and derives its target label
+  from the objective constant.
+- `SLO` and `CPU` are translated in the Chinese tab rail.
+- Two registries opening the same tenant directory at once no longer race on
+  DuckDB's file header. Opens are serialized per canonical tenant directory, so
+  a concurrent create cannot leave one caller with "not a valid DuckDB database
+  file".
+- Profile requests in the drawer are aborted when the node or window changes,
+  and a profile-type change only re-queries the profile data rather than the
+  network history.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -520,7 +562,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/xsj321/LidlessEye/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/xsj321/LidlessEye/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/xsj321/LidlessEye/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/xsj321/LidlessEye/compare/v0.1.7...v0.1.8

@@ -16,7 +16,7 @@
 // Both take a formatter rather than a unit string so the axis, the tooltip and
 // the labels agree on how a number reads (bytes, cores, %, ms).
 
-import { useEffect, useRef } from "react";
+import { useEffect, useId, useRef } from "react";
 import * as echarts from "echarts/core";
 import { BarChart, LineChart } from "echarts/charts";
 import {
@@ -42,10 +42,14 @@ export function Chart({
   option,
   height,
   testId,
+  label,
+  describedBy,
 }: {
   option: EChartsCoreOption;
   height: number;
   testId?: string;
+  label?: string;
+  describedBy?: string;
 }) {
   const element = useRef<HTMLDivElement | null>(null);
   const instance = useRef<echarts.ECharts | null>(null);
@@ -68,7 +72,72 @@ export function Chart({
     instance.current?.setOption(option, { notMerge: true });
   }, [option]);
 
-  return <div ref={element} style={{ height }} className="w-full" data-testid={testId} />;
+  return (
+    <div
+      ref={element}
+      style={{ height }}
+      className="w-full"
+      data-testid={testId}
+      role="img"
+      aria-label={label}
+      aria-describedby={describedBy}
+    />
+  );
+}
+
+/**
+ * A chart is a picture, so the numbers behind it also get a real table.
+ * `<details>` keeps the panel compact while leaving every value available to
+ * keyboard and screen-reader users — and to anyone who wants to copy a value
+ * out instead of reading it off a tooltip.
+ */
+function DataTable({
+  columns,
+  rows,
+  testId,
+}: {
+  columns: string[];
+  rows: string[][];
+  testId?: string;
+}) {
+  if (!rows.length) return null;
+  return (
+    <details className="mt-1 text-[10px] text-muted-foreground" data-testid={testId ? `${testId}-table` : undefined}>
+      <summary className="w-fit cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        View data table
+      </summary>
+      <div className="mt-1 max-h-32 overflow-auto rounded border">
+        <table className="w-full border-collapse text-left font-mono text-[9px]">
+          <thead className="sticky top-0 bg-muted/80">
+            <tr>
+              {columns.map((column) => (
+                <th key={column} scope="col" className="border-b px-1.5 py-1 font-medium">
+                  {column}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, index) => (
+              <tr key={row[0] ?? index} className="border-b last:border-0">
+                {row.map((cell, cellIndex) => (
+                  <td key={cellIndex} className="px-1.5 py-0.5">
+                    {cell}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  );
+}
+
+function clock(ms: number): string {
+  const date = new Date(ms);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 export interface ChartSeries {
@@ -117,6 +186,8 @@ export interface TimeChartOptions {
   yMax?: number;
   height?: number;
   testId?: string;
+  /** What the line means, for assistive technology. */
+  description?: string;
 }
 
 /** A time series with a clock axis: the default shape for "over the window". */
@@ -127,7 +198,10 @@ export function TimeChart({
   yMax,
   height = 148,
   testId,
+  description,
 }: TimeChartOptions) {
+  const descriptionId = useId();
+  const label = description ?? `Time series with ${series.length} series over the selected window`;
   const option: EChartsCoreOption = {
     backgroundColor: "transparent",
     animationDuration: 320,
@@ -185,7 +259,9 @@ export function TimeChart({
     series: series.map((entry) => ({
       type: "line" as const,
       name: entry.name,
-      showSymbol: false,
+      // A one-bucket window has a value but no line. Showing the symbol makes
+      // the single observation visible instead of looking like an empty chart.
+      showSymbol: entry.points.length <= 2,
       symbol: "circle",
       symbolSize: 4,
       step: entry.step ? ("end" as const) : undefined,
@@ -221,7 +297,30 @@ export function TimeChart({
     })),
   };
 
-  return <Chart option={option} height={height} testId={testId} />;
+  const tableRows = series[0]?.points.map(([time], index) => [
+    clock(time),
+    ...series.map((entry) => (entry.points[index] ? format(entry.points[index][1]) : "—")),
+  ]) ?? [];
+
+  return (
+    <>
+      <p id={descriptionId} className="sr-only">
+        {label}
+      </p>
+      <Chart
+        option={option}
+        height={height}
+        testId={testId}
+        label={label}
+        describedBy={descriptionId}
+      />
+      <DataTable
+        columns={["Time", ...series.map((entry) => entry.name)]}
+        rows={tableRows}
+        testId={testId}
+      />
+    </>
+  );
 }
 
 export interface BarChartOptions {
@@ -230,11 +329,26 @@ export interface BarChartOptions {
   height?: number;
   color?: string;
   testId?: string;
+  /** Rankings default to eight; the profile tab asks for its full top 12. */
+  limit?: number;
+  description?: string;
 }
 
 /** A sorted horizontal ranking, largest at the top. */
-export function RankingChart({ items, format, height = 180, color = "#6ba7f7", testId }: BarChartOptions) {
-  const shown = items.slice(0, 8);
+export function RankingChart({
+  items,
+  format,
+  height = 180,
+  color = "#6ba7f7",
+  testId,
+  limit = 8,
+  description,
+}: BarChartOptions) {
+  const descriptionId = useId();
+  const shown = items.slice(0, limit);
+  const label =
+    description ??
+    `Ranking of ${shown.length} items, largest first`;
   const option: EChartsCoreOption = {
     backgroundColor: "transparent",
     animationDuration: 320,
@@ -272,5 +386,23 @@ export function RankingChart({ items, format, height = 180, color = "#6ba7f7", t
       },
     ],
   };
-  return <Chart option={option} height={height} testId={testId} />;
+  return (
+    <>
+      <p id={descriptionId} className="sr-only">
+        {label}
+      </p>
+      <Chart
+        option={option}
+        height={height}
+        testId={testId}
+        label={label}
+        describedBy={descriptionId}
+      />
+      <DataTable
+        columns={["Item", "Value"]}
+        rows={shown.map((item) => [item.name, format(item.value)])}
+        testId={testId}
+      />
+    </>
+  );
 }

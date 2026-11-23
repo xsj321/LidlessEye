@@ -103,12 +103,17 @@ pub trait ServiceMapStore {
     ) -> Result<Vec<MapHistoryPoint>, Self::Error>;
 
     /// Counters of edges incident to a node, bucketed by `step_ns`.
+    ///
+    /// `protocol`, when set, restricts the buckets to edges carrying that
+    /// application protocol. The DNS tab needs its own series instead of a
+    /// note saying the map only stores latency per edge.
     fn net_edge_history(
         &self,
         node: &str,
         from_ns: u64,
         until_ns: u64,
         step_ns: u64,
+        protocol: Option<&str>,
     ) -> Result<Vec<MapHistoryPoint>, Self::Error>;
 
     /// Counters of edges whose server is an external host, bucketed by `step_ns`.
@@ -118,6 +123,7 @@ pub trait ServiceMapStore {
         from_ns: u64,
         until_ns: u64,
         step_ns: u64,
+        protocol: Option<&str>,
     ) -> Result<Vec<MapHistoryPoint>, Self::Error>;
 
     /// Dense per-bucket totals of one counter over all edges.
@@ -170,8 +176,9 @@ impl<T: ServiceMapStore + ?Sized> ServiceMapStore for std::sync::Arc<T> {
         from_ns: u64,
         until_ns: u64,
         step_ns: u64,
+        protocol: Option<&str>,
     ) -> Result<Vec<MapHistoryPoint>, Self::Error> {
-        T::net_edge_history(self.as_ref(), node, from_ns, until_ns, step_ns)
+        T::net_edge_history(self.as_ref(), node, from_ns, until_ns, step_ns, protocol)
     }
 
     fn net_host_edge_history(
@@ -180,8 +187,9 @@ impl<T: ServiceMapStore + ?Sized> ServiceMapStore for std::sync::Arc<T> {
         from_ns: u64,
         until_ns: u64,
         step_ns: u64,
+        protocol: Option<&str>,
     ) -> Result<Vec<MapHistoryPoint>, Self::Error> {
-        T::net_host_edge_history(self.as_ref(), host, from_ns, until_ns, step_ns)
+        T::net_host_edge_history(self.as_ref(), host, from_ns, until_ns, step_ns, protocol)
     }
 
     fn net_histogram_metric(
@@ -584,6 +592,11 @@ pub struct MapEdge {
     /// rather than a stale number).
     #[serde(default)]
     pub rtt_us: u64,
+    /// How many closed connections produced `rtt_us`. Panel-level averages use
+    /// this as the weight: averaging two means with different sample counts
+    /// silently gives a one-sample edge the same vote as a busy one.
+    #[serde(default)]
+    pub rtt_samples: u64,
     /// `Host:` header most recently seen on this edge, if it carried HTTP.
     #[serde(default)]
     pub host: String,
@@ -781,6 +794,10 @@ pub struct MapHistoryPoint {
     /// Sample-weighted mean round-trip time over the bucket.
     #[serde(default)]
     pub rtt_us: u64,
+    /// Number of closed connections behind `rtt_us`, so a caller can combine
+    /// buckets without losing the weighting.
+    #[serde(default)]
+    pub rtt_samples: u64,
     #[serde(default)]
     pub pods: u32,
     #[serde(default)]
@@ -798,6 +815,10 @@ pub struct MapHistory {
     pub from_ns: u64,
     pub until_ns: u64,
     pub step_ns: u64,
+    /// Echoes the optional application-protocol filter, so a client cannot
+    /// mistake DNS-only buckets for the node's whole traffic.
+    #[serde(default)]
+    pub protocol: String,
     /// What the node itself sent and received, plus its replica gauge.
     #[serde(default)]
     pub points: Vec<MapHistoryPoint>,
@@ -814,18 +835,21 @@ pub fn servicemap_history<S: ServiceMapStore>(
     from_ns: u64,
     until_ns: u64,
     step_ns: u64,
+    protocol: Option<&str>,
 ) -> Result<MapHistory, S::Error> {
     let step_ns = step_ns.max(1);
+    let protocol_name = protocol.unwrap_or_default();
     // A host node exists only in the drawing: it is synthesized from the edges
     // that name it, so it has no rows of its own in `net_nodes`. Its counters
     // are those edges, and the same buckets serve as both series.
     if let Some(host) = node.strip_prefix(EXTERNAL_HOST_PREFIX) {
-        let points = store.net_host_edge_history(host, from_ns, until_ns, step_ns)?;
+        let points = store.net_host_edge_history(host, from_ns, until_ns, step_ns, protocol)?;
         return Ok(MapHistory {
             node: node.to_string(),
             from_ns,
             until_ns,
             step_ns,
+            protocol: protocol_name.to_string(),
             edges: points.clone(),
             points,
         });
@@ -835,8 +859,9 @@ pub fn servicemap_history<S: ServiceMapStore>(
         from_ns,
         until_ns,
         step_ns,
+        protocol: protocol_name.to_string(),
         points: store.net_node_history(node, from_ns, until_ns, step_ns)?,
-        edges: store.net_edge_history(node, from_ns, until_ns, step_ns)?,
+        edges: store.net_edge_history(node, from_ns, until_ns, step_ns, protocol)?,
     })
 }
 

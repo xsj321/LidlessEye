@@ -85,7 +85,7 @@ cargo build --release -p lidlesseye-mcp
 | `list_series` | 服务、profile 类型与标签集合 | `from`、`until`、选择器 |
 | `list_label_values` | 某个标签最常见的取值 | `name`、`limit`、时间窗 |
 | `get_service_map` | top 节点与边，连接数/字节/重传，RTT 单位毫秒 | `from`、`until` |
-| `get_service_map_history` | 某节点自身及关联边的历史计数 | `node`、`buckets`、时间窗 |
+| `get_service_map_history` | 某节点自身及关联边的历史计数 | `node`、`buckets`、可选 `protocol`（如 `dns`）、时间窗 |
 | `get_service_map_histogram` | 每桶流量总量与峰值位置 | `metric`、`buckets`、时间窗 |
 | `get_flamegraph_summary` | 总量、样本数与最热 inclusive 帧 | `profile_type`、`max_frames`、时间窗 |
 | `get_top` | self value 最热函数及占比 | `profile_type`、`limit`、时间窗 |

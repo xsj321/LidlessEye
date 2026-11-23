@@ -22,9 +22,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -33,6 +33,20 @@ use crate::store::{PruneStats, S3Config, Store, StoreConfig, StoreStats};
 
 /// Maximum accepted tenant id length.
 pub const MAX_TENANT_LEN: usize = 64;
+
+/// Serializes `Store::open` per tenant directory.
+///
+/// A `TenantStore` guards its own map with a write lock, but a process can hold
+/// more than one registry over the same data directory (tests do, and a future
+/// hot-reload path could too). Without this lock two registries can initialize
+/// the same DuckDB file at once; the loser then sees a half-written header and
+/// reports "not a valid DuckDB database file".
+static OPEN_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn open_lock(dir: &Path) -> Arc<Mutex<()>> {
+    let mut locks = OPEN_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock();
+    locks.entry(dir.to_path_buf()).or_default().clone()
+}
 
 /// Identifier of a tenant.
 ///
@@ -252,6 +266,16 @@ impl TenantStore {
             s3,
             parquet_local_ttl_ns: self.base.parquet_local_ttl_ns,
         };
+        // Another registry over the same directory may be opening this tenant
+        // right now. DuckDB writes its file header during open, so the two
+        // initializations must not overlap — even though each registry has its
+        // own in-memory lock. Canonicalizing makes `a/tenants/x` and
+        // `a/../a/tenants/x` share one lock.
+        let dir = cfg.root.clone();
+        std::fs::create_dir_all(&dir)?;
+        let canonical = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let mutex = open_lock(&canonical);
+        let _open_guard = mutex.lock();
         let store = Arc::new(Store::open(cfg)?);
         stores.insert(tenant.clone(), store.clone());
         debug!(tenant = %tenant, batches = store.stats().batch_count, "tenant opened");

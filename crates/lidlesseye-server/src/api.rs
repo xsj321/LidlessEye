@@ -780,12 +780,20 @@ pub async fn servicemap_history(
     let (from, until) = params.range(now)?;
     let buckets = params.usize_param("buckets", 60).clamp(1, 600) as u64;
     let step_ns = ((until - from) / buckets).max(1);
+    // An application-protocol filter is optional. The DNS tab passes `dns`
+    // to get its own series; every other caller sees all incident edges.
+    let protocol = params
+        .get("protocol")
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .map(str::to_string);
     let Some(store) = maybe_store(&state, &caller) else {
         return Ok(Json(MapHistory {
             node,
             from_ns: from,
             until_ns: until,
             step_ns,
+            protocol: protocol.unwrap_or_default(),
             ..Default::default()
         }));
     };
@@ -793,7 +801,16 @@ pub async fn servicemap_history(
     let started = Instant::now();
     let history = state
         .query_guard(store.clone())
-        .run(move || lidlesseye_core::servicemap_history(&store, &node, from, until, step_ns))
+        .run(move || {
+            lidlesseye_core::servicemap_history(
+                &store,
+                &node,
+                from,
+                until,
+                step_ns,
+                protocol.as_deref(),
+            )
+        })
         .await
         .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);

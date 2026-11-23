@@ -591,9 +591,13 @@ export class DashboardStore {
    * rather than appending keeps the drill-down predictable: what you click is
    * what you see.
    */
-  showProfile(filters: LabelFilter[]) {
+  showProfile(filters: LabelFilter[], type?: string) {
     this.valueCache.clear();
-    this.commit({ filters, activeLabel: null });
+    this.commit({
+      filters,
+      activeLabel: null,
+      ...(type ? { type } : {}),
+    });
     this.setView("flamegraph");
   }
 

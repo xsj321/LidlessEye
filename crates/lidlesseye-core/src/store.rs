@@ -1950,8 +1950,10 @@ impl Store {
                 tx_bytes: row.get::<_, i64>(9).unwrap_or(0).max(0) as u64,
                 rx_bytes: row.get::<_, i64>(10).unwrap_or(0).max(0) as u64,
                 // Mean round-trip time over the connections that closed inside
-                // the window; zero when none did.
+                // the window; zero when none did. Keep the denominator so the
+                // panel can weight edges correctly.
                 rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
+                rtt_samples,
                 // Old Parquet files predate these columns and read as NULL.
                 host: row
                     .get::<_, Option<String>>(13)
@@ -2011,6 +2013,7 @@ impl Store {
                 connections: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
                 retransmits: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
                 rtt_us: 0,
+                rtt_samples: 0,
                 pods: row.get::<_, i64>(5).unwrap_or(0).max(0) as u32,
                 ready: row.get::<_, i64>(6).unwrap_or(0).max(0) as u32,
             });
@@ -2034,6 +2037,7 @@ impl Store {
         from_ns: u64,
         until_ns: u64,
         step_ns: u64,
+        protocol: Option<&str>,
     ) -> Result<Vec<MapHistoryPoint>> {
         let step = ts(step_ns.max(1));
         let conn = self.read_conn()?;
@@ -2046,6 +2050,7 @@ impl Store {
                  FROM net_edges \
                  WHERE server_id = 'external' \
                    AND (lower(host) = ? OR lower(host) = ? || '.') \
+                   AND (? IS NULL OR protocol = ?) \
                    AND bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY slot ORDER BY slot",
             )
@@ -2056,6 +2061,8 @@ impl Store {
                 step,
                 host,
                 host,
+                protocol,
+                protocol,
                 ts(from_ns),
                 ts(until_ns)
             ])
@@ -2074,6 +2081,7 @@ impl Store {
                 connections: row.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
                 retransmits: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
                 rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
+                rtt_samples,
                 pods: 0,
                 ready: 0,
             });
@@ -2094,6 +2102,7 @@ impl Store {
         from_ns: u64,
         until_ns: u64,
         step_ns: u64,
+        protocol: Option<&str>,
     ) -> Result<Vec<MapHistoryPoint>> {
         let step = ts(step_ns.max(1));
         let conn = self.read_conn()?;
@@ -2105,7 +2114,9 @@ impl Store {
                         sum(CASE WHEN client_id = ? THEN rx_bytes ELSE tx_bytes END), \
                         sum(rtt_us_sum), sum(rtt_samples) \
                  FROM net_edges \
-                 WHERE (client_id = ? OR server_id = ?) AND bucket_ns >= ? AND bucket_ns < ? \
+                 WHERE (client_id = ? OR server_id = ?) \
+                   AND (? IS NULL OR protocol = ?) \
+                   AND bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY slot ORDER BY slot",
             )
             .map_err(db_err)?;
@@ -2117,6 +2128,8 @@ impl Store {
                 node,
                 node,
                 node,
+                protocol,
+                protocol,
                 ts(from_ns),
                 ts(until_ns)
             ])
@@ -2134,6 +2147,7 @@ impl Store {
                 connections: row.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
                 retransmits: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
                 rtt_us: rtt_us_sum.checked_div(rtt_samples).unwrap_or(0),
+                rtt_samples,
                 pods: 0,
                 ready: 0,
             });
@@ -2355,8 +2369,9 @@ impl lidlesseye_servicemap::ServiceMapStore for Store {
         from_ns: u64,
         until_ns: u64,
         step_ns: u64,
+        protocol: Option<&str>,
     ) -> Result<Vec<MapHistoryPoint>> {
-        Store::net_edge_history(self, node, from_ns, until_ns, step_ns)
+        Store::net_edge_history(self, node, from_ns, until_ns, step_ns, protocol)
     }
 
     fn net_host_edge_history(
@@ -2365,8 +2380,9 @@ impl lidlesseye_servicemap::ServiceMapStore for Store {
         from_ns: u64,
         until_ns: u64,
         step_ns: u64,
+        protocol: Option<&str>,
     ) -> Result<Vec<MapHistoryPoint>> {
-        Store::net_host_edge_history(self, host, from_ns, until_ns, step_ns)
+        Store::net_host_edge_history(self, host, from_ns, until_ns, step_ns, protocol)
     }
 
     fn net_histogram_metric(
@@ -3460,14 +3476,16 @@ mod tests {
         assert_eq!((points[1].pods, points[1].ready), (1, 0));
 
         let edges = store
-            .net_edge_history("shop/a", start, start + 2 * step, step)
+            .net_edge_history("shop/a", start, start + 2 * step, step, None)
             .unwrap();
         assert_eq!(edges.len(), 2);
         // 50us over two samples, doubled because two agents reported it.
         assert_eq!(edges[0].rtt_us, 50);
+        assert_eq!(edges[0].rtt_samples, 4);
         assert_eq!(edges[0].tx_bytes, 2 * 5000);
         assert_eq!(edges[0].rx_bytes, 2 * 10000);
         assert_eq!(edges[1].rtt_us, 450);
+        assert_eq!(edges[1].rtt_samples, 2);
 
         // Asking for a narrower step re-buckets the same rows.
         let coarse = store
@@ -3858,6 +3876,66 @@ mod tests {
             .append(&report("api", 1_000, "a", &["hot"], 10))
             .expect("a late interrupt must not poison an ingest");
         assert_eq!(store.stats().batch_count, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The DNS tab asks for its own buckets. Without a protocol filter it
+    /// would draw the node's whole traffic, which is a different question.
+    #[test]
+    fn edge_history_can_filter_by_application_protocol() {
+        use crate::servicemap::{ServiceEdge, ServiceNode};
+
+        let (store, dir) = temp_store("edge-history-protocol");
+        let start = 1_700_000_000_000_000_000u64;
+        let step = 10_000_000_000u64;
+        store
+            .append_servicemap(&ServiceMapBatch {
+                start_ns: start,
+                end_ns: start + step,
+                nodes: vec![ServiceNode::new("shop/a", NodeKind::Workload)],
+                edges: vec![
+                    ServiceEdge {
+                        client: "shop/a".to_string(),
+                        server: "shop/b".to_string(),
+                        protocol: "http".to_string(),
+                        connections: 5,
+                        tx_bytes: 500,
+                        rx_bytes: 1_000,
+                        rtt_us_sum: 500,
+                        rtt_samples: 5,
+                        ..Default::default()
+                    },
+                    ServiceEdge {
+                        client: "shop/a".to_string(),
+                        server: "dns/53".to_string(),
+                        protocol: "dns".to_string(),
+                        connections: 3,
+                        tx_bytes: 30,
+                        rx_bytes: 60,
+                        rtt_us_sum: 90,
+                        rtt_samples: 3,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let all = store
+            .net_edge_history("shop/a", start, start + step, step, None)
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].connections, 8);
+
+        let dns = store
+            .net_edge_history("shop/a", start, start + step, step, Some("dns"))
+            .unwrap();
+        assert_eq!(dns.len(), 1);
+        assert_eq!(dns[0].connections, 3);
+        assert_eq!(dns[0].rtt_samples, 3);
+        assert_eq!(dns[0].rtt_us, 30);
+
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

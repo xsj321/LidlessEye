@@ -190,7 +190,9 @@ const ZH: Record<string, string> = {
   "Drag to resize · arrow keys to nudge": "拖动调整宽度 · 方向键微调",
   "Window from the toolbar · the same one the flamegraph uses":
     "时间范围来自工具栏 · 与火焰图使用相同范围",
+  SLO: "SLO",
   Instances: "实例",
+  CPU: "CPU",
   Memory: "内存",
   Net: "网络",
   DNS: "DNS",

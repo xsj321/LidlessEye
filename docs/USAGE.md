@@ -149,13 +149,16 @@ The seven tabs answer different questions:
 
 | Tab | What to look at |
 | --- | --- |
-| **SLO** | Availability against the 99.9 % objective, error rate over time (retransmits are the failure proxy), mean RTT. |
-| **Instances** | Desired vs ready replicas over the window and the sampled pod list with each pod's node. |
-| **CPU** | Cores over time, derived from on-CPU samples divided by their bucket width. |
-| **Memory** | The heap profile type actually present, using its declared unit. If the agent only sends CPU profiles, the tab says so. |
-| **Net** | In/out throughput, RTT samples, and the caller/callee lists with per-hop rates. |
-| **DNS** | TCP/53 peers, mean RTT and retransmits. UDP lookups are not captured. |
-| **Profiling** | Hottest functions, **the flamegraph for this node**, and a button to open that selector in the full flamegraph view. |
+| **SLO** | Success proxy and error-budget burn against the 99.9 % objective, error rate over time, sample-weighted mean RTT, callers and callees. |
+| **Instances** | Desired vs ready replicas, sampled pods with phase/state/node, and a click on a pod that opens its profiles with a `k8s_pod` filter. Services show their backing endpoints instead of an empty placeholder. |
+| **CPU** | Selectable `cpu` / `off_cpu` / `wall` cores, derived from samples divided by bucket width, plus a per-series breakdown. |
+| **Memory** | A selector over the heap types actually present, shown in each type's declared unit; in-use types are levels, allocation types are rates. |
+| **Net** | In/out throughput, sample-weighted RTT, protocol ranking, container-aware peer lists, hosts and SQL statements with literals redacted. |
+| **DNS** | TCP/53 lookup rate and latency per bucket, latency by resolver, and peers. qname/rcode are not collected; UDP lookups are not captured. |
+| **Profiling** | A profile-type selector, top 12 functions, series count, **the flamegraph for this node**, query context, and a button to open the same type and selector in the full view. |
+
+Every chart carries a long description and a collapsible data table with the
+same values, so the numbers are available without reading pixels off a canvas.
 
 ### The embedded flamegraph
 
