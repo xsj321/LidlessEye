@@ -57,10 +57,16 @@ export function Dashboard() {
   const state = useDashboard();
   const t = useT();
 
-  // A tenant-scoped token cannot enumerate tenants: keep showing the one it is
-  // pinned to rather than pretending there is a choice. The control lives in
-  // the header now — it changes the whole screen, not just the query row.
-  const showTenant = state.tenants.length > 1 || Boolean(state.tenant);
+  // The picker always renders. A tenant-scoped token cannot enumerate tenants,
+  // and a brand-new server has none on disk yet, so the list is often empty:
+  // the control then shows the one tenant that is actually in use — `default`
+  // when nothing chose otherwise. Hiding it made an empty install look broken
+  // ("there is nothing here, not even a default"), while every query was in
+  // fact being answered by `default` all along. The control lives in the
+  // header: it changes the whole screen, not just the query row.
+  const tenantOptions = state.tenants.length
+    ? state.tenants
+    : [state.tenant || "default"];
 
   return (
     <div id="app-shell">
@@ -80,30 +86,26 @@ export function Dashboard() {
           {/* The brand already lives in the navigation drawer; repeating it
               here only pushed the useful controls to the right. */}
           <div className="ml-auto flex items-center gap-2">
-            {showTenant ? (
-              <Select
-                value={state.tenant}
-                onValueChange={(value) => dashboardStore.setTenantId(value)}
+            <Select
+              value={state.tenant}
+              onValueChange={(value) => dashboardStore.setTenantId(value)}
+            >
+              <SelectTrigger
+                size="sm"
+                id="tenant"
+                className="w-36"
+                aria-label={t("Tenant")}
               >
-                <SelectTrigger
-                  size="sm"
-                  id="tenant"
-                  className="w-36"
-                  aria-label={t("Tenant")}
-                >
-                  <SelectValue placeholder={t("default")} />
-                </SelectTrigger>
-                <SelectContent>
-                  {(state.tenants.length ? state.tenants : [state.tenant || "default"]).map(
-                    (id) => (
-                      <SelectItem key={id} value={id}>
-                        {id}
-                      </SelectItem>
-                    ),
-                  )}
-                </SelectContent>
-              </Select>
-            ) : null}
+                <SelectValue placeholder={t("default")} />
+              </SelectTrigger>
+              <SelectContent>
+                {tenantOptions.map((id) => (
+                  <SelectItem key={id} value={id}>
+                    {id}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <span className="font-mono text-[11px] text-muted-foreground" data-testid="build-info">
               {state.build}
             </span>

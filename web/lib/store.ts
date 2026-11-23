@@ -129,7 +129,10 @@ function initialState(): DashboardState {
     baseUntilNs: 0,
     filters: [],
     groupBy: "",
-    tenant: "",
+    // Never empty: the header renders this as the current tenant, and a blank
+    // one is what "there is nothing here, not even a default" looks like while
+    // the tenant list is still loading (or when it cannot be read at all).
+    tenant: getTenant() || "default",
     auto: false,
     unit: "nanoseconds",
     mapMetric: "connections",

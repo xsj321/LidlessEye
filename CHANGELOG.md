@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [Unreleased]
+
+### Fixed
+
+- The tenant control is always on screen, seeded with `default`. It used to be
+  hidden whenever the tenant list came back empty or had not loaded yet, which
+  is the state a brand-new server is in — every query was being answered by
+  `default` while the header showed no tenant at all, so an empty install
+  looked like it had nowhere to write.
+
 ## [0.1.4] - 2026-11-23
 
 A fresh install is usable again: the tenant catalogue can be read before a
