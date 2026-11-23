@@ -30,7 +30,9 @@ pub mod model;
 pub mod pprof;
 pub mod query;
 pub mod selector;
-pub mod servicemap;
+/// Service map types and query composition, re-exported from the dedicated
+/// crate so existing `lidlesseye_core::servicemap::*` paths keep working.
+pub use lidlesseye_servicemap as servicemap;
 pub mod store;
 pub mod tenant;
 pub mod time;

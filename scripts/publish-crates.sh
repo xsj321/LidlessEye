@@ -26,7 +26,7 @@
 #
 #   printf %s "$TOKEN" > .tmp/crates-token
 #
-# Why this exists instead of four `cargo publish` calls:
+# Why this exists instead of six `cargo publish` calls:
 #
 #  * order matters — a crate cannot be published before its dependencies are in
 #    the index, and the index is not instantaneous, so each step waits for its
@@ -96,8 +96,16 @@ fi
 # do not let it rewrite the sources of the packaged copy.
 export LIDLESSEYE_PREBUILT_BPF=1
 
-# Dependency order: core ← ebpf, server ← lidlesseye.
-crates=(lidlesseye-core lidlesseye-ebpf lidlesseye-server lidlesseye)
+# Dependency order: servicemap ← core ← {ebpf, server} ← lidlesseye;
+# mcp only needs servicemap plus the HTTP API, so it can follow the server.
+crates=(
+  lidlesseye-servicemap
+  lidlesseye-core
+  lidlesseye-ebpf
+  lidlesseye-server
+  lidlesseye
+  lidlesseye-mcp
+)
 
 # Sparse index path: `li/dl/lidlesseye-core` for these names, and the same
 # two-plus-two split crates.io uses for every crate with four or more characters.

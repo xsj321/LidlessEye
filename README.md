@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](crates)
 [![DuckDB](https://img.shields.io/badge/storage-DuckDB%202.0-yellow.svg)](crates/lidlesseye-core)
 
-[English](README.md) · [中文](README.zh-CN.md) · [Step-by-step usage](docs/USAGE.md) · [使用指南（中文）](docs/USAGE.zh-CN.md) · [Changelog](CHANGELOG.md)
+[English](README.md) · [中文](README.zh-CN.md) · [Step-by-step usage](docs/USAGE.md) · [使用指南（中文）](docs/USAGE.zh-CN.md) · [MCP for AI](docs/mcp.md) · [MCP 中文](docs/mcp.zh-CN.md) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -74,6 +74,8 @@ The dashboard opens on the **service map**. Click any node to inspect its SLO, r
 | Profiling | hottest functions, **an embedded flamegraph for this node**, and a jump to the full view |
 
 **Analyse** — flamegraphs with search, zoom and breadcrumbs; top-N functions; time series; a label explorer with structured filter rows; and a comparison view that colours a regression red. Windows are chosen the way a Grafana user expects: pick a range first, then bracket the part of it you care about.
+
+**Ask an AI** — an optional stdio [MCP server](docs/mcp.md) exposes read-only tools for the service map, flamegraph summaries, top functions, time series and window diffs. Results are summary-first with explicit units, query context and truncation flags, so a model can explain a number instead of guessing where it came from.
 
 **Operate** — multi-tenancy via `X-Scope-OrgID`, per-tenant tokens and retention, Prometheus metrics, a `fsck` command, a Docker image, a Helm chart and an embeddable Rust API.
 
@@ -189,6 +191,17 @@ async fn main() -> Result<()> {
 
 `agent(false)` gives you storage and the HTTP API only. Runnable examples: `cargo run --example embed`, `cargo run --example synthetic`.
 
+The workspace publishes these crates:
+
+| Crate | Role |
+| --- | --- |
+| `lidlesseye` | binary and embedding facade |
+| `lidlesseye-server` | HTTP API and embedded dashboard |
+| `lidlesseye-core` | DuckDB/Parquet storage and query engine |
+| `lidlesseye-ebpf` | eBPF programs and BPF-side helpers |
+| `lidlesseye-servicemap` | service-map model, protocol constants and pure query logic |
+| `lidlesseye-mcp` | read-only MCP tools for AI clients |
+
 ## HTTP API
 
 | Method | Path | Description |
@@ -211,6 +224,15 @@ curl -s 'http://localhost:4040/api/v1/top?profile_type=cpu&from=now-1h&limit=5' 
 curl -s 'http://localhost:4040/api/v1/servicemap?from=now-1h' | jq '.nodes | length'
 ```
 
+## Ask an AI over MCP
+
+```bash
+cargo build --release -p lidlesseye-mcp
+./target/release/lidlesseye-mcp --base-url http://127.0.0.1:4040 --tenant default
+```
+
+Register that binary with an MCP client (Claude Desktop, an IDE agent, or another MCP host). Useful tools include `list_tenants`, `get_service_map`, `get_service_map_histogram`, `get_top`, `get_flamegraph_summary`, `get_timeseries` and `diff_profiles`. Each result carries `summary`, `query_context`, `unit`, `truncated`, bounded `data` and `suggestions`. See [docs/mcp.md](docs/mcp.md) for configuration, the full tool table and the recommended analysis loop.
+
 ## CLI
 
 ```
@@ -224,7 +246,7 @@ lidlesseye info     # build and platform information
 
 `collect` accepts `--frequency`, `--flush`, `--label k=v`, `--service-name`, `--no-cpu`, `--no-offcpu`, `--no-heap`, `--no-alloc`, `--heap-objects`, `--no-k8s-labels`, `--no-k8s-pod-metadata`, `--k8s-pod-refresh`, `--server`, `--tenant`, `--auth-token` and `--duration`. Set `LIDLESSEYE_NODE_NAME` (the Helm chart passes `spec.nodeName`) so the `node` label stays stable across rollouts.
 
-Full reference: [HTTP API](docs/api.md) · [Architecture](docs/architecture.md) · [Deployment](docs/deployment.md) · [UI](docs/ui.md).
+Full reference: [HTTP API](docs/api.md) · [MCP for AI](docs/mcp.md) · [Architecture](docs/architecture.md) · [Deployment](docs/deployment.md) · [UI](docs/ui.md).
 
 ## Testing
 
@@ -255,6 +277,7 @@ The browser test seeds two tenants and fails on any console error, so a renderin
 | [Step-by-step usage](docs/USAGE.md) · [中文](docs/USAGE.zh-CN.md) | the dashboard, ranges, filters, the CLI, first hour with the tool |
 | [Architecture](docs/architecture.md) | how eBPF collection, ingest, DuckDB and the service map fit together, and why |
 | [HTTP API](docs/api.md) | every endpoint, parameter and response shape |
+| [MCP for AI](docs/mcp.md) · [中文](docs/mcp.zh-CN.md) | installing the stdio MCP server, every tool, AI-friendly response shape and analysis workflow |
 | [Deployment](docs/deployment.md) | Helm values, storage modes, S3 archiving, retention, quotas |
 | [Dashboard and UI rules](docs/ui.md) | what each view shows, and the design rules the front end is held to |
 | [Embedding](docs/embedding.md) | using the server as a Rust crate |

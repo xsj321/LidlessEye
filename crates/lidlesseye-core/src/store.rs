@@ -59,44 +59,16 @@ pub const MAX_SCAN_ROWS: usize = 2_000_000;
 
 /// The counter the service map's time brush plots.
 ///
-/// All three live in the same `net_edges` rows, so switching between them is a
-/// change of aggregate rather than of query: the brush keeps its buckets and
-/// the bars keep their meaning ("how much of this, per bucket"). Requests are
-/// TCP connections opened, because without payload parsing there is no request
-/// count to divide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NetMetric {
-    #[default]
-    Connections,
-    Bytes,
-    Retransmits,
-}
+/// The type lives with the service map model; it is re-exported here because
+/// storage code needs the SQL expression that backs each variant.
+pub use lidlesseye_servicemap::NetMetric;
 
-impl NetMetric {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "connections" | "requests" | "request" | "conn" => Some(Self::Connections),
-            "bytes" | "traffic" => Some(Self::Bytes),
-            "retransmits" | "retrans" => Some(Self::Retransmits),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Connections => "connections",
-            Self::Bytes => "bytes",
-            Self::Retransmits => "retransmits",
-        }
-    }
-
-    /// SQL expression to sum. Constants only — never user input.
-    fn column(self) -> &'static str {
-        match self {
-            Self::Connections => "connections",
-            Self::Bytes => "tx_bytes + rx_bytes",
-            Self::Retransmits => "retransmits",
-        }
+/// SQL expression to sum for a map metric. Constants only — never user input.
+fn net_metric_column(metric: NetMetric) -> &'static str {
+    match metric {
+        NetMetric::Connections => "connections",
+        NetMetric::Bytes => "tx_bytes + rx_bytes",
+        NetMetric::Retransmits => "retransmits",
     }
 }
 
@@ -2226,7 +2198,7 @@ impl Store {
                 "SELECT bucket_ns, sum({}) FROM net_edges \
                  WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY bucket_ns ORDER BY bucket_ns",
-                metric.column()
+                net_metric_column(metric)
             ))
             .map_err(db_err)?;
         let mut rows = stmt
@@ -2353,6 +2325,63 @@ impl Store {
             *out.entry(node_id(namespace, name)).or_insert(0) += value.max(0) as u64;
         }
         Ok(out)
+    }
+}
+
+impl lidlesseye_servicemap::ServiceMapStore for Store {
+    type Error = Error;
+
+    fn net_nodes(&self, from_ns: u64, until_ns: u64, limit: usize) -> Result<Vec<MapNode>> {
+        Store::net_nodes(self, from_ns, until_ns, limit)
+    }
+
+    fn net_edges(&self, from_ns: u64, until_ns: u64) -> Result<Vec<MapEdge>> {
+        Store::net_edges(self, from_ns, until_ns)
+    }
+
+    fn net_node_history(
+        &self,
+        node: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>> {
+        Store::net_node_history(self, node, from_ns, until_ns, step_ns)
+    }
+
+    fn net_edge_history(
+        &self,
+        node: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>> {
+        Store::net_edge_history(self, node, from_ns, until_ns, step_ns)
+    }
+
+    fn net_host_edge_history(
+        &self,
+        host: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>> {
+        Store::net_host_edge_history(self, host, from_ns, until_ns, step_ns)
+    }
+
+    fn net_histogram_metric(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+        buckets: usize,
+        metric: NetMetric,
+    ) -> Result<Vec<u64>> {
+        Store::net_histogram_metric(self, from_ns, until_ns, step_ns, buckets, metric)
+    }
+
+    fn cpu_by_service(&self, from_ns: u64, until_ns: u64) -> Result<HashMap<String, u64>> {
+        Store::cpu_by_service(self, from_ns, until_ns)
     }
 }
 

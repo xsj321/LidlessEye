@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](crates)
 [![DuckDB](https://img.shields.io/badge/storage-DuckDB%202.0-yellow.svg)](crates/lidlesseye-core)
 
-[English](README.md) · [中文](README.zh-CN.md) · [Step-by-step usage](docs/USAGE.md) · [使用指南（中文）](docs/USAGE.zh-CN.md) · [更新日志](CHANGELOG.md)
+[English](README.md) · [中文](README.zh-CN.md) · [Step-by-step usage](docs/USAGE.md) · [使用指南（中文）](docs/USAGE.zh-CN.md) · [AI 使用 MCP](docs/mcp.zh-CN.md) · [MCP English](docs/mcp.md) · [更新日志](CHANGELOG.md)
 
 </div>
 
@@ -74,6 +74,8 @@ sudo ./target/release/lidlesseye serve --agent --data-dir ./data
 | Profiling | 最热函数、**该节点内嵌的火焰图**，以及跳转到完整视图 |
 
 **分析** —— 支持搜索、缩放和面包屑的火焰图；Top-N 函数；时间序列；带结构化筛选行的标签浏览器；能把回退染红的对比视图。时间窗口的选法与 Grafana 一致：先选范围，再在其中框选关心的区间。
+
+**让 AI 查询** —— 可选的 stdio [MCP 服务端](docs/mcp.zh-CN.md) 暴露只读工具，可查询服务地图、火焰图摘要、Top 函数、时间序列和窗口对比。结果遵循 summary first，带明确单位、查询上下文和截断标记，模型可以解释数字来源，而不需要猜测。
 
 **运维** —— 通过 `X-Scope-OrgID` 做多租户隔离、按租户的 token 与保留策略、Prometheus 指标、`fsck` 校验命令、Docker 镜像、Helm chart，以及可嵌入的 Rust API。
 
@@ -184,6 +186,17 @@ async fn main() -> Result<()> {
 
 `agent(false)` 只提供存储与 HTTP API。可运行示例：`cargo run --example embed`、`cargo run --example synthetic`。
 
+工作区发布的 crate：
+
+| Crate | 职责 |
+| --- | --- |
+| `lidlesseye` | 二进制与嵌入入口 |
+| `lidlesseye-server` | HTTP API 与内嵌看板 |
+| `lidlesseye-core` | DuckDB/Parquet 存储与查询引擎 |
+| `lidlesseye-ebpf` | eBPF 程序与 BPF 侧辅助函数 |
+| `lidlesseye-servicemap` | 服务地图模型、协议常量与纯查询逻辑 |
+| `lidlesseye-mcp` | 面向 AI 客户端的只读 MCP 工具 |
+
 ## HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -206,6 +219,15 @@ curl -s 'http://localhost:4040/api/v1/top?profile_type=cpu&from=now-1h&limit=5' 
 curl -s 'http://localhost:4040/api/v1/servicemap?from=now-1h' | jq '.nodes | length'
 ```
 
+## 通过 MCP 让 AI 查询
+
+```bash
+cargo build --release -p lidlesseye-mcp
+./target/release/lidlesseye-mcp --base-url http://127.0.0.1:4040 --tenant default
+```
+
+把这个二进制注册到 MCP 客户端（Claude Desktop、IDE agent 或其它 MCP host）。常用工具包括 `list_tenants`、`get_service_map`、`get_service_map_histogram`、`get_top`、`get_flamegraph_summary`、`get_timeseries` 和 `diff_profiles`。每个结果都包含 `summary`、`query_context`、`unit`、`truncated`、有限的 `data` 和 `suggestions`。配置、完整工具表和推荐排查顺序见 [docs/mcp.zh-CN.md](docs/mcp.zh-CN.md)。
+
 ## 命令行
 
 ```
@@ -219,7 +241,7 @@ lidlesseye info     # 构建与平台信息
 
 `collect` 支持 `--frequency`、`--flush`、`--label k=v`、`--service-name`、`--no-cpu`、`--no-offcpu`、`--no-heap`、`--no-alloc`、`--heap-objects`、`--no-k8s-labels`、`--no-k8s-pod-metadata`、`--k8s-pod-refresh`、`--server`、`--tenant`、`--auth-token` 和 `--duration`。设置 `LIDLESSEYE_NODE_NAME`（Helm chart 传入 `spec.nodeName`）可让 `node` 标签在滚动更新后保持稳定。
 
-完整参考：[HTTP API](docs/api.md) · [架构](docs/architecture.md) · [部署](docs/deployment.md) · [界面](docs/ui.md)。
+完整参考：[HTTP API](docs/api.md) · [MCP](docs/mcp.zh-CN.md) · [架构](docs/architecture.md) · [部署](docs/deployment.md) · [界面](docs/ui.md)。
 
 ## 测试
 
@@ -250,6 +272,7 @@ cargo fmt --all --check
 | [使用指南](docs/USAGE.zh-CN.md) · [English](docs/USAGE.md) | 看板、时间范围、筛选、CLI，上手第一小时 |
 | [架构](docs/architecture.md) | eBPF 采集、导入、DuckDB 与服务地图如何串起来，以及为什么这样选 |
 | [HTTP API](docs/api.md) | 每个端点、参数与返回结构 |
+| [MCP](docs/mcp.zh-CN.md) · [English](docs/mcp.md) | 安装 stdio MCP 服务端、工具清单、AI 友好的返回结构与排查流程 |
 | [部署](docs/deployment.md) | Helm values、存储模式、S3 归档、保留期、配额 |
 | [看板与 UI 规则](docs/ui.md) | 每个视图展示什么，以及前端必须遵守的设计规则 |
 | [嵌入](docs/embedding.md) | 把服务端当作 Rust crate 使用 |

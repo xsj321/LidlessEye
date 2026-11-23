@@ -103,6 +103,36 @@ runtime's memory route can see.
   in a short top-N window; the reader capability and an individual sample are
   now described separately.
 
+## [0.1.10] - 2026-11-23
+
+Service-map types are a standalone crate, and AI clients can query both the
+map and profiles through a read-only MCP server.
+
+### Added
+
+- `lidlesseye-servicemap` owns the service-map model, wire-protocol constants
+  and pure query composition. It depends only on `serde` and exposes a
+  `ServiceMapStore` seam, so the protocol can be shared with the eBPF collector
+  and queried by tools without linking DuckDB. `lidlesseye-core` re-exports it
+  as `lidlesseye_core::servicemap`, keeping every existing import path valid.
+- `lidlesseye-mcp` is a stdio MCP server with twelve read-only tools:
+  `get_health`, `list_tenants`, `list_profile_types`, `list_series`,
+  `list_label_values`, `get_service_map`, `get_service_map_history`,
+  `get_service_map_histogram`, `get_flamegraph_summary`, `get_top`,
+  `get_timeseries` and `diff_profiles`. Each result has a summary, exact query
+  context, explicit unit, truncation flag, ranked data subset and suggested
+  next calls; errors use MCP `isError` with actionable feedback.
+- [docs/mcp.md](docs/mcp.md) and [docs/mcp.zh-CN.md](docs/mcp.zh-CN.md) document
+  client configuration, the tool table, the response envelope and a safe
+  analysis workflow. Both READMEs, the documentation index and the
+  architecture guide link to them.
+
+### Changed
+
+- `scripts/publish-crates.sh` publishes `lidlesseye-servicemap` before
+  `lidlesseye-core` and includes `lidlesseye-mcp`, so the new crates are
+  available from crates.io in dependency order.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -490,7 +520,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/xsj321/LidlessEye/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/xsj321/LidlessEye/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/xsj321/LidlessEye/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/xsj321/LidlessEye/compare/v0.1.6...v0.1.7

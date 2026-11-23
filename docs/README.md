@@ -7,6 +7,8 @@
 | [ui.md](ui.md) | use the dashboard: time-range histogram, label filters, compare view, URL deep links |
 | [architecture.md](architecture.md) | understand the design: crates, data flow, DuckDB schema, query pipeline, concurrency, benchmarks |
 | [api.md](api.md) | call the HTTP API: endpoints, parameters, payloads, status codes, metrics |
+| [mcp.md](mcp.md) | expose service maps and profiles as read-only MCP tools for AI clients (English) |
+| [mcp.zh-CN.md](mcp.zh-CN.md) | 同上，中文 MCP 文档 |
 | [deployment.md](deployment.md) | run it: one host, server + agents, Docker, Kubernetes/Helm, privileges, sizing, monitoring, troubleshooting |
 | [embedding.md](embedding.md) | embed the server in a Rust program, write a custom collector, ingest without the CLI |
 | [multi-tenancy.md](multi-tenancy.md) | isolate tenants: layout, naming, tokens, limits, pruning, failure behaviour |

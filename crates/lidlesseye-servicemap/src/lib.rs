@@ -1,4 +1,4 @@
-//! The service map data model.
+//! The service map data model and query composition.
 //!
 //! The map is a time-bucketed graph: agents observe TCP connections inside each
 //! pod's network namespace, resolve both endpoints to a service (a workload, a
@@ -7,19 +7,17 @@
 //! for, which is what makes the map follow the same time range as the
 //! flamegraph.
 //!
-//! Edges carry what the agent can observe: new connections, retransmits and an
-//! application protocol. The eBPF collector sniffs the first payload written
-//! to a socket and sets a protocol bit; a port-based guess is the fallback for
-//! a connection that carried no parseable payload (TLS without an uprobe, for
-//! instance). Node CPU is joined from the profile store, so a service that
-//! burns CPU but serves little traffic is visible as such.
+//! This crate owns the shapes and the pure query logic. It deliberately knows
+//! nothing about DuckDB, tenants or async runtimes: [`ServiceMapStore`] is the
+//! seam through which an implementation supplies rows, and
+//! [`lidlesseye_core`](https://docs.rs/lidlesseye-core) implements it for the
+//! real store. That keeps the protocol constants shareable with the eBPF
+//! collector and makes the map queryable by tools such as the MCP server
+//! without pulling in a database.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-
-use crate::error::Result;
-use crate::store::{NetMetric, Store};
 
 /// Node id for traffic that has no endpoint inside the cluster.
 pub const EXTERNAL_ID: &str = "external";
@@ -35,6 +33,176 @@ pub const MAX_NODES: usize = 600;
 /// traffic stays on the aggregate `external` node rather than pushing the
 /// cluster's own services out of the map.
 pub const MAX_EXTERNAL_HOSTS: usize = 40;
+
+/// The counter the service map's time brush plots.
+///
+/// All three live in the same `net_edges` rows, so switching between them is a
+/// change of aggregate rather than of query: the brush keeps its buckets and
+/// the bars keep their meaning ("how much of this, per bucket"). Requests are
+/// TCP connections opened, because without payload parsing there is no request
+/// count to divide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetMetric {
+    /// TCP connections opened in the window.
+    #[default]
+    Connections,
+    /// Bytes sent plus bytes received.
+    Bytes,
+    /// Retransmitted segments.
+    Retransmits,
+}
+
+impl NetMetric {
+    /// Parse a metric name from user input, accepting the UI's aliases.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "connections" | "requests" | "request" | "conn" => Some(Self::Connections),
+            "bytes" | "traffic" => Some(Self::Bytes),
+            "retransmits" | "retrans" => Some(Self::Retransmits),
+            _ => None,
+        }
+    }
+
+    /// Canonical name used in API responses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connections => "connections",
+            Self::Bytes => "bytes",
+            Self::Retransmits => "retransmits",
+        }
+    }
+}
+
+/// Storage seam used by the service map's query composition.
+///
+/// The error type is associated instead of fixed so callers keep their own
+/// error semantics: the real store returns `lidlesseye_core::Error`, while a
+/// test double can return any error it likes.
+pub trait ServiceMapStore {
+    /// Error returned by the storage implementation.
+    type Error;
+
+    /// Nodes seen in `[from_ns, until_ns)`, at most `limit` rows.
+    fn net_nodes(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+        limit: usize,
+    ) -> Result<Vec<MapNode>, Self::Error>;
+
+    /// Aggregated edges seen in `[from_ns, until_ns)`.
+    fn net_edges(&self, from_ns: u64, until_ns: u64) -> Result<Vec<MapEdge>, Self::Error>;
+
+    /// A node's own counters, bucketed by `step_ns`.
+    fn net_node_history(
+        &self,
+        node: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>, Self::Error>;
+
+    /// Counters of edges incident to a node, bucketed by `step_ns`.
+    fn net_edge_history(
+        &self,
+        node: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>, Self::Error>;
+
+    /// Counters of edges whose server is an external host, bucketed by `step_ns`.
+    fn net_host_edge_history(
+        &self,
+        host: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>, Self::Error>;
+
+    /// Dense per-bucket totals of one counter over all edges.
+    fn net_histogram_metric(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+        buckets: usize,
+        metric: NetMetric,
+    ) -> Result<Vec<u64>, Self::Error>;
+
+    /// CPU nanoseconds attributed to each service node id.
+    fn cpu_by_service(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+    ) -> Result<HashMap<String, u64>, Self::Error>;
+}
+
+impl<T: ServiceMapStore + ?Sized> ServiceMapStore for std::sync::Arc<T> {
+    type Error = T::Error;
+
+    fn net_nodes(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+        limit: usize,
+    ) -> Result<Vec<MapNode>, Self::Error> {
+        T::net_nodes(self.as_ref(), from_ns, until_ns, limit)
+    }
+
+    fn net_edges(&self, from_ns: u64, until_ns: u64) -> Result<Vec<MapEdge>, Self::Error> {
+        T::net_edges(self.as_ref(), from_ns, until_ns)
+    }
+
+    fn net_node_history(
+        &self,
+        node: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>, Self::Error> {
+        T::net_node_history(self.as_ref(), node, from_ns, until_ns, step_ns)
+    }
+
+    fn net_edge_history(
+        &self,
+        node: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>, Self::Error> {
+        T::net_edge_history(self.as_ref(), node, from_ns, until_ns, step_ns)
+    }
+
+    fn net_host_edge_history(
+        &self,
+        host: &str,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+    ) -> Result<Vec<MapHistoryPoint>, Self::Error> {
+        T::net_host_edge_history(self.as_ref(), host, from_ns, until_ns, step_ns)
+    }
+
+    fn net_histogram_metric(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+        step_ns: u64,
+        buckets: usize,
+        metric: NetMetric,
+    ) -> Result<Vec<u64>, Self::Error> {
+        T::net_histogram_metric(self.as_ref(), from_ns, until_ns, step_ns, buckets, metric)
+    }
+
+    fn cpu_by_service(
+        &self,
+        from_ns: u64,
+        until_ns: u64,
+    ) -> Result<HashMap<String, u64>, Self::Error> {
+        T::cpu_by_service(self.as_ref(), from_ns, until_ns)
+    }
+}
 
 /// Node id for a namespace/workload pair, or just the name outside Kubernetes.
 ///
@@ -444,7 +612,11 @@ impl ServiceMap {
 }
 
 /// Query the map for a window, joining per-service CPU from the profiles.
-pub fn servicemap(store: &Store, from_ns: u64, until_ns: u64) -> Result<ServiceMap> {
+pub fn servicemap<S: ServiceMapStore>(
+    store: &S,
+    from_ns: u64,
+    until_ns: u64,
+) -> Result<ServiceMap, S::Error> {
     let mut nodes = store.net_nodes(from_ns, until_ns, MAX_NODES + 1)?;
     let mut truncated = nodes.len() > MAX_NODES;
     let mut edges = store.net_edges(from_ns, until_ns)?;
@@ -636,13 +808,13 @@ pub struct MapHistory {
 }
 
 /// Per-bucket history of one node over `[from_ns, until_ns)`.
-pub fn servicemap_history(
-    store: &Store,
+pub fn servicemap_history<S: ServiceMapStore>(
+    store: &S,
     node: &str,
     from_ns: u64,
     until_ns: u64,
     step_ns: u64,
-) -> Result<MapHistory> {
+) -> Result<MapHistory, S::Error> {
     let step_ns = step_ns.max(1);
     // A host node exists only in the drawing: it is synthesized from the edges
     // that name it, so it has no rows of its own in `net_nodes`. Its counters
@@ -687,13 +859,13 @@ pub struct MapHistogram {
 }
 
 /// Per-bucket totals of one counter over the whole map.
-pub fn servicemap_histogram(
-    store: &Store,
+pub fn servicemap_histogram<S: ServiceMapStore>(
+    store: &S,
     from_ns: u64,
     until_ns: u64,
     buckets: usize,
     metric: NetMetric,
-) -> Result<MapHistogram> {
+) -> Result<MapHistogram, S::Error> {
     let buckets = buckets.max(1);
     let step_ns = ((until_ns.saturating_sub(from_ns)) / buckets as u64).max(1);
     Ok(MapHistogram {
@@ -929,11 +1101,11 @@ mod tests {
 
     #[test]
     fn ports_name_the_protocol_they_usually_carry() {
-        assert_eq!(crate::servicemap::protocol_for_port(443), "https");
-        assert_eq!(crate::servicemap::protocol_for_port(5432), "postgres");
-        assert_eq!(crate::servicemap::protocol_for_port(9042), "cassandra");
-        assert_eq!(crate::servicemap::protocol_for_port(4500), "foundationdb");
-        assert_eq!(crate::servicemap::protocol_for_port(12345), "tcp");
+        assert_eq!(super::protocol_for_port(443), "https");
+        assert_eq!(super::protocol_for_port(5432), "postgres");
+        assert_eq!(super::protocol_for_port(9042), "cassandra");
+        assert_eq!(super::protocol_for_port(4500), "foundationdb");
+        assert_eq!(super::protocol_for_port(12345), "tcp");
     }
 
     #[test]

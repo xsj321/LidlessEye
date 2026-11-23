@@ -3,15 +3,20 @@
 ## Crates
 
 ```
-lidlesseye-core      data model, DuckDB store, query engine, selectors
-lidlesseye-ebpf      aya loader, BPF C programs, collector loop, symbolization
-lidlesseye-server    axum router, HTTP handlers, embedded UI, metrics
-lidlesseye           the embeddable `LidlessEye` builder + the `lidlesseye` CLI
+lidlesseye-servicemap service-map model, protocol constants, pure query logic
+lidlesseye-core       data model, DuckDB store, query engine, selectors
+lidlesseye-ebpf       aya loader, BPF C programs, collector loop, symbolization
+lidlesseye-server     axum router, HTTP handlers, embedded UI, metrics
+lidlesseye-mcp        read-only MCP tools that call the HTTP API
+lidlesseye            the embeddable `LidlessEye` builder + the `lidlesseye` CLI
 ```
 
-The dependency graph is a straight line: `core` knows nothing about eBPF,
-`ebpf` and `server` both depend on `core`, and the top-level crate wires them
-together. That is what makes both of these possible at the same time:
+The dependency graph is layered and acyclic: `servicemap` depends only on
+`serde`; `core` re-exports it for existing users and implements its store
+trait; `ebpf` and `server` depend on `core`; `mcp` depends on `servicemap` plus
+a small HTTP client and talks to `server` over HTTP, so it never links DuckDB.
+The top-level crate wires the runtime components together. That is what makes
+both of these possible at the same time:
 
 - `lidlesseye serve --agent` — everything in one process;
 - `lidlesseye collect --server …` — the agent alone, pushing to a remote server.
