@@ -74,6 +74,38 @@ fn note_drop(dropped: &AtomicU64, last_warn: &AtomicU64, what: &str) {
     }
 }
 
+/// How long one batch keeps retrying while the server is unreachable.
+///
+/// A rolling upgrade takes far longer than the old ~12 s retry budget: the
+/// server stops, its startup probe waits for tenant stores to open, and the
+/// Service endpoint only comes back after that. Dropping a batch in that gap
+/// left a visible hole in every profile. Five minutes is long enough for a
+/// slow restart while still bounding how long one batch can own the uploader.
+const UPLOAD_RETRY_BUDGET: Duration = Duration::from_secs(300);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(10);
+
+fn retry_backoff(attempt: u32) -> Duration {
+    let shift = (attempt.saturating_sub(1)).min(6);
+    Duration::from_millis(250u64.saturating_mul(1u64 << shift)).min(MAX_RETRY_BACKOFF)
+}
+
+/// A response that says "this payload is wrong" will not become right by
+/// sending it again. Transport failures, 408, 429 and 5xx are worth retrying.
+fn retriable_upload_error(err: &Error) -> bool {
+    let Error::Http(message) = err else {
+        return false;
+    };
+    let Some(rest) = message.strip_prefix("server returned ") else {
+        return true;
+    };
+    let status = rest
+        .split_whitespace()
+        .next()
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    status == 408 || status == 429 || (500..600).contains(&status)
+}
+
 /// Handle used to enqueue reports. Cheap to clone.
 #[derive(Clone)]
 pub struct PublisherHandle {
@@ -255,6 +287,7 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
                 let batch = std::mem::take(&mut buffer);
                 let count = batch.len();
                 let mut attempt = 0u32;
+                let started = tokio::time::Instant::now();
                 loop {
                     match post_service_map(&client, &map_url, &batch).await {
                         Ok(()) => {
@@ -262,17 +295,33 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
                             break;
                         }
                         Err(err) => {
-                            attempt += 1;
-                            if attempt >= 6 {
+                            if !retriable_upload_error(&err) {
                                 tracing::warn!(
                                     windows = count,
+                                    error = %err,
+                                    "dropping service map windows after a permanent server error"
+                                );
+                                break;
+                            }
+                            attempt += 1;
+                            if started.elapsed() >= UPLOAD_RETRY_BUDGET {
+                                tracing::warn!(
+                                    windows = count,
+                                    attempts = attempt,
+                                    elapsed_ms = started.elapsed().as_millis(),
                                     error = %err,
                                     "dropping service map windows after repeated upload failures"
                                 );
                                 break;
                             }
-                            let backoff =
-                                Duration::from_millis(250 * 2u64.pow((attempt - 1).min(4)));
+                            let backoff = retry_backoff(attempt);
+                            tracing::debug!(
+                                windows = count,
+                                attempt,
+                                backoff_ms = backoff.as_millis(),
+                                error = %err,
+                                "service map upload failed, retrying"
+                            );
                             tokio::time::sleep(backoff).await;
                         }
                     }
@@ -307,14 +356,14 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
 
             let batch = std::mem::take(&mut buffer);
             let count = batch.len();
-            // Retries cover the startup race in a cluster: the agent DaemonSet
-            // is usually scheduled before the server Deployment is listening,
-            // and dropping the first batches would leave a hole at every
-            // rollout. Five backoffs of 0.5–4s ride out ~12s of downtime; past
-            // that the server is genuinely unreachable and the batch is
-            // dropped rather than buffered without bound.
-            const MAX_ATTEMPTS: u32 = 6;
+            // A rolling upgrade is not a 12 s blip: the old pod terminates,
+            // the new one opens every tenant store before it listens, and the
+            // Service endpoint only comes back afterwards. Retry transient
+            // failures for up to `UPLOAD_RETRY_BUDGET` so a restart does not
+            // punch a hole in every profile, while keeping one batch from
+            // owning the uploader forever.
             let mut attempt = 0u32;
+            let started = tokio::time::Instant::now();
             loop {
                 match post_batch(&client, &url, None, &batch).await {
                     Ok(()) => {
@@ -322,16 +371,26 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
                         break;
                     }
                     Err(err) => {
-                        attempt += 1;
-                        if attempt >= MAX_ATTEMPTS {
+                        if !retriable_upload_error(&err) {
                             tracing::warn!(
                                 reports = count,
+                                error = %err,
+                                "dropping reports after a permanent server error"
+                            );
+                            break;
+                        }
+                        attempt += 1;
+                        if started.elapsed() >= UPLOAD_RETRY_BUDGET {
+                            tracing::warn!(
+                                reports = count,
+                                attempts = attempt,
+                                elapsed_ms = started.elapsed().as_millis(),
                                 error = %err,
                                 "dropping reports after repeated upload failures"
                             );
                             break;
                         }
-                        let backoff = Duration::from_millis(250 * 2u64.pow((attempt - 1).min(4)));
+                        let backoff = retry_backoff(attempt);
                         tracing::debug!(
                             error = %err,
                             attempt,
@@ -449,5 +508,29 @@ mod tests {
         h.send_servicemap(ServiceMapBatch::default());
         h.send_servicemap(ServiceMapBatch::default());
         assert_eq!(h.drop_stats().1, 1);
+    }
+
+    #[test]
+    fn upload_backoff_caps_without_overflowing() {
+        assert_eq!(retry_backoff(1), Duration::from_millis(250));
+        assert_eq!(retry_backoff(5), Duration::from_millis(4000));
+        assert_eq!(retry_backoff(6), Duration::from_millis(8000));
+        assert_eq!(retry_backoff(100), MAX_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn transport_errors_are_retried_but_bad_requests_are_not() {
+        assert!(retriable_upload_error(&Error::Http(
+            "error sending request for url (http://lidlesseye:4040/ingest)".into()
+        )));
+        assert!(retriable_upload_error(&Error::Http(
+            "server returned 503 Service Unavailable: busy".into()
+        )));
+        assert!(retriable_upload_error(&Error::Http(
+            "server returned 429 Too Many Requests: retry".into()
+        )));
+        assert!(!retriable_upload_error(&Error::Http(
+            "server returned 400 Bad Request: invalid report JSON".into()
+        )));
     }
 }

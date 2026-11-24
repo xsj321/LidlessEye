@@ -488,6 +488,15 @@ current schema no longer rebuilds its indexes or rewrites `meta` on every open,
 and the tenant catalogue computes stats and the distinct-series count in one
 scan instead of two.
 
+**`dropping reports after repeated upload failures` during a rollout**
+The agent retries transport errors and 408/429/5xx for up to five minutes,
+with backoff capped at 10 s. A rolling upgrade can keep the server endpoint
+away longer than the old ~12 s budget: the old pod terminates, the new one
+opens every tenant store before listening, and only then does the Service get
+an endpoint. If the warning still appears, check the server pod's startup
+progress lines above; a genuinely permanent 4xx is dropped immediately instead
+of being retried.
+
 **`open_files` / memory grows forever**
 With DuckDB there is one file per tenant, never one per report, so service-name
 cardinality cannot create files — but it does create distinct label strings in

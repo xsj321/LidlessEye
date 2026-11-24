@@ -234,6 +234,23 @@ wait, and a current database is no longer rewritten just by opening it.
   second is logged as well. `lidlesseye_core=info` is now included in the
   default filter and in the container image.
 
+## [0.1.15] - 2026-11-24
+
+Agents now ride out a rolling upgrade instead of dropping profiles and service
+map windows while the server endpoint is briefly absent.
+
+### Fixed
+
+- Profile and service-map uploads retried transport failures for only ~12 s.
+  During an upgrade the old pod terminates, the new one opens every tenant
+  store before listening, and the Service endpoint returns later than that, so
+  `ingest` and `servicemap/ingest` produced `error sending request` and dropped
+  whole batches. Retries now use a five-minute budget with backoff from 250 ms
+  to 10 s, which covers an ordinary rollout without holding a batch forever.
+- Permanent 4xx responses are no longer retried; only transport errors, 408,
+  429 and 5xx are. Final drop warnings now include attempt count and elapsed
+  time so a real outage is distinguishable from a bad payload.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -621,7 +638,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/xsj321/LidlessEye/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/xsj321/LidlessEye/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/xsj321/LidlessEye/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/xsj321/LidlessEye/compare/v0.1.11...v0.1.12
