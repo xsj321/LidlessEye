@@ -262,7 +262,8 @@ the archive probe fails with `501 Not Implemented` and archival stays paused
 while local staging grows. The server keeps the only local copy in that case,
 so no data is lost, but the staging area will eventually apply backpressure.
 Test doubles must provide those three operations; a PUT-only mock is not
-enough.
+enough. `deploy/test/s3mock/s3mock.py` is a minimal implementation used by the
+local cluster fixtures.
 
 Object lifecycle/retention for the bucket must be configured outside the chart.
 Budget for the storage class, requests and the longest unconfirmed staging
