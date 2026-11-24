@@ -188,6 +188,29 @@ deleting it. Legacy mode values (`duckdb`, `parquet`) are accepted with a
 warning and mapped to `disk` / `s3` so old Helm values do not start an empty
 store. Keep the old PVC/backup until the first full retention cycle has passed.
 
+### Canary and rollback
+
+The storage upgrade is one-way for a data volume: once the legacy DuckDB file
+has been exported, an older server cannot read the new Parquet-only layout.
+Rollback therefore means restoring the pre-upgrade PVC snapshot, not just
+redeploying the old image.
+
+1. Snapshot the PVC (or take a DuckDB-consistent backup with the server
+   stopped) and record `GET /api/v1/stats` for each tenant before the upgrade.
+2. Canary on a copied volume first. Start the new image with the chart's
+   `replicaCount: 1` / `Recreate` defaults, then watch the first-open logs:
+   `exporting legacy DuckDB`, `verified … rows`, `store ready`.
+3. Confirm the totals and flamegraph for the same windows still match, and that
+   `tenants/default/lidlesseye.duckdb.migrated-…` plus
+   `tenants/default/parquet/<table>/h…-legacy.parquet` exist. A second restart
+   must not create another migrated file.
+4. Check `/api/v1/stats` → `locks` for a steady `holder=idle` and
+   `/metrics` for `lidlesseye_parquet_files_pruned_total`. Trigger an immediate
+   flush with `lidlesseye flush --server http://lidlesseye:4040` if the RPO must
+   be shortened before traffic is shifted.
+5. Roll back by stopping the new server, restoring the pre-upgrade snapshot and
+   redeploying the old image. Do not point the old image at a migrated volume.
+
 ```bash
 # disk mode (default): local Parquet only
 lidlesseye serve --storage-mode=disk \
