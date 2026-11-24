@@ -251,6 +251,28 @@ map windows while the server endpoint is briefly absent.
   429 and 5xx are. Final drop warnings now include attempt count and elapsed
   time so a real outage is distinguishable from a bad payload.
 
+## [0.1.17] - 2026-11-24
+
+S3-compatible endpoints that do not implement multipart uploads can now archive
+Parquet instead of backing off forever on HTTP 501.
+
+### Added
+
+- `--s3-max-parts-per-file` (env `LIDLESSEYE_S3_MAX_PARTS_PER_FILE`, Helm
+  `server.storage.s3.maxPartsPerFile`) sets DuckDB's
+  `s3_uploader_max_parts_per_file`. Set it to `1` to write each archive object
+  with a single PUT on gateways and test servers that reject multipart uploads.
+  Values outside DuckDB's accepted range (1..=10000) are rejected at startup.
+  The default stays unset, so AWS S3 keeps multipart uploads.
+- `docs/deployment.md` documents when to use the single-PUT mode and its
+  memory trade-off.
+
+### Upgrade notes
+
+No storage layout change: existing Parquet files, DuckDB migrations and S3
+objects are read exactly as before. The flag only changes how new archive
+objects are uploaded.
+
 ## [0.1.16] - 2026-11-24
 
 Storage no longer keeps a persistent DuckDB file that every agent and dashboard
@@ -697,7 +719,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/xsj321/LidlessEye/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/xsj321/LidlessEye/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/xsj321/LidlessEye/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/xsj321/LidlessEye/compare/v0.1.13...v0.1.14
