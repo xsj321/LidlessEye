@@ -243,10 +243,40 @@ pub(crate) fn create_schema(conn: &Connection, state: &ParquetState) -> Result<(
     // Columns added after a release: `CREATE TABLE` above is a no-op on an
     // existing database, so the hot tier needs an explicit migration. Old
     // Parquet files simply lack the column and `union_by_name` reads NULL.
+    // The canonical VIEWs depend on the hot tables, and DuckDB refuses an
+    // ALTER while a dependent VIEW exists, so drop them first and rebuild
+    // them below. On a fresh store this is a no-op.
+    for def in TABLES {
+        conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", def.name))
+            .map_err(|e| Error::Db(format!("dropping view {}: {e}", def.name)))?;
+    }
+    // DuckDB does not support `ADD COLUMN IF NOT EXISTS` with a NOT NULL
+    // default, so ask the catalogue which columns are already there. This was
+    // previously a swallowed error: a fresh store tried to re-add every column
+    // and silently kept only the ones the DDL already provided.
+    let mut existing = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = 'net_edges_hot'",
+            )
+            .map_err(|e| Error::Db(format!("reading net_edges_hot columns: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Db(format!("reading net_edges_hot columns: {e}")))?;
+        for row in rows {
+            existing.push(row.map_err(|e| Error::Db(format!("reading column name: {e}")))?);
+        }
+    }
     for column in ["client_pod", "server_pod", "host", "sql"] {
-        let _ = conn.execute_batch(&format!(
-            "ALTER TABLE net_edges_hot ADD COLUMN IF NOT EXISTS {column} VARCHAR DEFAULT '' NOT NULL"
-        ));
+        if existing.iter().any(|name| name == column) {
+            continue;
+        }
+        conn.execute_batch(&format!(
+            "ALTER TABLE net_edges_hot ADD COLUMN {column} VARCHAR DEFAULT '' NOT NULL"
+        ))
+        .map_err(|e| Error::Db(format!("migrating net_edges_hot.{column}: {e}")))?;
     }
     refresh_views(conn, state)
 }

@@ -2561,16 +2561,49 @@ fn create_schema(conn: &Connection) -> Result<()> {
 /// bucket or a node still benefit from an ART index — especially on the wide
 /// time ranges that were slow before. Created defensively so an older database
 /// or a build without ART support still opens.
-fn create_indexes(conn: &Connection) -> Result<()> {
-    let indexes = [
+/// Indexes every read path relies on, paired with the name needed to rebuild
+/// them. Schema migrations must drop these before altering a table: DuckDB
+/// refuses `ALTER TABLE` while an index depends on the table.
+const INDEXES: &[(&str, &str)] = &[
+    (
+        "idx_net_edges_bucket",
         "CREATE INDEX IF NOT EXISTS idx_net_edges_bucket ON net_edges(bucket_ns)",
+    ),
+    (
+        "idx_net_edges_node",
         "CREATE INDEX IF NOT EXISTS idx_net_edges_node ON net_edges(client_id, server_id)",
+    ),
+    (
+        "idx_net_nodes_bucket",
         "CREATE INDEX IF NOT EXISTS idx_net_nodes_bucket ON net_nodes(bucket_ns)",
+    ),
+    (
+        "idx_net_nodes_node",
         "CREATE INDEX IF NOT EXISTS idx_net_nodes_node ON net_nodes(node_id)",
+    ),
+    (
+        "idx_samples_time",
         "CREATE INDEX IF NOT EXISTS idx_samples_time ON samples(profile_type, start_ns, end_ns)",
+    ),
+    (
+        "idx_batches_time",
         "CREATE INDEX IF NOT EXISTS idx_batches_time ON batches(profile_type, start_ns, end_ns)",
-    ];
-    for sql in indexes {
+    ),
+];
+
+/// Drop the indexes that `create_indexes` owns so a migration can alter their
+/// tables. Only called when a column actually needs adding: doing this on
+/// every open makes concurrent readers fight over DuckDB's WAL.
+fn drop_indexes(conn: &Connection) -> Result<()> {
+    for (name, _) in INDEXES {
+        conn.execute_batch(&format!("DROP INDEX IF EXISTS {name}"))
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+fn create_indexes(conn: &Connection) -> Result<()> {
+    for (_, sql) in INDEXES {
         if let Err(err) = conn.execute_batch(sql) {
             warn!("skipping index `{sql}`: {err}");
         }
@@ -2585,54 +2618,69 @@ fn create_indexes(conn: &Connection) -> Result<()> {
 /// is asked rather than relying on `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`,
 /// whose availability depends on the DuckDB build the agent was linked with.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    add_columns(
-        conn,
-        "net_edges",
-        &[
-            ("tx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
-            ("rx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
-            ("rtt_us_sum", "BIGINT DEFAULT 0 NOT NULL"),
-            ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
-            ("client_container", "VARCHAR DEFAULT '' NOT NULL"),
-            ("server_container", "VARCHAR DEFAULT '' NOT NULL"),
-            ("client_pod", "VARCHAR DEFAULT '' NOT NULL"),
-            ("server_pod", "VARCHAR DEFAULT '' NOT NULL"),
-            ("host", "VARCHAR DEFAULT '' NOT NULL"),
-            ("sql", "VARCHAR DEFAULT '' NOT NULL"),
-        ],
-    )?;
-    add_columns(
-        conn,
-        "net_nodes",
-        &[
-            ("pods", "BIGINT DEFAULT 0 NOT NULL"),
-            ("ready", "BIGINT DEFAULT 0 NOT NULL"),
-            ("instances", "VARCHAR DEFAULT '[]' NOT NULL"),
-            ("containers", "VARCHAR DEFAULT '[]' NOT NULL"),
-        ],
-    )
+    const NET_EDGE_COLUMNS: &[(&str, &str)] = &[
+        ("tx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
+        ("rx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
+        ("rtt_us_sum", "BIGINT DEFAULT 0 NOT NULL"),
+        ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
+        ("client_container", "VARCHAR DEFAULT '' NOT NULL"),
+        ("server_container", "VARCHAR DEFAULT '' NOT NULL"),
+        ("client_pod", "VARCHAR DEFAULT '' NOT NULL"),
+        ("server_pod", "VARCHAR DEFAULT '' NOT NULL"),
+        ("host", "VARCHAR DEFAULT '' NOT NULL"),
+        ("sql", "VARCHAR DEFAULT '' NOT NULL"),
+    ];
+    const NET_NODE_COLUMNS: &[(&str, &str)] = &[
+        ("pods", "BIGINT DEFAULT 0 NOT NULL"),
+        ("ready", "BIGINT DEFAULT 0 NOT NULL"),
+        ("instances", "VARCHAR DEFAULT '[]' NOT NULL"),
+        ("containers", "VARCHAR DEFAULT '[]' NOT NULL"),
+    ];
+
+    let edges = missing_columns(conn, "net_edges", NET_EDGE_COLUMNS)?;
+    let nodes = missing_columns(conn, "net_nodes", NET_NODE_COLUMNS)?;
+    // The common case — an already-current database — must stay read-only at
+    // the DDL level. Dropping and recreating indexes every time a second
+    // connection opens the same file makes DuckDB fight over its WAL.
+    if edges.is_empty() && nodes.is_empty() {
+        return Ok(());
+    }
+
+    drop_indexes(conn)?;
+    add_columns(conn, "net_edges", &edges)?;
+    add_columns(conn, "net_nodes", &nodes)?;
+    create_indexes(conn)
+}
+
+fn existing_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_name = ?",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![table], |row| row.get::<_, String>(0))
+        .map_err(db_err)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(db_err)
+}
+
+fn missing_columns<'a>(
+    conn: &Connection,
+    table: &str,
+    added: &'a [(&'a str, &'a str)],
+) -> Result<Vec<(&'a str, &'a str)>> {
+    let existing = existing_columns(conn, table)?;
+    Ok(added
+        .iter()
+        .copied()
+        .filter(|(column, _)| !existing.iter().any(|name| name.as_str() == *column))
+        .collect())
 }
 
 fn add_columns(conn: &Connection, table: &str, added: &[(&str, &str)]) -> Result<()> {
-    let mut existing: Vec<String> = Vec::new();
-    {
-        let mut stmt = conn
-            .prepare(
-                "SELECT column_name FROM information_schema.columns \
-                 WHERE table_name = ?",
-            )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map(params![table], |row| row.get::<_, String>(0))
-            .map_err(db_err)?;
-        for row in rows {
-            existing.push(row.map_err(db_err)?);
-        }
-    }
     for (column, definition) in added {
-        if existing.iter().any(|name| name == column) {
-            continue;
-        }
         conn.execute_batch(&format!(
             "ALTER TABLE {table} ADD COLUMN {column} {definition}"
         ))
@@ -2928,6 +2976,65 @@ mod tests {
         assert_eq!(store2.stats().batch_count, 3);
         assert_eq!(store2.stats().total_value, 3_000);
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_indexed_old_net_edges_table_upgrades_in_place() {
+        let dir = std::env::temp_dir().join(format!("lidlesseye-upgrade-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            // This is the 0.1.10 shape: no `rtt_samples`, but with the indexes
+            // that earlier starts created. DuckDB refuses to ALTER a table
+            // while an index depends on it, which used to make every upgraded
+            // tenant fail to open.
+            let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE net_edges (
+                    bucket_ns BIGINT NOT NULL,
+                    client_id VARCHAR NOT NULL,
+                    server_id VARCHAR NOT NULL,
+                    protocol VARCHAR NOT NULL,
+                    client_container VARCHAR DEFAULT '' NOT NULL,
+                    server_container VARCHAR DEFAULT '' NOT NULL,
+                    client_pod VARCHAR DEFAULT '' NOT NULL,
+                    server_pod VARCHAR DEFAULT '' NOT NULL,
+                    connections BIGINT NOT NULL,
+                    retransmits BIGINT NOT NULL,
+                    tx_bytes BIGINT NOT NULL,
+                    rx_bytes BIGINT NOT NULL,
+                    rtt_us_sum BIGINT NOT NULL
+                 );
+                 CREATE INDEX idx_net_edges_bucket ON net_edges(bucket_ns);
+                 CREATE INDEX idx_net_edges_node ON net_edges(client_id, server_id);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(StoreConfig::new(&dir)).unwrap();
+        assert!(store.net_edges(0, u64::MAX).unwrap().is_empty());
+
+        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        let columns: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.columns \
+                 WHERE table_name = 'net_edges' AND column_name = 'rtt_samples'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1, "rtt_samples was not migrated");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'net_edges'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            indexes >= 2,
+            "net_edges indexes were not rebuilt: {indexes}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

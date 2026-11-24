@@ -175,6 +175,24 @@ and every chart exposes the same numbers as a semantic table.
   and a profile-type change only re-queries the profile data rather than the
   network history.
 
+## [0.1.12] - 2026-11-24
+
+An upgrade no longer leaves an existing tenant database unopenable.
+
+### Fixed
+
+- `Store::open` now drops its own indexes before adding columns to an older
+  `net_edges` table and rebuilds them afterwards. DuckDB refuses `ALTER TABLE`
+  while an index depends on the table, so an upgrade from 0.1.10 left the
+  `default` tenant closed with `Dependency Error: Cannot alter entry
+  "net_edges" because there are entries that depend on it`.
+- Parquet mode drops the canonical views before migrating `net_edges_hot` and
+  restores them afterwards, for the same reason. Migration errors are no
+  longer silently ignored there.
+- A regression test opens a 0.1.10-shaped, indexed `net_edges` table with the
+  current binary and verifies that `rtt_samples` and both indexes exist
+  afterwards.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -562,7 +580,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/xsj321/LidlessEye/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/xsj321/LidlessEye/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/xsj321/LidlessEye/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/xsj321/LidlessEye/compare/v0.1.8...v0.1.9
