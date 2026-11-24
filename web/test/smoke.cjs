@@ -220,6 +220,21 @@ async function seed() {
         containers: ["app", "istio-proxy"],
       },
       {
+        id: "shop/gateway",
+        namespace: "shop",
+        workload: "gateway",
+        service: "gateway",
+        kind: "workload",
+        pods: 3,
+        ready: 3,
+        instances: [
+          { name: "gateway-5b6c7d8e9f-a1b2c", uid: "uid-gateway-1", ready: true, phase: "Running" },
+          { name: "gateway-5b6c7d8e9f-d3e4f", uid: "uid-gateway-2", ready: true, phase: "Running" },
+          { name: "gateway-5b6c7d8e9f-g5h6j", uid: "uid-gateway-3", ready: true, phase: "Running" },
+        ],
+        containers: ["app"],
+      },
+      {
         id: "shop/payments",
         namespace: "shop",
         workload: "payments",
@@ -285,6 +300,24 @@ async function seed() {
         rtt_us_sum: 5_000,
         rtt_samples: 5,
       },
+      // A peer workload with three replicas, each calling a different cart
+      // pod. The upstream cards must be drawn and connected per replica, not
+      // with every curve starting at the first one.
+      ...[1, 2, 3].map((n) => ({
+        client: "shop/gateway",
+        server: "shop/cart",
+        protocol: "http",
+        client_container: "app",
+        server_container: "istio-proxy",
+        client_pod: `uid-gateway-${n}`,
+        server_pod: `uid-cart-${n}`,
+        connections: 10 * n,
+        retransmits: 0,
+        rx_bytes: 1_000 * n,
+        tx_bytes: 500 * n,
+        rtt_us_sum: 2_000 * n,
+        rtt_samples: n,
+      })),
       // Two callees of one node that also talk to each other: the neighbourhood
       // draws that as an arc outside the callee column.
       {
@@ -1318,6 +1351,21 @@ async function main() {
   check(
     hops.some((h) => h.from?.includes("::") && h.to?.includes("::")),
     "at least one hop runs container-to-container",
+    JSON.stringify(hops),
+  );
+  // Three replica cards are drawn, but a line that always leaves the first
+  // one is still wrong: each pod must own the traffic attributed to its UID.
+  const edgeEnds = new Set(hops.flatMap((h) => [h.from?.split("@")[0], h.to?.split("@")[0]]));
+  const selfPods = ["uid-cart-1", "uid-cart-2", "uid-cart-3"];
+  check(
+    selfPods.every((uid) => [...edgeEnds].some((key) => key?.includes(`self::pod:${uid}`))),
+    "every self pod card carries an edge attributed to its UID",
+    JSON.stringify(hops),
+  );
+  const peerPods = ["uid-gateway-1", "uid-gateway-2", "uid-gateway-3"];
+  check(
+    peerPods.every((uid) => [...edgeEnds].some((key) => key?.includes(`up:shop/gateway::pod:${uid}`))),
+    "every peer pod card carries an edge attributed to its UID",
     JSON.stringify(hops),
   );
   const ports = await mapPage

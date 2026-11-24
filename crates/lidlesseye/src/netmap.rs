@@ -263,6 +263,12 @@ where
     }
 }
 
+/// Aggregation key for one direction of traffic between two replicas.
+///
+/// The pod UIDs keep replicas of one workload separate even though they share
+/// a single map node.
+type EdgeKey = (String, String, String, String, String, String, String);
+
 /// Turns drained eBPF flows into one map window.
 ///
 /// The observer of a flow is a pod, so the pod's own address is enough to
@@ -283,8 +289,9 @@ impl FlowMapper {
             ..Default::default()
         };
         let mut nodes: HashMap<String, ServiceNode> = HashMap::new();
-        let mut edges: HashMap<(String, String, String, String, String), ServiceEdge> =
-            HashMap::new();
+        // Pod UIDs are part of the key: two replicas share one workload node,
+        // but the one-hop view must keep their traffic on separate cards.
+        let mut edges: HashMap<EdgeKey, ServiceEdge> = HashMap::new();
         let containers = ContainerMap::scan(&self.pods);
         let mut skipped = 0usize;
         let mut hairpin = 0usize;
@@ -377,6 +384,19 @@ impl FlowMapper {
             } else {
                 (flow.tx_bytes, flow.rx_bytes)
             };
+            // The observing agent knows the local replica exactly, and the
+            // peer's UID comes with the resolved pod. Without these the
+            // front-end cannot tell which pod card owns the hop and every
+            // replica's traffic lands on the workload fallback card.
+            let (client_pod, server_pod) = if swapped {
+                (String::new(), meta.uid.clone())
+            } else {
+                let peer_pod = match &peer {
+                    Peer::Pod(other) => other.uid.clone(),
+                    _ => String::new(),
+                };
+                (meta.uid.clone(), peer_pod)
+            };
 
             // The observing socket belongs to one container of the pod, and the
             // peer may be a pod whose port names one on its side. Both are
@@ -429,12 +449,17 @@ impl FlowMapper {
                 slot.connections += flow.opens;
             }
 
+            // Pod UIDs belong in the key: two replicas of one workload are one
+            // node on the map, but they are different cards in the one-hop
+            // view. Merging them here would keep only the first replica's UID.
             let key = (
                 client.clone(),
                 server.clone(),
                 protocol.clone(),
                 client_container.clone(),
                 server_container.clone(),
+                client_pod.clone(),
+                server_pod.clone(),
             );
             let edge = edges.entry(key).or_insert_with(|| ServiceEdge {
                 client,
@@ -442,6 +467,8 @@ impl FlowMapper {
                 protocol,
                 client_container,
                 server_container,
+                client_pod,
+                server_pod,
                 ..Default::default()
             });
             edge.connections += flow.opens;
@@ -1559,6 +1586,55 @@ mod tests {
                 .edges
                 .iter()
                 .all(|edge| edge.server == "shop/payments")
+        );
+    }
+
+    /// Two replicas of one workload are one map node, but they must stay two
+    /// edges with their own pod UIDs; otherwise the one-hop view draws every
+    /// replica's traffic on the first card.
+    #[test]
+    fn flows_from_two_replicas_keep_their_pod_uids() {
+        let mapper = mapper(&[
+            ("u1", "shop", "checkout", "10.0.0.2"),
+            ("u3", "shop", "checkout", "10.0.0.3"),
+            ("u2", "shop", "payments", "10.0.0.7"),
+        ]);
+        let batch = mapper.batch(
+            vec![
+                flow(
+                    ("10.0.0.2", 43210),
+                    ("10.0.0.7", 5432),
+                    Role::Client,
+                    900,
+                    2000,
+                ),
+                flow(
+                    ("10.0.0.3", 43211),
+                    ("10.0.0.7", 5432),
+                    Role::Client,
+                    100,
+                    300,
+                ),
+            ],
+            1,
+        );
+        assert_eq!(batch.edges.len(), 2, "replica flows must not be merged");
+        let mut clients: Vec<_> = batch
+            .edges
+            .iter()
+            .map(|edge| {
+                (
+                    edge.client_pod.as_str(),
+                    edge.server_pod.as_str(),
+                    edge.connections,
+                )
+            })
+            .collect();
+        clients.sort();
+        assert_eq!(
+            clients,
+            vec![("u1", "u2", 1), ("u3", "u2", 1)],
+            "each edge must name the replica that opened it"
         );
     }
 

@@ -193,6 +193,23 @@ An upgrade no longer leaves an existing tenant database unopenable.
   current binary and verifies that `rtt_samples` and both indexes exist
   afterwards.
 
+## [0.1.13] - 2026-11-24
+
+Each replica in the one-hop map now owns the connections it actually carried.
+
+### Fixed
+
+- The eBPF flow mapper left `client_pod` and `server_pod` empty and aggregated
+  edges only by workload, protocol and container. When several pods belonged to
+  one workload their traffic was merged into a single edge, so the front-end
+  had one UID to attach and drew every curve from the first replica's card.
+  The observing pod's UID and the resolved peer pod's UID are now written to
+  the edge and included in its aggregation key, preserving separate
+  container-level connections for each replica.
+- The browser smoke fixture now has three gateway replicas calling three
+  different cart pods and asserts that every self and peer pod card carries an
+  edge attributed to its own UID.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -580,7 +597,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/xsj321/LidlessEye/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/xsj321/LidlessEye/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/xsj321/LidlessEye/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/xsj321/LidlessEye/compare/v0.1.9...v0.1.10
