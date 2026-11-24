@@ -55,7 +55,8 @@ pub use servicemap::{
 };
 pub use store::{
     BatchMeta, DB_FILE, MAX_SCAN_ROWS, NetMetric, PruneStats, S3Config, SCHEMA_VERSION, SampleRow,
-    ScanQuery, ScanResult, SeriesInfo, StorageMode, Store, StoreConfig, StoreStats, duckdb_version,
+    ScanQuery, ScanResult, SeriesInfo, StorageMode, Store, StoreConfig, StoreLockStats, StoreStats,
+    duckdb_version,
 };
 pub use tenant::{MAX_TENANT_LEN, TenantId, TenantInfo, TenantLimits, TenantStore};
 pub use time::{now_ns, parse_duration_ns};

@@ -529,6 +529,25 @@ range, lower `--retention` (fewer files to open per query), and check that
 `parquet` store's queries opens every archived object's footer, so the number
 of *files*, not the number of rows, is what the per-query cost tracks.
 
+**Locating a slow request (store lock vs. query vs. I/O)**
+
+Every tenant store publishes lock telemetry. `/api/v1/stats` returns a `locks`
+object with the current owner (`idle`, `read`, `write`, `flush`, `compact`,
+`archive`, `prune`, `maintenance`), how long it has held the connection, the
+cumulative/total/max wait times and the count of waits over 100 ms. The server
+also logs:
+
+- `stage=read_slot_wait` — time spent in the async read semaphore (15 s cap → 503);
+- `stage=store_lock_wait` — time spent waiting for the tenant's DuckDB connection,
+  including `requester`, `holder` and `holder_held_ms`;
+- `stage=query_exec` — blocking query duration over one second;
+- `stage=store_lock_hold` (debug) — release of a labelled owner.
+
+A chain of `requester=read holder=write` lines during ingest points at write
+serialization; `holder=compact|archive|flush` points at background work on the
+same connection; `read_slot_wait` without `store_lock_wait` means the query
+concurrency cap, not the store, is the bottleneck.
+
 **`database is locked` / `Could not set lock on file …`**
 Another process has the tenant database open. DuckDB allows one writer per
 file: stop the second `serve` instance (or the CLI `query`/`fsck` running

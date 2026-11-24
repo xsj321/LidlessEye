@@ -621,17 +621,19 @@ pub async fn stats(
     let store = maybe_store(&state, &caller);
     // Both numbers are full scans of `batches`, and the dashboard polls this
     // every few seconds. They share one read slot and one blocking task.
-    let (summary, series_count) = match store {
+    let (summary, series_count, locks) = match store {
         Some(store) => {
+            let locks = Some(store.lock_stats());
             let _slot = state.read_slot().await?;
             // `stats_checked`, not `stats`: a busy store must be a 503, not
             // "0 batches", which a dashboard renders as an empty install.
-            state
+            let (stats, series) = state
                 .query_guard(store.clone())
                 .run(move || store.stats_checked())
-                .await?
+                .await?;
+            (stats, series, locks)
         }
-        None => (Default::default(), 0),
+        None => (Default::default(), 0, None),
     };
     let activity = state.activity(&caller.tenant);
     Ok(Json(StatsResponse {
@@ -639,6 +641,7 @@ pub async fn stats(
         tenant: caller.tenant.to_string(),
         uptime_seconds: state.uptime().as_secs(),
         store: summary,
+        locks,
         series: series_count,
         tenants: state.registry().tenant_ids().len(),
         // Per tenant, not per process: a token scoped to one tenant must not

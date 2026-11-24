@@ -38,7 +38,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 use lidlesseye_core::model::Report;
-use lidlesseye_core::store::{StoreConfig, StoreStats};
+use lidlesseye_core::store::{StoreConfig, StoreLockStats, StoreStats};
 use lidlesseye_core::{BatchMeta, Store, TenantId, TenantStore};
 
 pub use config::ServerConfig;
@@ -293,9 +293,18 @@ impl QueryGuard {
             debug!("query exceeded timeout; interrupting DuckDB");
             watchdog_store.interrupt();
         });
+        let started = Instant::now();
         let result = tokio::task::spawn_blocking(query).await;
+        let elapsed = started.elapsed();
         watchdog.abort();
         self.done.store(true, Ordering::Relaxed);
+        if elapsed >= Duration::from_secs(1) {
+            info!(
+                stage = "query_exec",
+                elapsed_ms = elapsed.as_millis(),
+                "blocking query finished"
+            );
+        }
         result.unwrap_or_else(|err| std::panic::resume_unwind(err.into_panic()))
     }
 }
@@ -335,7 +344,18 @@ impl AppState {
         let Some(semaphore) = &self.inner.reads else {
             return Ok(None);
         };
-        match tokio::time::timeout(READ_QUEUE_TIMEOUT, semaphore.clone().acquire_owned()).await {
+        let started = Instant::now();
+        let outcome =
+            tokio::time::timeout(READ_QUEUE_TIMEOUT, semaphore.clone().acquire_owned()).await;
+        let waited = started.elapsed();
+        if waited >= Duration::from_millis(100) {
+            info!(
+                stage = "read_slot_wait",
+                wait_ms = waited.as_millis(),
+                "waited for a query read slot"
+            );
+        }
+        match outcome {
             Ok(Ok(permit)) => Ok(Some(permit)),
             Ok(Err(_)) => Err(ApiError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -834,6 +854,9 @@ pub struct StatsResponse {
     pub tenant: String,
     pub uptime_seconds: u64,
     pub store: StoreStats,
+    /// Connection-lock telemetry for the selected tenant, so a slow request
+    /// can be attributed to a reader, ingest, or a specific background job.
+    pub locks: Option<StoreLockStats>,
     pub series: usize,
     pub tenants: usize,
     pub ingest_reports: u64,

@@ -34,6 +34,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::Instant;
 
 use duckdb::{Connection, InterruptHandle, params};
 use parking_lot::Mutex;
@@ -317,6 +319,187 @@ struct Ids {
     next_batch: u64,
 }
 
+/// Who owns the single store connection, for lock-wait diagnostics.
+///
+/// Every operation that serialises on `conn` declares itself here. A slow
+/// request can then be attributed to the actual holder instead of the
+/// catch-all "store busy", which was the reason a rollout with several agents
+/// turned into unexplained 408s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ConnUser {
+    Idle = 0,
+    Read = 1,
+    Write = 2,
+    Flush = 3,
+    Compact = 4,
+    Archive = 5,
+    Prune = 6,
+    Maintenance = 7,
+}
+
+impl ConnUser {
+    fn label(self) -> &'static str {
+        match self {
+            ConnUser::Idle => "idle",
+            ConnUser::Read => "read",
+            ConnUser::Write => "write",
+            ConnUser::Flush => "flush",
+            ConnUser::Compact => "compact",
+            ConnUser::Archive => "archive",
+            ConnUser::Prune => "prune",
+            ConnUser::Maintenance => "maintenance",
+        }
+    }
+
+    fn from_byte(value: u8) -> Self {
+        match value {
+            1 => ConnUser::Read,
+            2 => ConnUser::Write,
+            3 => ConnUser::Flush,
+            4 => ConnUser::Compact,
+            5 => ConnUser::Archive,
+            6 => ConnUser::Prune,
+            7 => ConnUser::Maintenance,
+            _ => ConnUser::Idle,
+        }
+    }
+}
+
+/// Atomic counters behind [`Store::lock_stats`].
+#[derive(Debug, Default)]
+struct LockTelemetry {
+    user: AtomicU8,
+    acquired_ns: AtomicU64,
+    waits: AtomicU64,
+    wait_nanos: AtomicU64,
+    max_wait_nanos: AtomicU64,
+    slow_waits: AtomicU64,
+    held_nanos: AtomicU64,
+}
+
+/// Observable snapshot of the connection mutex.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StoreLockStats {
+    /// Current owner (`idle`, `read`, `write`, ...).
+    pub holder: String,
+    /// How long the current owner has held the connection, in milliseconds.
+    pub held_ms: u64,
+    /// Number of times a caller had to wait for the connection.
+    pub waits: u64,
+    /// Total time spent waiting, in milliseconds.
+    pub wait_ms: u64,
+    /// Longest single wait, in milliseconds.
+    pub max_wait_ms: u64,
+    /// Waits longer than 100 ms.
+    pub slow_waits: u64,
+}
+
+impl LockTelemetry {
+    fn holder(&self) -> ConnUser {
+        ConnUser::from_byte(self.user.load(Ordering::Acquire))
+    }
+
+    fn held_ms(&self) -> u64 {
+        let acquired = self.acquired_ns.load(Ordering::Relaxed);
+        if acquired == 0 {
+            return 0;
+        }
+        now_ns().saturating_sub(acquired) / 1_000_000
+    }
+
+    fn record_wait(&self, requester: ConnUser, waited: std::time::Duration) {
+        let nanos = waited.as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        self.wait_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.max_wait_nanos.fetch_max(nanos, Ordering::Relaxed);
+        if waited >= std::time::Duration::from_millis(100) {
+            self.slow_waits.fetch_add(1, Ordering::Relaxed);
+            info!(
+                stage = "store_lock_wait",
+                requester = requester.label(),
+                holder = self.holder().label(),
+                holder_held_ms = self.held_ms(),
+                wait_ms = waited.as_millis(),
+                "waited for the store connection"
+            );
+        }
+    }
+
+    fn acquire(&self, user: ConnUser) {
+        self.user.store(user as u8, Ordering::Release);
+        self.acquired_ns.store(now_ns(), Ordering::Release);
+    }
+
+    fn release(&self) {
+        let acquired = self.acquired_ns.swap(0, Ordering::AcqRel);
+        if acquired != 0 {
+            self.held_nanos
+                .fetch_add(now_ns().saturating_sub(acquired), Ordering::Relaxed);
+        }
+        self.user.store(ConnUser::Idle as u8, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> StoreLockStats {
+        StoreLockStats {
+            holder: self.holder().label().to_string(),
+            held_ms: self.held_ms(),
+            waits: self.waits.load(Ordering::Relaxed),
+            wait_ms: self.wait_nanos.load(Ordering::Relaxed) / 1_000_000,
+            max_wait_ms: self.max_wait_nanos.load(Ordering::Relaxed) / 1_000_000,
+            slow_waits: self.slow_waits.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A store-connection guard that publishes its owner and wait time.
+struct ConnLock<'a> {
+    guard: parking_lot::MutexGuard<'a, Connection>,
+    telemetry: &'a LockTelemetry,
+    user: ConnUser,
+}
+
+impl<'a> ConnLock<'a> {
+    fn new(
+        guard: parking_lot::MutexGuard<'a, Connection>,
+        telemetry: &'a LockTelemetry,
+        user: ConnUser,
+    ) -> Self {
+        telemetry.acquire(user);
+        ConnLock {
+            guard,
+            telemetry,
+            user,
+        }
+    }
+}
+
+impl Deref for ConnLock<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for ConnLock<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for ConnLock<'_> {
+    fn drop(&mut self) {
+        debug!(
+            stage = "store_lock_hold",
+            user = self.user.label(),
+            held_ms = self.telemetry.held_ms(),
+            "released store connection"
+        );
+        self.telemetry.release();
+    }
+}
+
 /// Thread-safe profile store.
 ///
 /// DuckDB's Rust binding has no separate `Database` handle: a `Connection`
@@ -328,6 +511,9 @@ struct Ids {
 pub struct Store {
     cfg: StoreConfig,
     conn: Mutex<Connection>,
+    /// Lock owner/wait telemetry, so a slow request can be attributed to a
+    /// read, an ingest write, or a specific background job.
+    telemetry: LockTelemetry,
     /// Cloneable handle that interrupts whatever query is currently running on
     /// `conn` from another thread. Lets the HTTP layer cancel a long scan as
     /// soon as the client goes away or a newer query supersedes it, instead of
@@ -370,7 +556,7 @@ pub struct Store {
 /// "interrupt" window strictly inside the "connection is held" window.
 struct ReadConn<'a> {
     _active: parking_lot::MutexGuard<'a, ()>,
-    conn: parking_lot::MutexGuard<'a, Connection>,
+    conn: ConnLock<'a>,
 }
 
 impl Deref for ReadConn<'_> {
@@ -442,18 +628,44 @@ impl Store {
         // Acquire the connection first: while a read is merely *waiting* for
         // it, a watchdog interrupt must be a no-op rather than hitting the
         // transaction that currently owns the connection.
-        let conn = self.conn.try_lock_for(READ_LOCK_WAIT).ok_or_else(|| {
+        let started = Instant::now();
+        let guard = self.conn.try_lock_for(READ_LOCK_WAIT).ok_or_else(|| {
             Error::Busy(format!(
                 "the store was busy for {}s; a wide scan is running. Narrow the \
                  time range or retry",
                 READ_LOCK_WAIT.as_secs()
             ))
         })?;
+        self.telemetry.record_wait(ConnUser::Read, started.elapsed());
         let active = self.read_active.lock();
         Ok(ReadConn {
             _active: active,
-            conn,
+            conn: ConnLock::new(guard, &self.telemetry, ConnUser::Read),
         })
+    }
+
+    /// Take the connection for a write/maintenance operation and label the
+    /// owner while it is held. Replaces bare `conn.lock()` calls so a queued
+    /// reader can see whether it is waiting behind an ingest, a flush or a
+    /// compaction.
+    fn lock_conn(&self, user: ConnUser) -> ConnLock<'_> {
+        let started = Instant::now();
+        let guard = self.conn.lock();
+        self.telemetry.record_wait(user, started.elapsed());
+        ConnLock::new(guard, &self.telemetry, user)
+    }
+
+    /// [`Store::lock_conn`] with a bounded wait for background work.
+    fn try_lock_conn(&self, user: ConnUser, timeout: std::time::Duration) -> Option<ConnLock<'_>> {
+        let started = Instant::now();
+        let guard = self.conn.try_lock_for(timeout)?;
+        self.telemetry.record_wait(user, started.elapsed());
+        Some(ConnLock::new(guard, &self.telemetry, user))
+    }
+
+    /// Current connection-owner and wait statistics, for diagnostics.
+    pub fn lock_stats(&self) -> StoreLockStats {
+        self.telemetry.snapshot()
     }
 
     /// Name of the table writes must go to. In Parquet mode the canonical
@@ -584,6 +796,7 @@ impl Store {
         let store = Store {
             cfg,
             conn: Mutex::new(conn),
+            telemetry: LockTelemetry::default(),
             interrupt,
             read_active: Mutex::new(()),
             frame_cache: Mutex::new(HashMap::new()),
@@ -753,7 +966,7 @@ impl Store {
         let samples_t = self.wtable("samples");
         let batches_t = self.wtable("batches");
         {
-            let conn = self.conn.lock();
+            let conn = self.lock_conn(ConnUser::Write);
             in_transaction(&conn, "COMMIT", |conn| -> Result<()> {
                 if !pending.frames.is_empty() {
                     let mut stmt = conn
@@ -1300,7 +1513,7 @@ impl Store {
         let Some(state) = &self.parquet else {
             return Ok(0);
         };
-        let conn = self.conn.lock();
+        let conn = self.lock_conn(ConnUser::Flush);
         parquet::flush_hot(&conn, state)
     }
 
@@ -1320,7 +1533,7 @@ impl Store {
         if !self.maintenance_window() {
             return Ok(0);
         }
-        let Some(conn) = self.conn.try_lock_for(BACKGROUND_LOCK_WAIT) else {
+        let Some(conn) = self.try_lock_conn(ConnUser::Flush, BACKGROUND_LOCK_WAIT) else {
             return Ok(0);
         };
         parquet::flush_hot(&conn, state)
@@ -1350,7 +1563,7 @@ impl Store {
             .trim_start_matches('h')
             .parse::<u64>()
             .unwrap_or(u64::MAX);
-        let Some(conn) = self.conn.try_lock_for(BACKGROUND_LOCK_WAIT) else {
+        let Some(conn) = self.try_lock_conn(ConnUser::Compact, BACKGROUND_LOCK_WAIT) else {
             return Ok(parquet::CompactStats::default());
         };
         parquet::compact_local(&conn, state, current_hour)
@@ -1363,7 +1576,7 @@ impl Store {
         let Some(state) = &self.parquet else {
             return Ok(parquet::CompactStats::default());
         };
-        let conn = self.conn.lock();
+        let conn = self.lock_conn(ConnUser::Compact);
         parquet::compact_local(&conn, state, u64::MAX)
     }
 
@@ -1380,7 +1593,7 @@ impl Store {
         if !self.maintenance_window() {
             return Ok(parquet::ArchiveStats::default());
         }
-        let Some(conn) = self.conn.try_lock_for(BACKGROUND_LOCK_WAIT) else {
+        let Some(conn) = self.try_lock_conn(ConnUser::Archive, BACKGROUND_LOCK_WAIT) else {
             return Ok(parquet::ArchiveStats::default());
         };
         parquet::archive_local(&conn, state, now_ns, s3)
@@ -1535,7 +1748,7 @@ impl Store {
             // Background work yields: if a query holds the connection, skip
             // this pass. Retention and eviction are measured in hours; the
             // next tick is a minute away and a query is what a user sees.
-            let Some(conn) = self.conn.try_lock_for(BACKGROUND_LOCK_WAIT) else {
+            let Some(conn) = self.try_lock_conn(ConnUser::Prune, BACKGROUND_LOCK_WAIT) else {
                 return Ok(stats);
             };
             if let Some(retention) = self.cfg.retention_ns {
@@ -1633,7 +1846,7 @@ impl Store {
         let nodes_t = self.wtable("net_nodes");
         let edges_t = self.wtable("net_edges");
         {
-            let conn = self.conn.lock();
+            let conn = self.lock_conn(ConnUser::Maintenance);
             conn.execute_batch(&format!(
                 "DELETE FROM {samples_t}; DELETE FROM {stacks_t}; DELETE FROM {frames_t}; \
                  DELETE FROM {batches_t}; DELETE FROM {nodes_t}; DELETE FROM {edges_t};"
@@ -1657,7 +1870,7 @@ impl Store {
                 }
             }
             state.clear_manifest()?;
-            let conn = self.conn.lock();
+            let conn = self.lock_conn(ConnUser::Maintenance);
             parquet::refresh_views(&conn, state)?;
         }
         self.frame_cache.lock().clear();
@@ -1681,7 +1894,7 @@ impl Store {
 
     fn fsck_inner(&self) -> Result<()> {
         let path = self.path();
-        let conn = self.conn.lock();
+        let conn = self.lock_conn(ConnUser::Maintenance);
         conn.execute_batch("CHECKPOINT").map_err(db_err)?;
 
         let orphan_stacks: i64 = conn
@@ -1719,7 +1932,7 @@ impl Store {
     /// the way a per-file store could: it would destroy the whole tenant.
     /// Returns the number of rows removed.
     pub fn repair(&self) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.lock_conn(ConnUser::Maintenance);
         let (broken, _) = self.dangling_stacks(&conn)?;
         let removed = in_transaction(&conn, "COMMIT", |conn| -> Result<usize> {
             let mut removed = 0usize;
@@ -1805,7 +2018,7 @@ impl Store {
         let bucket = ts(batch.start_ns);
         let nodes_t = self.wtable("net_nodes");
         let edges_t = self.wtable("net_edges");
-        let conn = self.conn.lock();
+        let conn = self.lock_conn(ConnUser::Write);
         in_transaction(&conn, "COMMIT", |conn| -> Result<()> {
             if !batch.nodes.is_empty() {
                 let mut stmt = conn
@@ -3106,6 +3319,27 @@ mod tests {
 
         assert_eq!(decode_labels(""), BTreeMap::new());
         assert_eq!(decode_labels("a=1").get("a").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn lock_stats_expose_the_current_holder() {
+        let (store, _dir) = temp_store("lock-stats");
+        assert_eq!(store.lock_stats().holder, "idle");
+
+        let guard = store.lock_conn(ConnUser::Compact);
+        let held = store.lock_stats();
+        assert_eq!(held.holder, "compact");
+        let waits = held.waits;
+        drop(guard);
+
+        assert_eq!(store.lock_stats().holder, "idle");
+        store
+            .telemetry
+            .record_wait(ConnUser::Read, std::time::Duration::from_millis(25));
+        let stats = store.lock_stats();
+        assert_eq!(stats.waits, waits + 1);
+        assert_eq!(stats.max_wait_ms, 25);
+        assert_eq!(stats.slow_waits, 0);
     }
 
     #[test]
