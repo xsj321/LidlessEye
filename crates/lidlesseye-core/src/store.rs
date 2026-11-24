@@ -1846,12 +1846,14 @@ impl Store {
                 stats.removed_batches += removed.max(0) as usize;
             }
 
-            if let Some(limit) = self.cfg.max_disk_bytes {
-                // Delete whole batches, oldest first, until the *retained*
-                // data fits. DuckDB does not return freed row-group space to
-                // the filesystem, so the file size is not an eviction signal:
-                // using it would evict everything and still never reach the
-                // limit. `SUM(batches.bytes)` is, and the loop is bounded.
+            // In canonical modes the cap is enforced by removing whole
+            // Parquet generations above. Deleting hot rows here cannot shrink
+            // the archived dataset, and looping over `SUM(bytes)` would spin
+            // forever on data that lives in files (seen as a 100-second prune
+            // tick in the S3 staging test).
+            if let Some(limit) = self.cfg.max_disk_bytes
+                && !self.cfg.storage_mode.canonical().uses_parquet()
+            {
                 let mut guard = 0;
                 loop {
                     let size: i64 = conn

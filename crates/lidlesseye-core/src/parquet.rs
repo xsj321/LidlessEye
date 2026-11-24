@@ -1225,6 +1225,21 @@ mod tests {
     use crate::selector::Selector;
     use crate::store::{StorageMode, Store, StoreConfig};
 
+    /// A loopback port that accepts and immediately closes S3 requests, so a
+    /// failed archive is fast and deterministic instead of waiting on httpfs's
+    /// production timeout.
+    fn refusing_s3_endpoint() -> (String, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let incoming = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for stream in incoming.incoming() {
+                drop(stream);
+            }
+        });
+        (endpoint, listener)
+    }
+
     fn parquet_store(name: &str, ttl_ns: u64) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!("ldx-pq-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1386,6 +1401,78 @@ mod tests {
         assert_eq!(flame_total(&store), 0);
         // Flushing an empty hot tier is a no-op.
         assert_eq!(store.flush_hot().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_s3_archive_keeps_the_only_local_copy() {
+        let dir = std::env::temp_dir().join(format!("ldx-pq-s3fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (endpoint, _listener) = refusing_s3_endpoint();
+        let s3 = S3Config {
+            bucket: "unused".into(),
+            prefix: "test".into(),
+            // The probe fails before any local file can be treated as confirmed.
+            endpoint: Some(endpoint),
+            use_ssl: Some(false),
+            url_style: Some("path".into()),
+            ..Default::default()
+        };
+        let cfg = StoreConfig {
+            root: dir.clone(),
+            storage_mode: StorageMode::S3,
+            s3: Some(s3),
+            parquet_local_ttl_ns: Some(0),
+            ..StoreConfig::new(&dir)
+        };
+        let store = Store::open(cfg).unwrap();
+        store
+            .append(&report("checkout", 1_000_000_000, 42))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+
+        let stats = store.archive_local(u64::MAX).unwrap();
+        assert!(stats.failed > 0, "the unreachable endpoint must fail");
+        assert!(
+            store.staged_bytes() > 0,
+            "local staging is the only copy and must survive a failed upload"
+        );
+        assert_eq!(flame_total(&store), 42, "the staged copy stays queryable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s3_staging_is_not_evicted_by_the_disk_cap() {
+        let dir = std::env::temp_dir().join(format!("ldx-pq-s3cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (endpoint, _listener) = refusing_s3_endpoint();
+        let s3 = S3Config {
+            bucket: "unused".into(),
+            prefix: "test".into(),
+            endpoint: Some(endpoint),
+            use_ssl: Some(false),
+            url_style: Some("path".into()),
+            ..Default::default()
+        };
+        let cfg = StoreConfig {
+            root: dir.clone(),
+            storage_mode: StorageMode::S3,
+            s3: Some(s3),
+            max_disk_bytes: Some(1),
+            ..StoreConfig::new(&dir)
+        };
+        let store = Store::open(cfg).unwrap();
+        store
+            .append(&report("checkout", 1_000_000_000, 42))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+
+        store.prune(crate::now_ns()).unwrap();
+        assert!(
+            store.staged_bytes() > 0,
+            "S3 staging is unconfirmed data and must never be pruned locally"
+        );
+        assert_eq!(flame_total(&store), 42);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

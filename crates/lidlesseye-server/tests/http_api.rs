@@ -12,6 +12,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use lidlesseye_core::model::ProfileType;
+use lidlesseye_core::store::{S3Config, StorageMode};
 use lidlesseye_core::{Frame, ReportBuilder, TenantLimits, now_ns};
 use lidlesseye_server::{LidlessEye, ServerConfig};
 use serde_json::{Value, json};
@@ -250,6 +251,63 @@ async fn flush_endpoint_persists_the_hot_tier() {
     .await;
     assert_eq!(status, StatusCode::OK, "{fg}");
     assert_eq!(fg["total"], 1_000_000_000i64, "{fg}");
+}
+
+#[tokio::test]
+async fn s3_staging_full_applies_backpressure() {
+    let dir = tempfile::tempdir().unwrap();
+    // Accept and drop S3 requests so startup discovery fails immediately.
+    let s3_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let s3_endpoint = s3_listener.local_addr().unwrap().to_string();
+    let incoming = s3_listener.try_clone().unwrap();
+    std::thread::spawn(move || {
+        for stream in incoming.incoming() {
+            drop(stream);
+        }
+    });
+    let mut cfg = config(dir.path());
+    cfg.storage_mode = Some(StorageMode::S3);
+    cfg.max_disk_bytes = Some(1);
+    cfg.s3 = Some(S3Config {
+        bucket: "unused".into(),
+        prefix: "test".into(),
+        endpoint: Some(s3_endpoint),
+        use_ssl: Some(false),
+        url_style: Some("path".into()),
+        ..Default::default()
+    });
+    let app = router_with(dir.path(), cfg).await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/ingest",
+        Some(report("checkout", "cpu", 10)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(&app, "POST", "/api/v1/flush", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Local files in S3 mode are unconfirmed staging. A full staging area
+    // must refuse new writes instead of deleting the only copy to make room.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/ingest",
+        Some(report("checkout", "cpu", 10)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("staging")),
+        "{body}"
+    );
 }
 
 #[tokio::test]
