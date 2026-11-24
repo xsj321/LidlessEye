@@ -231,11 +231,23 @@ async fn flush_endpoint_persists_the_hot_tier() {
         "flush did not move any rows: {flushed}"
     );
 
+    // Fragments live in `hour=<n>/` shards, so the listing has to recurse one
+    // level. A flat `read_dir` here would keep passing only if the layout
+    // regressed back to unsharded files.
     let samples = dir.path().join("tenants/default/parquet/samples");
     let parquet_files: Vec<_> = std::fs::read_dir(&samples)
         .unwrap()
         .flatten()
-        .map(|entry| entry.path())
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                std::fs::read_dir(path)
+                    .map(|dir| dir.flatten().map(|file| file.path()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            } else {
+                vec![path]
+            }
+        })
         .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
         .collect();
     assert!(!parquet_files.is_empty(), "no Parquet samples were written");

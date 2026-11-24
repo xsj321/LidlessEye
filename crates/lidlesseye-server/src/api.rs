@@ -603,13 +603,14 @@ pub async fn tenants(
 
 /// One row of the tenant catalogue, with empty stats when nothing is stored.
 fn describe_tenant(state: &AppState, tenant: &TenantId) -> TenantInfo {
-    // One `stats_checked()` call computes stats and the distinct-series count
-    // in the same scan. The old pair of `stats()` + `series_count()` scanned
-    // `batches` twice for the first catalogue request after an upgrade.
+    // From the tenant's stats cache: computed when cold, reused for its TTL.
+    // Computing it for every tenant on every poll is what made the dashboard's
+    // first request wait on a scan per tenant, and the server also warms these
+    // caches in the background at start-up.
     let (stats, series) = state
         .registry()
         .tenant(tenant)
-        .and_then(|store| store.stats_checked().ok())
+        .map(|store| store.stats_cached())
         .unwrap_or_default();
     TenantInfo {
         id: tenant.to_string(),

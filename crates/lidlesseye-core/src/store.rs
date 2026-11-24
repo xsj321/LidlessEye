@@ -211,6 +211,14 @@ pub struct StoreConfig {
     /// before a flush. `None` uses ten seconds.
     #[serde(default)]
     pub flush_interval_ns: Option<u64>,
+    /// Number of read connections opened onto the same in-memory database.
+    ///
+    /// Reads used to share one mutex-guarded connection, so a single wide scan
+    /// put every other request in a queue that ended in a 408. DuckDB is
+    /// MVCC: separate connections can read concurrently while the writer
+    /// commits. `None` derives a small pool from the thread count.
+    #[serde(default)]
+    pub read_connections: Option<usize>,
 }
 
 impl StoreConfig {
@@ -225,7 +233,19 @@ impl StoreConfig {
             s3: None,
             parquet_local_ttl_ns: None,
             flush_interval_ns: None,
+            read_connections: None,
         }
+    }
+
+    /// Effective number of read connections.
+    ///
+    /// Four by default: enough that a dashboard's independent panels (map,
+    /// histogram, series list, stats) no longer queue behind each other, and
+    /// small enough that the extra per-connection DuckDB state stays trivial.
+    /// A pod with many cores may raise it; there is no benefit above the
+    /// query-concurrency limit the server applies.
+    pub fn read_connections(&self) -> usize {
+        self.read_connections.unwrap_or(4).clamp(1, 32)
     }
 
     /// Effective local Parquet TTL: one hour unless overridden.
@@ -581,28 +601,22 @@ impl Drop for ConnLock<'_> {
 
 /// Thread-safe profile store.
 ///
-/// DuckDB's Rust binding has no separate `Database` handle: a `Connection`
-/// owns the engine, and opening the same file twice in one process is a lock
-/// conflict rather than a second reader. Every operation therefore goes
-/// through one connection behind a mutex. Queries are still parallel *inside*
-/// DuckDB (`threads`), which is where a large scan actually spends its time;
-/// what is serialized is the short per-query setup.
+/// DuckDB's Rust binding exposes no separate `Database` handle, but a
+/// `Connection` can be cloned onto the same in-memory database. That is what
+/// the pool below uses: one writer connection owns the hot tables, and several
+/// read connections serve queries concurrently under DuckDB's MVCC. Previously
+/// a single mutex-guarded connection serialised everything, so one wide scan
+/// queued every other request behind it until the HTTP deadline (a 408 that
+/// looked like a broken server).
 pub struct Store {
     cfg: StoreConfig,
+    /// Writer connection: hot-table inserts, flushes, DDL, maintenance.
     conn: Mutex<Connection>,
-    /// Lock owner/wait telemetry, so a slow request can be attributed to a
-    /// read, an ingest write, or a specific background job.
+    /// Owner/wait telemetry for the writer lock, so a slow ingest or flush is
+    /// attributable. Reads are not tracked here: several run at once.
     telemetry: LockTelemetry,
-    /// Cloneable handle that interrupts whatever query is currently running on
-    /// `conn` from another thread. Lets the HTTP layer cancel a long scan as
-    /// soon as the client goes away or a newer query supersedes it, instead of
-    /// holding the single connection hostage until it finishes.
-    interrupt: Arc<InterruptHandle>,
-    /// Held for exactly as long as a read owns `conn`. `interrupt()` consults
-    /// this before signalling DuckDB: an interrupt aimed at a finished read
-    /// must not land on a write that is now inside an explicit transaction,
-    /// which would leave the shared connection aborted.
-    read_active: Mutex<()>,
+    /// Read connections onto the same in-memory database.
+    readers: ReaderPool,
     /// `(module, symbol, file, line)` -> frame id, for the write path only.
     frame_cache: Mutex<HashMap<FrameKey, u32>>,
     ids: Mutex<Ids>,
@@ -611,7 +625,7 @@ pub struct Store {
     parquet: ParquetState,
     /// Second in-memory connection used by compaction and S3 upload. It only
     /// opens Parquet files, so a long merge/upload no longer blocks queries
-    /// or ingests on the connection that owns the hot tables and VIEWs.
+    /// or ingests on the connection that owns the hot tables.
     maintenance_conn: Mutex<Connection>,
     /// Wall-clock instant of the last local Parquet compaction pass. The
     /// compaction tick runs every few seconds; rewriting an hour's files that
@@ -620,21 +634,127 @@ pub struct Store {
     /// Last successful hot-tier flush, for the configured RPO cadence.
     last_flush_ns: std::sync::atomic::AtomicU64,
     /// Cached [`StoreStats`], the distinct-series count, and when they were
-    /// computed. Every open dashboard polls `stats`, and in Parquet mode that
-    /// query opens every file's footer just to count rows.
+    /// computed. Every open dashboard polls `stats`, and in canonical modes
+    /// that query has to open the footer of every Parquet file to count rows.
     stats_cache: Mutex<Option<(u64, StoreStats, usize)>>,
 }
 
-/// A read's exclusive hold on the store connection.
+/// One read connection onto the shared database.
+struct ReaderSlot {
+    conn: Mutex<Connection>,
+    /// Locked for exactly as long as a query owns this slot. [`ReaderPool::interrupt_all`]
+    /// consults it so an interrupt cannot land on an idle connection — and
+    /// never on the writer, whose transaction must not be aborted.
+    active: Mutex<()>,
+    interrupt: Arc<InterruptHandle>,
+}
+
+/// A small fixed pool of read connections.
 ///
-/// The second guard is what makes [`Store::interrupt`] safe: it is locked only
-/// while a read is actually on the connection, so a late watchdog tick cannot
-/// abort an ingest that acquired `conn` immediately after the read finished.
-/// `_active` is declared first so it is dropped first; that ordering keeps the
-/// "interrupt" window strictly inside the "connection is held" window.
+/// Slots are handed out from a free list and returned on drop. Waiting is
+/// bounded: a caller that cannot get a slot is told the store is busy, which
+/// the HTTP layer turns into a retryable response instead of letting the
+/// request sit until its own deadline.
+struct ReaderPool {
+    slots: Vec<ReaderSlot>,
+    /// Ids of free slots, most recently used first so a single sequential
+    /// client keeps reusing one connection (and its warm caches).
+    free: Mutex<Vec<usize>>,
+    cv: parking_lot::Condvar,
+    /// Wait counters; ownership is not tracked per slot because several reads
+    /// legitimately run at once.
+    waits: AtomicU64,
+    wait_nanos: AtomicU64,
+    max_wait_nanos: AtomicU64,
+}
+
+impl ReaderPool {
+    /// Clone `count` connections off `conn` and give each the session settings
+    /// it would otherwise lack.
+    ///
+    /// DuckDB's `SET` is session-scoped for most options, so a cloned
+    /// connection starts with the defaults: no metadata cache, a 30-second
+    /// HTTP timeout, one thread. Applying the same tuning here is what makes
+    /// the pool actually fast — and what keeps a stalled S3 read from holding
+    /// a reader for hours.
+    fn new(conn: &Connection, count: usize, cfg: &StoreConfig, temp: &Path) -> Result<Self> {
+        let mut slots = Vec::with_capacity(count);
+        for _ in 0..count {
+            let reader = conn
+                .try_clone()
+                .map_err(|err| Error::Db(format!("opening a read connection: {err}")))?;
+            tune_connection(&reader, temp, cfg)?;
+            if let Some(s3) = &cfg.s3 {
+                parquet::configure_s3(&reader, s3)?;
+            }
+            let interrupt = reader.interrupt_handle();
+            slots.push(ReaderSlot {
+                conn: Mutex::new(reader),
+                active: Mutex::new(()),
+                interrupt,
+            });
+        }
+        let free = (0..slots.len()).rev().collect();
+        Ok(ReaderPool {
+            slots,
+            free: Mutex::new(free),
+            cv: parking_lot::Condvar::new(),
+            waits: AtomicU64::new(0),
+            wait_nanos: AtomicU64::new(0),
+            max_wait_nanos: AtomicU64::new(0),
+        })
+    }
+
+    fn acquire(&self, timeout: std::time::Duration) -> Option<usize> {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut free = self.free.lock();
+        let idx = loop {
+            if let Some(idx) = free.pop() {
+                break Some(idx);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break None;
+            }
+            self.cv.wait_for(&mut free, deadline - now);
+        };
+        let waited = started.elapsed();
+        if waited >= std::time::Duration::from_millis(1) {
+            let nanos = waited.as_nanos().min(u128::from(u64::MAX)) as u64;
+            self.waits.fetch_add(1, Ordering::Relaxed);
+            self.wait_nanos.fetch_add(nanos, Ordering::Relaxed);
+            self.max_wait_nanos.fetch_max(nanos, Ordering::Relaxed);
+        }
+        idx
+    }
+
+    fn release(&self, idx: usize) {
+        self.free.lock().push(idx);
+        self.cv.notify_one();
+    }
+
+    /// Interrupt every read that is currently running. Finished slots are
+    /// skipped, and the writer is never touched.
+    fn interrupt_all(&self) {
+        for slot in &self.slots {
+            if slot.active.try_lock().is_none() {
+                slot.interrupt.interrupt();
+            }
+        }
+    }
+}
+
+/// A read's exclusive hold on one pool slot.
+///
+/// `_active` is declared first so it is released first, keeping the
+/// "interrupt may fire" window strictly inside the "connection is held"
+/// window.
 struct ReadConn<'a> {
     _active: parking_lot::MutexGuard<'a, ()>,
-    conn: ConnLock<'a>,
+    conn: parking_lot::MutexGuard<'a, Connection>,
+    pool: &'a ReaderPool,
+    idx: usize,
 }
 
 impl Deref for ReadConn<'_> {
@@ -648,6 +768,15 @@ impl Deref for ReadConn<'_> {
 impl DerefMut for ReadConn<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
+    }
+}
+
+impl Drop for ReadConn<'_> {
+    fn drop(&mut self) {
+        // Return the slot after the guards above are gone. The pool hands the
+        // id out again only to a caller that immediately blocks on the slot's
+        // own mutex, so this cannot race with the connection still in use.
+        self.pool.release(self.idx);
     }
 }
 
@@ -665,38 +794,40 @@ const READ_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 /// enough that a query never notices.
 const BACKGROUND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long an ingest waits for the writer before telling the agent to retry.
+///
+/// Long enough for a flush of the current hot tier, short enough that a wedged
+/// writer cannot pin every ingest request in the server until the HTTP deadline.
+const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Store {
     /// Whether this store keeps rows in a DuckDB file or in Parquet/S3.
     pub fn storage_mode(&self) -> StorageMode {
         self.cfg.storage_mode
     }
 
-    /// Take the connection for a read, or fail with [`Error::Busy`].
+    /// Take a read connection, or fail with [`Error::Busy`].
     ///
-    /// Every read path must use this rather than `lock()`. A reader that blocks
-    /// indefinitely is what turned one slow scan into a cascading outage: the
-    /// queued readers cannot be cancelled (the watchdog can only interrupt the
-    /// query that is *running*, not the one still waiting), so each of them
-    /// kept a worker and a slot until the request timeout, and the dashboard
-    /// showed 408s for a server that was merely busy.
+    /// There are several, so a scan no longer queues every other request. The
+    /// wait is still bounded: a caller that cannot get one within
+    /// [`READ_LOCK_WAIT`] is told the store is busy, which the HTTP layer can
+    /// turn into a retryable response instead of a 60 s timeout.
     fn read_conn(&self) -> Result<ReadConn<'_>> {
-        // Acquire the connection first: while a read is merely *waiting* for
-        // it, a watchdog interrupt must be a no-op rather than hitting the
-        // transaction that currently owns the connection.
-        let started = Instant::now();
-        let guard = self.conn.try_lock_for(READ_LOCK_WAIT).ok_or_else(|| {
+        let idx = self.readers.acquire(READ_LOCK_WAIT).ok_or_else(|| {
             Error::Busy(format!(
                 "the store was busy for {}s; a wide scan is running. Narrow the \
                  time range or retry",
                 READ_LOCK_WAIT.as_secs()
             ))
         })?;
-        self.telemetry
-            .record_wait(ConnUser::Read, started.elapsed());
-        let active = self.read_active.lock();
+        let slot = &self.readers.slots[idx];
+        let active = slot.active.lock();
+        let conn = slot.conn.lock();
         Ok(ReadConn {
             _active: active,
-            conn: ConnLock::new(guard, &self.telemetry, ConnUser::Read),
+            conn,
+            pool: &self.readers,
+            idx,
         })
     }
 
@@ -714,20 +845,65 @@ impl Store {
     /// [`Store::lock_conn`] with a bounded wait for background work.
     fn try_lock_conn(&self, user: ConnUser, timeout: std::time::Duration) -> Option<ConnLock<'_>> {
         let started = Instant::now();
-        let guard = self.conn.try_lock_for(timeout)?;
+        let guard = self.conn.try_lock_for(timeout);
+        // Record the wait whether or not it succeeded: a timeout is exactly the
+        // datapoint that explains a burst of `Busy` responses.
         self.telemetry.record_wait(user, started.elapsed());
+        let guard = guard?;
         Some(ConnLock::new(guard, &self.telemetry, user))
+    }
+
+    /// Take the writer for an ingest, or report [`Error::Busy`].
+    ///
+    /// Ingest used to wait for the connection indefinitely. When a flush or a
+    /// maintenance pass owned it, agent reports piled up inside the server,
+    /// each holding a request slot, until the HTTP layer timed them out and the
+    /// agents retried — the "report queue full" storm. A bounded wait turns
+    /// that into a fast, retryable error while the work that holds the writer
+    /// finishes.
+    fn write_conn(&self) -> Result<ConnLock<'_>> {
+        self.try_lock_conn(ConnUser::Write, WRITE_LOCK_WAIT)
+            .ok_or_else(|| {
+                Error::Busy(format!(
+                    "the store was busy for {}s; a flush or maintenance pass owns the \
+                     writer. Retry the report",
+                    WRITE_LOCK_WAIT.as_secs()
+                ))
+            })
     }
 
     /// Current connection-owner and wait statistics, for diagnostics.
     pub fn lock_stats(&self) -> StoreLockStats {
-        self.telemetry.snapshot()
+        let mut stats = self.telemetry.snapshot();
+        // Reader waits live in the pool (there is no single owner to report).
+        stats.waits += self.readers.waits.load(Ordering::Relaxed);
+        stats.wait_ms += self.readers.wait_nanos.load(Ordering::Relaxed) / 1_000_000;
+        stats.max_wait_ms = stats
+            .max_wait_ms
+            .max(self.readers.max_wait_nanos.load(Ordering::Relaxed) / 1_000_000);
+        stats
     }
 
     /// Canonical names are VIEWs (hot ∪ local ∪ S3), so writes always target
     /// the in-memory hot table.
     fn wtable(&self, name: &str) -> String {
         format!("{name}_hot")
+    }
+
+    /// `FROM`-clause for a canonical table restricted to a time window.
+    ///
+    /// Every read uses this instead of naming a VIEW. The relation is the hot
+    /// tier plus only the Parquet hours that can overlap `[from_ns, until_ns)`:
+    /// a one-hour query over a week of history names one file, where a VIEW
+    /// over the whole archive would make DuckDB open every footer in the
+    /// retention window before it could return a single row.
+    fn span(&self, table: &str, from_ns: u64, until_ns: u64) -> String {
+        parquet::table_span(&self.parquet, table, from_ns, until_ns)
+    }
+
+    /// [`Store::span`] over the whole dataset, for aggregates with no window.
+    fn span_all(&self, table: &str) -> String {
+        parquet::table_span_all(&self.parquet, table)
     }
 }
 
@@ -803,32 +979,49 @@ impl Store {
         );
 
         // A separate connection for merges/uploads: it opens Parquet files and
-        // S3 objects, never the hot tables or the canonical VIEWs. A slow
-        // upload can no longer make every ingest and query wait on it.
+        // S3 objects, never the hot tables. A slow upload can no longer make
+        // every ingest and query wait on it.
         let maintenance_conn = Connection::open_in_memory()
             .map_err(|err| Error::Db(format!("opening maintenance DuckDB: {err}")))?;
         if mode == StorageMode::S3 {
             parquet::configure_s3(&maintenance_conn, cfg.s3.as_ref().expect("validated above"))?;
         }
-        let interrupt = conn.interrupt_handle();
+        // Readers share the same in-memory database through cloned
+        // connections, so queries no longer serialise on the writer. Each one
+        // is tuned again: DuckDB's SET is session-scoped.
+        let readers = ReaderPool::new(
+            &conn,
+            cfg.read_connections(),
+            &cfg,
+            &parquet_state.dir.join(".duckdb-tmp"),
+        )?;
 
         info!(stage = "id_counters", "loading store id counters");
         let ids = {
-            // These SELECTs hit canonical names: real tables in DuckDB mode,
-            // VIEWs over (hot ∪ local ∪ S3) in Parquet mode.
+            // Ids are allocated across the *whole* dataset, so these three
+            // lookups must span the hot tier and every Parquet file. They are
+            // one `MAX` per table; DuckDB answers each from file statistics
+            // without reading any row groups.
+            let frames_span = parquet::table_span_all(&parquet_state, "frames");
+            let stacks_span = parquet::table_span_all(&parquet_state, "stacks");
+            let batches_span = parquet::table_span_all(&parquet_state, "batches");
             let max_frame: i64 = conn
-                .query_row("SELECT COALESCE(MAX(frame_id), 0) FROM frames", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    &format!("SELECT COALESCE(MAX(frame_id), 0) FROM {frames_span}"),
+                    [],
+                    |row| row.get(0),
+                )
                 .unwrap_or(0);
             let max_stack: i64 = conn
-                .query_row("SELECT COALESCE(MAX(stack_id), 0) FROM stacks", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    &format!("SELECT COALESCE(MAX(stack_id), 0) FROM {stacks_span}"),
+                    [],
+                    |row| row.get(0),
+                )
                 .unwrap_or(0);
             let max_batch: i64 = conn
                 .query_row(
-                    "SELECT COALESCE(MAX(batch_id), 0) FROM batches",
+                    &format!("SELECT COALESCE(MAX(batch_id), 0) FROM {batches_span}"),
                     [],
                     |row| row.get(0),
                 )
@@ -847,8 +1040,7 @@ impl Store {
             cfg,
             conn: Mutex::new(conn),
             telemetry: LockTelemetry::default(),
-            interrupt,
-            read_active: Mutex::new(()),
+            readers,
             frame_cache: Mutex::new(HashMap::new()),
             ids: Mutex::new(ids),
             parquet: parquet_state,
@@ -875,11 +1067,10 @@ impl Store {
     /// unlucky tick during `ROLLBACK` stranded the connection in the aborted
     /// state that made every later ingest fail with the same error.
     pub fn interrupt(&self) {
-        let Some(_guard) = self.read_active.try_lock() else {
-            self.interrupt.interrupt();
-            return;
-        };
-        drop(_guard);
+        // Only readers are interrupted. The writer's connection is never
+        // signalled: a watchdog tick that lands inside its transaction leaves
+        // DuckDB aborted, and every later ingest fails with the same error.
+        self.readers.interrupt_all();
     }
 
     pub fn config(&self) -> &StoreConfig {
@@ -925,9 +1116,13 @@ impl Store {
         selector: &Selector,
     ) -> Result<Vec<Arc<BatchMeta>>> {
         let conn = self.read_conn()?;
-        let mut sql = String::from(
+        let span = match window {
+            Some((_, from_ns, until_ns)) => self.span("batches", from_ns, until_ns),
+            None => self.span_all("batches"),
+        };
+        let mut sql = format!(
             "SELECT batch_id, profile_type, service_name, labels, start_ns, end_ns, \
-                    total_value, sample_count, bytes, created_ns FROM batches",
+                    total_value, sample_count, bytes, created_ns FROM {span}"
         );
         let mut clauses: Vec<String> = Vec::new();
         let mut args: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
@@ -1013,7 +1208,7 @@ impl Store {
         let samples_t = self.wtable("samples");
         let batches_t = self.wtable("batches");
         {
-            let conn = self.lock_conn(ConnUser::Write);
+            let conn = self.write_conn()?;
             in_transaction(&conn, "COMMIT", |conn| -> Result<()> {
                 if !pending.frames.is_empty() {
                     let mut stmt = conn
@@ -1095,8 +1290,10 @@ impl Store {
         );
 
         // A caller that appends and then asks for stats must see its own write.
-        // The cache only short-circuits polling between writes.
-        *self.stats_cache.lock() = None;
+        // Clearing the cache did that by forcing a full re-scan — on every
+        // append, which is every few seconds per agent. The deltas are exact,
+        // so account them instead; the TTL still refreshes the series count.
+        self.bump_cached_stats(total_value, bytes, report.start_ns, report.end_ns);
         Ok(Arc::new(BatchMeta {
             batch_id,
             profile_type: report.profile_type.clone(),
@@ -1202,6 +1399,7 @@ impl Store {
     /// reference.
     pub fn scan(&self, query: &ScanQuery<'_>) -> Result<ScanResult> {
         let conn = self.read_conn()?;
+        let span = self.span("samples", query.from_ns, query.until_ns);
         let types = query.profile_type.source_types();
         let placeholders = vec!["?"; types.len()].join(", ");
         // A selector or a `group_by` needs the series columns; a plain
@@ -1222,21 +1420,21 @@ impl Store {
         let mut sql = if gauge {
             let inner = vec!["?"; types.len()].join(", ");
             format!(
-                "SELECT {series_columns}SUM(value), COUNT(*) FROM samples \
+                "SELECT {series_columns}SUM(value), COUNT(*) FROM {span} \
                  WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ? \
                    AND (service_name, labels, end_ns) IN (\
-                        SELECT service_name, labels, MAX(end_ns) FROM samples \
+                        SELECT service_name, labels, MAX(end_ns) FROM {span} \
                         WHERE profile_type IN ({inner}) AND end_ns > ? AND start_ns < ? \
                         GROUP BY 1, 2)"
             )
         } else if needs_series {
             format!(
-                "SELECT stack_id, service_name, labels, SUM(value), COUNT(*) FROM samples \
+                "SELECT stack_id, service_name, labels, SUM(value), COUNT(*) FROM {span} \
                  WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ?"
             )
         } else {
             format!(
-                "SELECT stack_id, SUM(value), COUNT(*) FROM samples \
+                "SELECT stack_id, SUM(value), COUNT(*) FROM {span} \
                  WHERE profile_type IN ({placeholders}) AND end_ns > ? AND start_ns < ?"
             )
         };
@@ -1375,24 +1573,27 @@ impl Store {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS lidlesseye_query_ids(id BIGINT); \
-             DELETE FROM lidlesseye_query_ids;",
-        )
-        .map_err(db_err)?;
+        // A uniquely named staging table, not a shared one: every read has its
+        // own connection onto the same in-memory database, and a shared
+        // `lidlesseye_query_ids` would let two concurrent scans delete each
+        // other's ids and silently drop stacks.
+        let ids_table = next_staging_table();
+        conn.execute_batch(&format!("CREATE TEMP TABLE {ids_table}(id BIGINT)"))
+            .map_err(db_err)?;
         {
-            let mut appender = conn.appender("lidlesseye_query_ids").map_err(db_err)?;
+            let mut appender = conn.appender(&ids_table).map_err(db_err)?;
             for &id in ids {
                 appender.append_row([id as i64]).map_err(db_err)?;
             }
             appender.flush().map_err(db_err)?;
         }
+        let span = self.span_all("stacks");
         let mut out = HashMap::with_capacity(ids.len());
         let mut stmt = conn
-            .prepare(
-                "SELECT s.stack_id, s.frames FROM stacks s \
-                 JOIN lidlesseye_query_ids q ON s.stack_id = q.id",
-            )
+            .prepare(&format!(
+                "SELECT s.stack_id, s.frames FROM {span} s \
+                 JOIN {ids_table} q ON s.stack_id = q.id"
+            ))
             .map_err(db_err)?;
         let mut rows = stmt.query([]).map_err(db_err)?;
         while let Some(row) = rows.next().map_err(db_err)? {
@@ -1400,6 +1601,9 @@ impl Store {
             let blob: Vec<u8> = row.get(1).map_err(db_err)?;
             out.insert(id, unpack_frames(&blob));
         }
+        drop(rows);
+        drop(stmt);
+        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {ids_table}"));
         Ok(out)
     }
 
@@ -1409,24 +1613,23 @@ impl Store {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS lidlesseye_query_ids(id BIGINT); \
-             DELETE FROM lidlesseye_query_ids;",
-        )
-        .map_err(db_err)?;
+        let ids_table = next_staging_table();
+        conn.execute_batch(&format!("CREATE TEMP TABLE {ids_table}(id BIGINT)"))
+            .map_err(db_err)?;
         {
-            let mut appender = conn.appender("lidlesseye_query_ids").map_err(db_err)?;
+            let mut appender = conn.appender(&ids_table).map_err(db_err)?;
             for &id in ids {
                 appender.append_row([id as i64]).map_err(db_err)?;
             }
             appender.flush().map_err(db_err)?;
         }
+        let span = self.span_all("frames");
         let mut out = HashMap::with_capacity(ids.len());
         let mut stmt = conn
-            .prepare(
-                "SELECT f.frame_id, f.module, f.symbol, f.file, f.line FROM frames f \
-                 JOIN lidlesseye_query_ids q ON f.frame_id = q.id",
-            )
+            .prepare(&format!(
+                "SELECT f.frame_id, f.module, f.symbol, f.file, f.line FROM {span} f \
+                 JOIN {ids_table} q ON f.frame_id = q.id"
+            ))
             .map_err(db_err)?;
         let mut rows = stmt.query([]).map_err(db_err)?;
         while let Some(row) = rows.next().map_err(db_err)? {
@@ -1442,6 +1645,9 @@ impl Store {
                 },
             );
         }
+        drop(rows);
+        drop(stmt);
+        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {ids_table}"));
         Ok(out)
     }
 
@@ -1449,6 +1655,38 @@ impl Store {
         self.stats_snapshot()
             .unwrap_or((StoreStats::default(), 0))
             .0
+    }
+
+    /// The cached catalogue numbers, without scanning.
+    ///
+    /// The tenant list describes every tenant at once. Answering it used to
+    /// mean a full scan per tenant on the request path — ten tenants of 1.5 s
+    /// each is what made the dashboard's first call time out.
+    ///
+    /// This reads the cache and computes it only when it is cold or older than
+    /// the TTL, so the cost is at most one scan per tenant per minute. The
+    /// server warms every tenant in the background at start-up, and write
+    /// paths account their own deltas (see [`Store::bump_cached_stats`]) rather
+    /// than dropping the cache, so a busy tenant does not rescan on every poll.
+    pub fn stats_cached(&self) -> (StoreStats, usize) {
+        self.stats_snapshot().unwrap_or_default()
+    }
+
+    /// Account a committed batch in the cached catalogue.
+    ///
+    /// Only meaningful while an entry exists: with none, the next reader
+    /// computes the truth, which is more accurate than a delta anyway.
+    fn bump_cached_stats(&self, value: u64, bytes: u64, start_ns: u64, end_ns: u64) {
+        let mut cache = self.stats_cache.lock();
+        let Some((_, stats, _)) = cache.as_mut() else {
+            return;
+        };
+        stats.batch_count += 1;
+        stats.total_value = stats.total_value.saturating_add(value);
+        stats.logical_bytes = stats.logical_bytes.saturating_add(bytes);
+        stats.earliest_ns = Some(stats.earliest_ns.map_or(start_ns, |old| old.min(start_ns)));
+        stats.latest_ns = Some(stats.latest_ns.map_or(end_ns, |old| old.max(end_ns)));
+        // `total_bytes` is a directory walk and is refreshed on every read.
     }
 
     /// [`Store::stats_snapshot`] without the fallback: a busy store is an
@@ -1472,16 +1710,23 @@ impl Store {
         // Dashboards poll this every few seconds. In Parquet mode the query
         // reads every file's footer, so a short cache removes a surprising
         // amount of metadata I/O without making the number stale to the eye.
-        if let Some((at, cached, series)) = *self.stats_cache.lock()
-            && now.saturating_sub(at) < 30_000_000_000
+        if let Some((at, mut cached, series)) = *self.stats_cache.lock()
+            && now.saturating_sub(at) < 60_000_000_000
         {
+            // The physical footprint is a directory walk, not a scan, and it
+            // does change on every flush/archive. Refreshing just this field
+            // keeps the byte gauge honest without re-counting a single row.
+            cached.total_bytes = self.disk_bytes();
             return Ok((cached, series));
         }
         let conn = self.read_conn()?;
+        let span = self.span_all("batches");
         let scan_started = std::time::Instant::now();
         let row = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(total_value), 0), COALESCE(SUM(bytes), 0), \
-                    MIN(start_ns), MAX(end_ns) FROM batches",
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(total_value), 0), COALESCE(SUM(bytes), 0), \
+                 MIN(start_ns), MAX(end_ns) FROM {span}"
+            ),
             [],
             |row| {
                 Ok((
@@ -1512,7 +1757,10 @@ impl Store {
         // the mutex is not reentrant.
         let series: usize = conn
             .query_row(
-                "SELECT COUNT(*) FROM (SELECT DISTINCT service_name, profile_type, labels FROM batches)",
+                &format!(
+                    "SELECT COUNT(*) FROM \
+                     (SELECT DISTINCT service_name, profile_type, labels FROM {span})"
+                ),
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -1543,9 +1791,10 @@ impl Store {
         let moved = parquet::flush_hot(&conn, &self.parquet)?;
         self.last_flush_ns
             .store(now_ns(), std::sync::atomic::Ordering::Relaxed);
-        if moved > 0 {
-            *self.stats_cache.lock() = None;
-        }
+        // A flush moves rows from the hot tier into a file; the row count, the
+        // value sum and the time bounds are all unchanged. Dropping the cached
+        // catalogue here made every flush invalidate the whole tenant, and the
+        // next poll re-scanned every file just to print the same numbers.
         Ok(moved)
     }
 
@@ -1569,9 +1818,7 @@ impl Store {
         let moved = parquet::flush_hot(&conn, &self.parquet)?;
         self.last_flush_ns
             .store(now, std::sync::atomic::Ordering::Relaxed);
-        if moved > 0 {
-            *self.stats_cache.lock() = None;
-        }
+        // Row counts survive a flush; see `flush_hot`.
         Ok(moved)
     }
 
@@ -1600,13 +1847,9 @@ impl Store {
         };
         let stats = parquet::compact_local(&conn, &self.parquet, current_hour)?;
         drop(conn);
-        if stats.files_written > 0 {
-            let Some(hot) = self.try_lock_conn(ConnUser::Maintenance, BACKGROUND_LOCK_WAIT) else {
-                return Ok(stats);
-            };
-            parquet::refresh_views(&hot, &self.parquet)?;
-            *self.stats_cache.lock() = None;
-        }
+        // A merge rewrites the same rows into fewer files, so the row counts
+        // the catalogue caches are still correct, and the file index was
+        // refreshed inside `compact_local`. Invalidate nothing.
         Ok(stats)
     }
 
@@ -1614,17 +1857,13 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn compact_all_for_test(&self) -> Result<parquet::CompactStats> {
         let conn = self.maintenance_conn.lock();
-        let stats = parquet::compact_local(&conn, &self.parquet, u64::MAX)?;
-        drop(conn);
-        let hot = self.lock_conn(ConnUser::Maintenance);
-        parquet::refresh_views(&hot, &self.parquet)?;
-        Ok(stats)
+        parquet::compact_local(&conn, &self.parquet, u64::MAX)
     }
 
     /// Upload completed local Parquet files to S3 and remove the local copies
     /// only after the object has been verified. Runs entirely on the
-    /// maintenance connection; the hot connection is only used to refresh the
-    /// read-side VIEWs once new objects are known.
+    /// maintenance connection; the read index is updated before the local
+    /// files are deleted, so no query is left naming a path that is gone.
     pub fn archive_local(&self, now_ns: u64) -> Result<parquet::ArchiveStats> {
         if self.parquet.mode != StorageMode::S3 {
             return Ok(parquet::ArchiveStats::default());
@@ -1635,21 +1874,28 @@ impl Store {
         let Some(conn) = self.maintenance_conn.try_lock_for(BACKGROUND_LOCK_WAIT) else {
             return Ok(parquet::ArchiveStats::default());
         };
-        let stats = parquet::archive_local(&conn, &self.parquet, now_ns, s3)?;
-        drop(conn);
-        if stats.files_uploaded > 0 {
-            let Some(hot) = self.try_lock_conn(ConnUser::Maintenance, BACKGROUND_LOCK_WAIT) else {
-                return Ok(stats);
-            };
-            parquet::refresh_views(&hot, &self.parquet)?;
-            *self.stats_cache.lock() = None;
-        }
-        Ok(stats)
+        // Moving an hour from local staging to S3 does not change how many
+        // rows exist, so the catalogue's cached counts stay valid.
+        parquet::archive_local(&conn, &self.parquet, now_ns, s3)
     }
 
     /// Total bytes of Parquet files staged on local disk.
     pub fn staged_bytes(&self) -> u64 {
         parquet::staged_bytes(&self.parquet)
+    }
+
+    /// How many Parquet files a window would name for one table. Tests only:
+    /// the whole point of sharding is that this number stays small.
+    #[cfg(test)]
+    pub(crate) fn window_file_count(&self, table: &str, from_ns: u64, until_ns: u64) -> usize {
+        parquet::window_file_count(&self.parquet, table, from_ns, until_ns)
+    }
+
+    /// Rescan the local Parquet tree. Tests only: production code reindexes
+    /// after every flush, merge or removal.
+    #[cfg(test)]
+    pub(crate) fn reindex(&self) {
+        parquet::reindex_local(&self.parquet);
     }
 
     pub fn series(
@@ -1668,8 +1914,9 @@ impl Store {
         selector: &Selector,
     ) -> Result<Vec<SeriesInfo>> {
         let conn = self.read_conn()?;
+        let span = self.span("batches", from_ns, until_ns);
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 // A gauge is reported as the newest batch of the series, not as
                 // the sum of every batch in the window: `inuse_space` is memory
                 // held at one instant, and adding ten instants multiplies it by
@@ -1677,9 +1924,9 @@ impl Store {
                 "SELECT service_name, profile_type, labels, \
                         CASE WHEN profile_type IN ('inuse_space', 'inuse_objects') \
                              THEN arg_max(total_value, end_ns) ELSE SUM(total_value) END, \
-                        COUNT(*), MIN(start_ns), MAX(end_ns) FROM batches \
-                 WHERE end_ns > ? AND start_ns < ? GROUP BY 1, 2, 3",
-            )
+                        COUNT(*), MIN(start_ns), MAX(end_ns) FROM {span} \
+                 WHERE end_ns > ? AND start_ns < ? GROUP BY 1, 2, 3"
+            ))
             .map_err(db_err)?;
         let mut rows = stmt
             .query(params![ts(from_ns), ts(until_ns)])
@@ -1752,8 +1999,12 @@ impl Store {
         let Ok(conn) = self.read_conn() else {
             return 0;
         };
+        let span = self.span_all("batches");
         conn.query_row(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT service_name, profile_type, labels FROM batches)",
+            &format!(
+                "SELECT COUNT(*) FROM \
+                 (SELECT DISTINCT service_name, profile_type, labels FROM {span})"
+            ),
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -1767,8 +2018,12 @@ impl Store {
         let Ok(conn) = self.read_conn() else {
             return false;
         };
+        let span = self.span_all("batches");
         conn.query_row(
-            "SELECT 1 FROM batches WHERE service_name = ? AND profile_type = ? AND labels = ? LIMIT 1",
+            &format!(
+                "SELECT 1 FROM {span} \
+                 WHERE service_name = ? AND profile_type = ? AND labels = ? LIMIT 1"
+            ),
             params![
                 report.service_name,
                 report.profile_type.as_str(),
@@ -1809,9 +2064,8 @@ impl Store {
             )?;
             archive_bytes = archives.bytes_reclaimed;
             stats.removed_files = archives.files_removed;
-            if archives.files_removed > 0 {
-                parquet::refresh_views(&conn, &self.parquet)?;
-            }
+            // `prune_archives` already rescanned the file index; there are no
+            // views left to rebuild.
             if let Some(retention) = self.cfg.retention_ns {
                 let cutoff = now_ns.saturating_sub(retention);
                 let removed: i64 = conn
@@ -1855,11 +2109,14 @@ impl Store {
                 && !self.cfg.storage_mode.canonical().uses_parquet()
             {
                 let mut guard = 0;
+                let legacy_span = self.span_all("batches");
                 loop {
                     let size: i64 = conn
-                        .query_row("SELECT COALESCE(SUM(bytes), 0) FROM batches", [], |row| {
-                            row.get(0)
-                        })
+                        .query_row(
+                            &format!("SELECT COALESCE(SUM(bytes), 0) FROM {legacy_span}"),
+                            [],
+                            |row| row.get(0),
+                        )
                         .unwrap_or(0);
                     if size.max(0) as u64 <= limit || guard >= 10_000 {
                         break;
@@ -1867,7 +2124,10 @@ impl Store {
                     guard += 1;
                     let oldest: Option<i64> = conn
                         .query_row(
-                            "SELECT batch_id FROM batches ORDER BY start_ns ASC, batch_id ASC LIMIT 1",
+                            &format!(
+                                "SELECT batch_id FROM {legacy_span} \
+                                 ORDER BY start_ns ASC, batch_id ASC LIMIT 1"
+                            ),
                             [],
                             |row| row.get(0),
                         )
@@ -1920,23 +2180,18 @@ impl Store {
             .map_err(db_err)?;
             conn.execute_batch("CHECKPOINT").map_err(db_err)?;
         }
-        // In Parquet mode the canonical tables are VIEWs; also drop the local
-        // files they read so a clear really empties the store. Archived S3
-        // objects are left for bucket lifecycle policies; queries still see
-        // nothing here because the view over this tenant's prefix is empty
-        // after its local files are removed. For a full purge the operator
-        // clears the S3 prefix.
+        // In canonical modes the durable rows are Parquet files under
+        // `hour=<n>/`, so a clear must remove the whole table tree — a
+        // one-level `read_dir` would leave every shard behind. Archived S3
+        // objects are left for bucket lifecycle policies; for a full purge the
+        // operator clears the S3 prefix.
         for def in parquet::TABLES {
             let dir = self.parquet.table_dir(def.name);
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::create_dir_all(&dir);
         }
-        self.parquet.clear_manifest()?;
-        let conn = self.lock_conn(ConnUser::Maintenance);
-        parquet::refresh_views(&conn, &self.parquet)?;
+        self.parquet.clear_index()?;
+        parquet::reindex_local(&self.parquet);
         self.frame_cache.lock().clear();
         *self.stats_cache.lock() = None;
         let mut ids = self.ids.lock();
@@ -1961,10 +2216,14 @@ impl Store {
         let conn = self.lock_conn(ConnUser::Maintenance);
         conn.execute_batch("CHECKPOINT").map_err(db_err)?;
 
+        let samples_span = self.span_all("samples");
+        let stacks_span = self.span_all("stacks");
         let orphan_stacks: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM samples s LEFT JOIN stacks k USING (stack_id) \
-                 WHERE k.stack_id IS NULL",
+                &format!(
+                    "SELECT COUNT(*) FROM {samples_span} s LEFT JOIN {stacks_span} k \
+                     USING (stack_id) WHERE k.stack_id IS NULL"
+                ),
                 [],
                 |row| row.get(0),
             )
@@ -2046,9 +2305,11 @@ impl Store {
     /// compare its ids against `frames`. Frames are compact enough to hold in
     /// memory; a store with millions of distinct frames makes this slow.
     fn dangling_stacks(&self, conn: &Connection) -> Result<(HashSet<u64>, usize)> {
+        let frames_span = self.span_all("frames");
+        let stacks_span = self.span_all("stacks");
         let known: HashSet<i64> = {
             let mut stmt = conn
-                .prepare("SELECT frame_id FROM frames")
+                .prepare(&format!("SELECT frame_id FROM {frames_span}"))
                 .map_err(db_err)?;
             let mut rows = stmt.query([]).map_err(db_err)?;
             let mut set = HashSet::new();
@@ -2059,7 +2320,7 @@ impl Store {
         };
 
         let mut stmt = conn
-            .prepare("SELECT stack_id, frames FROM stacks")
+            .prepare(&format!("SELECT stack_id, frames FROM {stacks_span}"))
             .map_err(db_err)?;
         let mut rows = stmt.query([]).map_err(db_err)?;
         let mut broken = HashSet::new();
@@ -2094,7 +2355,7 @@ impl Store {
         let bucket = ts(batch.start_ns);
         let nodes_t = self.wtable("net_nodes");
         let edges_t = self.wtable("net_edges");
-        let conn = self.lock_conn(ConnUser::Write);
+        let conn = self.write_conn()?;
         in_transaction(&conn, "COMMIT", |conn| -> Result<()> {
             if !batch.nodes.is_empty() {
                 let mut stmt = conn
@@ -2160,27 +2421,30 @@ impl Store {
             }
             Ok(())
         })?;
-        // The map contributes to `total_bytes`; a cached stats value from
-        // before this window would undercount it.
-        *self.stats_cache.lock() = None;
+        // `total_bytes` is a directory walk, refreshed on every read of the
+        // cache; the row counts belong to `batches`, which this does not touch.
+        // Clearing the cache here made every service-map window — one per node
+        // every ten seconds — force the next dashboard poll to rescan the
+        // tenant's whole archive.
         Ok(())
     }
 
     /// Nodes of the map, busiest first.
     pub fn net_nodes(&self, from_ns: u64, until_ns: u64, limit: usize) -> Result<Vec<MapNode>> {
         let conn = self.read_conn()?;
+        let span = self.span("net_nodes", from_ns, until_ns);
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT node_id, any_value(namespace), any_value(workload), any_value(service), \
                         any_value(kind), sum(rx_bytes), sum(tx_bytes), sum(connections), \
                         sum(retransmits), \
                         arg_max(pods, (bucket_ns, pods)), arg_max(ready, (bucket_ns, pods)), \
                         arg_max(instances, (bucket_ns, pods)), \
                         arg_max(containers, (bucket_ns, pods)) \
-                 FROM net_nodes WHERE bucket_ns >= ? AND bucket_ns < ? \
+                 FROM {span} WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY node_id \
-                 ORDER BY sum(connections) + (sum(rx_bytes) + sum(tx_bytes)) / 1024 DESC LIMIT ?",
-            )
+                 ORDER BY sum(connections) + (sum(rx_bytes) + sum(tx_bytes)) / 1024 DESC LIMIT ?"
+            ))
             .map_err(db_err)?;
         let mut rows = stmt
             .query(params![ts(from_ns), ts(until_ns), limit as i64])
@@ -2228,21 +2492,22 @@ impl Store {
     /// map flicker as connections stop being re-established.
     pub fn net_edges(&self, from_ns: u64, until_ns: u64) -> Result<Vec<MapEdge>> {
         let conn = self.read_conn()?;
+        let span = self.span("net_edges", from_ns, until_ns);
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT client_id, server_id, protocol, client_container, server_container, \
                         client_pod, server_pod, \
                         sum(connections), sum(retransmits), \
                         sum(tx_bytes), sum(rx_bytes), sum(rtt_us_sum), sum(rtt_samples), \
                         arg_max(nullif(host, ''), bucket_ns), \
                         arg_max(nullif(sql, ''), bucket_ns) \
-                 FROM net_edges WHERE bucket_ns >= ? AND bucket_ns < ? \
+                 FROM {span} WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY client_id, server_id, protocol, client_container, server_container, \
                           client_pod, server_pod, \
                           CASE WHEN server_id = 'external' THEN coalesce(host, '') ELSE '' END \
                  HAVING sum(connections) + sum(tx_bytes) + sum(rx_bytes) > 0 \
-                 ORDER BY sum(connections) + sum(tx_bytes) / 1024 DESC LIMIT 4000",
-            )
+                 ORDER BY sum(connections) + sum(tx_bytes) / 1024 DESC LIMIT 4000"
+            ))
             .map_err(db_err)?;
         let mut rows = stmt
             .query(params![ts(from_ns), ts(until_ns)])
@@ -2313,14 +2578,15 @@ impl Store {
     ) -> Result<Vec<MapHistoryPoint>> {
         let step = ts(step_ns.max(1));
         let conn = self.read_conn()?;
+        let span = self.span("net_nodes", from_ns, until_ns);
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT CAST((bucket_ns - ?) / ? AS BIGINT) AS slot, \
                         sum(rx_bytes), sum(tx_bytes), sum(connections), sum(retransmits), \
                         max(pods), max(ready) \
-                 FROM net_nodes WHERE node_id = ? AND bucket_ns >= ? AND bucket_ns < ? \
-                 GROUP BY slot ORDER BY slot",
-            )
+                 FROM {span} WHERE node_id = ? AND bucket_ns >= ? AND bucket_ns < ? \
+                 GROUP BY slot ORDER BY slot"
+            ))
             .map_err(db_err)?;
         let mut rows = stmt
             .query(params![ts(from_ns), step, node, ts(from_ns), ts(until_ns)])
@@ -2364,19 +2630,20 @@ impl Store {
     ) -> Result<Vec<MapHistoryPoint>> {
         let step = ts(step_ns.max(1));
         let conn = self.read_conn()?;
+        let span = self.span("net_edges", from_ns, until_ns);
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT CAST((bucket_ns - ?) / ? AS BIGINT) AS slot, \
                         sum(connections), sum(retransmits), \
                         sum(tx_bytes), sum(rx_bytes), \
                         sum(rtt_us_sum), sum(rtt_samples) \
-                 FROM net_edges \
+                 FROM {span} \
                  WHERE server_id = 'external' \
                    AND (lower(host) = ? OR lower(host) = ? || '.') \
                    AND (? IS NULL OR protocol = ?) \
                    AND bucket_ns >= ? AND bucket_ns < ? \
-                 GROUP BY slot ORDER BY slot",
-            )
+                 GROUP BY slot ORDER BY slot"
+            ))
             .map_err(db_err)?;
         let mut rows = stmt
             .query(params![
@@ -2429,19 +2696,20 @@ impl Store {
     ) -> Result<Vec<MapHistoryPoint>> {
         let step = ts(step_ns.max(1));
         let conn = self.read_conn()?;
+        let span = self.span("net_edges", from_ns, until_ns);
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT CAST((bucket_ns - ?) / ? AS BIGINT) AS slot, \
                         sum(connections), sum(retransmits), \
                         sum(CASE WHEN client_id = ? THEN tx_bytes ELSE rx_bytes END), \
                         sum(CASE WHEN client_id = ? THEN rx_bytes ELSE tx_bytes END), \
                         sum(rtt_us_sum), sum(rtt_samples) \
-                 FROM net_edges \
+                 FROM {span} \
                  WHERE (client_id = ? OR server_id = ?) \
                    AND (? IS NULL OR protocol = ?) \
                    AND bucket_ns >= ? AND bucket_ns < ? \
-                 GROUP BY slot ORDER BY slot",
-            )
+                 GROUP BY slot ORDER BY slot"
+            ))
             .map_err(db_err)?;
         let mut rows = stmt
             .query(params![
@@ -2530,9 +2798,12 @@ impl Store {
         // the spread below clips it to the visible range.
         const LOOKBACK_NS: u64 = 3_600_000_000_000;
         let conn = self.read_conn()?;
+        // The span has to cover the lookback too, or a batch that started just
+        // before the window would be pruned away by the hour shard.
+        let span = self.span("net_edges", from_ns.saturating_sub(LOOKBACK_NS), until_ns);
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT bucket_ns, sum({}) FROM net_edges \
+                "SELECT bucket_ns, sum({}) FROM {span} \
                  WHERE bucket_ns >= ? AND bucket_ns < ? \
                  GROUP BY bucket_ns ORDER BY bucket_ns",
                 net_metric_column(metric)
@@ -2634,12 +2905,13 @@ impl Store {
     /// `service_name` and land on a node with the same id the agent would use.
     pub fn cpu_by_service(&self, from_ns: u64, until_ns: u64) -> Result<HashMap<String, u64>> {
         let conn = self.read_conn()?;
+        let span = self.span("samples", from_ns, until_ns);
         let mut stmt = conn
-            .prepare(
-                "SELECT service_name, labels, sum(value) FROM samples \
+            .prepare(&format!(
+                "SELECT service_name, labels, sum(value) FROM {span} \
                  WHERE profile_type = 'cpu' AND start_ns < ? AND end_ns > ? \
-                 GROUP BY service_name, labels",
-            )
+                 GROUP BY service_name, labels"
+            ))
             .map_err(db_err)?;
         let mut rows = stmt
             .query(params![ts(until_ns), ts(from_ns)])
@@ -2749,6 +3021,10 @@ fn tune_connection(conn: &Connection, path: &Path, cfg: &StoreConfig) -> Result<
         // to the temp directory instead of getting the process OOM-killed.
         format!("SET memory_limit='{}'", cfg.duckdb_memory_limit()),
         format!("SET temp_directory='{}'", temp_dir.display()),
+        // Keyed by file path, so a query that spans the same local hour files
+        // as the previous one reads their footers from memory instead of from
+        // disk. Off by default in DuckDB.
+        "SET parquet_metadata_cache=true".to_string(),
     ];
     // Thread count is pinned through duckdb::Config at open time (see
     // Store::open); no need to issue a redundant SET here.
@@ -3160,6 +3436,16 @@ fn add_columns(conn: &Connection, table: &str, added: &[(&str, &str)]) -> Result
 /// `label != value` correctly (the label may simply be absent). Those run in
 /// Rust after the scan. `service_name` is included because a dashboard almost
 /// always filters on it and it is the column with the most distinct values.
+/// A unique table name for per-query staging data.
+///
+/// Reads run on separate connections onto the same in-memory database, so a
+/// fixed name would let concurrent scans `DELETE` each other's ids and drop
+/// stacks from the result.
+fn next_staging_table() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("lidlesseye_stage_{}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
 fn push_selector_sql(
     selector: &Selector,
     clauses: &mut Vec<String>,
@@ -3521,6 +3807,66 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Sharding exists so that a query names the hours it asks for. Without
+    /// it a one-hour request over a week of history made DuckDB open every
+    /// footer in the archive — the 60-second timeouts that started this work.
+    #[test]
+    fn a_query_window_names_only_the_hours_it_needs() {
+        let (store, dir) = temp_store("window-shard");
+        const HOUR: u64 = 3_600_000_000_000;
+        store
+            .append(&report("api", HOUR, "a", &["hot", "main"], 10))
+            .unwrap();
+        store
+            .append(&report("api", 3 * HOUR, "a", &["hot", "main"], 32))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+
+        let all = store.window_file_count("samples", 0, u64::MAX);
+        let one = store.window_file_count("samples", HOUR, HOUR + 1_000_000);
+        assert_eq!(all, 2, "both hours are indexed separately");
+        assert_eq!(one, 1, "a one-hour window must name one file");
+
+        // Narrowing the files must not lose rows.
+        assert_eq!(store.stats().batch_count, 2);
+        let rows = store
+            .select(&ProfileType::cpu(), 0, u64::MAX, &Selector::default())
+            .unwrap();
+        let total: u64 = rows.iter().map(|b| b.total_value).sum();
+        assert_eq!(total, 42, "both hours are still readable through the span");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Reads used to share one mutex-guarded connection, so holding two at
+    /// once was impossible and a wide scan queued every other request until
+    /// the HTTP deadline. The pool must hand out distinct connections.
+    #[test]
+    fn several_reads_can_be_held_at_the_same_time() {
+        let (store, dir) = temp_store("concurrent-reads");
+        store
+            .append(&report("api", 1_000, "a", &["hot", "main"], 7))
+            .unwrap();
+
+        let first = store.read_conn().expect("first read connection");
+        let second = store.read_conn().expect("second read connection");
+        let a: i64 = first.query_row("SELECT 42", [], |row| row.get(0)).unwrap();
+        let b: i64 = second.query_row("SELECT 42", [], |row| row.get(0)).unwrap();
+        assert_eq!((a, b), (42, 42), "both connections must answer");
+
+        drop(first);
+        drop(second);
+        // The slots are reusable afterwards.
+        let again = store.read_conn().expect("a reused read connection");
+        let count: i64 = again
+            .query_row("SELECT COUNT(*) FROM batches_hot", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(again);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn physical_size_tracks_flushed_parquet_not_the_hot_tier() {
         let (store, dir) = temp_store("disk-bytes");
@@ -3614,11 +3960,13 @@ mod tests {
             .unwrap();
 
         let conn = store.conn.lock();
+        // The dictionary rows are written to the hot tier; there are no
+        // canonical views, so read the hot table directly.
         let frames: i64 = conn
-            .query_row("SELECT COUNT(*) FROM frames", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM frames_hot", [], |row| row.get(0))
             .unwrap();
         let stacks: i64 = conn
-            .query_row("SELECT COUNT(*) FROM stacks", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM stacks_hot", [], |row| row.get(0))
             .unwrap();
         assert_eq!(frames, 2, "a frame must be stored once per database");
         // Stacks are deduplicated per batch, so two batches hold two stacks.
@@ -4294,15 +4642,16 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The interrupt handle must be able to stop a running query from another
-    /// thread — this is what frees the single connection when a newer query
-    /// supersedes an old long scan.
+    /// The interrupt must stop a running read from another thread — this is
+    /// what frees a connection when a client disconnects or a query outlives
+    /// its deadline. It must never touch the writer.
     #[test]
     fn interrupt_stops_a_running_query_from_another_thread() {
         let (store, dir) = temp_store("interrupt");
-        let caller = store.interrupt.clone();
+        let store = Arc::new(store);
+        let worker = store.clone();
         let thread = std::thread::spawn(move || {
-            let conn = store.conn.lock();
+            let conn = worker.read_conn().expect("a read connection");
             // A deliberately long scan (20 billion rows to count) that cannot
             // finish before the interrupt below, but uses O(1) memory.
             conn.execute_batch(
@@ -4310,11 +4659,11 @@ mod tests {
             )
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
-        caller.interrupt();
+        store.interrupt();
         let result = thread.join().unwrap();
         assert!(result.is_err(), "the query should be interrupted");
 
-        // `store` was moved into the thread and dropped when it finished.
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

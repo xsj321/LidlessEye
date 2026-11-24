@@ -1,204 +1,239 @@
-# Parquet/S3 查询裁剪修复方案（评审稿）
+# Parquet/S3 查询性能事故：根因与修复（0.1.19 落地记录）
 
-> 状态：待评审。本文只描述问题、根因和候选方案，尚未修改任何代码。
-> 目标：代码层根治 + 本地集群验证；按项目规则，合并前需完成升级回归测试并打 patch 版。
+> 本文是 0.1.19 的实现记录，不再包含"待评审"的方案选项。
+> 被否决的两条错误结论保留在第 2 节，避免以后重复踩坑。
 
 ## 1. 现象
 
-0.1.16 引入"内存热层 + Parquet/S3"后，在本地集群观察到：
+0.1.16 引入"内存热层 + Parquet/S3"后，本地集群出现：
 
-- 打开 dashboard（尤其 timeseries 页）后，`/api/v1/tenants`、`/api/v1/stats`、
-  `/api/v1/timeseries` 陆续从数百毫秒劣化到 20–60 秒超时；
-- server 日志出现大量 `store_lock_wait`（`requester=write/read`，`wait_ms` 从几秒
-  涨到 50+ 秒）与 `query_exec elapsed_ms=45000`（读连接 45 秒超时）；
-- agent 侧随之出现 `report queue full` / `dropping reports after repeated upload
-  failures`；
-- 重启 server 只能短暂恢复，页面继续轮询后再次劣化。
+- `/api/v1/tenants`、`/api/v1/stats`、`/api/v1/timeseries`、`/metrics` 从数百毫秒
+  劣化到 40–60 秒超时（HTTP 层 60 秒返回 408），前端页面因此空白；
+- 同一时刻 `/api/v1/version`（不碰 store）仍是 10 ms —— HTTP 层健康，问题在 store 层；
+- server 日志 `store_lock_wait requester=write ... wait_ms=75000~313000`；
+- agent 随之 `report queue full` / 放弃上报；
+- 重启 server 短暂恢复，几分钟后再次劣化。
 
-## 2. 根因（经受控实验确认）
+## 2. 先排除的错误结论
 
-**与数据量无关，与时间范围无关，只与查询必须打开的 Parquet 文件数量有关。**
+### 2.1 不是数据量
 
-受控证据（同一 pod、同一时刻）：
+`globex` 只有 90 行、`default` 有数百万行，两者在故障时**都会** 408。
+`shop-stress` 的 stats 扫描日志是 `elapsed_ms≈1500`，不是几十秒。
 
-| 测试 | S3 对象数 | 查询范围 | 耗时 |
-|---|---|---|---|
-| `globex` timeseries | 2 | 8 天 | 0.48 s，200 |
-| `default` timeseries | 84 | 1 小时 | 20 s+，超时 |
-| `default` timeseries（停写入、刚重启） | 84 | 1 小时 | 1.1 s，200 |
+### 2.2 不是 Parquet 文件数量
 
-`globex` 查 8 天比 `default` 查 1 小时快 40 倍，且两者数据量相差 45 倍——
-排除了数据量和时间范围的解释。
-
-机制：
-
-1. `archive_local` 把每个 epoch hour 归档成
-   `s3://<bucket>/<prefix>/<tenant>/<table>/hour=<n>.parquet`。
-   `hour=<n>` 位于**对象名**中，不是 `hour=<n>/...` 形式的目录层级。
-2. `refresh_views` 据此构造静态 VIEW：
-
-   ```sql
-   CREATE OR REPLACE VIEW batches AS
-     SELECT * FROM batches_hot
-     UNION ALL BY NAME
-     SELECT * FROM read_parquet(
-       ['s3://.../hour=498755.parquet', ... 全部对象 ...],
-       hive_partitioning=false, union_by_name=true
-     )
-   ```
-
-3. DuckDB 绑定 `read_parquet([...])` 时，为确定 schema（尤其
-   `union_by_name=true`）会打开列表中**每一个**对象的 footer。对象在 S3 上，
-   每次 footer 读取都是一次 httpfs HTTP 请求。
-4. 因此 `WHERE start_ns < ? AND end_ns > ?` 无论多窄，都无法在 bind 阶段跳过
-   任何文件；zone map 只能跳过**行组**，省不掉 footer 的远程 I/O。
-5. 文件越多，单次查询的固定成本越高。`default/batches` 有 84 个 S3 对象，
-   全部 tenant 合计 591 个；页面多个控件并发查询时，这些固定成本叠加，
-   单个连接被依次占用到 45 秒超时，写请求排队，形成级联劣化。
-
-`docs/architecture.md` 中"Binding a query therefore never contacts S3"的假设
-不成立：**不 LIST 桶 ≠ 不访问 S3**，显式列表只是把 LIST 换成了逐对象 footer
-读取。
-
-## 3. 失败过的思路（不要重试）
-
-- **换个 S3 mock / 支持 multipart**：已解决上传侧问题，但与查询侧 footer 数量无关。
-- **调 `--query-concurrency` / 读槽位**：只是把排队换个地方，固定 I/O 成本不变。
-- **加大 `READ_LOCK_WAIT` / HTTP 超时**：让卡死更久，不减少工作。
-- **`SET max_filesize`/单 PUT 上传选项**：httpfs v2.0.0 无对应能力，0.1.18 已撤销。
-
-## 4. 候选方案
-
-### 方案 A — 把 hour 提升为 hive 分区目录（推荐）
-
-把归档对象键从
+实测单个 S3 请求（经 kube-proxy + port-forward 打到 s3mock）：
 
 ```
-<base>/<tenant>/<table>/hour=<n>.parquet
+HEAD hour=498557.parquet  0.006s × 8 次，稳定 6 ms
 ```
 
-改为
+84 个文件 × 2 次请求 × 6 ms ≈ **1 秒**。DuckDB 2.x 可以把 S3 上的 Parquet
+直接当作表来读，文件数量本身不是瓶颈。
 
-```
-<base>/<tenant>/<table>/hour=<n>/part-0.parquet
-```
+真正的成本不是"文件多"，而是**每次查询都要为它给出的每个路径付一次 footer
+往返**（见 3.1）。所以正确的方向是"别给那么多路径"，而不是"把文件合少"。
 
-VIEW 改为按前缀 glob，并声明分区列：
+## 3. 根因（按贡献排序）
+
+### 3.1 canonical 表是 VIEW，覆盖整个保留窗口
+
+0.1.16 的实现：
 
 ```sql
-CREATE OR REPLACE VIEW batches AS
-  SELECT * FROM batches_hot
+CREATE VIEW samples AS
+  SELECT * FROM samples_hot
   UNION ALL BY NAME
-  SELECT * FROM read_parquet(
-    '<base>/<tenant>/batches/**/*.parquet',
-    hive_partitioning=true,
-    union_by_name=true,
-    filename=false
-  )
+  SELECT * FROM read_parquet([全部本地文件, 全部 S3 对象],
+                             hive_partitioning=false, union_by_name=true);
 ```
 
-DuckDB 把 `hour` 暴露为分区列后，`WHERE start_ns < ? AND end_ns > ?`
-仍不能直接裁 hour（谓词在 `start_ns` 上），需要**额外**把 hour 谓词下推：
+`read_parquet([...])` 必须打开所列**每一个**路径的 footer 才能知道 schema 和
+row group 布局。VIEW 定义里是整条保留窗口的全部文件（`default` 租户 84 个，
+`shop-stress` 更多），于是——
+
+> **查 1 小时，要付 8 天的 footer 成本。**
+
+前端每几秒轮询一次，每次轮询都把全部 footer 重读一遍。
+
+### 3.2 元数据缓存默认关闭
+
+DuckDB 的这两个设置默认都是 `false`，代码里也从未打开：
+
+| 设置 | 默认 | 作用 |
+|---|---|---|
+| `enable_http_metadata_cache` | `false` | 缓存 HTTP/对象元数据（ETag、长度） |
+| `parquet_metadata_cache` | `false` | 缓存 Parquet schema / row group 统计 |
+
+**直接证据**：s3mock 最近 300 条请求里，`shop-stress/batches` 的**同一个**
+`hour=*.parquet` 被 GET/HEAD 了 **151 次**；`zeta`、`acme`、`stress-trial` 各 30 次。
+正常的一次性读取不会这样。
+
+### 3.3 单连接串行
+
+每个 tenant 只有一把 `conn: Mutex<Connection>`：读、ingest、flush 共用一条连接。
+一个宽扫描执行期间，后续请求全部排队；排满 60 秒就是 HTTP 408。
+
+### 3.4 请求路径做全表扫描
+
+`/api/v1/stats`、`/api/v1/tenants`（每个 tenant 一行）、`/metrics`
+（`registry.total_stats()` 遍历所有 tenant）都要执行：
 
 ```sql
-... WHERE hour >= <from_hour> AND hour <= <until_hour>
+SELECT COUNT(*), SUM(total_value), SUM(bytes), MIN(start_ns), MAX(end_ns) FROM batches
+SELECT COUNT(*) FROM (SELECT DISTINCT service_name, profile_type, labels FROM batches)
 ```
 
-由于 VIEW 是静态的，这条谓词要由查询层统一追加。两种落地方式：
+`stats_snapshot` 本来有 30 秒内存缓存兜底，但 `archive_local` 和
+`compact_local` 成功后都会 `*stats_cache = None`（每 10 秒一轮），
+`/metrics` 又走 `total_stats()` 绕开缓存逐个 tenant 现算。
+于是缓存每 10 秒被打掉一次，10 个 tenant × 1.5 秒 = 15 秒的全量扫描被反复触发。
+`bind()` 里还有一次启动期 `total_stats()`，在十租户环境下让 liveness 探针直接超时被杀。
 
-- A1：`hour` 列进入 VIEW 的 SELECT 列表，所有查询的 SQL 生成处统一加
-  `hour` 范围条件（改动面：query.rs / store.rs 的所有 VIEW 查询）；
-- A2：用一个 table function / 宏接受 from/until 参数，按窗口生成文件列表。
+### 3.5 写路径无超时
 
-优点：DuckDB 标准做法；一次迁移后长期受益；S3 LIST 由 glob 承担（启动时
-已有 best-effort glob，运行时 bind 会 LIST，但只列目录不读 footer）。
+读走 `read_conn()`（45 秒 `try_lock_for`，超时 503），但写走 `lock_conn()`
+→ `self.conn.lock()`，**没有超时**。一次慢扫描会把 agent 的 ingest 无限期排在后面
+（日志里 75–313 秒），agent 超时重试又加重队列，形成雪崩。
 
-缺点：
+### 3.6 `http_timeout` 单位写错（秒 vs 毫秒）
 
-- 需要重写已有 591 个对象的 key（S3 不支持 rename，需 COPY + DELETE）；
-- `hour` 列与现有 schema 合并要处理旧对象没有分区列的情况；
-- 查询 SQL 改动面较大，需要覆盖 flamegraph / diff / top / timeseries /
-  series / label-values / servicemap / histogram / stats 全部路径。
+DuckDB 的 `http_timeout` 单位是**秒**，默认 30。代码写的是
+`SET http_timeout=15000`，注释意图是"15 秒"，实际是 **15000 秒 ≈ 4.16 小时**。
+一旦某个 S3 连接半开，这次 `recv` 会挂起 4 小时；watchdog 的 `interrupt()`
+只置标志位，打不断阻塞的 socket 读 —— 这就是"重启就好、不重启永远不好"。
 
-### 方案 B — 在 VIEW 文件列表生成时按"当前小时"裁剪，不按时窗裁剪
+### 3.7 因果链
 
-不现实：VIEW 是全局静态对象，无法按单个查询的时间窗变化。仅按"最近 N 小时"
-裁剪会改变语义（历史查询失效），排除。
+```
+VIEW 覆盖整个保留窗口
+  → 每次 poll 为每个文件付一次 footer 往返（且缓存全关，无法复用）
+  → stats 扫描 1~2 s，10 个 tenant 串成 15 s
+  → 每 10 s 的 archive/compact 又清空 stats 缓存
+  → 前端高频轮询持续占住唯一一条 conn
+  → 写（agent ingest）在无超时的 lock 上排队 → 上报超时 → 重试 → 队列更长
+  → 偶发半开连接遇上 http_timeout=15000 秒 → 锁被占 4 小时 → 全站 408
+```
 
-### 方案 C — 查询结果侧加缓存，降低重复查询的固定成本
+## 4. 修复
 
-对 `stats`/`series` 已有 30 s 缓存；对 timeseries 按 (tenant, type, from,
-until, selector) 缓存。能显著缓解 dashboard 轮询，但：
+### 4.1 取消 VIEW：按 hour 分片的文件索引 + 每查询动态 span
 
-- 首次查询仍要打开全部 footer；
-- 缓存键随拖动时间栏爆炸；
-- 不解决根因，只掩盖症状。
+`parquet.rs` 不再维护"扁平的全部文件列表"，也不再建 VIEW，而是把文件按
+**数据所属的 epoch hour** 分组，查询时按时间窗只挑相关的 hour：
 
-可作为 A 的补充，不单独采用。
+```rust
+pub(crate) struct TableFiles {
+    by_hour: BTreeMap<u64, Vec<String>>,
+    unknown: Vec<String>,   // 名字里没有 hour 的旧文件：每个窗口都挂载
+}
 
-### 方案 D — 每个 hour 一个独立 VIEW / 分区表，查询按小时 UNION 对应视图
+pub(crate) fn table_span(state, table, from_ns, until_ns) -> String {
+    // → "(SELECT * FROM samples_hot UNION ALL BY NAME
+    //     SELECT * FROM read_parquet(['...hour=498557/part-...', ...],
+    //                                hive_partitioning=false, union_by_name=true))"
+}
+```
 
-按 hour 建子 VIEW（`batches_h498755` …），查询层根据窗口拼出需要的 hour
-列表再 UNION。等价于手写分区裁剪。
+要点：
 
-优点：不动 S3 key，无数据迁移。
-缺点：VIEW 数量随小时线性增长；每次归档都要 DDL；查询 SQL 生成复杂且
-难以覆盖所有路径；仍需在 bind 时打开所选 hour 的 footer（但数量从 84 降到
-窗口内小时数）。
+- `table_span_all`（`0..u64::MAX`）用于没有时间窗的基数统计，其余查询一律走
+  `table_span`，一个 1 小时窗口只列出 1 个对象。
+- `unknown`（无法归入某小时的文件）在**每个**窗口都挂载 —— 分片不允许藏起
+  它无法归因的数据。
+- `union_by_name=true` 不是可选项：升级会加列，归档里还留着加列之前的文件，
+  按位置 UNION 会让 binder 直接拒绝。
+- `hour_window` 对 `until` 做独占处理，窗口边界不会多挂一个 hour。
 
-## 5. 推荐组合
+### 4.2 新布局（旧布局继续可读）
 
-**方案 A（A1 变体）+ 方案 C 的 stats 缓存增强**：
+| 位置 | 0.1.19 写入路径 | 仍然被索引的旧路径 |
+|---|---|---|
+| 本地 | `parquet/<table>/hour=<n>/part-<stamp>-<rows>.parquet` | `<table>/h<hour>-<stamp>-<rows>.parquet`、`h<hour>-final-<stamp>.parquet` |
+| 本地合并 | `hour=<n>/final-<unique>.parquet` | — |
+| S3 | `{base}/{table}/hour=<n>/part-<stamp>.parquet` | `{table}/hour=<n>.parquet` |
 
-1. 归档键改为 hour 目录分区；
-2. VIEW 用 glob + `hive_partitioning=true`，`hour` 作为分区列暴露；
-3. 在 store 层提供一个统一的"带 hour 裁剪"的查询入口，所有读路径复用，
-   避免遗漏；
-4. 保留并延长 stats 缓存，减少 `tenants`/`stats` 的重复扫描。
+`discover_s3_objects` 用双 glob（`**/*.parquet` + `*/*.parquet`）同时覆盖新旧布局，
+按 key 里的 `hour=` 入索引，**不做任何对象迁移**。
 
-## 6. 迁移与升级兼容（强制要求）
+分片的小时**必须用整数除法**。DuckDB 的 `/` 是浮点，`CAST(double AS BIGINT)`
+四舍五入：`start_ns/1e9/3600` 会把 13:43 的事件算成第 14 小时，于是每个小时的后
+半段数据都落在下一小时的目录里，"窗口截止到现在"的查询看不到它们 —— 这是 0.1.19
+开发过程中真实踩到的坑（由 CLI 的 ingest→query 往返测试暴露）。改成 `//`。
 
-按项目规则，不能只验证全新安装。必须覆盖：
+旧布局文件的小时取自**写入时的挂钟**，跨小时边界的 flush 会把 13:59 的行命名为
+14:00。因此只要某张表还存在旧布局文件，它的查询窗口就向前后各放宽一小时：
+多挂两个对象，换"升级后不丢边界数据"。
 
-1. **旧对象在线迁移**：server 启动时发现旧式 `hour=<n>.parquet` 对象，
-   逐个 COPY 到 `hour=<n>/part-0.parquet`，校验行数一致后删除旧对象；
-   迁移期间新旧 VIEW 并存，保证查询不中断。
-2. **manifest 兼容**：`manifest.json` 同时接受新旧两种 key；迁移完成后
-   重写 manifest；进程崩溃后可从头重放（COPY 是幂等的，按目标 key 判存）。
-3. **回滚**：迁移不删除源对象直到目标校验通过；回滚时切回旧 VIEW 定义
-   即可读到旧对象（保留一个可配置的宽限期，例如 24 h 后才清理旧 key）。
-4. **升级回归测试**：用 0.1.18 真实产出的库 + S3 数据启动新版本，验证：
-   - tenant 能打开、迁移完成；
-   - 迁移前后查询行数一致；
-   - 窄/宽范围查询均返回且耗时与文件数无关；
-   - agent 持续写入的同时页面轮询不再劣化；
-   - 中断迁移后重启能续跑。
-5. **schema/DDL 检查**：`CREATE OR REPLACE VIEW` 会改动依赖对象；确认没有
-   索引/外键依赖 VIEW，且最新 schema 时启动时不做多余 DDL，避免多连接争 WAL。
+### 4.3 多读连接池（读写分离）
 
-## 7. 验证计划（本地集群）
+```rust
+struct ReaderPool { slots: Vec<ReaderSlot>, free: Mutex<Vec<usize>>, cv: Condvar, .. }
+```
 
-1. 部署改版镜像到本地 `lidlesseye` 命名空间，保留现有 S3 数据；
-2. 观察启动日志：旧对象迁移完成、VIEW 重建、无 `Dependency Error`；
-3. 对比迁移前后：
-   - `default/batches` 查询耗时（目标：<2 s，且与窗口宽度无关）；
-   - S3 对象访问次数（目标：只访问窗口内 hour 的分区）；
-   - agent `report queue full` / upload failure 消失；
-4. 压力验证：页面 tabs + 多租户轮询 10 分钟，`store_lock_wait` 回到百毫秒级。
+- `Connection::try_clone()` 派生出 N 条连接（`--query-concurrency`，默认 4，
+  clamp 1..=32），共享同一个 in-memory 数据库，靠 DuckDB 的 MVCC 并发读。
+- 克隆出来的连接是**全新会话**，`SET` 是会话级的，所以 `tune_connection` 与
+  `configure_s3` 必须在每个槽位上重新执行一次。
+- 写连接 `conn` 仍独享，`interrupt()` 只打断读槽位，绝不打断写事务。
+- 读等待仍是有界的（45 秒），拿不到就返回 `Error::Busy` → HTTP 503 + `Retry-After`。
 
-## 8. 版本计划
+### 4.4 开启元数据缓存并修正超时单位
 
-- 修复走 patch 版本：`0.1.18` → `0.1.19`；
-- 同步更新 `Cargo.toml`、`Cargo.lock`、各 crate 版本、
-  `deploy/helm/lidlesseye/Chart.yaml`、`web/package.json`；
-- 更新 `docs/architecture.md`（修正"不访问 S3"的错误描述）、
-  `docs/deployment.md`（S3 key 格式变更与迁移说明）、`CHANGELOG.md`；
-- 本地验证通过后打 tag `v0.1.19`，推 GitHub，CI/Release/镜像按既有流程；
-- 按规则补齐 Docker Hub 镜像（若 secrets 未配置则手动 push）。
+```rust
+SET http_timeout=15;                    // 秒，不是毫秒
+SET http_retries=2;
+SET enable_http_metadata_cache=true;
+SET parquet_metadata_cache=true;
+```
 
-## 9. 需要评审确认的问题
+全部用 `let _ =` 忽略失败（旧版 httpfs 不认新名字时不应影响启动）。
 
-1. 是否接受 S3 key 格式变更（涉及 591 个对象重写）？
-2. 迁移宽限期取 24 h 是否合适？
-3. `hour` 谓词下推采用 A1（改所有查询入口）还是 A2（参数化 table function）？
-4. 是否需要同时把 `manifest.json` 升级为带版本的格式？
+### 4.5 stats 缓存只在该失效时失效
+
+- `flush_hot` / `flush_hot_when_idle` / `compact_local` / `archive_local`
+  都是**行数不变的搬迁**，不再清空缓存；只在 `prune`、`append`、服务图写入时失效。
+- TTL 30 s → 60 s；命中时刷新 `total_bytes`（用 `disk_bytes()`，成本只有一次目录遍历）。
+- `/api/v1/stats`、`/api/v1/tenants`、`/metrics` 全部改走 `stats_cached()`，
+  请求路径不再做全表扫描。
+- `bind()` 不再在启动时 `total_stats()`；改为 `serve_with_shutdown` 里的后台任务
+  逐个 tenant 预热，不阻塞 liveness。
+
+### 4.6 有界写等待
+
+```rust
+const WRITE_LOCK_WAIT: Duration = Duration::from_secs(30);
+```
+
+ingest（`append`、`append_servicemap`）改为 `write_conn()?`，拿不到写连接就返回
+`Error::Busy`，让 agent 快速回压重试，而不是把 9–13 次重试全堆在队列里。
+
+### 4.7 并发读下的暂存表名
+
+`load_stacks` / `load_frames` 原来往一个固定名字的临时表里灌数据再 JOIN。
+单连接时代这是安全的；并发读之后两个请求会互相 `DELETE`。改为原子递增的
+`lidlesseye_stage_<n>`。
+
+## 5. 验证
+
+1. **单元测试**：`a_query_window_names_only_the_hours_it_needs`（1 小时窗口只列出
+   1 个对象且不丢行）、`a_flush_files_rows_under_the_hour_they_describe`（小时后半段
+   写入的行能按自己的小时查到）、`an_upgraded_legacy_file_stays_visible_beside_its_hour`
+   （旧布局文件跨小时仍可见）、`several_reads_can_be_held_at_the_same_time`、
+   `interrupt_stops_a_running_query_from_another_thread`。
+2. **本地集群**：连续调 3 次 `/api/v1/stats`，第 2、3 次对 s3mock 的数据 GET/HEAD
+   应接近 0。
+3. `/api/v1/stats`、`/api/v1/tenants`、`/metrics` 的 p95 应 < 1 s。
+4. 日志不再出现 `wait_ms > 5000` 的 `store_lock_wait`。
+5. 把 s3mock 停掉再恢复，应在 15 秒内返回错误而不是挂死 4 小时。
+6. **升级回归**：用 0.1.18 写出的数据目录（含 S3 对象，新旧两种命名）直接启动
+   新版本，tenant 能打开、历史数据可查、不触发任何 DDL。
+
+## 6. 未做与不做
+
+- **不做 hive 分区目录迁移**：目录化解决的是"文件多"，实测文件多不是瓶颈。
+  新写入用 `hour=<n>/` 前缀是因为它让分区信息来自**路径本身**，读取时不需要
+  再猜文件属于哪个小时；旧对象仍按 key 名解析，不需要搬迁。
+- **不做 schema 迁移**：本次没有任何表结构变化，DuckDB 里只有内存表和
+  `.tmp` 暂存，升级只是替换镜像。

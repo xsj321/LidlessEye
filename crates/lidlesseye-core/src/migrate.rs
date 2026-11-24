@@ -54,8 +54,10 @@ pub fn migrate_legacy(root: &Path) -> Result<MigrationStats> {
         std::fs::create_dir_all(&dir)?;
         let mut hours: Vec<i64> = Vec::new();
         if let Some(column) = def.hour_column {
+            // `//` is integer division; `/` is floating point and would round
+            // an event at half past to the next hour.
             let sql = format!(
-                "SELECT DISTINCT CAST({column}/1_000_000_000/3600 AS BIGINT) FROM {}",
+                "SELECT DISTINCT ({column} // 1_000_000_000 // 3600) FROM {}",
                 def.name
             );
             let mut stmt = conn
@@ -79,7 +81,7 @@ pub fn migrate_legacy(root: &Path) -> Result<MigrationStats> {
             }
             let filter = def
                 .hour_column
-                .map(|column| format!("WHERE CAST({column}/1_000_000_000/3600 AS BIGINT) = {hour}"))
+                .map(|column| format!("WHERE ({column} // 1_000_000_000 // 3600) = {hour}"))
                 .unwrap_or_default();
             let count: i64 = conn
                 .query_row(

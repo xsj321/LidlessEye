@@ -550,6 +550,10 @@ impl LidlessEye {
             s3: cfg.s3.clone(),
             parquet_local_ttl_ns: cfg.parquet_local_ttl_ns,
             flush_interval_ns: cfg.storage_flush_interval_ns,
+            // Match the pool to the read-slot cap: a larger pool would just
+            // queue on the semaphore instead, a smaller one would make the
+            // semaphore pointless.
+            read_connections: cfg.query_concurrency(),
         };
         let registry = TenantStore::open_with_limits(
             &cfg.data_dir,
@@ -558,23 +562,21 @@ impl LidlessEye {
             cfg.max_tenants,
         )
         .map_err(|err| format!("failed to open tenant registry: {err}"))?;
-        // Read every tenant's totals *before* the socket exists. In Parquet
-        // mode that walks each tenant's S3 prefix, which on a real
-        // installation takes tens of seconds; a listener that is bound but not
-        // yet served accepts the connection and then answers nothing, and a
-        // liveness probe reports that as a timeout. Kubelet kills the process
-        // over it, so the container ends up restarting exactly when it was
-        // still starting up.
-        let stats = registry.total_stats();
+        // Do *not* compute every tenant's totals before binding. That is a
+        // full scan of each tenant's `batches` (and, in canonical modes, of
+        // every Parquet footer) and it runs before the socket can answer a
+        // liveness probe: a ten-tenant installation spent the better part of a
+        // minute here, so kubelet killed the container while it was still
+        // starting. The catalogue warms itself on first request instead, and
+        // `serve` kicks that off in the background.
+        let tenants = registry.tenant_ids().len();
         let listener = TcpListener::bind(cfg.listen)
             .await
             .map_err(|err| format!("failed to bind {}: {err}", cfg.listen))?;
         info!(
             addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             data_dir = %cfg.data_dir.display(),
-            tenants = registry.tenant_ids().len(),
-            batches = stats.batch_count,
-            bytes = stats.total_bytes,
+            tenants,
             "store opened"
         );
         Ok(Self::from_registry_inner(Arc::new(registry), cfg, listener))
@@ -693,6 +695,22 @@ impl LidlessEye {
         // merges/uploads files. Its cadence must be at least as frequent as
         // the configured flush interval, otherwise the RPO is silently larger
         // than the value the operator chose.
+        let warm = registry.clone();
+        tokio::spawn(async move {
+            // The dashboard's first request is the tenant catalogue, which
+            // describes every tenant. Those numbers come from a scan per
+            // tenant; computing them inside that request makes a cold start
+            // look like a hung server. Fill the cache off the request path so
+            // the answer is already there.
+            let _ = tokio::task::spawn_blocking(move || {
+                for id in warm.tenant_ids() {
+                    if let Some(store) = warm.tenant(&id) {
+                        let _ = store.stats_checked();
+                    }
+                }
+            })
+            .await;
+        });
         let compact_registry = registry.clone();
         let flush_interval = cfg
             .storage_flush_interval_ns

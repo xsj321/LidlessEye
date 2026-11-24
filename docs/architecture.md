@@ -215,23 +215,57 @@ tier, while Parquet files (local, plus verified S3 objects in `s3` mode) are the
 only durable data.
 
 ```text
-<data-dir>/tenants/<tenant>/parquet/<table>/h<epoch-hour>-<stamp>-<rows>.parquet
-<data-dir>/tenants/<tenant>/parquet/<table>/h<epoch-hour>-final-<stamp>.parquet
-s3://<bucket>/<prefix>/<tenant>/<table>/hour=<epoch-hour>.parquet   # s3 mode only
+<data-dir>/tenants/<tenant>/parquet/<table>/hour=<epoch-hour>/part-<stamp>-<rows>.parquet
+<data-dir>/tenants/<tenant>/parquet/<table>/hour=0/part-<stamp>-<rows>.parquet   # dictionaries
+s3://<bucket>/<prefix>/<tenant>/<table>/hour=<epoch-hour>/part-<stamp>.parquet   # s3 mode only
 ```
 
-Writes go to `<table>_hot` tables; canonical names are VIEWs over
-`hot UNION ALL BY NAME read_parquet(<explicit files>)`. A flush writes a
-`.tmp` fragment, reads it back to verify the row count, then atomically renames
-it. Completed hours are merged into one final file on a **separate** in-memory
-connection, so an upload/merge does not hold the query/ingest connection. The
-read side ignores fragments superseded by a newer final, which keeps counts
-correct even after a crash between publishing and cleanup.
+Writes go to `<table>_hot` tables. There are **no canonical VIEWs**: every read
+builds its own `FROM` clause from the hot table plus only the Parquet hours that
+overlap the requested window. That matters more than it sounds — `read_parquet`
+has to open the footer of every path it is given, including objects in S3, so a
+VIEW over the whole archive made a one-hour query pay for the entire retention
+window on every dashboard poll. Naming two hours instead of eighty-four turned
+a 60-second timeout into a sub-second scan.
+
+The pre-0.1.19 layouts (`<table>/h<hour>-*.parquet` locally and
+`<table>/hour=<hour>.parquet` in S3) are still indexed and read, so upgrading
+needs no rewrite of the archive: the index derives the hour from the directory
+component or, failing that, from the file name. Those files were tagged with the
+wall clock at write time rather than with the hour of their rows, so a flush that
+straddled a boundary can hold the previous hour's rows. While a legacy file is
+still present in a table, its window is widened by one hour on each side — two
+extra objects, in exchange for not losing the last minute of an hour on upgrade.
+
+The partition hour is computed with `//`, not `/`. DuckDB's `/` is floating
+point and `CAST(double AS BIGINT)` rounds to nearest, so `start_ns/1e9/3600` put
+every event after half past into the *next* hour: half of each hour's data was
+invisible to a query whose window ended at "now".
+
+
+A flush writes a `.tmp` fragment, reads it back to verify the row count, then
+atomically renames it. Completed hours are merged into one final file on a
+**separate** in-memory connection, so an upload/merge does not hold the
+connection ingests use. The read side ignores fragments superseded by a newer
+final, which keeps counts correct even after a crash between publishing and
+cleanup.
+
+Reads and writes are also separated at the connection level: one writer
+connection owns the hot tables, and a small pool of cloned read connections
+serves queries concurrently under DuckDB's MVCC. Previously a single
+mutex-guarded connection serialised everything, so one wide scan queued every
+other request behind it until the HTTP deadline.
 
 Retention removes whole committed hours; `--max-disk` is a hard cap that evicts
 the oldest files first. Legacy `lidlesseye.duckdb` files are exported to
 Parquet once on first open and renamed to `*.migrated-*`; legacy mode values
 `duckdb` and `parquet` are mapped to `disk` and `s3` with a warning.
+
+`http_timeout` is in **seconds**; releases before 0.1.19 set it to `15000`,
+i.e. four hours, which let one half-open keep-alive socket hold a reader for the
+rest of the day. Metadata caching (`enable_http_metadata_cache`,
+`parquet_metadata_cache`) is enabled explicitly because DuckDB leaves it off —
+without it the same object was observed being re-read 151 times in a minute.
 
 The following sections describe the original file-per-tenant engine and the
 first Parquet/S3 prototype; they remain useful context for the schema and query

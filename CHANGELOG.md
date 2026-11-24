@@ -251,6 +251,80 @@ map windows while the server endpoint is briefly absent.
   429 and 5xx are. Final drop warnings now include attempt count and elapsed
   time so a real outage is distinguishable from a bad payload.
 
+## [0.1.19] - 2026-11-24
+
+Queries no longer pay for the whole retention window. The canonical tables stopped
+being VIEWs over every archived object, reads stopped sharing one connection, and
+the catalogue endpoints stopped scanning every tenant on every poll. Together these
+were why the dashboard went blank: a 60-second HTTP timeout on `/api/v1/stats`,
+`/api/v1/tenants` and `/metrics` while `/api/v1/version` answered in 10 ms.
+
+### Fixed
+
+- A canonical table was
+  `SELECT * FROM t_hot UNION ALL BY NAME SELECT * FROM read_parquet([every file])`.
+  DuckDB must open the footer of every path it is given — over the network for S3 —
+  so a one-hour query over eight days of history paid for all eight days, on every
+  dashboard poll. Files are now indexed by the epoch hour of the data they hold and
+  each query names only the hours its window can touch; a one-hour window names one
+  object. Files whose name carries no hour are still mounted for every window, so
+  sharding can never hide data it cannot attribute.
+- `enable_http_metadata_cache` and `parquet_metadata_cache` both default to
+  `false` and were never set. With them off, one archive object was GET/HEAD-ed
+  151 times in a minute. Both are now on, per connection.
+- `SET http_timeout=15000` was meant to be 15 seconds; DuckDB reads the unit as
+  seconds, so it was 4.16 hours. A half-open S3 socket therefore held a connection
+  for hours and the query watchdog could not break the blocking read — "restart the
+  server and it works again". Now 15 seconds, with `http_retries=2`.
+- Reads shared one `Mutex<Connection>` with ingest and flush, so a wide scan queued
+  every other request until the 60-second HTTP deadline. Reads now use a pool of
+  cloned connections (default 4, `--query-concurrency`), which share the in-memory
+  database through MVCC. Each clone is a fresh session, so the tuning and S3
+  settings are re-applied per slot. Interrupts are aimed only at readers, never at
+  the writer.
+- `/api/v1/stats`, `/api/v1/tenants` and `/metrics` each ran `COUNT(*)` plus
+  `COUNT(DISTINCT …)` over the full archive on the request path. They now read a
+  per-tenant cache that is computed when cold and reused for 60 s. The cache is
+  no longer dropped by flushing, compaction, archiving or service-map windows —
+  those move the same rows between files, or touch tables the count does not
+  include — and an append accounts its own deltas instead of invalidating, so a
+  tenant that is being written to does not rescan on every dashboard poll. Only
+  pruning still invalidates. `bind()` no longer computes tenant totals before it
+  starts serving, which was failing the liveness probe in a ten-tenant cluster;
+  a background task warms the cache after startup instead.
+- Ingest waited on the writer with no timeout. Behind a slow scan that turned into
+  75–313 second lock waits, agent upload timeouts, retries and `report queue full`.
+  Ingest now waits at most 30 seconds and answers `503` with `Retry-After`, which
+  the agent already treats as retryable.
+- `load_stacks` and `load_frames` staged rows into one fixed-name temporary table.
+  That was safe when reads were serialised; with concurrent readers two requests
+  could clear each other's staging rows. The name is now unique per call.
+- The hour a Parquet fragment is filed under was computed in SQL as
+  `CAST(start_ns/1_000_000_000/3600 AS BIGINT)`. DuckDB's `/` is floating point
+  and the cast rounds to nearest, so an event at 13:43 became hour 14: half of
+  every hour's data sat in the next hour's directory and was invisible to a query
+  whose window ended at "now". The partition now uses integer division (`//`),
+  in both the flush and the legacy-export path.
+
+### Changed
+
+- New Parquet writes are sharded into `hour=<n>/` directories locally and
+  `hour=<n>/` key prefixes on S3. Files from every earlier release
+  (`h<hour>-<stamp>-<rows>.parquet`, `h<hour>-final-<stamp>.parquet`,
+  `hour=<n>.parquet`) are still discovered and read; nothing is migrated or
+  rewritten. Those files were tagged with the wall clock at write time, so a
+  flush that straddled an hour boundary can hold the previous hour's rows; while
+  such a file is still present, its window is widened by one hour on each side
+  (two extra objects) instead of losing those rows after an upgrade.
+
+### Upgrade notes
+
+No schema change: the DuckDB database is in-memory and nothing durable changed
+shape, so upgrading is an image swap. Existing local directories and S3 objects
+are indexed at startup exactly as before — the index is rebuilt by scanning the
+local tree and by one `glob()` per prefix, so a fresh pod against an existing
+bucket still sees its history.
+
 ## [0.1.18] - 2026-11-24
 
 Remove an S3 option that could not do what it claimed.
@@ -734,7 +808,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/xsj321/LidlessEye/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/xsj321/LidlessEye/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/xsj321/LidlessEye/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/xsj321/LidlessEye/compare/v0.1.15...v0.1.16

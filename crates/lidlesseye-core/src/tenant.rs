@@ -286,6 +286,9 @@ impl TenantStore {
             s3,
             parquet_local_ttl_ns: self.base.parquet_local_ttl_ns,
             flush_interval_ns: self.base.flush_interval_ns,
+            // Per-tenant read connections, sized process-wide: the pool is
+            // what lets one slow panel stop blocking the others.
+            read_connections: self.base.read_connections,
         };
         // Another registry over the same directory may be opening this tenant
         // right now. DuckDB writes its file header during open, so the two
@@ -343,19 +346,20 @@ impl TenantStore {
     }
 
     /// Stats for every tenant on disk.
+    ///
+    /// Each entry comes from the tenant's stats cache, which is computed on
+    /// demand when cold and then reused for the TTL. Computing it here for
+    /// every tenant on every poll is what turned the dashboard's first request
+    /// into a fifteen-second wait; the server also warms the cache in the
+    /// background at start-up so that first poll usually finds it full.
     pub fn tenants(&self) -> Vec<TenantInfo> {
         self.tenant_ids()
             .into_iter()
             .map(|id| {
-                // `stats()` and `series_count()` used to be two scans of
-                // `batches` for every tenant, on the dashboard's very first
-                // request. `stats_checked()` computes both in one pass and
-                // caches them; use its checked form so a busy store is not
-                // reported as an empty installation.
-                let (stats, series) = match self.tenant(&id).map(|store| store.stats_checked()) {
-                    Some(Ok(pair)) => pair,
-                    _ => (StoreStats::default(), 0),
-                };
+                let (stats, series) = self
+                    .tenant(&id)
+                    .map(|store| store.stats_cached())
+                    .unwrap_or_default();
                 TenantInfo {
                     id: id.to_string(),
                     stats,
@@ -366,12 +370,18 @@ impl TenantStore {
             .collect()
     }
 
-    /// Aggregate stats over all tenants.
+    /// Aggregate stats over all tenants, from the per-tenant cached numbers.
+    ///
+    /// The only caller is `/metrics`, which Prometheus scrapes every few
+    /// seconds. Summing `stats()` per tenant there meant a full scan of every
+    /// tenant on every scrape — a self-inflicted load that competed with the
+    /// dashboard for the same connections. A scrape may be up to one cache
+    /// window stale, which is irrelevant for a gauge.
     pub fn total_stats(&self) -> StoreStats {
         let mut total = StoreStats::default();
         for id in self.tenant_ids() {
             if let Some(store) = self.tenant(&id) {
-                let stats = store.stats();
+                let (stats, _) = store.stats_cached();
                 total.batch_count += stats.batch_count;
                 total.total_bytes += stats.total_bytes;
                 total.logical_bytes += stats.logical_bytes;

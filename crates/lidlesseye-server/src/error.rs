@@ -79,6 +79,17 @@ impl IntoResponse for ApiError {
             "error": self.message,
             "status": self.status.as_u16(),
         });
+        // A 503 is always transient here (the store was busy), so say so in the
+        // one way HTTP clients understand. Agents back off on their own, but a
+        // browser or an `curl` user should not be left guessing how long.
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            return (
+                self.status,
+                [(axum::http::header::RETRY_AFTER, "2")],
+                Json(body),
+            )
+                .into_response();
+        }
         (self.status, Json(body)).into_response()
     }
 }
