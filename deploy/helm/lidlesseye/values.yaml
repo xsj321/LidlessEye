@@ -83,10 +83,6 @@ server:
       secretKey: ""
       useSSL: true
       urlStyle: path
-      # DuckDB multipart parts per upload (1-10000). Set to 1 to force a single
-      # PUT on S3-compatible endpoints that do not implement multipart uploads.
-      # Leave empty for AWS S3 (multipart is more robust there).
-      maxPartsPerFile: null
       # If set, read credentials from this existing Secret instead of the keys
       # above. Expected keys: access-key, secret-key.
       existingSecret: ""

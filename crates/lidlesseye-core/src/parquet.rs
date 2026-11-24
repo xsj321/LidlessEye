@@ -220,13 +220,6 @@ pub(crate) fn configure_s3(conn: &Connection, s3: &S3Config) -> Result<()> {
     ))?;
     let style = s3.url_style.as_deref().unwrap_or("path");
     set(format!("SET s3_url_style='{}'", esc(style)))?;
-    // DuckDB always uploads with the multipart API. A single part makes it
-    // fall back to one PUT, which is what S3-compatible gateways that do not
-    // implement multipart need. Leave it unset for AWS S3: multipart is more
-    // robust there and avoids buffering an entire object in memory.
-    if let Some(parts) = s3.max_parts_per_file {
-        set(format!("SET s3_uploader_max_parts_per_file={parts}"))?;
-    }
     // Without a bound, one stalled object read holds the tenant's only
     // connection forever: the query never finishes, so it never releases the
     // mutex, so every request after it is refused. DuckDB's own default is
@@ -1699,65 +1692,6 @@ mod tests {
             !map2.nodes.is_empty(),
             "net node visible after parquet flush"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn single_put_setting_is_applied_without_changing_the_default() {
-        let conn = Connection::open_in_memory().unwrap();
-        let s3 = S3Config {
-            bucket: "unused".into(),
-            max_parts_per_file: Some(1),
-            ..Default::default()
-        };
-        configure_s3(&conn, &s3).unwrap();
-        let parts: i64 = conn
-            .query_row(
-                "SELECT current_setting('s3_uploader_max_parts_per_file')::BIGINT",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(parts, 1, "explicit single PUT must reach DuckDB");
-
-        // Leaving it unset keeps AWS S3's multipart default: buffering a whole
-        // object in memory is only worth it for endpoints that need it.
-        let default_conn = Connection::open_in_memory().unwrap();
-        configure_s3(
-            &default_conn,
-            &S3Config {
-                bucket: "unused".into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let default_parts: i64 = default_conn
-            .query_row(
-                "SELECT current_setting('s3_uploader_max_parts_per_file')::BIGINT",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(default_parts, 10_000);
-    }
-
-    #[test]
-    fn s3_part_count_outside_duckdb_range_is_rejected() {
-        let dir = std::env::temp_dir().join(format!("ldx-pq-parts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut cfg = StoreConfig::new(&dir);
-        cfg.storage_mode = StorageMode::S3;
-        cfg.s3 = Some(S3Config {
-            bucket: "b".into(),
-            max_parts_per_file: Some(0),
-            ..Default::default()
-        });
-        assert!(
-            cfg.validate().is_err(),
-            "DuckDB only accepts 1..=10000 parts per file"
-        );
-        cfg.s3.as_mut().unwrap().max_parts_per_file = Some(1);
-        assert!(cfg.validate().is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

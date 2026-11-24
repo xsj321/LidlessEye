@@ -253,17 +253,16 @@ Relevant values under `server.storage`:
 | `s3.prefix` | `lidlesseye` | key prefix; the tenant id is appended per tenant |
 | `s3.endpoint` | `""` | `host:port`; empty uses the AWS default endpoint |
 | `s3.region` / `s3.useSSL` / `s3.urlStyle` | `us-east-1` / `true` / `path` | httpfs connection settings |
-| `s3.maxPartsPerFile` | `null` | set to `1` for endpoints without multipart upload support (single PUT) |
 | `s3.existingSecret` | `""` | pre-created secret with `access-key` / `secret-key` |
 
-DuckDB uploads objects with the S3 multipart API by default. Some S3-compatible
-gateways and lightweight test servers do not implement it and answer
-`501 Not Implemented`; archival then backs off forever while local staging
-grows. Set `s3.maxPartsPerFile: 1` (CLI `--s3-max-parts-per-file=1`,
-env `LIDLESSEYE_S3_MAX_PARTS_PER_FILE=1`) to make DuckDB write each object with
-a single PUT. The trade-off is that the whole object is buffered in memory
-during upload, so only use it for endpoints that need it. AWS S3 should keep
-the default.
+DuckDB's httpfs writes every S3 object with the multipart upload API; there is
+no single-PUT setting. An S3-compatible endpoint must implement
+`CreateMultipartUpload`, `UploadPart` and `CompleteMultipartUpload`, otherwise
+the archive probe fails with `501 Not Implemented` and archival stays paused
+while local staging grows. The server keeps the only local copy in that case,
+so no data is lost, but the staging area will eventually apply backpressure.
+Test doubles must provide those three operations; a PUT-only mock is not
+enough.
 
 Object lifecycle/retention for the bucket must be configured outside the chart.
 Budget for the storage class, requests and the longest unconfirmed staging

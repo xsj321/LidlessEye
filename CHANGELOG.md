@@ -251,6 +251,21 @@ map windows while the server endpoint is briefly absent.
   429 and 5xx are. Final drop warnings now include attempt count and elapsed
   time so a real outage is distinguishable from a bad payload.
 
+## [0.1.18] - 2026-11-24
+
+Remove an S3 option that could not do what it claimed.
+
+### Fixed
+
+- 0.1.17 added `--s3-max-parts-per-file` for endpoints that reject multipart
+  uploads. DuckDB's httpfs always writes through `CreateMultipartUpload`,
+  `UploadPart` and `CompleteMultipartUpload` — there is no single-PUT code path
+  — and the default `s3_uploader_max_filesize` made even a one-part setting
+  invalid. The CLI flag, env var, Helm value and the setting itself are
+  removed. `docs/deployment.md` now states the real requirement: an
+  S3-compatible endpoint must implement multipart uploads, and a PUT-only test
+  double cannot archive. Existing volumes and objects are unaffected.
+
 ## [0.1.17] - 2026-11-24
 
 S3-compatible endpoints that do not implement multipart uploads can now archive
@@ -719,7 +734,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/xsj321/LidlessEye/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/xsj321/LidlessEye/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/xsj321/LidlessEye/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/xsj321/LidlessEye/compare/v0.1.14...v0.1.15

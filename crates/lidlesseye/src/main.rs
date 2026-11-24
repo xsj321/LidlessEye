@@ -97,10 +97,6 @@ struct ServeArgs {
     /// S3 URL style: `path` (MinIO) or `host` (AWS).
     #[arg(long, env = "LIDLESSEYE_S3_URL_STYLE")]
     s3_url_style: Option<String>,
-    /// DuckDB multipart parts per upload (1-10000). Use 1 to force a single
-    /// PUT on S3-compatible endpoints without multipart support.
-    #[arg(long, env = "LIDLESSEYE_S3_MAX_PARTS_PER_FILE")]
-    s3_max_parts_per_file: Option<u64>,
     /// How long compacted Parquet stays local before S3 upload/removal
     /// (`1h` by default; shorter values are useful for testing).
     #[arg(long, env = "LIDLESSEYE_PARQUET_LOCAL_TTL")]
@@ -414,7 +410,6 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             secret_access_key: args.s3_secret_key.clone(),
             use_ssl: args.s3_use_ssl,
             url_style: args.s3_url_style.clone(),
-            max_parts_per_file: args.s3_max_parts_per_file,
         });
     let parquet_local_ttl = match &args.parquet_local_ttl {
         Some(value) => Some(parse_duration(value)?),

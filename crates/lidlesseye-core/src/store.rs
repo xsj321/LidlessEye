@@ -175,12 +175,6 @@ pub struct S3Config {
     /// `path` for MinIO, `host` for AWS virtual-hosted buckets.
     #[serde(default)]
     pub url_style: Option<String>,
-    /// DuckDB's `s3_uploader_max_parts_per_file`. Set to `1` for S3-compatible
-    /// endpoints that do not implement the multipart upload API: with a single
-    /// part, DuckDB writes the object with one PUT. `None` keeps DuckDB's
-    /// default, which is the right choice for AWS S3.
-    #[serde(default)]
-    pub max_parts_per_file: Option<u64>,
 }
 
 /// Tunables for the storage engine.
@@ -249,13 +243,6 @@ impl StoreConfig {
         if self.storage_mode.canonical() == StorageMode::S3 && self.s3.is_none() {
             return Err(Error::InvalidArgument(
                 "storage mode `s3` requires --s3-bucket and credentials".into(),
-            ));
-        }
-        if let Some(parts) = self.s3.as_ref().and_then(|s3| s3.max_parts_per_file)
-            && !(1..=10_000).contains(&parts)
-        {
-            return Err(Error::InvalidArgument(
-                "--s3-max-parts-per-file must be between 1 and 10000".into(),
             ));
         }
         Ok(())
