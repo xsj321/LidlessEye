@@ -64,6 +64,9 @@ spec:
             - --s3-region={{ .Values.server.storage.s3.region }}
             - --s3-url-style={{ .Values.server.storage.s3.urlStyle }}
             - --s3-use-ssl={{ .Values.server.storage.s3.useSSL }}
+            {{- with .Values.server.storage.s3.maxPartsPerFile }}
+            - --s3-max-parts-per-file={{ . }}
+            {{- end }}
             - --parquet-local-ttl={{ .Values.server.storage.localTTL }}
             {{- end }}
             {{- range .Values.server.tenants.allowed }}
