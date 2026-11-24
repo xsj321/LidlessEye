@@ -698,10 +698,10 @@ impl LidlessEye {
         let warm = registry.clone();
         tokio::spawn(async move {
             // The dashboard's first request is the tenant catalogue, which
-            // describes every tenant. Those numbers come from a scan per
-            // tenant; computing them inside that request makes a cold start
-            // look like a hung server. Fill the cache off the request path so
-            // the answer is already there.
+            // describes every tenant. The first tenant to be asked for has to
+            // count its whole archive, and doing that inside the request makes
+            // a cold start look like a hung server. Count it off the request
+            // path so the answer is already there.
             let _ = tokio::task::spawn_blocking(move || {
                 for id in warm.tenant_ids() {
                     if let Some(store) = warm.tenant(&id) {

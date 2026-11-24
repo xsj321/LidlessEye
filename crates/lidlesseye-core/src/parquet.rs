@@ -173,13 +173,14 @@ impl TableFiles {
     }
 }
 
-/// Whether a path predates the `hour=<n>/` layout.
+/// Whether a path predates the `hour=<n>` layout.
 ///
-/// Old files carried the hour in the *file name* (`h<n>-<stamp>.parquet`,
-/// `hour=<n>.parquet`), which is indistinguishable from a sharded path by
-/// parsing alone — the sharded form puts `hour=` in a directory component.
+/// Current files say `hour=<n>` in a directory component (local) or carry the
+/// `-part-` marker in a flat key (S3). Everything else — `hour=<n>.parquet`
+/// and `h<n>-<stamp>.parquet` — was named after the wall clock at write time,
+/// which is indistinguishable from a data hour by parsing alone.
 fn is_legacy_path(path: &str) -> bool {
-    !path.split('/').any(|segment| {
+    let sharded = path.split('/').any(|segment| {
         // httpfs hands back URL-escaped keys, so `hour=7` can arrive as
         // `hour%3D7`. A legacy flat key is `hour=<n>.parquet`, which has a
         // suffix and is therefore not a partition *component*.
@@ -187,7 +188,16 @@ fn is_legacy_path(path: &str) -> bool {
         segment
             .strip_prefix("hour=")
             .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-    })
+    });
+    if sharded {
+        return false;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match name.strip_prefix("hour=") {
+        // `hour=<n>-part-<stamp>.parquet` is this release's archive key.
+        Some(rest) => !rest.contains("-part-"),
+        None => true,
+    }
 }
 
 /// Local and remote file placement for every table, sharded by data hour.
@@ -471,8 +481,15 @@ fn remove_tmp_files(dir: &Path) {
 ///
 /// The bucket is the source of truth for archived objects. If the in-memory
 /// index is lost (a new pod, a rebuilt PVC) we would otherwise hide every
-/// archived hour, so one recursive `glob()` per table prefix re-discovers them.
+/// archived hour, so a `glob()` over the tenant prefix re-discovers them.
 /// Query binding never issues a LIST: it names files from the index.
+///
+/// One pattern, not one per table: a LIST against an object store costs a
+/// round trip, and this ran twelve of them per tenant at every start. Six times
+/// fewer round trips is the difference between a ready pod and one the startup
+/// probe kills. `*` per level rather than `**` for the same reason — a glob is
+/// expanded one directory at a time, so a recursive pattern over an archive
+/// with an `hour=<n>/` directory per hour is one LIST per hour.
 ///
 /// Returns the number of newly discovered objects. Any error is swallowed by
 /// the caller so an unreachable/misconfigured S3 never blocks startup.
@@ -485,34 +502,29 @@ pub(crate) fn discover_s3_objects(
     let mut index = state.load_index();
     let mut added = 0usize;
 
-    for def in TABLES {
-        // Two layouts are read at once: the current sharded one
-        // (`<table>/hour=<n>/<file>.parquet`) and the older flat one
-        // (`<table>/hour=<n>.parquet` or `<table>/h<n>-*.parquet`). Globbing
-        // both is one LIST each and keeps an upgrade from hiding history.
-        let patterns = [
-            format!("{base}/{}/**/*.parquet", def.name),
-            format!("{base}/{}/*.parquet", def.name),
-        ];
-        let mut found: Vec<String> = Vec::new();
-        for pattern in patterns {
-            // DuckDB's glob() returns a `file` column of fully-qualified s3://
-            // URIs (URL-escaped keys). Bind the pattern so a quote in a prefix
-            // can never break the SQL.
-            let mut stmt = conn
-                .prepare("SELECT file FROM glob(?)")
-                .map_err(|e| Error::Db(format!("preparing S3 discovery for {}: {e}", def.name)))?;
-            let rows = stmt
-                .query_map([pattern.as_str()], |r| r.get::<_, String>(0))
-                .map_err(|e| Error::Db(format!("listing S3 objects for {}: {e}", def.name)))?;
-            for row in rows.flatten() {
-                found.push(normalize_s3_uri(&row, s3));
-            }
-        }
-
-        let entry = index.s3_mut(def.name);
-        for uri in found {
+    // Every layout this reads is flat under the table:
+    // `<table>/hour=<n>-part-<stamp>.parquet` (current),
+    // `<table>/hour=<n>.parquet` (0.1.16–0.1.18 archive) and
+    // `<table>/h<n>-*.parquet` (a pre-0.1.19 local tree copied into a bucket).
+    // One pattern covers all three: a LIST for the prefix, one per table.
+    let pattern = format!("{base}/*/*.parquet");
+    {
+        // DuckDB's glob() returns a `file` column of fully-qualified s3://
+        // URIs (URL-escaped keys). Bind the pattern so a quote in a prefix
+        // can never break the SQL.
+        let mut stmt = conn
+            .prepare("SELECT file FROM glob(?)")
+            .map_err(|e| Error::Db(format!("preparing S3 discovery for {pattern}: {e}")))?;
+        let rows = stmt
+            .query_map([pattern.as_str()], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Db(format!("listing S3 objects for {pattern}: {e}")))?;
+        for row in rows.flatten() {
+            let uri = normalize_s3_uri(&row, s3);
+            let Some(table) = table_of_key(&uri, &base) else {
+                continue;
+            };
             let hour = hour_from_key(&uri);
+            let entry = index.s3_mut(table);
             let already = match hour {
                 Some(hour) => entry
                     .by_hour
@@ -538,6 +550,17 @@ pub(crate) fn discover_s3_objects(
         state.save_index(&index)?;
     }
     Ok(added)
+}
+
+/// The table an object belongs to: the first key segment after the tenant
+/// prefix, which is the same position in both layouts.
+fn table_of_key<'a>(uri: &'a str, base: &str) -> Option<&'a str> {
+    let rest = uri.strip_prefix(base)?.trim_start_matches('/');
+    let table = rest.split('/').next()?;
+    TABLES
+        .iter()
+        .find(|def| def.name == table)
+        .map(|def| def.name)
 }
 
 /// The hour an S3 key belongs to, from either layout.
@@ -1030,15 +1053,21 @@ pub(crate) fn archive_local(
                 .map(|p| format!("'{}'", esc(p)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            // Shard the archive the same way as the local tree, so a windowed
-            // query can name the archived hours it needs instead of every
-            // object in the bucket.
+            // Flat key with the hour in the name, not an `hour=<n>/` prefix.
+            //
+            // The hour still has to be in the key, so a windowed query can name
+            // the archived hours it needs instead of every object in the
+            // bucket. What must *not* be there is a directory level: a `glob()`
+            // resolves one directory at a time, so `<table>/hour=<n>/<file>`
+            // cost one LIST per archived hour at start-up. With a flat key the
+            // whole tenant prefix is six LISTs, which is the difference between
+            // a ready pod and one the startup probe kills.
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
             let key_url = format!(
-                "{}/{}/hour={}/part-{stamp}.parquet",
+                "{}/{}/hour={}-part-{stamp}.parquet",
                 state.s3_base(),
                 def.name,
                 hour

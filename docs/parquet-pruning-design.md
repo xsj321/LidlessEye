@@ -152,10 +152,16 @@ pub(crate) fn table_span(state, table, from_ns, until_ns) -> String {
 |---|---|---|
 | 本地 | `parquet/<table>/hour=<n>/part-<stamp>-<rows>.parquet` | `<table>/h<hour>-<stamp>-<rows>.parquet`、`h<hour>-final-<stamp>.parquet` |
 | 本地合并 | `hour=<n>/final-<unique>.parquet` | — |
-| S3 | `{base}/{table}/hour=<n>/part-<stamp>.parquet` | `{table}/hour=<n>.parquet` |
+| S3 | `{base}/{table}/hour=<n>-part-<stamp>.parquet` | `{table}/hour=<n>.parquet` |
 
-`discover_s3_objects` 用双 glob（`**/*.parquet` + `*/*.parquet`）同时覆盖新旧布局，
-按 key 里的 `hour=` 入索引，**不做任何对象迁移**。
+本地用 `hour=<n>/` 目录分片，S3 用平坦 key —— 这个不对称是刻意的：`read_dir`
+免费，而 `glob()` 是**逐层展开**的。S3 上如果也用 `hour=<n>/` 前缀，启动时每个
+已归档的小时都要一次 LIST：十租户集群实测每个租户 12 个模式的 LIST 要 18–51 秒，
+直接超过 startupProbe 的 300 秒预算。改成平坦 key 后，整个租户只有
+`glob('{base}/*/*.parquet')` 一次调用（前缀一次 + 每张表一次）。
+
+`discover_s3_objects` 用这一个模式同时覆盖新旧布局（`hour=<n>-part-…`、
+`hour=<n>.parquet`、`h<n>-…`），按 key 里的 `hour=` 入索引，**不做任何对象迁移**。
 
 分片的小时**必须用整数除法**。DuckDB 的 `/` 是浮点，`CAST(double AS BIGINT)`
 四舍五入：`start_ns/1e9/3600` 会把 13:43 的事件算成第 14 小时，于是每个小时的后
@@ -190,11 +196,20 @@ SET parquet_metadata_cache=true;
 
 全部用 `let _ =` 忽略失败（旧版 httpfs 不认新名字时不应影响启动）。
 
-### 4.5 stats 缓存只在该失效时失效
+### 4.5 目录统计改为可维护的聚合
 
-- `flush_hot` / `flush_hot_when_idle` / `compact_local` / `archive_local`
-  都是**行数不变的搬迁**，不再清空缓存；只在 `prune`、`append`、服务图写入时失效。
-- TTL 30 s → 60 s；命中时刷新 `total_bytes`（用 `disk_bytes()`，成本只有一次目录遍历）。
+- 行数/求和/时间边界是一次性读出来的 `RowAgg`，之后由写路径**维护**，不再有 TTL：
+  - `append` 在**释放写连接之前**把自己的行加进去；
+  - `prune` 在仍持有写连接时 `recount` 一次并装回；
+  - `flush_hot` / `flush_hot_when_idle` / `compact_local` / `archive_local` 是行数不变的
+    搬迁，不碰聚合；服务图写入只动 `net_*`，也不碰。
+- 关键顺序：`recount` 走 `write_conn()`（独占写连接），`append` 在放锁前 `add`。
+  这样不存在"已提交但尚未计入聚合"的窗口，recount 不可能跨过它而漏掉一行。
+  （早一版用读连接算完再写缓存，正好丢掉这个窗口内的 batch，被
+  `pruning_while_ingesting_keeps_the_index_consistent` 抓到，
+  现在由 `a_poll_during_ingest_never_undercounts` 守着。）
+- 读聚合只是拿锁 + clone；`total_bytes` 命中时用 `disk_bytes()` 刷新（一次目录遍历）。
+- distinct series 没有精确增量形式，仍是扫描，但换成 10 分钟一档。
 - `/api/v1/stats`、`/api/v1/tenants`、`/metrics` 全部改走 `stats_cached()`，
   请求路径不再做全表扫描。
 - `bind()` 不再在启动时 `total_stats()`；改为 `serve_with_shutdown` 里的后台任务

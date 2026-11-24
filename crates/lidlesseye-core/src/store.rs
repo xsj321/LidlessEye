@@ -633,10 +633,52 @@ pub struct Store {
     last_compact_ns: std::sync::atomic::AtomicU64,
     /// Last successful hot-tier flush, for the configured RPO cadence.
     last_flush_ns: std::sync::atomic::AtomicU64,
-    /// Cached [`StoreStats`], the distinct-series count, and when they were
-    /// computed. Every open dashboard polls `stats`, and in canonical modes
-    /// that query has to open the footer of every Parquet file to count rows.
-    stats_cache: Mutex<Option<(u64, StoreStats, usize)>>,
+    /// Row counts, sums and time bounds of `batches`, carried forward by every
+    /// path that changes them.
+    ///
+    /// Every open dashboard polls `stats`, and in canonical modes the answer
+    /// has to read the whole archive: `COUNT(*)` is cheap only while the rows
+    /// are hot, and `SUM(total_value)` reads a column's data pages either way.
+    /// Recomputing per poll is what made the endpoint time out. So it is read
+    /// once, under the writer connection, and then *maintained*: an append adds
+    /// its own contribution, a prune recounts. `None` means "not counted yet".
+    agg: Mutex<Option<RowAgg>>,
+    /// `(computed_at, distinct series)`. A full scan of the label columns with
+    /// no exact incremental form, so it runs on a slow clock instead.
+    series_cache: Mutex<Option<(u64, usize)>>,
+}
+
+/// The row half of [`StoreStats`]: everything that a write path can adjust
+/// arithmetically.
+#[derive(Debug, Clone, Copy, Default)]
+struct RowAgg {
+    batch_count: usize,
+    total_value: u64,
+    logical_bytes: u64,
+    earliest_ns: Option<u64>,
+    latest_ns: Option<u64>,
+}
+
+impl RowAgg {
+    /// Account one committed batch.
+    fn add(&mut self, value: u64, bytes: u64, start_ns: u64, end_ns: u64) {
+        self.batch_count += 1;
+        self.total_value = self.total_value.saturating_add(value);
+        self.logical_bytes = self.logical_bytes.saturating_add(bytes);
+        self.earliest_ns = Some(self.earliest_ns.map_or(start_ns, |at| at.min(start_ns)));
+        self.latest_ns = Some(self.latest_ns.map_or(end_ns, |at| at.max(end_ns)));
+    }
+
+    fn into_stats(self, total_bytes: u64) -> StoreStats {
+        StoreStats {
+            batch_count: self.batch_count,
+            total_bytes,
+            logical_bytes: self.logical_bytes,
+            total_value: self.total_value,
+            earliest_ns: self.earliest_ns,
+            latest_ns: self.latest_ns,
+        }
+    }
 }
 
 /// One read connection onto the shared database.
@@ -981,6 +1023,7 @@ impl Store {
         // A separate connection for merges/uploads: it opens Parquet files and
         // S3 objects, never the hot tables. A slow upload can no longer make
         // every ingest and query wait on it.
+        let extras = std::time::Instant::now();
         let maintenance_conn = Connection::open_in_memory()
             .map_err(|err| Error::Db(format!("opening maintenance DuckDB: {err}")))?;
         if mode == StorageMode::S3 {
@@ -995,8 +1038,18 @@ impl Store {
             &cfg,
             &parquet_state.dir.join(".duckdb-tmp"),
         )?;
+        // Opening connections is not free: each read slot re-runs `LOAD httpfs`
+        // and the whole session tuning, so this is worth attributing when a
+        // ten-tenant start runs past its probe budget.
+        info!(
+            stage = "connections",
+            readers = cfg.read_connections(),
+            elapsed_ms = extras.elapsed().as_millis(),
+            "auxiliary connections ready"
+        );
 
         info!(stage = "id_counters", "loading store id counters");
+        let ids_started = std::time::Instant::now();
         let ids = {
             // Ids are allocated across the *whole* dataset, so these three
             // lookups must span the hot tier and every Parquet file. They are
@@ -1036,6 +1089,12 @@ impl Store {
             }
         };
 
+        info!(
+            stage = "id_counters",
+            elapsed_ms = ids_started.elapsed().as_millis(),
+            "id counters loaded"
+        );
+
         let store = Store {
             cfg,
             conn: Mutex::new(conn),
@@ -1047,7 +1106,8 @@ impl Store {
             maintenance_conn: Mutex::new(maintenance_conn),
             last_compact_ns: std::sync::atomic::AtomicU64::new(0),
             last_flush_ns: std::sync::atomic::AtomicU64::new(now_ns()),
-            stats_cache: Mutex::new(None),
+            agg: Mutex::new(None),
+            series_cache: Mutex::new(None),
         };
         info!(
             root = %store.cfg.root.display(),
@@ -1280,6 +1340,16 @@ impl Store {
                 .map_err(db_err)?;
                 Ok(())
             })?;
+            // Fold the batch into the catalogue aggregate *before* releasing the
+            // writer. A caller that appends and then asks for stats must see its
+            // own write, and clearing the cache did that by forcing a full
+            // re-scan on every append — which is every few seconds per agent.
+            // Doing it here instead keeps the arithmetic exact: a recount (see
+            // `Store::row_agg`) can only run while it owns this connection, so
+            // it can never see a committed batch that is not counted yet.
+            if let Some(agg) = self.agg.lock().as_mut() {
+                agg.add(total_value, bytes, report.start_ns, report.end_ns);
+            }
         }
 
         debug!(
@@ -1289,11 +1359,8 @@ impl Store {
             "wrote batch"
         );
 
-        // A caller that appends and then asks for stats must see its own write.
-        // Clearing the cache did that by forcing a full re-scan — on every
-        // append, which is every few seconds per agent. The deltas are exact,
-        // so account them instead; the TTL still refreshes the series count.
-        self.bump_cached_stats(total_value, bytes, report.start_ns, report.end_ns);
+        // The catalogue aggregate was updated under the writer above, so a
+        // caller that appends and then asks for stats already sees this batch.
         Ok(Arc::new(BatchMeta {
             batch_id,
             profile_type: report.profile_type.clone(),
@@ -1657,36 +1724,15 @@ impl Store {
             .0
     }
 
-    /// The cached catalogue numbers, without scanning.
+    /// The catalogue numbers, without scanning.
     ///
     /// The tenant list describes every tenant at once. Answering it used to
     /// mean a full scan per tenant on the request path — ten tenants of 1.5 s
-    /// each is what made the dashboard's first call time out.
-    ///
-    /// This reads the cache and computes it only when it is cold or older than
-    /// the TTL, so the cost is at most one scan per tenant per minute. The
-    /// server warms every tenant in the background at start-up, and write
-    /// paths account their own deltas (see [`Store::bump_cached_stats`]) rather
-    /// than dropping the cache, so a busy tenant does not rescan on every poll.
+    /// each is what made the dashboard's first call time out. The row half is
+    /// now arithmetic (see [`Store::append`]); only the distinct-series count
+    /// still costs a scan, and it is allowed to be ten minutes old.
     pub fn stats_cached(&self) -> (StoreStats, usize) {
         self.stats_snapshot().unwrap_or_default()
-    }
-
-    /// Account a committed batch in the cached catalogue.
-    ///
-    /// Only meaningful while an entry exists: with none, the next reader
-    /// computes the truth, which is more accurate than a delta anyway.
-    fn bump_cached_stats(&self, value: u64, bytes: u64, start_ns: u64, end_ns: u64) {
-        let mut cache = self.stats_cache.lock();
-        let Some((_, stats, _)) = cache.as_mut() else {
-            return;
-        };
-        stats.batch_count += 1;
-        stats.total_value = stats.total_value.saturating_add(value);
-        stats.logical_bytes = stats.logical_bytes.saturating_add(bytes);
-        stats.earliest_ns = Some(stats.earliest_ns.map_or(start_ns, |old| old.min(start_ns)));
-        stats.latest_ns = Some(stats.latest_ns.map_or(end_ns, |old| old.max(end_ns)));
-        // `total_bytes` is a directory walk and is refreshed on every read.
     }
 
     /// [`Store::stats_snapshot`] without the fallback: a busy store is an
@@ -1698,64 +1744,38 @@ impl Store {
         Ok((stats, series))
     }
 
-    /// [`Store::stats`] plus the distinct-series count, computed together.
+    /// [`Store::stats`] plus the distinct-series count.
     ///
-    /// `/api/v1/stats` reports both, and the dashboard polls it every few
-    /// seconds. They are separate scans of `batches` — and in Parquet mode each
-    /// one opens every file's footer — so paying for them once per cache window
-    /// instead of twice per poll is most of what keeps an idle dashboard from
-    /// loading the CPU.
+    /// `/api/v1/stats` reports both and the dashboard polls it every few
+    /// seconds, so neither may scan. They get there differently:
+    ///
+    /// The counts, sums and time bounds are a [`RowAgg`], counted once (under
+    /// the writer, see [`Store::row_agg`]) and adjusted by every path that
+    /// changes the row set, so reading them is a mutex and a clone.
+    /// `total_bytes` is a directory walk and is refreshed here, because
+    /// flushing and archiving change it without changing a single row.
+    ///
+    /// The distinct-series count has no exact incremental form, so it is
+    /// cached on a slow clock and recomputed only when that expires. One
+    /// shared 60-second TTL made a poll pay for it once a minute: measured at
+    /// 11 s against a 4-million-row tenant, a visible stall on an otherwise
+    /// 40 ms endpoint. Ten minutes is far faster than series appear or
+    /// disappear, and the gauge is a cardinality estimate, not a ledger.
     pub fn stats_snapshot(&self) -> Result<(StoreStats, usize)> {
+        const SERIES_TTL: u64 = 600_000_000_000;
         let now = now_ns();
-        // Dashboards poll this every few seconds. In Parquet mode the query
-        // reads every file's footer, so a short cache removes a surprising
-        // amount of metadata I/O without making the number stale to the eye.
-        if let Some((at, mut cached, series)) = *self.stats_cache.lock()
-            && now.saturating_sub(at) < 60_000_000_000
+        let agg = self.row_agg()?;
+        let cached = *self.series_cache.lock();
+        if let Some((at, series)) = cached
+            && now.saturating_sub(at) < SERIES_TTL
         {
-            // The physical footprint is a directory walk, not a scan, and it
-            // does change on every flush/archive. Refreshing just this field
-            // keeps the byte gauge honest without re-counting a single row.
-            cached.total_bytes = self.disk_bytes();
-            return Ok((cached, series));
+            return Ok((agg.into_stats(self.disk_bytes()), series));
         }
+
         let conn = self.read_conn()?;
         let span = self.span_all("batches");
         let scan_started = std::time::Instant::now();
-        let row = conn.query_row(
-            &format!(
-                "SELECT COUNT(*), COALESCE(SUM(total_value), 0), COALESCE(SUM(bytes), 0), \
-                 MIN(start_ns), MAX(end_ns) FROM {span}"
-            ),
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0).unwrap_or(0),
-                    row.get::<_, i64>(1).unwrap_or(0),
-                    row.get::<_, i64>(2).unwrap_or(0),
-                    row.get::<_, Option<i64>>(3).ok().flatten(),
-                    row.get::<_, Option<i64>>(4).ok().flatten(),
-                ))
-            },
-        );
-        let (count, value, logical, earliest, latest) = match row {
-            Ok(v) => v,
-            Err(err) => {
-                warn!(error = %err, "stats query failed");
-                return Ok((StoreStats::default(), 0));
-            }
-        };
-        let stats = StoreStats {
-            batch_count: count.max(0) as usize,
-            total_bytes: self.disk_bytes(),
-            logical_bytes: logical.max(0) as u64,
-            total_value: value.max(0) as u64,
-            earliest_ns: earliest.map(|v| v.max(0) as u64),
-            latest_ns: latest.map(|v| v.max(0) as u64),
-        };
-        // Same connection, so this cannot be a second `series_count()` call —
-        // the mutex is not reentrant.
-        let series: usize = conn
+        let series = conn
             .query_row(
                 &format!(
                     "SELECT COUNT(*) FROM \
@@ -1766,16 +1786,92 @@ impl Store {
             )
             .map(|count| count.max(0) as usize)
             .unwrap_or(0);
-        *self.stats_cache.lock() = Some((now, stats, series));
+        *self.series_cache.lock() = Some((now, series));
         let elapsed = scan_started.elapsed();
         if elapsed > std::time::Duration::from_secs(1) {
             info!(
                 elapsed_ms = elapsed.as_millis(),
                 root = %self.cfg.root.display(),
-                "tenant stats scan was slow; this is what the first catalogue request waits for"
+                "distinct-series scan was slow; it runs once every ten minutes"
             );
         }
-        Ok((stats, series))
+        Ok((agg.into_stats(self.disk_bytes()), series))
+    }
+
+    /// The row aggregate, counting it the first time it is asked for.
+    ///
+    /// The recount runs under the *writer* connection, not a read clone, and
+    /// [`Store::append`] updates the aggregate before it gives the writer back.
+    /// That ordering is what makes the arithmetic exact: there is no instant
+    /// in which a batch is committed but not yet folded into the aggregate, so
+    /// a recount can never overlap one and lose it.
+    fn row_agg(&self) -> Result<RowAgg> {
+        if let Some(agg) = *self.agg.lock() {
+            return Ok(agg);
+        }
+        let conn = match self.write_conn() {
+            Ok(conn) => conn,
+            Err(err) => {
+                // A flush or a compaction owns the writer. Answering "0
+                // batches" would show an empty install, so fall back to a read
+                // snapshot — but do not install it: a batch committing during
+                // that scan may be missing from it, and the deltas added later
+                // would be added to a number that already lost rows.
+                warn!(error = %err, "counted the catalogue without the writer");
+                let conn = self.read_conn()?;
+                return self.recount(&conn);
+            }
+        };
+        // Nothing can append while this thread owns the writer, so a re-check
+        // under the guard is enough — no other thread can be counting.
+        if let Some(agg) = *self.agg.lock() {
+            return Ok(agg);
+        }
+        let started = std::time::Instant::now();
+        let agg = self.recount(&conn)?;
+        // Installed after the scan: the aggregate lock is never held across it.
+        *self.agg.lock() = Some(agg);
+        info!(
+            batches = agg.batch_count,
+            elapsed_ms = started.elapsed().as_millis(),
+            root = %self.cfg.root.display(),
+            "counted the archive for the catalogue"
+        );
+        Ok(agg)
+    }
+
+    /// Recount [`RowAgg`] from the database.
+    ///
+    /// The caller must own `conn` — the writer, or a maintenance connection
+    /// that already holds it — so the recount cannot interleave with an append.
+    fn recount(&self, conn: &Connection) -> Result<RowAgg> {
+        let span = self.span_all("batches");
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(total_value), 0), COALESCE(SUM(bytes), 0), \
+                     MIN(start_ns), MAX(end_ns) FROM {span}"
+                ),
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0).unwrap_or(0),
+                        row.get::<_, i64>(1).unwrap_or(0),
+                        row.get::<_, i64>(2).unwrap_or(0),
+                        row.get::<_, Option<i64>>(3).ok().flatten(),
+                        row.get::<_, Option<i64>>(4).ok().flatten(),
+                    ))
+                },
+            )
+            .map_err(db_err)?;
+        let (count, value, logical, earliest, latest) = row;
+        Ok(RowAgg {
+            batch_count: count.max(0) as usize,
+            total_value: value.max(0) as u64,
+            logical_bytes: logical.max(0) as u64,
+            earliest_ns: earliest.map(|v| v.max(0) as u64),
+            latest_ns: latest.map(|v| v.max(0) as u64),
+        })
     }
 
     /// Physical footprint of the tenant's durable data: the Parquet files on
@@ -2148,11 +2244,12 @@ impl Store {
             }
 
             conn.execute_batch("CHECKPOINT").map_err(db_err)?;
+            // The counts just changed. Recount while the writer is still held,
+            // so both this pass and the next reader observe the pruned state
+            // and no append can slip in between.
+            *self.agg.lock() = Some(self.recount(&conn)?);
         }
 
-        // The counts just changed; drop the value `before` cached so both this
-        // pass and the caller observe the pruned state.
-        *self.stats_cache.lock() = None;
         let after = self.stats();
         // Physical file size stays at its high-water mark after DELETE, so
         // report the logical size actually released instead.
@@ -2179,6 +2276,9 @@ impl Store {
             ))
             .map_err(db_err)?;
             conn.execute_batch("CHECKPOINT").map_err(db_err)?;
+            // Nothing is left to count. Set it under the writer so a reader
+            // cannot observe the old totals after the rows are gone.
+            *self.agg.lock() = Some(RowAgg::default());
         }
         // In canonical modes the durable rows are Parquet files under
         // `hour=<n>/`, so a clear must remove the whole table tree — a
@@ -2193,7 +2293,7 @@ impl Store {
         self.parquet.clear_index()?;
         parquet::reindex_local(&self.parquet);
         self.frame_cache.lock().clear();
-        *self.stats_cache.lock() = None;
+        *self.series_cache.lock() = None;
         let mut ids = self.ids.lock();
         ids.next_frame = 0;
         ids.next_stack = 0;
@@ -2295,6 +2395,8 @@ impl Store {
         // not be mistaken for a failed transaction and trigger a ROLLBACK of
         // work DuckDB already made durable.
         conn.execute_batch("CHECKPOINT").map_err(db_err)?;
+        // No aggregate to fix up: repair removes stacks and orphaned samples,
+        // never a `batches` row, so the catalogue numbers are still exact.
         Ok(removed)
     }
 
@@ -3702,6 +3804,45 @@ mod tests {
         assert_eq!(stats.waits, waits + 1);
         assert_eq!(stats.max_wait_ms, 25);
         assert_eq!(stats.slow_waits, 0);
+    }
+
+    /// A poll that overlaps an ingest must never report fewer batches than are
+    /// already written.
+    ///
+    /// The catalogue numbers used to be a scan whose result was cached after
+    /// the fact, so a batch that committed while that scan was running was
+    /// counted by neither side and the dashboard stayed one short until the
+    /// cache expired. Counting under the writer, and folding each append in
+    /// before the writer is released, is what closes that window: `stats` is
+    /// exact after every append, including the very first ones that race the
+    /// initial recount.
+    #[test]
+    fn a_poll_during_ingest_never_undercounts() {
+        let (store, dir) = temp_store("stats-race");
+        std::thread::scope(|scope| {
+            let poller = scope.spawn(|| {
+                for _ in 0..100 {
+                    let _ = store.stats_snapshot().unwrap();
+                }
+            });
+            for i in 0..100u64 {
+                store
+                    .append(&report("svc", 1_000 + i, "a", &["hot"], 10 + i))
+                    .unwrap();
+                assert_eq!(
+                    store.stats().batch_count,
+                    i as usize + 1,
+                    "batch {i} is not visible to the writer that just wrote it"
+                );
+            }
+            poller.join().unwrap();
+        });
+        let stats = store.stats();
+        assert_eq!(stats.batch_count, 100);
+        assert_eq!(stats.total_value, (0..100).map(|i| 10 + i).sum::<u64>());
+        assert_eq!(stats.earliest_ns, Some(1_000));
+        assert_eq!(stats.latest_ns, Some(1_099 + 10_000_000_000));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

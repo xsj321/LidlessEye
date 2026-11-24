@@ -199,18 +199,36 @@ impl TenantStore {
             stage = "tenants",
             "opening tenant stores"
         );
-        for (index, id) in tenants.iter().enumerate() {
-            info!(
-                tenant = %id,
-                index = index + 1,
-                total = tenants.len(),
-                stage = "tenant_open",
-                "opening tenant store"
-            );
-            if let Err(err) = registry.open_tenant(id) {
-                warn!(tenant = %id, error = %err, "failed to open tenant");
+        // In parallel, because opening a tenant is almost entirely waiting on
+        // the object store: discovery globs the prefix and the id counters read
+        // every footer. Ten tenants of that, one after another, is what pushed
+        // a start past the startup probe's budget and put the pod in a restart
+        // loop. Four at a time keeps the pod's memory in check while turning a
+        // serial sum into roughly the slowest single tenant.
+        let workers = tenants.len().clamp(1, 4);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(id) = tenants.get(index) else {
+                            break;
+                        };
+                        info!(
+                            tenant = %id,
+                            index = index + 1,
+                            total = tenants.len(),
+                            stage = "tenant_open",
+                            "opening tenant store"
+                        );
+                        if let Err(err) = registry.open_tenant(id) {
+                            warn!(tenant = %id, error = %err, "failed to open tenant");
+                        }
+                    }
+                });
             }
-        }
+        });
         info!(
             elapsed_ms = started.elapsed().as_millis(),
             stage = "tenants",
@@ -250,12 +268,6 @@ impl TenantStore {
     /// Open (creating the directory if needed) the store of a tenant.
     pub fn open_tenant(&self, tenant: &TenantId) -> Result<Arc<Store>> {
         if let Some(store) = self.stores.read().get(tenant) {
-            return Ok(store.clone());
-        }
-        let mut stores = self.stores.write();
-        // Re-check under the write lock: another thread may have won the race
-        // while we were waiting.
-        if let Some(store) = stores.get(tenant) {
             return Ok(store.clone());
         }
         let existing = self.tenant_ids().len();
@@ -300,10 +312,18 @@ impl TenantStore {
         let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         let mutex = open_lock(&canonical);
         let _open_guard = mutex.lock();
+        // Re-check under the open lock: another thread (or another registry
+        // over the same directory) may have finished opening this tenant while
+        // we waited. Nothing is held across `Store::open` itself — opening a
+        // tenant is mostly waiting on the object store, and a registry-wide
+        // lock there would make a ten-tenant start serial again.
+        if let Some(store) = self.stores.read().get(tenant) {
+            return Ok(store.clone());
+        }
         let opened = std::time::Instant::now();
         info!(tenant = %tenant, dir = %dir.display(), "tenant store open started");
         let store = Arc::new(Store::open(cfg)?);
-        stores.insert(tenant.clone(), store.clone());
+        self.stores.write().insert(tenant.clone(), store.clone());
         info!(
             tenant = %tenant,
             elapsed_ms = opened.elapsed().as_millis(),
@@ -347,11 +367,12 @@ impl TenantStore {
 
     /// Stats for every tenant on disk.
     ///
-    /// Each entry comes from the tenant's stats cache, which is computed on
-    /// demand when cold and then reused for the TTL. Computing it here for
-    /// every tenant on every poll is what turned the dashboard's first request
-    /// into a fifteen-second wait; the server also warms the cache in the
-    /// background at start-up so that first poll usually finds it full.
+    /// Each entry comes from the tenant's own aggregate, which costs a lock and
+    /// a clone once the tenant has counted its archive, and a one-off recount
+    /// while it has not. Computing the numbers here for every tenant on every
+    /// poll is what turned the dashboard's first request into a fifteen-second
+    /// wait; the server also warms each tenant in the background at start-up so
+    /// that first poll usually finds them counted.
     pub fn tenants(&self) -> Vec<TenantInfo> {
         self.tenant_ids()
             .into_iter()
@@ -370,13 +391,13 @@ impl TenantStore {
             .collect()
     }
 
-    /// Aggregate stats over all tenants, from the per-tenant cached numbers.
+    /// Aggregate stats over all tenants, from the per-tenant numbers.
     ///
     /// The only caller is `/metrics`, which Prometheus scrapes every few
-    /// seconds. Summing `stats()` per tenant there meant a full scan of every
-    /// tenant on every scrape — a self-inflicted load that competed with the
-    /// dashboard for the same connections. A scrape may be up to one cache
-    /// window stale, which is irrelevant for a gauge.
+    /// seconds. Summing a full scan per tenant there meant a self-inflicted
+    /// load that competed with the dashboard for the same connections. The
+    /// counts are exact; only `total_bytes` (a directory walk) and the
+    /// distinct-series count lag behind, which is irrelevant for a gauge.
     pub fn total_stats(&self) -> StoreStats {
         let mut total = StoreStats::default();
         for id in self.tenant_ids() {

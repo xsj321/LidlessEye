@@ -217,8 +217,13 @@ only durable data.
 ```text
 <data-dir>/tenants/<tenant>/parquet/<table>/hour=<epoch-hour>/part-<stamp>-<rows>.parquet
 <data-dir>/tenants/<tenant>/parquet/<table>/hour=0/part-<stamp>-<rows>.parquet   # dictionaries
-s3://<bucket>/<prefix>/<tenant>/<table>/hour=<epoch-hour>/part-<stamp>.parquet   # s3 mode only
+s3://<bucket>/<prefix>/<tenant>/<table>/hour=<epoch-hour>-part-<stamp>.parquet   # s3 mode only
 ```
+
+Local files are sharded into `hour=<n>/` directories; archived objects are flat
+with the hour in the key. That asymmetry is deliberate: a `read_dir` is free,
+while a `glob()` resolves one directory at a time, so an `hour=<n>/` prefix in
+the bucket meant one LIST per archived hour on every start.
 
 Writes go to `<table>_hot` tables. There are **no canonical VIEWs**: every read
 builds its own `FROM` clause from the hot table plus only the Parquet hours that
@@ -231,7 +236,9 @@ a 60-second timeout into a sub-second scan.
 The pre-0.1.19 layouts (`<table>/h<hour>-*.parquet` locally and
 `<table>/hour=<hour>.parquet` in S3) are still indexed and read, so upgrading
 needs no rewrite of the archive: the index derives the hour from the directory
-component or, failing that, from the file name. Those files were tagged with the
+component or, failing that, from the file name. Discovery is one
+`glob('{base}/*/*.parquet')` for the whole tenant — a LIST for the prefix plus
+one per table. Those files were tagged with the
 wall clock at write time rather than with the hour of their rows, so a flush that
 straddled a boundary can hold the previous hour's rows. While a legacy file is
 still present in a table, its window is widened by one hour on each side — two

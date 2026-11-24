@@ -283,15 +283,32 @@ were why the dashboard went blank: a 60-second HTTP timeout on `/api/v1/stats`,
   settings are re-applied per slot. Interrupts are aimed only at readers, never at
   the writer.
 - `/api/v1/stats`, `/api/v1/tenants` and `/metrics` each ran `COUNT(*)` plus
-  `COUNT(DISTINCT …)` over the full archive on the request path. They now read a
-  per-tenant cache that is computed when cold and reused for 60 s. The cache is
-  no longer dropped by flushing, compaction, archiving or service-map windows —
-  those move the same rows between files, or touch tables the count does not
-  include — and an append accounts its own deltas instead of invalidating, so a
-  tenant that is being written to does not rescan on every dashboard poll. Only
-  pruning still invalidates. `bind()` no longer computes tenant totals before it
-  starts serving, which was failing the liveness probe in a ten-tenant cluster;
-  a background task warms the cache after startup instead.
+  `COUNT(DISTINCT …)` over the full archive on the request path. The counts,
+  sums and time bounds are now a per-tenant aggregate that is read once and then
+  *maintained*: an append folds its own row in before it gives the writer back, a
+  prune recounts while it still holds it, and flushing, compaction, archiving and
+  service-map windows leave it alone (they move the same rows, or touch tables
+  the aggregate does not cover). Reading it is a mutex and a clone — no scan, no
+  TTL. Counting under the writer is what makes it exact: there is no instant in
+  which a batch is committed but not yet counted, so the recount cannot overlap
+  an append and lose it. An earlier cut of this counted on a read clone and
+  cached the result afterwards, which dropped exactly those batches (the
+  dashboard was one short until the cache expired);
+  `a_poll_during_ingest_never_undercounts` now pins it. The distinct-series
+  count has no exact incremental form, so it stays a scan on a ten-minute clock
+  — that scan alone measured 11 s on a 4-million-row tenant and used to stall one
+  poll per minute. `bind()` no longer computes tenant totals before it starts
+  serving, which was failing the liveness probe in a ten-tenant cluster; a
+  background task warms the aggregate of each tenant after startup instead.
+- Starting a server with ten tenants took longer than the startup probe's budget,
+  so the pod was killed and restarted in a loop before it ever served. Two causes:
+  object discovery issued twelve LISTs per tenant (two patterns per table), and
+  tenants were opened one after another. Discovery is now a single
+  `glob('{base}/*/*.parquet')` — one LIST for the prefix plus one per table, which
+  is also why archived keys are flat — and tenants open four at a time. Measured
+  on the local two-node cluster: 119 s for ten tenants instead of timing out.
+  Opening a tenant no longer holds the registry lock either, so one slow tenant
+  cannot block the others.
 - Ingest waited on the writer with no timeout. Behind a slow scan that turned into
   75–313 second lock waits, agent upload timeouts, retries and `report queue full`.
   Ingest now waits at most 30 seconds and answers `503` with `Retry-After`, which
@@ -308,14 +325,17 @@ were why the dashboard went blank: a 60-second HTTP timeout on `/api/v1/stats`,
 
 ### Changed
 
-- New Parquet writes are sharded into `hour=<n>/` directories locally and
-  `hour=<n>/` key prefixes on S3. Files from every earlier release
-  (`h<hour>-<stamp>-<rows>.parquet`, `h<hour>-final-<stamp>.parquet`,
-  `hour=<n>.parquet`) are still discovered and read; nothing is migrated or
-  rewritten. Those files were tagged with the wall clock at write time, so a
-  flush that straddled an hour boundary can hold the previous hour's rows; while
-  such a file is still present, its window is widened by one hour on each side
-  (two extra objects) instead of losing those rows after an upgrade.
+- New Parquet writes are sharded into `hour=<n>/` directories locally, and named
+  `hour=<n>-part-<stamp>.parquet` on S3 — flat, because a `glob()` resolves one
+  directory at a time and an `hour=<n>/` prefix cost one LIST per archived hour
+  at start-up (twelve LISTs per tenant became one per table). Files from every
+  earlier release (`h<hour>-<stamp>-<rows>.parquet`,
+  `h<hour>-final-<stamp>.parquet`, `hour=<n>.parquet`) are still discovered and
+  read; nothing is migrated or rewritten. Those files were tagged with the wall
+  clock at write time, so a flush that straddled an hour boundary can hold the
+  previous hour's rows; while such a file is still present, its window is
+  widened by one hour on each side (two extra objects) instead of losing those
+  rows after an upgrade.
 
 ### Upgrade notes
 
