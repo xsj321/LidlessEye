@@ -251,6 +251,65 @@ map windows while the server endpoint is briefly absent.
   429 and 5xx are. Final drop warnings now include attempt count and elapsed
   time so a real outage is distinguishable from a bad payload.
 
+## [0.1.16] - 2026-11-24
+
+Storage no longer keeps a persistent DuckDB file that every agent and dashboard
+request has to lock. Writes land in a process-local hot tier, then publish
+immutable Parquet files; DuckDB is now the in-process query engine over both.
+
+### Changed
+
+- The canonical storage modes are `disk` and `s3`, with `disk` as the default.
+  Neither mode creates or opens `lidlesseye.duckdb`. The legacy `duckdb` and
+  `parquet` values are still accepted and mapped to `disk` / `s3`, so existing
+  Helm values do not silently start an empty store.
+- A tenant now has one hot connection for ingest and queries and a separate
+  maintenance connection for Parquet compaction and S3 uploads. Long archive
+  work can no longer hold up the request path behind the same store lock.
+- Flush, compaction and retention write only Parquet. Files are created as
+  `.tmp`, read back for a row-count check, then atomically published; readers
+  apply a newest-final-wins rule so a crash cannot double-count superseded
+  fragments. All tables in one flush share a generation stamp, and retention
+  plus `maxDisk` evict whole generations from oldest to newest.
+- Partitions use the data's own time column rather than the flush clock, so
+  backfilled samples are retained according to when they happened.
+- In `s3` mode the local files are unconfirmed staging. Uploads probe the
+  destination, read the object back and compare row counts before staging is
+  deleted; verification failures keep the only local copy. Staging is never
+  removed by the local disk cap, and a full staging area returns HTTP 503 so
+  agents can retry instead of silently writing data that may be lost.
+- `server.storage.flushInterval` (CLI `--flush-interval`, default `10s`) is the
+  hot tier's RPO. `POST /api/v1/flush` requests an immediate flush from the
+  running server, and `lidlesseye flush --server …` calls that endpoint. CLI
+  `ingest --data-dir` flushes before it exits, because another process cannot
+  see the first process's in-memory hot tier.
+
+### Added
+
+- `/api/v1/stats` exposes per-connection lock waits and holders, and request
+  logs identify `read_slot_wait`, `store_lock_wait`, `query_exec` and
+  `store_lock_hold`. These diagnostics make it possible to confirm that an
+  incident is lock contention before changing the connection model again.
+- `lidlesseye_parquet_files_pruned_total` reports file-level retention work.
+- On first open, an existing `lidlesseye.duckdb` is exported table by table to
+  Parquet, verified by row count, then renamed to
+  `lidlesseye.duckdb.migrated-<stamp>`; its WAL is retained under the same
+  suffix. A second open does not migrate again.
+
+### Fixed
+
+- Multiple agents no longer queue behind a single-writer DuckDB file lock while
+  dashboard queries are running.
+- The disk cap now counts published Parquet bytes and removes complete old
+  generations; it no longer loops over stale in-memory batch totals.
+
+### Upgrade notes
+
+This volume migration is one-way: an older server cannot read the Parquet-only
+layout. Snapshot the PVC before upgrading, canary on a copy, and roll back by
+restoring that snapshot rather than by redeploying the old image. See
+`docs/deployment.md` → “Canary and rollback” for the full checklist.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -638,7 +697,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/xsj321/LidlessEye/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/xsj321/LidlessEye/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/xsj321/LidlessEye/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/xsj321/LidlessEye/compare/v0.1.12...v0.1.13
