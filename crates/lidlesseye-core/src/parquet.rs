@@ -1240,6 +1240,13 @@ mod tests {
         (endpoint, listener)
     }
 
+    fn disk_store(name: &str) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ldx-pq-disk-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(StoreConfig::new(&dir)).unwrap();
+        (store, dir)
+    }
+
     fn parquet_store(name: &str, ttl_ns: u64) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!("ldx-pq-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1315,6 +1322,77 @@ mod tests {
             "flushed rows readable zero-copy from parquet"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queries_see_hot_and_flushed_rows_together() {
+        let (store, dir) = disk_store("hot-and-files");
+        store
+            .append(&report("checkout", 1_000_000_000, 20))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+        store
+            .append(&report("checkout", 2_000_000_000, 22))
+            .unwrap();
+
+        assert_eq!(store.stats().batch_count, 2);
+        assert_eq!(flame_total(&store), 42, "the VIEW must union both tiers");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn final_file_hides_superseded_fragments_after_a_crash() {
+        let (store, dir) = disk_store("crash-fragments");
+        store
+            .append(&report("checkout", 1_000_000_000, 20))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+        store
+            .append(&report("checkout", 2_000_000_000, 22))
+            .unwrap();
+        assert!(store.flush_hot().unwrap() > 0);
+
+        let samples = dir.join("parquet").join("samples");
+        let fragments: Vec<_> = std::fs::read_dir(&samples)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(fragments.len(), 2);
+        let backup = dir.join("old-fragment.parquet");
+        std::fs::copy(&fragments[0], &backup).unwrap();
+
+        let mut merged = 0;
+        for _ in 0..8 {
+            let stats = store.compact_all_for_test().unwrap();
+            if stats.files_written == 0 {
+                break;
+            }
+            merged += stats.files_merged;
+        }
+        assert!(merged >= 2, "the hour should have been compacted");
+
+        // Simulate a crash between publishing the final and deleting inputs:
+        // an old fragment reappears with an older mtime. The read side must
+        // ignore it instead of double-counting the hour.
+        let resurrected = samples.join(fragments[0].file_name().unwrap());
+        std::fs::copy(&backup, &resurrected).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&resurrected)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+
+        let cfg = StoreConfig::new(&dir);
+        drop(store);
+        let reopened = Store::open(cfg).unwrap();
+        assert_eq!(
+            flame_total(&reopened),
+            42,
+            "a stale fragment must stay hidden"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
