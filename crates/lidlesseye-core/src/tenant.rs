@@ -285,6 +285,7 @@ impl TenantStore {
             storage_mode: self.base.storage_mode,
             s3,
             parquet_local_ttl_ns: self.base.parquet_local_ttl_ns,
+            flush_interval_ns: self.base.flush_interval_ns,
         };
         // Another registry over the same directory may be opening this tenant
         // right now. DuckDB writes its file header during open, so the two
@@ -394,7 +395,7 @@ impl TenantStore {
     /// files_merged)`. No-op when not in Parquet mode.
     pub fn compaction_tick(&self, now_ns: u64) -> Vec<(TenantId, usize, usize, usize)> {
         let mut out = Vec::new();
-        if self.base.storage_mode != crate::store::StorageMode::Parquet {
+        if !self.base.storage_mode.uses_parquet() {
             return out;
         }
         for id in self.tenant_ids() {
@@ -440,7 +441,7 @@ impl TenantStore {
                 continue;
             };
             match store.prune(now_ns) {
-                Ok(stats) if stats.removed_batches > 0 => {
+                Ok(stats) if stats.removed_batches > 0 || stats.removed_files > 0 => {
                     out.insert(id, stats);
                 }
                 Ok(_) => {}
@@ -654,11 +655,22 @@ mod tests {
     #[test]
     fn legacy_layout_is_migrated_once() {
         let dir = temp_dir("legacy");
-        // A store written before multi-tenancy: one database in the data dir.
-        let store = Store::open(StoreConfig::new(&dir)).unwrap();
-        store.append(&report("api", 1_000)).unwrap();
-        drop(store);
-        assert!(dir.join(DB_FILE).is_file());
+        std::fs::create_dir_all(&dir).unwrap();
+        // A store written before multi-tenancy: one DuckDB file in the data
+        // dir, with no per-tenant directory and no Parquet files.
+        let conn = duckdb::Connection::open(dir.join(DB_FILE)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE batches (
+                batch_id BIGINT PRIMARY KEY, profile_type VARCHAR NOT NULL,
+                service_name VARCHAR NOT NULL, labels VARCHAR NOT NULL,
+                start_ns BIGINT NOT NULL, end_ns BIGINT NOT NULL,
+                total_value BIGINT NOT NULL, sample_count BIGINT NOT NULL,
+                bytes BIGINT NOT NULL, created_ns BIGINT NOT NULL);
+             INSERT INTO batches VALUES
+                (1, 'cpu', 'api', '', 1000, 2000, 10, 1, 128, 1500);",
+        )
+        .unwrap();
+        drop(conn);
 
         let registry = TenantStore::open(&dir, StoreConfig::new(&dir)).unwrap();
         let default = TenantId::default_tenant();
@@ -671,8 +683,19 @@ mod tests {
                 .len(),
             1
         );
-        assert!(!dir.join(DB_FILE).exists(), "the old database file is gone");
-        assert!(registry.tenant_dir(&default).join(DB_FILE).is_file());
+        assert!(!dir.join(DB_FILE).exists(), "the old root file is gone");
+        let tenant_dir = registry.tenant_dir(&default);
+        assert!(!tenant_dir.join(DB_FILE).exists(), "no DuckDB file on disk");
+        assert!(
+            std::fs::read_dir(tenant_dir.join("parquet").join("batches"))
+                .unwrap()
+                .any(|e| e
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".parquet")),
+            "tenants must keep their data as Parquet"
+        );
 
         // Re-opening is idempotent.
         drop(registry);

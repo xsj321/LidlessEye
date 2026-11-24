@@ -18,6 +18,7 @@ pub struct Metrics {
     pub query_errors: AtomicU64,
     pub batches_written: AtomicU64,
     pub batches_pruned: AtomicU64,
+    pub parquet_files_pruned: AtomicU64,
 }
 
 impl Metrics {
@@ -78,6 +79,11 @@ impl Metrics {
                 "lidlesseye_batches_pruned_total",
                 "Ingest batches dropped by retention or eviction.",
                 self.batches_pruned.load(Ordering::Relaxed),
+            ),
+            counter(
+                "lidlesseye_parquet_files_pruned_total",
+                "Committed Parquet files removed by retention or the disk cap.",
+                self.parquet_files_pruned.load(Ordering::Relaxed),
             ),
         ];
         for (name, help, value) in counters {

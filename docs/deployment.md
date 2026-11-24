@@ -150,71 +150,92 @@ dashboard prompts for it (it is kept in `localStorage`).
 
 A CPU profile of a busy 32-core node at 99 Hz produces roughly
 `100–300 KiB` per flush after symbolization, i.e. a few hundred MiB per node per
-day. 10 nodes for 7 days fits comfortably in 20–50 GiB. Retention is enforced
-two ways — `--retention 7d` (age) and `--max-disk 50GB` (oldest-first trim) —
-and `lidlesseye fsck` verifies each tenant database plus the schema's referential
-invariants (`--fix` drops dangling rows rather than the file).
+day. 10 nodes for 7 days fits comfortably in 20–50 GiB.
 
-Two sizing caveats come from DuckDB rather than from the sampler:
+Neither canonical storage mode writes a persistent DuckDB file. DuckDB exists
+only inside the server process, as the query engine for the current hot tier;
+the durable dataset is Parquet files on the PVC (`disk`) or verified objects in
+S3 (`s3`). This removes the single-writer file lock that made many agents queue
+behind one tenant database.
 
-- The cap is measured against the estimated size of the *retained* batches
-  (`/api/v1/stats` → `logical_bytes`), not the file size. DuckDB frees deleted
-  rows inside existing row groups without returning blocks to the filesystem,
-  so `total_bytes` stays at its high-water mark. Provision the volume for that
-  high-water mark; freed space is reused by later writes.
-- A database file is locked by one process. The Helm chart uses a single replica
-  with the `Recreate` strategy for that reason; do not point two servers, or a
-  `serve` process and a CLI `fsck`, at the same data directory. Use a read-only
-  replica with its own copy instead.
+- Writes go into an in-memory hot table and are flushed to Parquet every
+  `--flush-interval` (default `10s`). A kill before a flush can lose at most
+  that window; the value is the deployment's RPO. `lidlesseye ingest --data-dir`
+  flushes before it exits, so a CLI import is durable when the command returns.
+  To shorten the window on a running server, call
+  `lidlesseye flush --server http://lidlesseye:4040 --tenant <id>` (or
+  `POST /api/v1/flush`); opening the data directory from another process would
+  only create a second, empty hot tier.
+- Flushes are partitioned by the **data's** hour, so backfills and delayed
+  reports are retained by their real timestamps. Completed hours are merged
+  into one deterministic final file; the read side ignores superseded fragments
+  even if a crash happened between publishing the final and deleting inputs.
+- `--retention 7d` deletes whole hours whose end is older than the cutoff.
+  `--max-disk 40GB` is a hard cap: oldest committed Parquet files are removed
+  first, which can discard data earlier than the retention window.
+- Compaction and S3 upload use a second in-memory DuckDB connection. A long
+  merge or upload no longer holds the connection that serves queries/ingest.
+- The PVC is still required in both modes: `disk` keeps its archive there and
+  `s3` keeps unconfirmed staging files. Never delete local staging that has not
+  been verified in the bucket.
+- The chart keeps `replicaCount: 1` and `Recreate`: a single writer avoids two
+  servers racing on the same tenant's Parquet files during a rollout.
 
-### Alternative: Parquet + S3 storage
-
-For larger or longer-lived datasets, switch the server from the single DuckDB
-file to tiered Parquet objects in S3. The hot tier stays in memory, small
-Parquet files are flushed to the data volume, and whole hours are merged and
-uploaded to S3 after `--parquet-local-ttl` (default `1h`), with the local copies
-deleted after a successful upload. Queries read hot + local + S3 through one
-VIEW; see [architecture.md](architecture.md#storage-parquet--s3) for the design.
+Upgrade from releases that used `lidlesseye.duckdb` is automatic: on first open
+the server exports every table into hour-partitioned Parquet files, verifies the
+row counts, and renames the old file to `lidlesseye.duckdb.migrated-…` instead of
+deleting it. Legacy mode values (`duckdb`, `parquet`) are accepted with a
+warning and mapped to `disk` / `s3` so old Helm values do not start an empty
+store. Keep the old PVC/backup until the first full retention cycle has passed.
 
 ```bash
-# binary / bare metal
-lidlesseye serve --storage-mode=parquet \
+# disk mode (default): local Parquet only
+lidlesseye serve --storage-mode=disk \
+  --retention=7d --max-disk=50GB --flush-interval=10s
+```
+
+### S3 archive mode
+
+For longer-lived datasets, use `s3`: local fragments are merged per hour,
+uploaded to S3, and only removed after the object has been read back. The
+object index is rebuilt from deterministic keys at startup; no JSON manifest
+or DuckDB database is persisted.
+
+```bash
+lidlesseye serve --storage-mode=s3 \
   --s3-bucket=profiles --s3-prefix=lidlesseye \
   --s3-endpoint=s3.example.com:9000 --s3-use-ssl=false \
-  --s3-url-style=path \
-  --parquet-local-ttl=1h
-# credentials come from env: LIDLESSEYE_S3_ACCESS_KEY / LIDLESSEYE_S3_SECRET_KEY
+  --s3-url-style=path --parquet-local-ttl=1h
+# credentials: LIDLESSEYE_S3_ACCESS_KEY / LIDLESSEYE_S3_SECRET_KEY
 ```
 
 ```bash
-# Helm
 helm install lidlesseye deploy/helm/lidlesseye \
   --namespace observability --create-namespace \
-  --set server.storage.mode=parquet \
+  --set server.storage.mode=s3 \
   --set server.storage.s3.bucket=profiles \
   --set server.storage.s3.endpoint=s3.example.com:9000 \
   --set server.storage.s3.useSSL=false \
   --set server.storage.s3.existingSecret=lidlesseye-s3
-# the secret must contain keys `access-key` and `secret-key`; if
-# existingSecret is empty the chart creates one from s3.accessKey/s3.secretKey
 ```
 
 Relevant values under `server.storage`:
 
 | Value | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `duckdb` | `duckdb` (original file) or `parquet` (tiered S3) |
-| `localTTL` | `1h` | how long a local Parquet file stays before S3 upload/removal |
-| `s3.bucket` | `""` | bucket name (required in `parquet` mode) |
+| `mode` | `disk` | `disk` (local Parquet) or `s3` (verified S3 archive) |
+| `flushInterval` | `10s` | hot-tier flush cadence / maximum RPO |
+| `localTTL` | `1h` | local fragment age before merge/upload |
+| `s3.bucket` | `""` | bucket name (required in `s3` mode) |
 | `s3.prefix` | `lidlesseye` | key prefix; the tenant id is appended per tenant |
 | `s3.endpoint` | `""` | `host:port`; empty uses the AWS default endpoint |
 | `s3.region` / `s3.useSSL` / `s3.urlStyle` | `us-east-1` / `true` / `path` | httpfs connection settings |
 | `s3.existingSecret` | `""` | pre-created secret with `access-key` / `secret-key` |
 
-The S3 bucket is the source of truth: on startup the server re-discovers
-archived objects from the bucket, so losing the local `manifest.json` or moving
-to a new node does not hide data. Any S3-compatible endpoint (AWS S3, MinIO,
-etc.) works. The original DuckDB file mode remains the default and is unchanged.
+Object lifecycle/retention for the bucket must be configured outside the chart.
+Budget for the storage class, requests and the longest unconfirmed staging
+backlog you can tolerate; the server applies backpressure instead of deleting
+the only copy when S3 is unavailable.
 
 ## 3. Kubernetes
 

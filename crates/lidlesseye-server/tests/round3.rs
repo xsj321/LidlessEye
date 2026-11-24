@@ -21,6 +21,23 @@ use lidlesseye_core::{
 use serde_json::json;
 use support::*;
 
+/// Bytes actually occupied by a tenant's Parquet tree.
+fn parquet_bytes(root: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return total;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += parquet_bytes(&path);
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
 /// A report whose every stack is worth exactly `per_stack`.
 fn deep_report(service: &str, per_stack: u64, stacks: usize) -> serde_json::Value {
     let now = now_ns();
@@ -443,14 +460,16 @@ async fn the_disk_cap_evicts_oldest_first() {
                 );
             }
             store.append(&builder.finish()).unwrap();
+            // Each flush is one eviction unit. Flushing once at the end would
+            // make a single oversized generation that the cap must drop whole.
+            store.flush_hot().unwrap();
         }
         assert_eq!(store.stats().batch_count, 20);
-        // The cap is applied by the store that opens the directory, so record
-        // what a fresh process would see.
-        let before = store.stats();
+        // The cap is applied to committed Parquet files, so measure the bytes
+        // a fresh process actually has on disk rather than logical row size.
         std::fs::write(
             dir.path().join("cap.txt"),
-            before.logical_bytes.to_string().as_bytes(),
+            parquet_bytes(&store.path()).to_string().as_bytes(),
         )
         .unwrap();
     }
@@ -482,16 +501,19 @@ async fn the_disk_cap_evicts_oldest_first() {
     let store = registry.open_tenant(&tenant).unwrap();
 
     let pruned = registry.prune(now).unwrap();
-    let removed: usize = pruned.values().map(|stats| stats.removed_batches).sum();
+    let removed: usize = pruned
+        .values()
+        .map(|stats| stats.removed_batches + stats.removed_files)
+        .sum();
     assert!(removed > 0, "the cap evicted nothing");
     let after = store.stats();
+    let remaining = parquet_bytes(&store.path());
     assert!(
-        after.logical_bytes <= cap,
-        "retained data is {} bytes, cap is {cap}",
-        after.logical_bytes
+        remaining <= cap,
+        "retained Parquet data is {remaining} bytes, cap is {cap}"
     );
 
-    // Eviction removes the oldest batches, so the newest one survives.
+    // Eviction removes the oldest generations, so the newest batch survives.
     let rows = store.series(0, u64::MAX, &Selector::default()).unwrap();
     let earliest = rows.iter().map(|r| r.start_ns).min().unwrap();
     assert!(
@@ -574,6 +596,7 @@ async fn unrelated_files_in_the_data_dir_are_ignored() {
     )
     .unwrap();
     assert_eq!(fg.total, 777);
+    store.flush_hot().unwrap();
 
     let reopened = TenantStore::open(dir.path(), StoreConfig::new(dir.path())).unwrap();
     let store = reopened.open_tenant(&tenant).unwrap();
@@ -607,6 +630,10 @@ async fn data_survives_a_restart() {
                 "acme",
             )
             .await;
+        }
+        for tenant in ["acme", "globex"] {
+            let (status, body) = call_as(&app, "POST", "/api/v1/flush", None, tenant).await;
+            assert_eq!(status, StatusCode::OK, "{tenant}: {body}");
         }
     }
 

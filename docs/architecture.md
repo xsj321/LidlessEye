@@ -207,7 +207,37 @@ The series name stays the process name unless the pod index knows better, which
 is what makes a host install, a container and a cluster behave identically up to
 the point where the cluster has something more to say.
 
-## Storage: DuckDB
+## Storage: hot tier + Parquet (current)
+
+Canonical modes are `disk` (default) and `s3`. Neither writes a persistent
+DuckDB database file: DuckDB is the in-process query engine for the current hot
+tier, while Parquet files (local, plus verified S3 objects in `s3` mode) are the
+only durable data.
+
+```text
+<data-dir>/tenants/<tenant>/parquet/<table>/h<epoch-hour>-<stamp>-<rows>.parquet
+<data-dir>/tenants/<tenant>/parquet/<table>/h<epoch-hour>-final-<stamp>.parquet
+s3://<bucket>/<prefix>/<tenant>/<table>/hour=<epoch-hour>.parquet   # s3 mode only
+```
+
+Writes go to `<table>_hot` tables; canonical names are VIEWs over
+`hot UNION ALL BY NAME read_parquet(<explicit files>)`. A flush writes a
+`.tmp` fragment, reads it back to verify the row count, then atomically renames
+it. Completed hours are merged into one final file on a **separate** in-memory
+connection, so an upload/merge does not hold the query/ingest connection. The
+read side ignores fragments superseded by a newer final, which keeps counts
+correct even after a crash between publishing and cleanup.
+
+Retention removes whole committed hours; `--max-disk` is a hard cap that evicts
+the oldest files first. Legacy `lidlesseye.duckdb` files are exported to
+Parquet once on first open and renamed to `*.migrated-*`; legacy mode values
+`duckdb` and `parquet` are mapped to `disk` and `s3` with a warning.
+
+The following sections describe the original file-per-tenant engine and the
+first Parquet/S3 prototype; they remain useful context for the schema and query
+SQL, but the layout above is what current releases ship.
+
+## Storage: DuckDB (legacy layout)
 
 Samples live in DuckDB 2.0 LTS ("Cinnamon Teal"), one database file per tenant:
 
@@ -384,13 +414,15 @@ so nothing is duplicated on disk.
 
 ## Concurrency
 
-- One `Connection` per tenant behind a mutex. DuckDB's Rust binding has no
-  separate `Database` handle, and opening the same file twice inside one
-  process is a lock conflict rather than a second reader — so serializing
-  access is the only option, not a design choice. Queries still run in
-  parallel *inside* DuckDB (`--duckdb-threads`, four by default, applies to
-  every tenant); what the mutex serializes is the short per-query setup and the
-  aggregation call itself.
+- One hot `Connection` per tenant behind a mutex for ingest and queries, plus
+  a second in-memory maintenance connection for Parquet merges and S3 uploads.
+  Opening the same on-disk file twice was a lock conflict in the legacy layout;
+  in current modes neither connection owns a database file, which is what lets
+  a long upload run without blocking ingest. Queries still run in parallel
+  *inside* DuckDB (`--duckdb-threads`, four by default, applies to both
+  connections). Lock telemetry (`/api/v1/stats` → `locks`, plus
+  `stage=store_lock_wait` logs) records the owner and wait time for every
+  contended acquisition.
 - Every store read runs on `spawn_blocking`, including the ones that look too
   cheap to bother (`/series`, `/profile-types`, `/stats`). A blocking call in
   an async handler does not just slow that request down — it removes one of the

@@ -58,17 +58,20 @@ server:
   # scan. `0` removes the cap (not recommended).
   queryConcurrency: 4
 
-  # Physical storage backend.
-  #   duckdb  - single lidlesseye.duckdb file per tenant (original, default)
-  #   parquet - in-memory hot tier + local Parquet, merged hourly to S3.
-  #             Reads scan Parquet directly (filter/projection pushdown,
-  #             HTTP range reads from S3) with no intermediate database copy.
+  # Physical storage backend. Neither mode writes a persistent DuckDB file:
+  #   disk - in-memory hot tier + local Parquet finals (default).
+  #   s3   - in-memory hot tier + local staging, uploaded to S3 only after the
+  #          object has been verified readable; the PVC keeps no DuckDB file.
+  # Old values `duckdb` and `parquet` are accepted with a warning and mapped
+  # to `disk` / `s3`; existing databases are exported to Parquet on first open.
   storage:
-    mode: duckdb
-    # How long merged Parquet stays on local disk before the S3 upload removes
-    # it. Queries inside this window read local files, older ones read S3.
+    mode: disk
+    # Maximum data-loss window when a pod is killed before a flush.
+    flushInterval: 10s
+    # How long a local fragment may wait before being merged (and, in s3 mode,
+    # uploaded). Queries read local files inside this window.
     localTTL: 1h
-    # S3-compatible object store, used only when mode=parquet. Works with AWS
+    # S3-compatible object store, used only when mode=s3. Works with AWS
     # S3 and with MinIO-style servers. For AWS, leave endpoint empty and set
     # urlStyle to "host"; for MinIO use endpoint + urlStyle=path + useSSL=false.
     s3:

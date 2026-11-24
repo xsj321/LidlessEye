@@ -24,6 +24,7 @@
 
 pub mod error;
 pub mod folded;
+pub mod migrate;
 pub(crate) mod parquet;
 pub use parquet::ArchiveStats;
 pub mod model;
@@ -39,6 +40,7 @@ pub mod time;
 
 pub use error::{Error, Result};
 pub use folded::{FoldedOptions, decode as decode_folded};
+pub use migrate::{MigrationStats, migrate_legacy};
 pub use model::{
     Frame, FrameRef, MAX_LABEL_KEY_LEN, MAX_LABEL_VALUE_LEN, MAX_LABELS, ProfileType, Report,
     ReportBuilder, SERVICE_NAME_LABEL, StackSample, Unit,

@@ -109,6 +109,7 @@ pub struct Builder {
     storage_mode: Option<lidlesseye_core::StorageMode>,
     s3: Option<lidlesseye_core::S3Config>,
     parquet_local_ttl: Option<Duration>,
+    storage_flush_interval: Option<Duration>,
     auth_token: Option<String>,
     read_only: bool,
     cors: Option<String>,
@@ -153,6 +154,7 @@ impl Default for Builder {
             storage_mode: None,
             s3: None,
             parquet_local_ttl: None,
+            storage_flush_interval: None,
             auth_token: None,
             read_only: false,
             cors: None,
@@ -237,6 +239,13 @@ impl Builder {
     /// How long archived Parquet stays on local disk before removal.
     pub fn parquet_local_ttl(mut self, ttl: Duration) -> Self {
         self.parquet_local_ttl = Some(ttl);
+        self
+    }
+
+    /// How often the in-memory hot tier is flushed to Parquet. This bounds the
+    /// data-loss window if the process is killed.
+    pub fn storage_flush_interval(mut self, interval: Duration) -> Self {
+        self.storage_flush_interval = Some(interval);
         self
     }
 
@@ -413,6 +422,7 @@ impl Builder {
             storage_mode: self.storage_mode,
             s3: self.s3.clone(),
             parquet_local_ttl_ns: self.parquet_local_ttl.map(|d| d.as_nanos() as u64),
+            storage_flush_interval_ns: self.storage_flush_interval.map(|d| d.as_nanos() as u64),
             auth_token: self.auth_token.clone(),
             tenant_tokens,
             allowed_tenants: self.allowed_tenants.clone(),

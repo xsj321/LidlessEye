@@ -82,6 +82,21 @@ pprof profile whose `sample_type` is empty defaults to `cpu`. Per-sample pprof
 labels become labels of their own series, which is how the Pyroscope SDKs tag
 pod/span data.
 
+## `POST /api/v1/flush`
+
+Flush the caller tenant's in-memory hot tier into Parquet before the configured
+`--flush-interval` elapses. The hot tier lives in the server process, so this is
+a server endpoint rather than a filesystem operation. The CLI equivalent is
+`lidlesseye flush --server <url> --tenant <id>`.
+
+```json
+{ "tenant": "default", "rows": 128, "mode": "disk" }
+```
+
+`rows` counts all hot rows moved by the flush (batches, samples, frames and
+dictionary rows). The endpoint uses the same authentication, tenant header and
+read-only check as `/ingest`.
+
 ## Time ranges
 
 `from` and `until` accept any of:

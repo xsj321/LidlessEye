@@ -38,7 +38,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 use lidlesseye_core::model::Report;
-use lidlesseye_core::store::{StoreConfig, StoreLockStats, StoreStats};
+use lidlesseye_core::store::{StorageMode, StoreConfig, StoreLockStats, StoreStats};
 use lidlesseye_core::{BatchMeta, Store, TenantId, TenantStore};
 
 pub use config::ServerConfig;
@@ -383,6 +383,22 @@ impl AppState {
             return Err(ApiError::forbidden("server is read-only"));
         }
         let store = self.writable_tenant(tenant)?;
+        // In S3 mode local Parquet files are unconfirmed staging copies. If
+        // the archive cannot drain and the staging area exceeds the hard cap,
+        // refuse new data instead of deleting the only copy to make room.
+        if store.config().storage_mode.canonical() == StorageMode::S3
+            && let Some(limit) = store.config().max_disk_bytes
+            && store.staged_bytes() > limit
+        {
+            return Err(ApiError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "S3 staging is full ({} > {limit} bytes); \
+                     wait for the archive backlog to drain",
+                    store.staged_bytes()
+                ),
+            ));
+        }
         let limits = self.inner.registry.limits(tenant);
         let max_series = limits.max_series;
         let tenant_label = tenant.to_string();
@@ -533,6 +549,7 @@ impl LidlessEye {
             storage_mode: cfg.storage_mode.unwrap_or_default(),
             s3: cfg.s3.clone(),
             parquet_local_ttl_ns: cfg.parquet_local_ttl_ns,
+            flush_interval_ns: cfg.storage_flush_interval_ns,
         };
         let registry = TenantStore::open_with_limits(
             &cfg.data_dir,
@@ -672,11 +689,19 @@ impl LidlessEye {
         let cfg = self.state.inner.cfg.clone();
         let metrics = self.state.inner.metrics.clone();
 
-        // Parquet mode needs a second loop that moves the in-memory hot tier
-        // to local Parquet and, past the local TTL, on to S3. In DuckDB mode
-        // `compaction_tick` is a cheap no-op, so this task is harmless there.
+        // This loop moves the hot tier to Parquet and, past the local TTL,
+        // merges/uploads files. Its cadence must be at least as frequent as
+        // the configured flush interval, otherwise the RPO is silently larger
+        // than the value the operator chose.
         let compact_registry = registry.clone();
-        let compact_interval = cfg.prune_interval.min(Duration::from_secs(10));
+        let flush_interval = cfg
+            .storage_flush_interval_ns
+            .map(Duration::from_nanos)
+            .unwrap_or(Duration::from_secs(10));
+        let compact_interval = cfg
+            .prune_interval
+            .min(Duration::from_secs(10))
+            .min(flush_interval);
         let compact = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(compact_interval.max(Duration::from_secs(1)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -713,11 +738,15 @@ impl LidlessEye {
                                 metrics
                                     .batches_pruned
                                     .fetch_add(stats.removed_batches as u64, Ordering::Relaxed);
+                                metrics
+                                    .parquet_files_pruned
+                                    .fetch_add(stats.removed_files as u64, Ordering::Relaxed);
                                 info!(
                                     tenant = %tenant,
                                     batches = stats.removed_batches,
+                                    files = stats.removed_files,
                                     bytes = stats.removed_bytes,
-                                    "pruned old batches"
+                                    "pruned old data"
                                 );
                             }
                         }
@@ -788,6 +817,7 @@ fn build_router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/", get(ui::index))
         .route("/ingest", post(api::ingest))
+        .route("/api/v1/flush", post(api::flush))
         .route("/api/v1/health", get(api::health))
         .route("/api/v1/ready", get(api::ready))
         .route("/api/v1/stats", get(api::stats))

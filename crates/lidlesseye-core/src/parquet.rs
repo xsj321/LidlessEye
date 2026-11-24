@@ -17,12 +17,12 @@
 //! UNION ALL SELECT <cols> FROM read_parquet([<explicit local + S3 file list>], hive_partitioning=false)
 //! ```
 //!
-//! The explicit file list comes from a small local `manifest.json` (S3 objects)
-//! plus a `read_dir` of the local staging dir. Explicit paths avoid a bucket
-//! LIST at query bind time — binding stays fast and works even when S3 is
-//! temporarily unreachable. On open we *do* run one best-effort `glob()` of
-//! each S3 prefix to rebuild the manifest, so a lost local manifest (PVC
-//! rebuild, new node) never hides already-archived data.
+//! The explicit file list comes from an in-memory index of S3 object keys
+//! plus a `read_dir` of the local staging dir. No JSON catalog or DuckDB
+//! database file is persisted: the Parquet files and S3 objects are the only
+//! durable state. Explicit paths avoid a bucket LIST at query bind time.
+//! On open we run one best-effort `glob()` of each S3 prefix to rebuild the
+//! object index, so a new pod against an existing bucket never hides data.
 //!
 //! So every existing read query sees the whole dataset — hot rows, local
 //! Parquet and archived S3 Parquet — without any change to its SQL.
@@ -47,7 +47,7 @@ use duckdb::Connection;
 use tracing::warn;
 
 use crate::error::{Error, Result};
-use crate::store::S3Config;
+use crate::store::{S3Config, StorageMode};
 
 /// One physical table and the projection used when exposing it through VIEWs.
 pub(crate) struct TableDef {
@@ -57,6 +57,9 @@ pub(crate) struct TableDef {
     pub columns: &'static str,
     /// CREATE TABLE body for the hot tier (`{t}` is the table name).
     pub ddl: &'static str,
+    /// Nanosecond column whose epoch hour forms the Parquet partition. Dictionaries
+    /// have no time column and are written into the current hour.
+    pub hour_column: Option<&'static str>,
 }
 
 pub(crate) const TABLES: &[TableDef] = &[
@@ -64,87 +67,87 @@ pub(crate) const TABLES: &[TableDef] = &[
         name: "batches",
         columns: "batch_id, profile_type, service_name, labels, start_ns, end_ns, total_value, sample_count, bytes, created_ns",
         ddl: "CREATE TABLE {t} (batch_id BIGINT PRIMARY KEY, profile_type VARCHAR NOT NULL, service_name VARCHAR NOT NULL, labels VARCHAR NOT NULL, start_ns BIGINT NOT NULL, end_ns BIGINT NOT NULL, total_value BIGINT NOT NULL, sample_count BIGINT NOT NULL, bytes BIGINT NOT NULL, created_ns BIGINT NOT NULL)",
+        hour_column: Some("start_ns"),
     },
     TableDef {
         name: "samples",
         columns: "batch_id, profile_type, service_name, labels, start_ns, end_ns, stack_id, value",
         ddl: "CREATE TABLE {t} (batch_id BIGINT NOT NULL, profile_type VARCHAR NOT NULL, service_name VARCHAR NOT NULL, labels VARCHAR NOT NULL, start_ns BIGINT NOT NULL, end_ns BIGINT NOT NULL, stack_id BIGINT NOT NULL, value BIGINT NOT NULL)",
+        hour_column: Some("start_ns"),
     },
     TableDef {
         name: "stacks",
         columns: "stack_id, frames",
         ddl: "CREATE TABLE {t} (stack_id BIGINT PRIMARY KEY, frames BLOB NOT NULL)",
+        hour_column: None,
     },
     TableDef {
         name: "frames",
         columns: "frame_id, module, symbol, file, line",
         ddl: "CREATE TABLE {t} (frame_id INTEGER PRIMARY KEY, module VARCHAR NOT NULL, symbol VARCHAR NOT NULL, file VARCHAR NOT NULL, line INTEGER NOT NULL)",
+        hour_column: None,
     },
     TableDef {
         name: "net_nodes",
         columns: "bucket_ns, node_id, namespace, workload, service, kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready, instances, containers",
         ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, node_id VARCHAR NOT NULL, namespace VARCHAR NOT NULL, workload VARCHAR NOT NULL, service VARCHAR NOT NULL, kind VARCHAR NOT NULL, k8s_node VARCHAR NOT NULL, rx_bytes BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, pods BIGINT DEFAULT 0 NOT NULL, ready BIGINT DEFAULT 0 NOT NULL, instances VARCHAR DEFAULT '[]' NOT NULL, containers VARCHAR DEFAULT '[]' NOT NULL)",
+        hour_column: Some("bucket_ns"),
     },
     TableDef {
         name: "net_edges",
         columns: "bucket_ns, client_id, server_id, protocol, client_container, server_container, client_pod, server_pod, connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples, host, sql",
         ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, client_id VARCHAR NOT NULL, server_id VARCHAR NOT NULL, protocol VARCHAR NOT NULL, client_container VARCHAR DEFAULT '' NOT NULL, server_container VARCHAR DEFAULT '' NOT NULL, client_pod VARCHAR DEFAULT '' NOT NULL, server_pod VARCHAR DEFAULT '' NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, rx_bytes BIGINT NOT NULL, rtt_us_sum BIGINT NOT NULL, rtt_samples BIGINT NOT NULL, host VARCHAR DEFAULT '' NOT NULL, sql VARCHAR DEFAULT '' NOT NULL)",
+        hour_column: Some("bucket_ns"),
     },
 ];
 
-/// A manifest of the S3 objects that back a table. Keeping this locally means
-/// a VIEW is built from an explicit list of object keys and never has to LIST
-/// the bucket at bind time — which is both faster and makes an initially empty
-/// (or temporarily unreachable) bucket a non-event. `serde` derives let us
-/// persist it as JSON so the catalogue survives restarts.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+/// In-memory index of the S3 objects that back a table. A VIEW is built from
+/// an explicit list of object keys and never has to LIST the bucket at bind
+/// time — binding stays fast and works while S3 is temporarily unreachable.
+/// The index is rebuilt from the bucket on open, never persisted as JSON.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Manifest {
     /// table name -> S3 URIs of the merged objects, oldest first.
     pub objects: std::collections::BTreeMap<String, Vec<String>>,
 }
 
-/// Per-store state that only the Parquet backend uses.
+/// Per-store state for the hot tier + Parquet layout.
 #[derive(Debug, Clone)]
 pub(crate) struct ParquetState {
-    /// `<root>/parquet` — local staged files, one subdir per table.
+    /// `<root>/parquet` — local Parquet files, one subdir per table.
     pub dir: PathBuf,
+    /// `disk` keeps local finals; `s3` uploads and removes local staging.
+    pub mode: StorageMode,
     pub bucket: String,
     /// Full S3 key prefix including the tenant id, no trailing slash.
     pub prefix: String,
+    /// How long a local fragment may wait before being merged/uploaded.
     pub local_ttl_ns: u64,
-    /// Path of the on-disk manifest JSON.
-    manifest_path: PathBuf,
+    /// Rebuilt from deterministic object keys on open; no on-disk catalogue.
+    manifest: Arc<Mutex<Manifest>>,
     /// When the next S3 archive attempt is allowed, after a failure.
     ///
-    /// An archive attempt is not cheap and it is not local: it re-reads and
-    /// re-compresses a whole hour and holds the tenant's only DuckDB
-    /// connection while it does. Retrying on the next tick — ten seconds
-    /// later — turned a bucket that rejects multipart uploads into a permanent
-    /// full-time scan: the pass never succeeded, so the local files were never
-    /// reclaimed, so the next pass had even more to read. Worse, every query
-    /// queued behind the connection it was holding, so the dashboard saw 408s
-    /// while the server was busy failing at something else.
-    ///
-    /// The backoff is global rather than per hour because a failure is almost
-    /// never about *one* hour: an unreachable endpoint, a bad credential and a
-    /// refused multipart upload all fail every hour the same way.
-    ///
-    /// It doubles on every consecutive failure up to [`ARCHIVE_MAX_BACKOFF`],
-    /// so a bucket that is broken for a day costs one failed merge every hour
-    /// rather than twelve every minute, and a bucket that was merely rate
-    /// limited is retried within minutes.
+    /// A failed upload has already paid for a whole-hour merge. Retrying every
+    /// ten seconds turned a broken bucket into a permanent full-time scan,
+    /// with every dashboard query queued behind it. The backoff is global
+    /// because the failure is almost never about one hour: an unreachable
+    /// endpoint, a bad credential and a refused multipart upload all fail
+    /// every hour the same way. It doubles up to [`ARCHIVE_MAX_BACKOFF`].
     archive_retry: Arc<Mutex<ArchiveRetry>>,
 }
 
 impl ParquetState {
-    pub fn new(root: &Path, s3: &S3Config, local_ttl_ns: u64) -> Self {
+    pub fn new(root: &Path, mode: StorageMode, s3: Option<&S3Config>, local_ttl_ns: u64) -> Self {
         let dir = root.join("parquet");
         ParquetState {
-            dir: dir.clone(),
-            bucket: s3.bucket.clone(),
-            prefix: s3.prefix.trim_matches('/').to_string(),
+            dir,
+            mode,
+            bucket: s3.map(|s| s.bucket.clone()).unwrap_or_default(),
+            prefix: s3
+                .map(|s| s.prefix.trim_matches('/').to_string())
+                .unwrap_or_default(),
             local_ttl_ns,
-            manifest_path: dir.join("manifest.json"),
+            manifest: Arc::new(Mutex::new(Manifest::default())),
             archive_retry: Arc::new(Mutex::new(ArchiveRetry::default())),
         }
     }
@@ -162,23 +165,20 @@ impl ParquetState {
     }
 
     pub fn load_manifest(&self) -> Manifest {
-        std::fs::read(&self.manifest_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        self.manifest.lock().clone()
     }
 
     pub fn save_manifest(&self, manifest: &Manifest) -> Result<()> {
-        let bytes = serde_json::to_vec(manifest).map_err(Error::Json)?;
-        // Write atomically so a crash never leaves a half-written catalogue.
-        let tmp = self.manifest_path.with_extension("json.tmp");
-        std::fs::write(&tmp, bytes).map_err(Error::Io)?;
-        std::fs::rename(&tmp, &self.manifest_path).map_err(Error::Io)?;
+        *self.manifest.lock() = manifest.clone();
         Ok(())
     }
 
+    /// Clear the in-memory object index. Also removes the `manifest.json` left
+    /// by releases before the index became in-memory only.
     pub fn clear_manifest(&self) -> Result<()> {
-        match std::fs::remove_file(&self.manifest_path) {
+        *self.manifest.lock() = Manifest::default();
+        let legacy = self.dir.join("manifest.json");
+        match std::fs::remove_file(legacy) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::Io(e)),
@@ -234,6 +234,20 @@ pub(crate) fn configure_s3(conn: &Connection, s3: &S3Config) -> Result<()> {
 /// Create the hot tables and the canonical VIEWs for a fresh Parquet store.
 pub(crate) fn create_schema(conn: &Connection, state: &ParquetState) -> Result<()> {
     std::fs::create_dir_all(&state.dir).map_err(Error::Io)?;
+    // A killed flush/merge leaves `.tmp` files that no VIEW references. They
+    // are inert, but they would count against the disk cap forever, so clean
+    // them up on every open. An old `manifest.json` is likewise obsolete now
+    // that the object index lives only in memory.
+    let _ = state.clear_manifest();
+    for def in TABLES {
+        if let Ok(entries) = std::fs::read_dir(state.table_dir(def.name)) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
     for def in TABLES {
         let ddl = def.ddl.replace("{t}", &format!("{}_hot", def.name));
         conn.execute_batch(&ddl)
@@ -348,18 +362,67 @@ fn normalize_s3_uri(file: &str, s3: &S3Config) -> String {
     format!("s3://{}/{}", s3.bucket, f.trim_start_matches('/'))
 }
 
-/// Collect the explicit Parquet file paths (local + S3) known for a table.
-fn parquet_paths(state: &ParquetState, manifest: &Manifest, table: &str) -> Vec<String> {
-    let mut paths = Vec::new();
+/// A completed hour has one immutable final file. Files written before it are
+/// already included in that final and must not be counted a second time —
+/// a crash between publishing the final and deleting the fragments would
+/// otherwise double every sample in the hour.
+fn is_final_file(name: &str) -> bool {
+    name.contains("-final") || name.contains("-compact") || name.contains("-merged")
+}
+
+/// Local Parquet paths for one table, with superseded hour fragments removed.
+///
+/// The newest final file of an hour wins; only files modified at the same time
+/// or later are still needed. This is a pure read-side rule, so recovery is
+/// idempotent whether or not the deleting compaction pass ran.
+fn local_parquet_paths(state: &ParquetState, table: &str) -> Vec<String> {
+    let mut by_hour: std::collections::BTreeMap<u64, Vec<(PathBuf, SystemTime)>> =
+        std::collections::BTreeMap::new();
     if let Ok(entries) = std::fs::read_dir(state.table_dir(table)) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".parquet") {
-                paths.push(entry.path().to_string_lossy().replace('\\', "/"));
+            if !name.ends_with(".parquet") {
+                continue;
             }
+            // Untagged files come from older releases or one-off imports;
+            // give them hour 0 so they stay queryable (and are pruned first).
+            let hour = parse_hour_tag(&name).unwrap_or(0);
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(UNIX_EPOCH);
+            by_hour
+                .entry(hour)
+                .or_default()
+                .push((entry.path(), modified));
+        }
+    }
+    let mut paths = Vec::new();
+    for (_, mut files) in by_hour {
+        let newest_final = files
+            .iter()
+            .filter(|(path, _)| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_final_file)
+            })
+            .map(|(_, modified)| *modified)
+            .max();
+        if let Some(modified) = newest_final {
+            files.retain(|(_, at)| *at >= modified);
+        }
+        for (path, _) in files {
+            paths.push(path.to_string_lossy().replace('\\', "/"));
         }
     }
     paths.sort();
+    paths
+}
+
+/// Collect the explicit Parquet file paths (local + S3) known for a table.
+fn parquet_paths(state: &ParquetState, manifest: &Manifest, table: &str) -> Vec<String> {
+    let mut paths = local_parquet_paths(state, table);
     if let Some(objects) = manifest.objects.get(table) {
         paths.extend(objects.iter().cloned());
     }
@@ -430,39 +493,93 @@ pub(crate) fn hour_tag() -> String {
 /// table and clear them. Called on a cadence; holds the connection lock at the
 /// call site so no reader observes a partially flushed state.
 pub(crate) fn flush_hot(conn: &Connection, state: &ParquetState) -> Result<usize> {
-    let tag = hour_tag();
     let mut moved = 0usize;
+    // One stamp for the whole flush: the files written for every table belong
+    // to the same logical generation. Retention and the disk cap evict by
+    // stamp, so per-table stamps could delete `batches` while leaving their
+    // `samples` (or vice versa), breaking referential integrity.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     for def in TABLES {
         let hot = format!("{}_hot", def.name);
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {hot}"), [], |r| r.get(0))
-            .unwrap_or(0);
-        if count <= 0 {
-            continue;
+        let dir = state.table_dir(def.name);
+        // Partition by the data's own timestamp, not the wall clock at flush
+        // time. Backfilled or delayed reports must land in the hour they
+        // describe, otherwise retention and the disk cap evict the wrong rows.
+        let mut hours: Vec<i64> = Vec::new();
+        if let Some(column) = def.hour_column {
+            let sql =
+                format!("SELECT DISTINCT CAST({column}/1_000_000_000/3600 AS BIGINT) FROM {hot}");
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| Error::Db(format!("listing {hot} hours: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(|e| Error::Db(format!("listing {hot} hours: {e}")))?;
+            for row in rows.flatten() {
+                hours.push(row);
+            }
+        } else {
+            // Dictionaries have no time column; file them under the current
+            // hour so they are merged alongside the rows that reference them.
+            hours.push(
+                hour_tag()
+                    .trim_start_matches('h')
+                    .parse::<i64>()
+                    .unwrap_or(0),
+            );
         }
-        // `count` is not unique within an hour: two flushes of the same number
-        // of rows used to write the same file name, so the second COPY
-        // silently overwrote the first and those rows vanished from every
-        // view. Use the wall clock at nanosecond resolution instead — the
-        // hour prefix (used for TTL/archival) stays intact, and two flushes
-        // in the same hour can no longer collide.
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let file = state
-            .table_dir(def.name)
-            .join(format!("{tag}-{stamp}-{count}.parquet"));
-        let sql = format!(
-            "COPY (SELECT {cols} FROM {hot}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
-            file.to_string_lossy().replace('\\', "/"),
-            cols = def.columns,
-        );
-        conn.execute_batch(&sql)
-            .map_err(|e| Error::Db(format!("flushing {}: {e}", def.name)))?;
+        hours.sort_unstable();
+        for hour in hours {
+            let filter = def
+                .hour_column
+                .map(|column| format!("WHERE CAST({column}/1_000_000_000/3600 AS BIGINT) = {hour}"))
+                .unwrap_or_default();
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {hot} {filter}"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+            if count <= 0 {
+                continue;
+            }
+            let name = format!("h{hour}-{stamp}-{count}.parquet");
+            let file = dir.join(&name);
+            let tmp = dir.join(format!("{name}.tmp"));
+            let sql = format!(
+                "COPY (SELECT {cols} FROM {hot} {filter}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
+                tmp.to_string_lossy().replace('\\', "/"),
+                cols = def.columns,
+            );
+            conn.execute_batch(&sql)
+                .map_err(|e| Error::Db(format!("flushing {}: {e}", def.name)))?;
+            // Publish only a file we have read back. A partial COPY is then a
+            // harmless `.tmp` that startup recovery removes, never a VIEW entry.
+            let rows: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM read_parquet('{}')",
+                        tmp.to_string_lossy().replace('\\', "/")
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if rows != count {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::Db(format!(
+                    "flushing {}: wrote {rows} rows, expected {count}",
+                    def.name
+                )));
+            }
+            std::fs::rename(&tmp, &file).map_err(Error::Io)?;
+            moved += count.max(0) as usize;
+        }
+        // Clear once per table, after every hour's file is safely published.
         conn.execute_batch(&format!("DELETE FROM {hot}"))
             .map_err(|e| Error::Db(format!("clearing hot {}: {e}", def.name)))?;
-        moved += count.max(0) as usize;
     }
     if moved > 0 {
         refresh_views(conn, state)?;
@@ -640,12 +757,53 @@ pub(crate) fn archive_local(
                 // waiting for.
                 return Ok(stats);
             }
+            // Never delete the only copy on a successful-looking upload:
+            // read the object back and compare row counts first. Some S3
+            // endpoints acknowledge multipart completion before the object is
+            // actually readable, and that used to turn a transient failure
+            // into permanent data loss.
+            let local_rows: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM read_parquet([{list}], \
+                         hive_partitioning=false, union_by_name=true)"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(-1);
+            let remote_rows: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM read_parquet('{key_url}', \
+                         hive_partitioning=false, union_by_name=true)"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(-1);
+            if remote_rows < 0 || remote_rows != local_rows {
+                let backoff = state.archive_retry.lock().record_failure(
+                    now,
+                    ARCHIVE_RETRY_AFTER,
+                    ARCHIVE_MAX_BACKOFF,
+                );
+                warn!(
+                    table = def.name,
+                    hour,
+                    local_rows,
+                    remote_rows,
+                    retry_in_secs = backoff.as_secs(),
+                    "uploaded Parquet object failed verification; keeping local copies"
+                );
+                stats.failed += 1;
+                return Ok(stats);
+            }
             state.archive_retry.lock().record_success();
 
-            // A successful COPY is our commit marker: record the object in the
-            // manifest first, then drop the local copies. Order matters — a
-            // crash between the two leaves a harmless extra local file, never
-            // a lost object.
+            // The verified object is now the durable copy: record it in the
+            // in-memory index first, then drop the local files. A crash between
+            // the two leaves a harmless extra local file, never a lost object.
             manifest
                 .objects
                 .entry(def.name.to_string())
@@ -662,10 +820,8 @@ pub(crate) fn archive_local(
             }
         }
     }
-    if stats.files_uploaded > 0 {
-        // Build views from the fresh manifest (now includes the S3 objects).
-        refresh_views(conn, state)?;
-    }
+    // The caller refreshes the canonical VIEWs on the hot connection: this
+    // function runs on the maintenance connection, which has no VIEWs.
     let _ = s3; // credentials already applied to the connection at open time
     Ok(stats)
 }
@@ -740,8 +896,8 @@ pub(crate) fn compact_local(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            let target = dir.join(format!("h{hour}-compact-{unique}.parquet"));
-            let tmp = dir.join(format!("h{hour}-compact-{unique}.parquet.tmp"));
+            let target = dir.join(format!("h{hour}-final-{unique}.parquet"));
+            let tmp = dir.join(format!("h{hour}-final-{unique}.parquet.tmp"));
             let sql = format!(
                 "COPY ({}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
                 merge_projection(&list),
@@ -789,58 +945,69 @@ pub(crate) fn compact_local(
     // back under budget; already-large merged files are left alone, so the
     // oldest data is rewritten at most once.
     for def in TABLES {
-        if merge_smallest_files(conn, state, def, 16)? {
+        if merge_smallest_files(conn, state, def, 16, current_hour)? {
             changed = true;
+            stats.files_written += 1;
         }
     }
-    if changed {
-        refresh_views(conn, state)?;
-    }
+    let _ = changed; // caller refreshes the read-side VIEWs on the hot connection
     Ok(stats)
 }
 
-/// Merge the smallest local files of one table until it holds `budget` files.
-/// Returns whether anything was rewritten.
+/// Keep the file count of one table under `budget` by merging the busiest
+/// closed hour into a single final file.
+///
+/// Merging across hours would make an hour's data depend on the time another
+/// hour was pruned, so the unit of merging is always one hour. Returns whether
+/// anything was rewritten.
 fn merge_smallest_files(
     conn: &Connection,
     state: &ParquetState,
     def: &TableDef,
     budget: usize,
+    current_hour: u64,
 ) -> Result<bool> {
     let dir = state.table_dir(def.name);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Ok(false);
     };
-    let mut files: Vec<(u64, u64, PathBuf)> = Vec::new();
+    let mut by_hour: std::collections::BTreeMap<u64, Vec<PathBuf>> =
+        std::collections::BTreeMap::new();
+    let mut total = 0usize;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".parquet") {
+            continue;
+        }
         let Some(hour) = parse_hour_tag(&name) else {
             continue;
         };
-        let Ok(meta) = entry.metadata() else {
+        if hour >= current_hour {
             continue;
-        };
-        files.push((meta.len(), hour, entry.path()));
+        }
+        total += 1;
+        by_hour.entry(hour).or_default().push(entry.path());
     }
-    if files.len() <= budget {
+    if total <= budget || by_hour.is_empty() {
         return Ok(false);
     }
-    files.sort_by_key(|(size, _, _)| *size);
-    let take = files.len() - budget + 1;
-    let chosen: Vec<(u64, u64, PathBuf)> = files.into_iter().take(take).collect();
-
+    let Some((hour, chosen)) = by_hour.into_iter().max_by_key(|(_, files)| files.len()) else {
+        return Ok(false);
+    };
+    if chosen.len() < 2 {
+        return Ok(false);
+    }
     let list = chosen
         .iter()
-        .map(|(_, _, p)| format!("'{}'", p.to_string_lossy().replace('\\', "/")))
+        .map(|p| format!("'{}'", p.to_string_lossy().replace('\\', "/")))
         .collect::<Vec<_>>()
         .join(", ");
-    let hour = chosen.iter().map(|(_, hour, _)| *hour).min().unwrap_or(0);
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let target = dir.join(format!("h{hour}-merged-{unique}.parquet"));
-    let tmp = dir.join(format!("h{hour}-merged-{unique}.parquet.tmp"));
+    let target = dir.join(format!("h{hour}-final-{unique}.parquet"));
+    let tmp = dir.join(format!("h{hour}-final-{unique}.parquet.tmp"));
     let sql = format!(
         "COPY ({}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
         merge_projection(&list),
@@ -849,7 +1016,7 @@ fn merge_smallest_files(
     if let Err(err) = conn.execute_batch(&sql) {
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::Db(format!(
-            "merging {} down to {budget} files: {err}",
+            "merging {} hour {hour} down to {budget} files: {err}",
             def.name
         )));
     }
@@ -867,8 +1034,10 @@ fn merge_smallest_files(
         let _ = std::fs::remove_file(&tmp);
         return Ok(false);
     }
+    // Publish first, then remove the inputs. The read-side "newest final wins"
+    // rule hides the inputs until they are gone, even after a crash.
     std::fs::rename(&tmp, &target).map_err(Error::Io)?;
-    for (_, _, file) in &chosen {
+    for file in &chosen {
         let _ = std::fs::remove_file(file);
     }
     Ok(true)
@@ -889,10 +1058,160 @@ pub(crate) fn staged_bytes(state: &ParquetState) -> u64 {
     total
 }
 
+/// Result of one archive-layer retention/cap pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ArchivePruneStats {
+    pub files_removed: usize,
+    pub bytes_reclaimed: u64,
+}
+
+/// Enforce retention and the disk cap on committed Parquet files.
+///
+/// `disk` mode has no database to shrink: deleting rows from the in-memory hot
+/// tier cannot reclaim PVC space, so eviction must remove whole hour files.
+/// `.tmp` files are never candidates — they are either a partial write or a
+/// published file whose deletion is still in flight. The hard disk cap wins
+/// over retention, as documented in the deployment guide.
+pub(crate) fn prune_archives(
+    state: &ParquetState,
+    now_ns: u64,
+    retention_ns: Option<u64>,
+    max_disk_bytes: Option<u64>,
+) -> Result<ArchivePruneStats> {
+    if state.mode != StorageMode::Disk {
+        // In `s3` mode local files are unconfirmed staging copies. Deleting
+        // them to meet a cap could destroy the only copy of a batch; bucket
+        // lifecycle rules own retention for confirmed objects.
+        return Ok(ArchivePruneStats::default());
+    }
+    struct File {
+        hour: u64,
+        stamp: Option<String>,
+        modified: SystemTime,
+        size: u64,
+        path: PathBuf,
+    }
+
+    let mut files: Vec<File> = Vec::new();
+    for def in TABLES {
+        let Ok(entries) = std::fs::read_dir(state.table_dir(def.name)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".parquet") {
+                continue;
+            }
+            let Some(hour) = parse_hour_tag(&name) else {
+                continue;
+            };
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            files.push(File {
+                hour,
+                stamp: parse_stamp_tag(&name),
+                modified: meta.modified().unwrap_or(UNIX_EPOCH),
+                size: meta.len(),
+                path: entry.path(),
+            });
+        }
+    }
+    let mut stats = ArchivePruneStats::default();
+    let cutoff_hour =
+        retention_ns.map(|retention| now_ns.saturating_sub(retention) / 1_000_000_000 / 3600);
+    let remove = |file: &File, stats: &mut ArchivePruneStats| {
+        if std::fs::remove_file(&file.path).is_ok() {
+            stats.files_removed += 1;
+            stats.bytes_reclaimed += file.size;
+        }
+    };
+    files.retain(|file| {
+        if cutoff_hour.is_some_and(|cutoff| file.hour < cutoff) {
+            remove(file, &mut stats);
+            false
+        } else {
+            true
+        }
+    });
+    if let Some(limit) = max_disk_bytes {
+        let total: u64 = files.iter().map(|file| file.size).sum();
+        if total > limit {
+            // A flush writes one file per table with the same stamp. They must
+            // be evicted together: deleting only the `batches` file would
+            // leave samples nobody can attribute to a series, and deleting
+            // only `samples` would keep empty batches. A compacted hour is
+            // one replacement file per table; removing it while the inputs
+            // remain would resurrect duplicates through the newest-final-wins
+            // read rule, so those hours are grouped as a single unit.
+            let final_hours: std::collections::BTreeSet<u64> = files
+                .iter()
+                .filter(|file| {
+                    is_final_file(&file.path.file_name().unwrap_or_default().to_string_lossy())
+                })
+                .map(|file| file.hour)
+                .collect();
+            let mut units: std::collections::BTreeMap<String, Vec<File>> =
+                std::collections::BTreeMap::new();
+            for file in files {
+                let key = if final_hours.contains(&file.hour) {
+                    format!("hour:{}", file.hour)
+                } else {
+                    file.stamp
+                        .clone()
+                        .unwrap_or_else(|| format!("hour:{}", file.hour))
+                };
+                units.entry(key).or_default().push(file);
+            }
+            let mut ordered: Vec<(u64, SystemTime, Vec<File>)> = units
+                .into_values()
+                .map(|unit| {
+                    let hour = unit.iter().map(|file| file.hour).min().unwrap_or(0);
+                    let modified = unit
+                        .iter()
+                        .map(|file| file.modified)
+                        .max()
+                        .unwrap_or(UNIX_EPOCH);
+                    (hour, modified, unit)
+                })
+                .collect();
+            ordered.sort_by_key(|(hour, modified, _)| (*hour, *modified));
+            let mut excess = total - limit;
+            for (_, _, unit) in &ordered {
+                if excess == 0 {
+                    break;
+                }
+                for file in unit {
+                    remove(file, &mut stats);
+                    excess = excess.saturating_sub(file.size);
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
 fn parse_hour_tag(name: &str) -> Option<u64> {
     let stem = name.strip_prefix('h')?;
     let end = stem.find('-').unwrap_or(stem.len());
     stem[..end].parse().ok()
+}
+
+/// The flush/merge stamp that ties one file per table into one logical write.
+/// Older layouts without a stamp are grouped by hour instead.
+fn parse_stamp_tag(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".parquet")?;
+    let (_, rest) = stem.strip_prefix('h')?.split_once('-')?;
+    let parts: Vec<&str> = rest.split('-').collect();
+    let first = *parts.first()?;
+    if first.is_empty() {
+        return None;
+    }
+    if matches!(first, "final" | "compact" | "merged" | "legacy") {
+        let stamp = parts.get(1).copied().unwrap_or("0");
+        return Some(format!("{first}-{stamp}"));
+    }
+    Some(first.to_string())
 }
 
 fn esc(value: &str) -> String {
@@ -1093,15 +1412,7 @@ mod tests {
         ))
         .unwrap();
 
-        let state = ParquetState {
-            dir: dir.join("parquet"),
-            bucket: "unused".into(),
-            prefix: "test".into(),
-            local_ttl_ns: u64::MAX,
-            manifest_path: dir.join("parquet").join("manifest.json"),
-            archive_retry: Arc::new(Mutex::new(ArchiveRetry::default())),
-        };
-        state.save_manifest(&Manifest::default()).unwrap();
+        let state = ParquetState::new(&dir, StorageMode::Disk, None, u64::MAX);
         create_schema(&conn, &state).unwrap();
 
         let rows: i64 = conn

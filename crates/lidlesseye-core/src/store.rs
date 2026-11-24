@@ -30,6 +30,10 @@
 //! `frames` is a global dictionary, so the same function appears once no matter
 //! how many batches reference it.
 
+// Legacy DuckDB-schema helpers are kept while the migration path is being
+// exercised; canonical modes no longer call them.
+#![allow(dead_code)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -76,21 +80,72 @@ fn net_metric_column(metric: NetMetric) -> &'static str {
 
 /// How rows are physically stored.
 ///
-/// * [`StorageMode::DuckDb`] keeps everything in one `lidlesseye.duckdb` file.
-///   This is the original, self-contained mode.
-/// * [`StorageMode::Parquet`] keeps a small in-memory "hot" DuckDB for recent
-///   writes, continuously flushes it to Parquet files on local disk, merges
-///   each completed hour into one large Parquet object in S3, and removes the
-///   local copy once the upload succeeds. Reads scan the hot tables and all
-///   Parquet files (local + S3) through canonical-name VIEWs, so DuckDB pushes
-///   filters/projections into the Parquet scans and never copies remote data
-///   into the database ("zero-copy" reads).
+/// Neither canonical mode creates a persistent DuckDB database file. DuckDB is
+/// an in-process query engine for the current hot tier; every durable row is a
+/// Parquet file (or, in `s3` mode, a verified S3 object).
+///
+/// * [`StorageMode::Disk`] flushes hot rows to local Parquet fragments, merges
+///   each completed hour into one deterministic final file and then removes
+///   the fragments. The PVC holds only Parquet data files.
+/// * [`StorageMode::S3`] reuses the same flush/merge protocol, uploads the
+///   merged file to S3 and removes the local staging copy only after the
+///   object has been read back successfully.
+///
+/// Reads scan the hot tables and all Parquet files through canonical-name
+/// VIEWs, so filters/projections are pushed into the Parquet scan and remote
+/// data is streamed rather than copied into the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum StorageMode {
-    #[default]
+    /// Legacy DuckDB file mode. Only kept for migration/old fixtures; no new
+    /// deployment may select it.
+    #[serde(rename = "duckdb")]
     DuckDb,
+    /// In-memory DuckDB hot tier, Parquet files on local disk. This is the
+    /// default and needs no object store.
+    #[serde(rename = "disk")]
+    #[default]
+    Disk,
+    /// In-memory hot tier, local Parquet staging, S3 as the archive.
+    #[serde(rename = "s3")]
+    S3,
+    /// Legacy name for [`StorageMode::S3`]. Accepted with a warning so old
+    /// Helm values do not silently start an empty store.
+    #[serde(rename = "parquet")]
     Parquet,
+}
+
+impl StorageMode {
+    /// Whether this mode uses the in-memory hot tier + Parquet layout.
+    pub fn uses_parquet(self) -> bool {
+        matches!(
+            self,
+            StorageMode::Disk | StorageMode::S3 | StorageMode::Parquet | StorageMode::DuckDb
+        )
+    }
+
+    /// Whether the value came from a pre-0.1.16 configuration.
+    pub fn is_legacy(self) -> bool {
+        matches!(self, StorageMode::DuckDb | StorageMode::Parquet)
+    }
+
+    /// Canonical mode used by the new storage layout.
+    pub fn canonical(self) -> Self {
+        match self {
+            StorageMode::Parquet => StorageMode::S3,
+            StorageMode::DuckDb => StorageMode::Disk,
+            other => other,
+        }
+    }
+
+    /// Configuration value used by the CLI and Helm chart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageMode::DuckDb => "duckdb",
+            StorageMode::Disk => "disk",
+            StorageMode::S3 => "s3",
+            StorageMode::Parquet => "parquet",
+        }
+    }
 }
 
 /// Connection details for the S3-compatible object store used by
@@ -147,11 +202,15 @@ pub struct StoreConfig {
     /// S3 connection used only in [`StorageMode::Parquet`] mode.
     #[serde(default)]
     pub s3: Option<S3Config>,
-    /// How long compacted Parquet stays on local disk before being uploaded
-    /// to S3 and removed. `None` uses one hour. This is the "hot on disk"
-    /// window: queries inside it read local files, older ranges read S3.
+    /// How long a completed Parquet fragment may wait on local disk before it
+    /// is merged (and, in `s3` mode, uploaded). `None` uses one hour.
     #[serde(default)]
     pub parquet_local_ttl_ns: Option<u64>,
+    /// How often the in-memory hot tier is flushed to a Parquet fragment.
+    /// This is the maximum exposure window (RPO) if the process is killed
+    /// before a flush. `None` uses ten seconds.
+    #[serde(default)]
+    pub flush_interval_ns: Option<u64>,
 }
 
 impl StoreConfig {
@@ -162,15 +221,31 @@ impl StoreConfig {
             max_disk_bytes: None,
             threads: None,
             duckdb_memory_limit: None,
-            storage_mode: StorageMode::DuckDb,
+            storage_mode: StorageMode::Disk,
             s3: None,
             parquet_local_ttl_ns: None,
+            flush_interval_ns: None,
         }
     }
 
     /// Effective local Parquet TTL: one hour unless overridden.
     pub fn parquet_local_ttl_ns(&self) -> u64 {
         self.parquet_local_ttl_ns.unwrap_or(3_600_000_000_000)
+    }
+
+    /// Effective hot-tier flush interval: ten seconds unless overridden.
+    pub fn flush_interval_ns(&self) -> u64 {
+        self.flush_interval_ns.unwrap_or(10_000_000_000)
+    }
+
+    /// Reject configurations that would start an empty store.
+    pub fn validate(&self) -> Result<()> {
+        if self.storage_mode.canonical() == StorageMode::S3 && self.s3.is_none() {
+            return Err(Error::InvalidArgument(
+                "storage mode `s3` requires --s3-bucket and credentials".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Effective DuckDB memory limit: the configured value or a conservative
@@ -199,6 +274,10 @@ pub struct StoreStats {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PruneStats {
     pub removed_batches: usize,
+    /// Whole Parquet files removed by retention or the disk cap. Disk-mode
+    /// eviction cannot delete individual rows, so this is the only removal
+    /// signal in that mode.
+    pub removed_files: usize,
     pub removed_bytes: u64,
 }
 
@@ -527,20 +606,19 @@ pub struct Store {
     /// `(module, symbol, file, line)` -> frame id, for the write path only.
     frame_cache: Mutex<HashMap<FrameKey, u32>>,
     ids: Mutex<Ids>,
-    /// Present only in Parquet mode: layout + lifecycle of the local/S3 files.
-    parquet: Option<ParquetState>,
+    /// Layout and lifecycle of the local/S3 Parquet files. Always present:
+    /// canonical modes never keep a persistent DuckDB database.
+    parquet: ParquetState,
+    /// Second in-memory connection used by compaction and S3 upload. It only
+    /// opens Parquet files, so a long merge/upload no longer blocks queries
+    /// or ingests on the connection that owns the hot tables and VIEWs.
+    maintenance_conn: Mutex<Connection>,
     /// Wall-clock instant of the last local Parquet compaction pass. The
     /// compaction tick runs every few seconds; rewriting an hour's files that
     /// often would cost more than it saves.
     last_compact_ns: std::sync::atomic::AtomicU64,
-    /// Last time a read started, in nanoseconds since the epoch (0 = never).
-    ///
-    /// Background maintenance checks it before starting: a merge or an archive
-    /// pass is a multi-minute operation on the same single connection, so
-    /// starting one while a dashboard is polling means every poll after it is
-    /// refused. Maintenance is expected to run when nobody is looking; that is
-    /// the only time it is free.
-    last_read_ns: std::sync::atomic::AtomicU64,
+    /// Last successful hot-tier flush, for the configured RPO cadence.
+    last_flush_ns: std::sync::atomic::AtomicU64,
     /// Cached [`StoreStats`], the distinct-series count, and when they were
     /// computed. Every open dashboard polls `stats`, and in Parquet mode that
     /// query opens every file's footer just to count rows.
@@ -582,16 +660,6 @@ impl DerefMut for ReadConn<'_> {
 /// the HTTP layer's 60 s deadline.
 const READ_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// How long the store must have been unread before background maintenance may
-/// start.
-///
-/// A minute, not twenty seconds: merging an hour of Parquet for a busy tenant
-/// takes minutes on a small host, and it holds the tenant's only connection
-/// while it does. An open dashboard polls every few seconds, so this gate
-/// means maintenance runs when the dashboard is closed — which is the only
-/// time its cost is invisible.
-const MAINTENANCE_IDLE_NS: u64 = 60_000_000_000;
-
 /// How long background maintenance waits for the connection before giving up
 /// on this tick. Long enough to slip in between two dashboard polls, short
 /// enough that a query never notices.
@@ -603,17 +671,6 @@ impl Store {
         self.cfg.storage_mode
     }
 
-    /// Whether a background job may start now.
-    ///
-    /// False while someone is reading: flushing, merging an hour of Parquet and
-    /// uploading it all hold the tenant's only connection for seconds to
-    /// minutes, and a query that arrives in that window cannot be served. The
-    /// next tick is ten seconds away and will find a quiet store eventually.
-    fn maintenance_window(&self) -> bool {
-        let last = self.last_read_ns.load(std::sync::atomic::Ordering::Relaxed);
-        now_ns().saturating_sub(last) > MAINTENANCE_IDLE_NS
-    }
-
     /// Take the connection for a read, or fail with [`Error::Busy`].
     ///
     /// Every read path must use this rather than `lock()`. A reader that blocks
@@ -623,8 +680,6 @@ impl Store {
     /// kept a worker and a slot until the request timeout, and the dashboard
     /// showed 408s for a server that was merely busy.
     fn read_conn(&self) -> Result<ReadConn<'_>> {
-        self.last_read_ns
-            .store(now_ns(), std::sync::atomic::Ordering::Relaxed);
         // Acquire the connection first: while a read is merely *waiting* for
         // it, a watchdog interrupt must be a no-op rather than hitting the
         // transaction that currently owns the connection.
@@ -636,7 +691,8 @@ impl Store {
                 READ_LOCK_WAIT.as_secs()
             ))
         })?;
-        self.telemetry.record_wait(ConnUser::Read, started.elapsed());
+        self.telemetry
+            .record_wait(ConnUser::Read, started.elapsed());
         let active = self.read_active.lock();
         Ok(ReadConn {
             _active: active,
@@ -668,13 +724,10 @@ impl Store {
         self.telemetry.snapshot()
     }
 
-    /// Name of the table writes must go to. In Parquet mode the canonical
-    /// names are VIEWs (hot ∪ local ∪ S3), so writes target the hot table.
+    /// Canonical names are VIEWs (hot ∪ local ∪ S3), so writes always target
+    /// the in-memory hot table.
     fn wtable(&self, name: &str) -> String {
-        match self.parquet {
-            Some(_) => format!("{name}_hot"),
-            None => name.to_string(),
-        }
+        format!("{name}_hot")
     }
 }
 
@@ -700,14 +753,23 @@ impl Store {
             "opening store"
         );
 
-        let parquet_state = if cfg.storage_mode == StorageMode::Parquet {
-            let s3 = cfg.s3.as_ref().ok_or_else(|| {
-                Error::InvalidArgument("parquet storage mode requires S3 configuration".into())
-            })?;
-            Some(ParquetState::new(&cfg.root, s3, cfg.parquet_local_ttl_ns()))
-        } else {
-            None
-        };
+        cfg.validate()?;
+        // Upgrade path: an existing database from an older release must be
+        // exported before the in-memory store starts, otherwise it would look
+        // like an empty installation and silently hide all history.
+        crate::migrate::migrate_legacy(&cfg.root)?;
+        let mode = cfg.storage_mode.canonical();
+        if cfg.storage_mode.is_legacy() {
+            warn!(
+                stage = "storage_mode",
+                legacy = cfg.storage_mode.as_str(),
+                canonical = mode.as_str(),
+                "legacy storage mode mapped to its canonical replacement"
+            );
+        }
+        let parquet_state =
+            ParquetState::new(&cfg.root, mode, cfg.s3.as_ref(), cfg.parquet_local_ttl_ns());
+        std::fs::create_dir_all(&parquet_state.dir).map_err(Error::Io)?;
 
         let mut duckdb_config = duckdb::Config::default();
         if let Some(threads) = cfg.threads {
@@ -716,50 +778,38 @@ impl Store {
                 .map_err(|err| Error::Db(format!("setting DuckDB threads: {err}")))?;
         }
 
-        let (conn, path) = if let Some(state) = &parquet_state {
-            // Hot tier only needs an in-memory database; durable rows live in
-            // Parquet files. This is the key to "no .duckdb file on disk".
-            //
-            // `open_in_memory_with_flags` — not `open_in_memory` — because the
-            // configured thread count has to reach the config object. The
-            // plain constructor silently took DuckDB's default of one thread
-            // per core, so a 20-core host ran every parquet scan on 20 threads
-            // while `--duckdb-threads=4` was ignored in this mode only.
-            let conn = Connection::open_in_memory_with_flags(duckdb_config)
-                .map_err(|err| Error::Db(format!("opening in-memory DuckDB: {err}")))?;
-            let s3 = cfg.s3.as_ref().expect("checked above");
+        // `open_in_memory_with_flags` — not `open_in_memory` — because the
+        // configured thread count has to reach the config object. There is no
+        // DuckDB file in either canonical mode; the durable dataset is Parquet.
+        let conn = Connection::open_in_memory_with_flags(duckdb_config)
+            .map_err(|err| Error::Db(format!("opening in-memory DuckDB: {err}")))?;
+        tune_connection(&conn, &parquet_state.dir.join(".duckdb-tmp"), &cfg)?;
+        if mode == StorageMode::S3 {
+            let s3 = cfg.s3.as_ref().expect("validated above");
             parquet::configure_s3(&conn, s3)?;
-            tune_connection(&conn, &cfg.root.join("parquet.meta.duckdb"), &cfg)?;
-            parquet::create_schema(&conn, state)?;
-            // S3 is the source of truth; the local manifest is only a cache.
-            // Re-discover archived objects so a lost manifest (new node / PVC
-            // rebuild / first start against an existing bucket) never hides
-            // data. Best-effort: an unreachable S3 must not block startup.
-            match parquet::discover_s3_objects(&conn, state, s3) {
-                Ok(0) | Err(_) => {} // nothing archived yet, or S3 unreachable: both fine
-                Ok(n) => eprintln!("lidlesseye: discovered {n} archived S3 object(s)"),
+        }
+        parquet::create_schema(&conn, &parquet_state)?;
+        if mode == StorageMode::S3 {
+            let s3 = cfg.s3.as_ref().expect("validated above");
+            match parquet::discover_s3_objects(&conn, &parquet_state, s3) {
+                Ok(0) | Err(_) => {} // nothing archived yet, or S3 unreachable
+                Ok(n) => info!(objects = n, "discovered archived S3 objects"),
             }
-            (conn, cfg.root.join(DB_FILE))
-        } else {
-            let path = cfg.root.join(DB_FILE);
-            info!(path = %path.display(), stage = "open_duckdb", "opening DuckDB file");
-            let conn = Connection::open_with_flags(&path, duckdb_config)
-                .map_err(|err| Error::Db(format!("opening {}: {err}", path.display())))?;
-            info!(
-                elapsed_ms = started.elapsed().as_millis(),
-                stage = "open_duckdb",
-                "DuckDB file opened"
-            );
-            tune_connection(&conn, &path, &cfg)?;
-            create_schema(&conn)?;
-            info!(
-                elapsed_ms = started.elapsed().as_millis(),
-                stage = "schema",
-                "DuckDB schema checked"
-            );
-            (conn, path)
-        };
-        let _ = &path; // path kept for the DuckDB `disk_bytes` helper
+        }
+        info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            stage = "schema",
+            "in-memory store ready"
+        );
+
+        // A separate connection for merges/uploads: it opens Parquet files and
+        // S3 objects, never the hot tables or the canonical VIEWs. A slow
+        // upload can no longer make every ingest and query wait on it.
+        let maintenance_conn = Connection::open_in_memory()
+            .map_err(|err| Error::Db(format!("opening maintenance DuckDB: {err}")))?;
+        if mode == StorageMode::S3 {
+            parquet::configure_s3(&maintenance_conn, cfg.s3.as_ref().expect("validated above"))?;
+        }
         let interrupt = conn.interrupt_handle();
 
         info!(stage = "id_counters", "loading store id counters");
@@ -802,12 +852,9 @@ impl Store {
             frame_cache: Mutex::new(HashMap::new()),
             ids: Mutex::new(ids),
             parquet: parquet_state,
+            maintenance_conn: Mutex::new(maintenance_conn),
             last_compact_ns: std::sync::atomic::AtomicU64::new(0),
-            // Seeded with "now" rather than 0: the maintenance window should
-            // also cover the first seconds after opening the store, so the
-            // dashboard's first paint is not competing with a background merge
-            // that started the moment the process did.
-            last_read_ns: std::sync::atomic::AtomicU64::new(now_ns()),
+            last_flush_ns: std::sync::atomic::AtomicU64::new(now_ns()),
             stats_cache: Mutex::new(None),
         };
         info!(
@@ -843,9 +890,9 @@ impl Store {
         &self.cfg.root
     }
 
-    /// Path of the database file.
+    /// Directory holding the durable Parquet dataset.
     pub fn path(&self) -> PathBuf {
-        self.cfg.root.join(DB_FILE)
+        self.parquet.dir.clone()
     }
 
     /// Kept for API compatibility; the schema is created on open.
@@ -1483,69 +1530,54 @@ impl Store {
         Ok((stats, series))
     }
 
-    /// Physical footprint of the tenant's database: the file DuckDB keeps its
-    /// blocks in, plus the write-ahead log.
-    ///
-    /// `pragma_database_size()` is the tempting source, but its
-    /// `database_size` only covers what has been checkpointed — right after a
-    /// burst of ingest it reports 0 while the WAL holds every byte — so the
-    /// number shown next to `logical_bytes` would look broken. The filesystem
-    /// does not guess, and it matches what an operator sees with `du`.
+    /// Physical footprint of the tenant's durable data: the Parquet files on
+    /// local disk. The hot tier and DuckDB itself are in memory and disappear
+    /// on restart, which is why they are not part of the disk cap.
     fn disk_bytes(&self) -> u64 {
-        if let Some(state) = &self.parquet {
-            // Local staged Parquet is the physical footprint we control; the
-            // hot tier is in-memory and the archive lives in S3.
-            return parquet::staged_bytes(state);
-        }
-        let path = self.path();
-        let main = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let mut wal = path.into_os_string();
-        wal.push(".wal");
-        let wal = std::fs::metadata(Path::new(&wal))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        main.saturating_add(wal)
+        parquet::staged_bytes(&self.parquet)
     }
 
-    /// Flush the in-memory hot tier to a local Parquet file and return the
-    /// number of rows moved. No-op in DuckDB mode. Safe to call periodically.
+    /// Flush the in-memory hot tier to a validated local Parquet fragment.
     pub fn flush_hot(&self) -> Result<usize> {
-        let Some(state) = &self.parquet else {
-            return Ok(0);
-        };
         let conn = self.lock_conn(ConnUser::Flush);
-        parquet::flush_hot(&conn, state)
+        let moved = parquet::flush_hot(&conn, &self.parquet)?;
+        self.last_flush_ns
+            .store(now_ns(), std::sync::atomic::Ordering::Relaxed);
+        if moved > 0 {
+            *self.stats_cache.lock() = None;
+        }
+        Ok(moved)
     }
 
     /// [`Store::flush_hot`] that yields to queries.
     ///
-    /// Compaction is background work on the same single connection that serves
-    /// every read. Taking the lock outright meant a tick that happened to land
-    /// while a query was running simply queued behind it, and every query
-    /// behind that — which is how a background job turns into a 60 s request
-    /// timeout. Background work waits at most [`BACKGROUND_LOCK_WAIT`] and
-    /// then skips the tick: the next one is ten seconds away, and a query is
-    /// the only thing a user can see.
+    /// Unlike merge/upload, a flush is short and bounds the data-loss window
+    /// (`--flush-interval`), so it must not wait for a 60-second "idle" period.
+    /// It waits at most [`BACKGROUND_LOCK_WAIT`] and skips this tick if a query
+    /// owns the connection; the next tick is seconds away.
     pub fn flush_hot_when_idle(&self) -> Result<usize> {
-        let Some(state) = &self.parquet else {
-            return Ok(0);
-        };
-        if !self.maintenance_window() {
+        let now = now_ns();
+        let last = self
+            .last_flush_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < self.cfg.flush_interval_ns() {
             return Ok(0);
         }
         let Some(conn) = self.try_lock_conn(ConnUser::Flush, BACKGROUND_LOCK_WAIT) else {
             return Ok(0);
         };
-        parquet::flush_hot(&conn, state)
+        let moved = parquet::flush_hot(&conn, &self.parquet)?;
+        self.last_flush_ns
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        if moved > 0 {
+            *self.stats_cache.lock() = None;
+        }
+        Ok(moved)
     }
 
-    /// Merge each completed hour's local Parquet files into one per table.
-    /// No-op in DuckDB mode, and throttled to once every ten minutes so the
-    /// ten-second compaction tick stays cheap.
+    /// Merge each completed hour's local Parquet files into one final file.
+    /// Throttled to once every ten minutes so the tick stays cheap.
     pub fn compact_local(&self) -> Result<parquet::CompactStats> {
-        let Some(state) = &self.parquet else {
-            return Ok(parquet::CompactStats::default());
-        };
         let now = now_ns();
         const INTERVAL_NS: u64 = 600_000_000_000;
         let last = self
@@ -1554,57 +1586,70 @@ impl Store {
         if now.saturating_sub(last) < INTERVAL_NS {
             return Ok(parquet::CompactStats::default());
         }
-        if !self.maintenance_window() {
-            return Ok(parquet::CompactStats::default());
-        }
         self.last_compact_ns
             .store(now, std::sync::atomic::Ordering::Relaxed);
         let current_hour = parquet::hour_tag()
             .trim_start_matches('h')
             .parse::<u64>()
             .unwrap_or(u64::MAX);
-        let Some(conn) = self.try_lock_conn(ConnUser::Compact, BACKGROUND_LOCK_WAIT) else {
+        // Merging rewrites Parquet files only; it cannot touch the hot tables.
+        // Keeping it on the maintenance connection is what stops a busy hour
+        // from making every ingest and dashboard query queue up.
+        let Some(conn) = self.maintenance_conn.try_lock_for(BACKGROUND_LOCK_WAIT) else {
             return Ok(parquet::CompactStats::default());
         };
-        parquet::compact_local(&conn, state, current_hour)
+        let stats = parquet::compact_local(&conn, &self.parquet, current_hour)?;
+        drop(conn);
+        if stats.files_written > 0 {
+            let Some(hot) = self.try_lock_conn(ConnUser::Maintenance, BACKGROUND_LOCK_WAIT) else {
+                return Ok(stats);
+            };
+            parquet::refresh_views(&hot, &self.parquet)?;
+            *self.stats_cache.lock() = None;
+        }
+        Ok(stats)
     }
 
-    /// Compact every hour, including the current one. Tests only: the public
-    /// method deliberately leaves the hour being written alone.
+    /// Compact every hour, including the current one. Tests only.
     #[cfg(test)]
     pub(crate) fn compact_all_for_test(&self) -> Result<parquet::CompactStats> {
-        let Some(state) = &self.parquet else {
-            return Ok(parquet::CompactStats::default());
-        };
-        let conn = self.lock_conn(ConnUser::Compact);
-        parquet::compact_local(&conn, state, u64::MAX)
+        let conn = self.maintenance_conn.lock();
+        let stats = parquet::compact_local(&conn, &self.parquet, u64::MAX)?;
+        drop(conn);
+        let hot = self.lock_conn(ConnUser::Maintenance);
+        parquet::refresh_views(&hot, &self.parquet)?;
+        Ok(stats)
     }
 
-    /// Merge local Parquet files older than the local TTL into one object per
-    /// table/hour, upload it to S3, and remove the local copies. No-op in
-    /// DuckDB mode. `now_ns` is supplied by the caller for deterministic TTL.
+    /// Upload completed local Parquet files to S3 and remove the local copies
+    /// only after the object has been verified. Runs entirely on the
+    /// maintenance connection; the hot connection is only used to refresh the
+    /// read-side VIEWs once new objects are known.
     pub fn archive_local(&self, now_ns: u64) -> Result<parquet::ArchiveStats> {
-        let Some(state) = &self.parquet else {
+        if self.parquet.mode != StorageMode::S3 {
             return Ok(parquet::ArchiveStats::default());
-        };
+        }
         let Some(s3) = &self.cfg.s3 else {
             return Ok(parquet::ArchiveStats::default());
         };
-        if !self.maintenance_window() {
-            return Ok(parquet::ArchiveStats::default());
-        }
-        let Some(conn) = self.try_lock_conn(ConnUser::Archive, BACKGROUND_LOCK_WAIT) else {
+        let Some(conn) = self.maintenance_conn.try_lock_for(BACKGROUND_LOCK_WAIT) else {
             return Ok(parquet::ArchiveStats::default());
         };
-        parquet::archive_local(&conn, state, now_ns, s3)
+        let stats = parquet::archive_local(&conn, &self.parquet, now_ns, s3)?;
+        drop(conn);
+        if stats.files_uploaded > 0 {
+            let Some(hot) = self.try_lock_conn(ConnUser::Maintenance, BACKGROUND_LOCK_WAIT) else {
+                return Ok(stats);
+            };
+            parquet::refresh_views(&hot, &self.parquet)?;
+            *self.stats_cache.lock() = None;
+        }
+        Ok(stats)
     }
 
-    /// Total bytes staged locally in Parquet mode (0 in DuckDB mode).
+    /// Total bytes of Parquet files staged on local disk.
     pub fn staged_bytes(&self) -> u64 {
-        self.parquet
-            .as_ref()
-            .map(parquet::staged_bytes)
-            .unwrap_or(0)
+        parquet::staged_bytes(&self.parquet)
     }
 
     pub fn series(
@@ -1739,6 +1784,7 @@ impl Store {
     pub fn prune(&self, now_ns: u64) -> Result<PruneStats> {
         let mut stats = PruneStats::default();
         let before = self.stats();
+        let archive_bytes: u64;
 
         let samples_t = self.wtable("samples");
         let batches_t = self.wtable("batches");
@@ -1751,6 +1797,21 @@ impl Store {
             let Some(conn) = self.try_lock_conn(ConnUser::Prune, BACKGROUND_LOCK_WAIT) else {
                 return Ok(stats);
             };
+            // The durable rows are Parquet files, not rows in a database file.
+            // Retention and the hard disk cap therefore have to remove whole
+            // committed files; deleting only from the hot tables reclaims no
+            // disk space at all.
+            let archives = parquet::prune_archives(
+                &self.parquet,
+                now_ns,
+                self.cfg.retention_ns,
+                self.cfg.max_disk_bytes,
+            )?;
+            archive_bytes = archives.bytes_reclaimed;
+            stats.removed_files = archives.files_removed;
+            if archives.files_removed > 0 {
+                parquet::refresh_views(&conn, &self.parquet)?;
+            }
             if let Some(retention) = self.cfg.retention_ns {
                 let cutoff = now_ns.saturating_sub(retention);
                 let removed: i64 = conn
@@ -1833,7 +1894,10 @@ impl Store {
         let after = self.stats();
         // Physical file size stays at its high-water mark after DELETE, so
         // report the logical size actually released instead.
-        stats.removed_bytes = before.logical_bytes.saturating_sub(after.logical_bytes);
+        stats.removed_bytes = before
+            .logical_bytes
+            .saturating_sub(after.logical_bytes)
+            .saturating_add(archive_bytes);
         Ok(stats)
     }
 
@@ -1860,19 +1924,17 @@ impl Store {
         // nothing here because the view over this tenant's prefix is empty
         // after its local files are removed. For a full purge the operator
         // clears the S3 prefix.
-        if let Some(state) = &self.parquet {
-            for def in parquet::TABLES {
-                let dir = state.table_dir(def.name);
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    for entry in entries.flatten() {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
+        for def in parquet::TABLES {
+            let dir = self.parquet.table_dir(def.name);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
                 }
             }
-            state.clear_manifest()?;
-            let conn = self.lock_conn(ConnUser::Maintenance);
-            parquet::refresh_views(&conn, state)?;
         }
+        self.parquet.clear_manifest()?;
+        let conn = self.lock_conn(ConnUser::Maintenance);
+        parquet::refresh_views(&conn, &self.parquet)?;
         self.frame_cache.lock().clear();
         *self.stats_cache.lock() = None;
         let mut ids = self.ids.lock();
@@ -1934,23 +1996,35 @@ impl Store {
     pub fn repair(&self) -> Result<usize> {
         let conn = self.lock_conn(ConnUser::Maintenance);
         let (broken, _) = self.dangling_stacks(&conn)?;
+        // Canonical names are VIEWs; DELETE must target the in-memory hot
+        // tables. Immutable Parquet files cannot be repaired in place.
+        let samples_t = self.wtable("samples");
+        let stacks_t = self.wtable("stacks");
         let removed = in_transaction(&conn, "COMMIT", |conn| -> Result<usize> {
             let mut removed = 0usize;
             for stack_id in broken {
                 let id = stack_id as i64;
                 removed += conn
-                    .execute("DELETE FROM samples WHERE stack_id = ?", params![id])
+                    .execute(
+                        &format!("DELETE FROM {samples_t} WHERE stack_id = ?"),
+                        params![id],
+                    )
                     .map_err(db_err)?;
                 removed += conn
-                    .execute("DELETE FROM stacks WHERE stack_id = ?", params![id])
+                    .execute(
+                        &format!("DELETE FROM {stacks_t} WHERE stack_id = ?"),
+                        params![id],
+                    )
                     .map_err(db_err)?;
             }
             // Samples whose stack is missing entirely (the other half of the
             // invariant checked by `fsck`).
             removed += conn
                 .execute(
-                    "DELETE FROM samples WHERE NOT EXISTS \
-                     (SELECT 1 FROM stacks k WHERE k.stack_id = samples.stack_id)",
+                    &format!(
+                        "DELETE FROM {samples_t} WHERE NOT EXISTS \
+                         (SELECT 1 FROM {stacks_t} k WHERE k.stack_id = {samples_t}.stack_id)"
+                    ),
                     [],
                 )
                 .map_err(db_err)?;
@@ -3380,7 +3454,9 @@ mod tests {
             .unwrap();
         assert_eq!(narrowed.len(), 1);
 
-        // Reopening reads the same rows out of the database file.
+        // Only flushed rows survive a restart; the hot tier is intentionally
+        // in memory and represents the configured RPO window.
+        store.flush_hot().unwrap();
         let store2 = Store::open(StoreConfig::new(&dir)).unwrap();
         assert_eq!(store2.stats().batch_count, 3);
         assert_eq!(store2.stats().total_value, 3_000);
@@ -3393,10 +3469,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lidlesseye-upgrade-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         {
-            // This is the 0.1.10 shape: no `rtt_samples`, but with the indexes
-            // that earlier starts created. DuckDB refuses to ALTER a table
-            // while an index depends on it, which used to make every upgraded
-            // tenant fail to open.
+            // An old release's file: the column added later is absent, and
+            // indexes depend on the table. The new store must export rows to
+            // Parquet rather than try to ALTER a file it will never open.
             let conn = Connection::open(dir.join(DB_FILE)).unwrap();
             conn.execute_batch(
                 "CREATE TABLE net_edges (
@@ -3415,52 +3490,52 @@ mod tests {
                     rtt_us_sum BIGINT NOT NULL
                  );
                  CREATE INDEX idx_net_edges_bucket ON net_edges(bucket_ns);
-                 CREATE INDEX idx_net_edges_node ON net_edges(client_id, server_id);",
+                 CREATE INDEX idx_net_edges_node ON net_edges(client_id, server_id);
+                 INSERT INTO net_edges VALUES
+                   (1000, 'a', 'b', 'tcp', '', '', 'pod-a', 'pod-b', 1, 0, 10, 10, 250);",
             )
             .unwrap();
         }
 
         let store = Store::open(StoreConfig::new(&dir)).unwrap();
-        assert!(store.net_edges(0, u64::MAX).unwrap().is_empty());
-
-        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
-        let columns: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM information_schema.columns \
-                 WHERE table_name = 'net_edges' AND column_name = 'rtt_samples'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(columns, 1, "rtt_samples was not migrated");
-        let indexes: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'net_edges'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let edges = store.net_edges(0, u64::MAX).unwrap();
+        assert_eq!(edges.len(), 1, "legacy rows must survive the upgrade");
+        assert_eq!(edges[0].rtt_samples, 0, "a missing column reads as zero");
+        assert!(!dir.join(DB_FILE).exists(), "old DuckDB file was retired");
+        let parquet = dir.join("parquet").join("net_edges");
         assert!(
-            indexes >= 2,
-            "net_edges indexes were not rebuilt: {indexes}"
+            std::fs::read_dir(&parquet).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".parquet")),
+            "legacy rows must be exported as Parquet"
         );
+        drop(store);
+
+        // A second open is idempotent and still sees exactly one row.
+        let store = Store::open(StoreConfig::new(&dir)).unwrap();
+        assert_eq!(store.net_edges(0, u64::MAX).unwrap().len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn physical_size_is_reported_while_the_data_sits_in_the_wal() {
+    fn physical_size_tracks_flushed_parquet_not_the_hot_tier() {
         let (store, dir) = temp_store("disk-bytes");
-        // Nothing has checkpointed or pruned yet, so every byte is in the
-        // write-ahead log — the window in which `pragma_database_size()`
-        // reported 0 and the dashboard showed "0 B" next to a non-zero
-        // logical size.
         store
             .append(&report("checkout", 1_000, "a", &["hot", "main"], 1_000))
             .unwrap();
 
-        let stats = store.stats();
-        assert!(stats.logical_bytes > 0, "{stats:?}");
-        assert!(stats.total_bytes > 0, "{stats:?}");
+        // The hot tier is in memory: no DuckDB file, no physical bytes yet.
+        let hot = store.stats();
+        assert!(hot.logical_bytes > 0, "{hot:?}");
+        assert_eq!(hot.total_bytes, 0, "{hot:?}");
+        assert!(!dir.join(DB_FILE).exists());
+
+        store.flush_hot().unwrap();
+        let flushed = store.stats();
+        assert!(flushed.total_bytes > 0, "{flushed:?}");
+        assert!(!dir.join(DB_FILE).exists());
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3561,26 +3636,25 @@ mod tests {
         store
             .append(&report("api", hour, "a", &["hot"], 10))
             .unwrap();
-        // DuckDB locks the file, so a second `Store` on the same path is an
-        // error rather than a second reader: reopen only after dropping.
+        // Persistence is Parquet: the hot tier must be flushed before a
+        // retention pass can see (or evict) these rows.
+        store.flush_hot().unwrap();
         drop(store);
 
         let mut cfg = StoreConfig::new(&dir);
         cfg.retention_ns = Some(hour + hour / 2);
-        let store = Store::open(cfg).unwrap();
-        let stats = store.prune(2 * hour).unwrap();
-        assert_eq!(stats.removed_batches, 1);
+        let mut store = Store::open(cfg).unwrap();
+        let stats = store.prune(3 * hour).unwrap();
+        assert!(stats.removed_bytes > 0);
         assert_eq!(store.stats().batch_count, 1);
-        drop(store);
 
-        // The cap is measured on retained data, not on the file, which DuckDB
-        // does not shrink.
-        let mut cfg = StoreConfig::new(&dir);
-        cfg.max_disk_bytes = Some(1);
-        let store = Store::open(cfg).unwrap();
+        // The hard disk cap is measured on physical Parquet bytes, so a one
+        // byte cap evicts every committed file.
+        store.cfg.max_disk_bytes = Some(1);
         store
             .append(&report("web", 3 * hour, "b", &["hot"], 10))
             .unwrap();
+        store.flush_hot().unwrap();
         assert!(store.stats().batch_count >= 1);
         store.prune(3 * hour).unwrap();
         assert_eq!(
@@ -3685,13 +3759,13 @@ mod tests {
         {
             let conn = store.conn.lock();
             conn.execute(
-                "INSERT INTO samples VALUES (999, 'cpu', 'api', '', 1000, 2000, 999999, 7)",
+                "INSERT INTO samples_hot VALUES (999, 'cpu', 'api', '', 1000, 2000, 999999, 7)",
                 [],
             )
             .unwrap();
             // A truncated blob: not a whole number of 4-byte frame ids.
             conn.execute(
-                "INSERT INTO stacks VALUES (999998, ?)",
+                "INSERT INTO stacks_hot VALUES (999998, ?)",
                 params![vec![1u8, 2, 3]],
             )
             .unwrap();
@@ -3708,7 +3782,7 @@ mod tests {
         );
         assert!(store.fsck().iter().all(|(_, r)| r.is_ok()));
         assert_eq!(store.stats().batch_count, before, "good batch survives");
-        assert!(store.path().is_file(), "database file survives");
+        assert!(store.path().is_dir(), "Parquet directory survives");
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4174,10 +4248,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The performance settings and indexes must actually take effect — a
-    /// silently skipped PRAGMA would leave long scans slow without any signal.
+    /// The performance settings must actually take effect — a silently
+    /// skipped PRAGMA would leave long scans slow without any signal.
     #[test]
-    fn performance_settings_and_indexes_are_applied() {
+    fn performance_settings_are_applied_and_no_db_file_is_created() {
         let (store, dir) = temp_store("tuning");
         let conn = store.conn.lock();
 
@@ -4209,24 +4283,9 @@ mod tests {
             "a conservative memory cap must be set, got {memory_limit}"
         );
 
-        let mut stmt = conn
-            .prepare("SELECT index_name FROM duckdb_indexes() WHERE index_name LIKE 'idx_%'")
-            .unwrap();
-        let indexes: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(|name| name.unwrap())
-            .collect();
-        for expected in [
-            "idx_net_edges_bucket",
-            "idx_net_nodes_bucket",
-            "idx_samples_time",
-        ] {
-            assert!(
-                indexes.iter().any(|name| name == expected),
-                "missing {expected}"
-            );
-        }
+        // Canonical modes have no persistent DuckDB file and no table indexes
+        // to migrate: the hot tables are recreated on every open.
+        assert!(!dir.join(DB_FILE).exists());
 
         drop(conn);
         drop(store);
@@ -4290,7 +4349,7 @@ mod tests {
     #[test]
     fn stale_duckdb_spill_is_reclaimed_at_open() {
         let root = std::env::temp_dir().join(format!("lidlesseye-spill-{}", uuid::Uuid::new_v4()));
-        let tmp = root.join(".duckdb-tmp");
+        let tmp = root.join("parquet").join(".duckdb-tmp");
         std::fs::create_dir_all(&tmp).unwrap();
         let stale = tmp.join("duckdb_temp_11_0_storage_DEFAULT-0.tmp");
         std::fs::write(&stale, vec![0u8; 4096]).unwrap();
@@ -4455,24 +4514,29 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A restart against an already-current database must not issue DDL. The
-    /// old code rebuilt six indexes and rewrote `meta.schema_version` on every
-    /// open, which made a large upgraded volume look hung before the first
-    /// dashboard request could get the connection.
+    /// Reopening an existing store only rebuilds in-memory tables and VIEWs;
+    /// it must not rewrite the Parquet dataset or create a database file.
     #[test]
-    fn a_current_schema_is_detected_without_writing() {
+    fn reopening_a_parquet_store_does_not_write_data_files() {
         let (store, dir) = temp_store("schema-current");
-        assert!(
-            schema_is_current(&store.conn.lock()),
-            "a store just created by this binary must be on the fast path"
-        );
+        store
+            .append(&report("api", 1_000, "a", &["hot"], 10))
+            .unwrap();
+        store.flush_hot().unwrap();
         drop(store);
 
+        let before: Vec<String> = std::fs::read_dir(dir.join("parquet").join("batches"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         let reopened = Store::open(StoreConfig::new(&dir)).unwrap();
-        assert!(
-            schema_is_current(&reopened.conn.lock()),
-            "a reopened store must still be on the fast path"
-        );
+        assert_eq!(reopened.stats().batch_count, 1);
+        assert!(!dir.join(DB_FILE).exists());
+        let after: Vec<String> = std::fs::read_dir(dir.join("parquet").join("batches"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(before, after, "opening a store must not rewrite Parquet");
         drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }

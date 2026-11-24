@@ -440,6 +440,71 @@ fn serve_answers_over_a_real_socket() {
 }
 
 #[test]
+fn flush_command_flushes_the_server_hot_tier() {
+    let dir = temp_dir("flush");
+    let server = serve(&["--data-dir", dir.join("data").to_str().unwrap()]);
+    let base = server.base_url.clone();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let body = serde_json::json!({
+        "service_name": "flush-svc",
+        "profile_type": "cpu",
+        "start_ns": now - 1_000_000,
+        "end_ns": now,
+        "strings": ["", "work"],
+        "stacks": [{"frames": [[0, 1, 0, 0]], "value": 4242}],
+    });
+    let response = client
+        .post(format!("{base}/ingest"))
+        .header("X-Scope-OrgID", "acme")
+        .json(&body)
+        .send()
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "ingest failed: {}",
+        response.text().unwrap()
+    );
+
+    let out = run(&["flush", "--server", &base, "--tenant", "acme"], None);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("flushed ") && out.stdout.contains("rows"),
+        "{}",
+        out.stdout
+    );
+
+    let query = run(
+        &[
+            "query",
+            "--data-dir",
+            dir.join("data").to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--from",
+            "1h",
+            "--top",
+        ],
+        None,
+    );
+    assert_eq!(query.code, Some(0), "{}", query.stderr);
+    assert!(query.stdout.contains("work"), "{}", query.stdout);
+}
+
+#[test]
 fn serve_requires_a_token_when_one_is_configured() {
     let dir = temp_dir("serve-auth");
     let data = dir.join("data");

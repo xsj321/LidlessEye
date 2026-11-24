@@ -172,6 +172,31 @@ fn bad_payload(err: lidlesseye_core::Error) -> ApiError {
     ApiError::bad_request(err.to_string())
 }
 
+/// `POST /api/v1/flush`
+///
+/// Move the caller tenant's in-memory hot tier to local Parquet before the
+/// configured cadence. The hot tier belongs to the running server process, so
+/// this must be a server endpoint: opening the data directory in another
+/// process would only create a second, empty hot tier.
+pub async fn flush(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let caller = state.authorize(&headers)?;
+    let store = state.writable_tenant(&caller.tenant)?;
+    let mode = store.config().storage_mode.canonical().as_str().to_string();
+    let rows = tokio::task::spawn_blocking(move || store.flush_hot())
+        .await
+        .map_err(|err| ApiError::internal(format!("flush task failed: {err}")))?
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "tenant": caller.tenant.to_string(),
+        "rows": rows,
+        "mode": mode,
+    }))
+    .into_response())
+}
+
 /// Decide how to read the body: explicit `format=` wins, then the content
 /// type, then a weak heuristic.
 fn ingest_format(headers: &HeaderMap, params: &Params) -> &'static str {

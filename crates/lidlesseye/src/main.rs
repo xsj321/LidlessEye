@@ -35,6 +35,8 @@ enum Command {
     Collect(CollectArgs),
     /// Import reports from files or stdin.
     Ingest(IngestArgs),
+    /// Flush a running server's tenant hot tier to Parquet (manual RPO control).
+    Flush(FlushArgs),
     /// Inspect a data directory from the terminal.
     Query(QueryArgs),
     /// Verify every tenant database and its stack/frame references.
@@ -66,9 +68,10 @@ struct ServeArgs {
     /// process keep answering `/api/v1/health` while a wide scan runs.
     #[arg(long, env = "LIDLESSEYE_QUERY_CONCURRENCY", default_value = "4")]
     query_concurrency: usize,
-    /// Physical storage backend: `duckdb` (single file, default) or `parquet`
-    /// (hot memory tier + local Parquet + hourly S3 archive).
-    #[arg(long, env = "LIDLESSEYE_STORAGE_MODE", default_value = "duckdb")]
+    /// Physical storage backend: `disk` (in-memory hot tier + local Parquet,
+    /// default) or `s3` (same hot tier, verified S3 archive). Legacy values
+    /// `duckdb` and `parquet` are mapped with a warning; migrate old data first.
+    #[arg(long, env = "LIDLESSEYE_STORAGE_MODE", default_value = "disk")]
     storage_mode: String,
     /// S3 bucket for Parquet mode.
     #[arg(long, env = "LIDLESSEYE_S3_BUCKET")]
@@ -98,6 +101,10 @@ struct ServeArgs {
     /// (`1h` by default; shorter values are useful for testing).
     #[arg(long, env = "LIDLESSEYE_PARQUET_LOCAL_TTL")]
     parquet_local_ttl: Option<String>,
+    /// How often the in-memory hot tier is flushed to Parquet. This is the
+    /// maximum data-loss window if the process is killed (`10s` by default).
+    #[arg(long, env = "LIDLESSEYE_FLUSH_INTERVAL", default_value = "10s")]
+    flush_interval: String,
     #[arg(long, env = "LIDLESSEYE_AUTH_TOKEN")]
     auth_token: Option<String>,
     /// Bind a bearer token to a tenant: `--tenant-token <token>=<tenant>`
@@ -266,6 +273,21 @@ struct IngestArgs {
 }
 
 #[derive(Debug, Args)]
+struct FlushArgs {
+    /// Running LidlessEye server whose hot tier should be flushed.
+    #[arg(long, env = "LIDLESSEYE_SERVER")]
+    server: String,
+    #[arg(long, env = "LIDLESSEYE_AUTH_TOKEN")]
+    auth_token: Option<String>,
+    /// Tenant whose hot tier should be flushed.
+    #[arg(long, default_value = "default")]
+    tenant: String,
+    /// Header the server reads the tenant from.
+    #[arg(long, default_value = "X-Tenant-Id")]
+    tenant_header: String,
+}
+
+#[derive(Debug, Args)]
 struct QueryArgs {
     #[arg(long, env = "LIDLESSEYE_DATA_DIR", default_value = "./lidlesseye-data")]
     data_dir: PathBuf,
@@ -335,6 +357,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Collect(args) => collect(args).await,
         Command::Ingest(args) => ingest(args).await,
         Command::Query(args) => query(args),
+        Command::Flush(args) => flush(args).await,
         Command::Fsck(args) => fsck(args),
         Command::Info => {
             println!("lidlesseye {}", env!("CARGO_PKG_VERSION"));
@@ -367,9 +390,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let max_disk = parse_optional_bytes(&args.max_disk)?;
 
     let storage_mode = match args.storage_mode.to_ascii_lowercase().as_str() {
-        "parquet" | "parquet-s3" | "s3" => lidlesseye_core::StorageMode::Parquet,
-        "duckdb" | "" => lidlesseye_core::StorageMode::DuckDb,
-        other => anyhow::bail!("unknown --storage-mode `{other}` (use duckdb or parquet)"),
+        "disk" | "" => lidlesseye_core::StorageMode::Disk,
+        "s3" => lidlesseye_core::StorageMode::S3,
+        // Legacy values stay parseable so an old Helm values file produces an
+        // explicit migration error rather than an empty in-memory store.
+        "parquet" | "parquet-s3" => lidlesseye_core::StorageMode::Parquet,
+        "duckdb" => lidlesseye_core::StorageMode::DuckDb,
+        other => anyhow::bail!("unknown --storage-mode `{other}` (use disk or s3)"),
     };
     let s3 = args
         .s3_bucket
@@ -388,6 +415,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         Some(value) => Some(parse_duration(value)?),
         None => None,
     };
+    let flush_interval = parse_duration(&args.flush_interval)?;
 
     let mut builder = Builder::new()
         .data_dir(&args.data_dir)
@@ -403,6 +431,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if let Some(ttl) = parquet_local_ttl {
         builder = builder.parquet_local_ttl(ttl);
     }
+    builder = builder.storage_flush_interval(flush_interval);
     builder = builder
         .auth_token(args.auth_token.clone())
         .cors(args.cors.clone())
@@ -678,8 +707,13 @@ async fn ingest(args: IngestArgs) -> anyhow::Result<()> {
             );
             count += 1;
         }
+        // This process owns the in-memory hot tier. Without a flush before it
+        // exits, the imported reports would exist only in the heap and a later
+        // `query`/`flush` process would open an empty store. A CLI import must
+        // be durable when it returns.
+        let moved = store.flush_hot()?;
         println!(
-            "imported {count} reports into {} as tenant `{tenant}`",
+            "imported {count} reports into {} as tenant `{tenant}` and flushed {moved} rows to Parquet",
             dir.display()
         );
         return Ok(());
@@ -774,6 +808,35 @@ fn query(args: QueryArgs) -> anyhow::Result<()> {
         );
     }
     println!("\ntotal: {}", format_value(total, "nanoseconds"));
+    Ok(())
+}
+
+async fn flush(args: FlushArgs) -> anyhow::Result<()> {
+    let id = lidlesseye::core::TenantId::parse(&args.tenant)?;
+    let url = format!("{}/api/v1/flush", args.server.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build the HTTP client")?;
+    let mut request = client.post(&url).header(&args.tenant_header, id.as_str());
+    if let Some(token) = &args.auth_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.with_context(|| {
+        format!("failed to reach {url}; the hot tier lives in the server process, not on disk")
+    })?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("flush failed with HTTP {status}: {body}");
+    }
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("flush returned invalid JSON: {body}"))?;
+    println!(
+        "flushed {} rows from tenant `{}` to Parquet",
+        value["rows"].as_u64().unwrap_or(0),
+        id
+    );
     Ok(())
 }
 

@@ -208,6 +208,51 @@ async fn ingest_then_query_roundtrip() {
 }
 
 #[tokio::test]
+async fn flush_endpoint_persists_the_hot_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(dir.path()).await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/ingest",
+        Some(report("checkout", "cpu", 1_000_000_000)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, flushed) = call(&app, "POST", "/api/v1/flush", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{flushed}");
+    assert_eq!(flushed["tenant"], "default");
+    assert!(
+        flushed["rows"].as_u64().unwrap_or(0) > 0,
+        "flush did not move any rows: {flushed}"
+    );
+
+    let samples = dir.path().join("tenants/default/parquet/samples");
+    let parquet_files: Vec<_> = std::fs::read_dir(&samples)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert!(!parquet_files.is_empty(), "no Parquet samples were written");
+
+    // Flushing moves rows to disk; it must not hide them from queries.
+    let (status, fg) = call(
+        &app,
+        "GET",
+        "/api/v1/flamegraph?profile_type=cpu&from=now-1h",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fg}");
+    assert_eq!(fg["total"], 1_000_000_000i64, "{fg}");
+}
+
+#[tokio::test]
 async fn wall_is_the_sum_of_cpu_and_off_cpu() {
     let dir = tempfile::tempdir().unwrap();
     let app = router(dir.path()).await;
@@ -406,6 +451,9 @@ async fn read_only_servers_reject_ingest_but_serve_queries() {
     {
         let app = LidlessEye::bind(config(dir.path())).await.unwrap().router();
         call(&app, "POST", "/ingest", Some(report("ro", "cpu", 42)), &[]).await;
+        // The hot tier lives in the server process; persist it before a new
+        // read-only server reopens the directory.
+        call(&app, "POST", "/api/v1/flush", None, &[]).await;
     }
     let app = router_with(
         dir.path(),

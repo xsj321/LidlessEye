@@ -55,7 +55,9 @@ spec:
                    to the flag's own default rather than render empty. */}}
             - --query-concurrency={{ ternary .Values.server.queryConcurrency 4 (hasKey .Values.server "queryConcurrency") }}
             - --storage-mode={{ .Values.server.storage.mode }}
-            {{- if eq .Values.server.storage.mode "parquet" }}
+            {{- /* Releases predating this key must keep the 10s RPO default. */}}
+            - --flush-interval={{ ternary .Values.server.storage.flushInterval "10s" (hasKey .Values.server.storage "flushInterval") }}
+            {{- if or (eq .Values.server.storage.mode "parquet") (eq .Values.server.storage.mode "s3") }}
             - --s3-bucket={{ .Values.server.storage.s3.bucket }}
             - --s3-prefix={{ .Values.server.storage.s3.prefix }}
             - --s3-endpoint={{ .Values.server.storage.s3.endpoint }}
@@ -85,7 +87,7 @@ spec:
               value: /var/lib/lidlesseye
             - name: LIDLESSEYE_LISTEN
               value: 0.0.0.0:{{ .Values.server.service.port }}
-            {{- if eq .Values.server.storage.mode "parquet" }}
+            {{- if or (eq .Values.server.storage.mode "parquet") (eq .Values.server.storage.mode "s3") }}
             - name: LIDLESSEYE_S3_ACCESS_KEY
               valueFrom:
                 secretKeyRef:

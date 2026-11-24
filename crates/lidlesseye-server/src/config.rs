@@ -67,8 +67,8 @@ pub struct ServerConfig {
     /// kubelet kills the process over when it cannot be served.
     #[serde(default)]
     pub query_concurrency: Option<usize>,
-    /// Physical storage backend: the original DuckDB file, or Parquet with
-    /// hourly S3 archival. `None` means DuckDB (the default).
+    /// Physical storage backend: `disk` (local Parquet, the default) or `s3`
+    /// (verified S3 archive). `None` means the canonical `disk` mode.
     #[serde(default)]
     pub storage_mode: Option<StorageMode>,
     /// S3-compatible object store configuration for Parquet mode.
@@ -77,6 +77,10 @@ pub struct ServerConfig {
     /// How long compacted Parquet stays on local disk before S3 upload/removal.
     #[serde(default)]
     pub parquet_local_ttl_ns: Option<u64>,
+    /// How often the in-memory hot tier is flushed to Parquet (nanoseconds).
+    /// This is the maximum data-loss window on an unclean shutdown.
+    #[serde(default)]
+    pub storage_flush_interval_ns: Option<u64>,
 }
 
 fn default_duckdb_threads() -> Option<usize> {
@@ -117,6 +121,7 @@ impl Default for ServerConfig {
             storage_mode: None,
             s3: None,
             parquet_local_ttl_ns: None,
+            storage_flush_interval_ns: None,
         }
     }
 }

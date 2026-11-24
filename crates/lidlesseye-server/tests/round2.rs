@@ -234,6 +234,9 @@ async fn a_read_only_server_refuses_writes_but_answers_queries() {
         &[],
     )
     .await;
+    // Data lives in the server's hot tier until it is flushed; a reader that
+    // reopens the directory must see the seed data on disk.
+    call(&writable, "POST", "/api/v1/flush", None, &[]).await;
     drop(writable);
 
     let app = router_with(
