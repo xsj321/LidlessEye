@@ -578,14 +578,18 @@ pub async fn tenants(
 
 /// One row of the tenant catalogue, with empty stats when nothing is stored.
 fn describe_tenant(state: &AppState, tenant: &TenantId) -> TenantInfo {
-    let store = state.registry().tenant(tenant);
+    // One `stats_checked()` call computes stats and the distinct-series count
+    // in the same scan. The old pair of `stats()` + `series_count()` scanned
+    // `batches` twice for the first catalogue request after an upgrade.
+    let (stats, series) = state
+        .registry()
+        .tenant(tenant)
+        .and_then(|store| store.stats_checked().ok())
+        .unwrap_or_default();
     TenantInfo {
         id: tenant.to_string(),
-        stats: store
-            .as_ref()
-            .map(|store| store.stats())
-            .unwrap_or_default(),
-        series: store.map(|store| store.series_count()).unwrap_or(0),
+        stats,
+        series,
         limits: state.registry().limits(tenant),
     }
 }

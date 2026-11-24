@@ -210,6 +210,30 @@ Each replica in the one-hop map now owns the connections it actually carried.
   different cart pods and asserts that every self and peer pod card carries an
   edge attributed to its own UID.
 
+## [0.1.14] - 2026-11-24
+
+The first dashboard request after a disk-DuckDB upgrade is no longer a silent
+wait, and a current database is no longer rewritten just by opening it.
+
+### Fixed
+
+- `Store::open` used to run `CREATE INDEX IF NOT EXISTS` for all six indexes and
+  `INSERT OR REPLACE INTO meta ('schema_version')` on **every** open, even when
+  the schema was already current. On a large upgraded volume that writes the
+  DuckDB catalog and WAL before the first query and can hold the tenant's only
+  connection past the dashboard's timeout. The catalog is now checked first; a
+  current database skips all DDL and version writes, and a real migration logs
+  each stage separately.
+- `/api/v1/tenants` computed stats and the distinct-series count with two scans
+  of `batches` for every tenant on the dashboard's first request. Both now come
+  from one cached `stats_checked()` call, in the tenant registry and in the
+  single-tenant path.
+- Startup and migration progress is visible with the default log filter: each
+  store open reports the directory, DuckDB file, schema, id counters and total
+  elapsed time; each tenant reports its own open time; a stats scan over one
+  second is logged as well. `lidlesseye_core=info` is now included in the
+  default filter and in the container image.
+
 ## [Unreleased]
 
 ## [0.1.5] - 2026-11-23
@@ -597,7 +621,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/xsj321/LidlessEye/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/xsj321/LidlessEye/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/xsj321/LidlessEye/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/xsj321/LidlessEye/compare/v0.1.10...v0.1.11

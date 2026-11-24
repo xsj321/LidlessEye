@@ -478,7 +478,15 @@ impl std::fmt::Debug for Store {
 impl Store {
     /// Open (and create if needed) the store under `cfg.root`.
     pub fn open(cfg: StoreConfig) -> Result<Self> {
+        let started = std::time::Instant::now();
         std::fs::create_dir_all(&cfg.root)?;
+        info!(
+            root = %cfg.root.display(),
+            mode = ?cfg.storage_mode,
+            elapsed_ms = started.elapsed().as_millis(),
+            stage = "directory",
+            "opening store"
+        );
 
         let parquet_state = if cfg.storage_mode == StorageMode::Parquet {
             let s3 = cfg.s3.as_ref().ok_or_else(|| {
@@ -522,15 +530,27 @@ impl Store {
             (conn, cfg.root.join(DB_FILE))
         } else {
             let path = cfg.root.join(DB_FILE);
+            info!(path = %path.display(), stage = "open_duckdb", "opening DuckDB file");
             let conn = Connection::open_with_flags(&path, duckdb_config)
                 .map_err(|err| Error::Db(format!("opening {}: {err}", path.display())))?;
+            info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                stage = "open_duckdb",
+                "DuckDB file opened"
+            );
             tune_connection(&conn, &path, &cfg)?;
             create_schema(&conn)?;
+            info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                stage = "schema",
+                "DuckDB schema checked"
+            );
             (conn, path)
         };
         let _ = &path; // path kept for the DuckDB `disk_bytes` helper
         let interrupt = conn.interrupt_handle();
 
+        info!(stage = "id_counters", "loading store id counters");
         let ids = {
             // These SELECTs hit canonical names: real tables in DuckDB mode,
             // VIEWs over (hot ∪ local ∪ S3) in Parquet mode.
@@ -577,6 +597,11 @@ impl Store {
             last_read_ns: std::sync::atomic::AtomicU64::new(now_ns()),
             stats_cache: Mutex::new(None),
         };
+        info!(
+            root = %store.cfg.root.display(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "store ready"
+        );
         Ok(store)
     }
 
@@ -1193,6 +1218,7 @@ impl Store {
             return Ok((cached, series));
         }
         let conn = self.read_conn()?;
+        let scan_started = std::time::Instant::now();
         let row = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(total_value), 0), COALESCE(SUM(bytes), 0), \
                     MIN(start_ns), MAX(end_ns) FROM batches",
@@ -1233,6 +1259,14 @@ impl Store {
             .map(|count| count.max(0) as usize)
             .unwrap_or(0);
         *self.stats_cache.lock() = Some((now, stats, series));
+        let elapsed = scan_started.elapsed();
+        if elapsed > std::time::Duration::from_secs(1) {
+            info!(
+                elapsed_ms = elapsed.as_millis(),
+                root = %self.cfg.root.display(),
+                "tenant stats scan was slow; this is what the first catalogue request waits for"
+            );
+        }
         Ok((stats, series))
     }
 
@@ -2473,7 +2507,22 @@ fn clear_stale_spill(dir: &Path) {
 }
 
 fn create_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(&format!(
+    let started = std::time::Instant::now();
+    // A current database must stay read-only at the DDL/DML level. The old
+    // code ran `CREATE INDEX IF NOT EXISTS` and `INSERT OR REPLACE INTO meta`
+    // on *every* open; on a large upgraded file that is a write to DuckDB's
+    // catalog and WAL before the first query, and it can hold the tenant's
+    // only connection long enough for the dashboard's first request to time
+    // out.
+    if schema_is_current(conn) {
+        info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "DuckDB schema is current; skipping migration"
+        );
+        return Ok(());
+    }
+    info!("DuckDB schema needs migration; progress will be logged by stage");
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS batches (
             batch_id BIGINT PRIMARY KEY,
             profile_type VARCHAR NOT NULL,
@@ -2548,12 +2597,114 @@ fn create_schema(conn: &Connection) -> Result<()> {
             rtt_us_sum BIGINT NOT NULL,
             rtt_samples BIGINT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);
-        INSERT OR REPLACE INTO meta VALUES ('schema_version', '{SCHEMA_VERSION}');"
-    ))
+        CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);",
+    )
     .map_err(db_err)?;
+    info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        stage = "tables",
+        "DuckDB migration step complete"
+    );
     add_missing_columns(conn)?;
-    create_indexes(conn)
+    info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        stage = "columns",
+        "DuckDB migration step complete"
+    );
+    create_indexes(conn)?;
+    info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        stage = "indexes",
+        "DuckDB migration step complete"
+    );
+    update_schema_version(conn)?;
+    info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "DuckDB schema is ready"
+    );
+    Ok(())
+}
+
+/// Names of the tables present in the database right now.
+fn table_names(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn
+        .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(db_err)?;
+    rows.collect::<std::result::Result<HashSet<_>, _>>()
+        .map_err(db_err)
+}
+
+/// Names of DuckDB's indexes. `duckdb_indexes()` is a table function, so a
+/// build without it simply takes the migration path rather than failing open.
+fn index_names(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn
+        .prepare("SELECT index_name FROM duckdb_indexes()")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(db_err)?;
+    rows.collect::<std::result::Result<HashSet<_>, _>>()
+        .map_err(db_err)
+}
+
+/// Is every object this binary expects already present?
+///
+/// Checking the catalog before issuing any DDL is what keeps a normal restart
+/// cheap. A version stamp alone is not enough: earlier releases added columns
+/// without bumping it, so the added columns and indexes are checked too.
+fn schema_is_current(conn: &Connection) -> bool {
+    let Ok(tables) = table_names(conn) else {
+        return false;
+    };
+    if REQUIRED_TABLES.iter().any(|name| !tables.contains(*name)) {
+        return false;
+    }
+    let Ok(version) = conn.query_row(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    ) else {
+        return false;
+    };
+    if version != SCHEMA_VERSION.to_string() {
+        return false;
+    }
+    let Ok(edges) = existing_columns(conn, "net_edges") else {
+        return false;
+    };
+    let edges: HashSet<&str> = edges.iter().map(String::as_str).collect();
+    if NET_EDGE_COLUMNS
+        .iter()
+        .any(|(column, _)| !edges.contains(*column))
+    {
+        return false;
+    }
+    let Ok(nodes) = existing_columns(conn, "net_nodes") else {
+        return false;
+    };
+    let nodes: HashSet<&str> = nodes.iter().map(String::as_str).collect();
+    if NET_NODE_COLUMNS
+        .iter()
+        .any(|(column, _)| !nodes.contains(*column))
+    {
+        return false;
+    }
+    let Ok(indexes) = index_names(conn) else {
+        return false;
+    };
+    !INDEXES.iter().any(|(name, _)| !indexes.contains(*name))
+}
+
+/// Stamp the schema only after every migration step succeeded. An interrupted
+/// migration must be attempted again on the next open.
+fn update_schema_version(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "INSERT OR REPLACE INTO meta VALUES ('schema_version', '{SCHEMA_VERSION}');"
+    ))
+    .map_err(db_err)
 }
 
 /// Indexes the columns every read path filters or groups on. DuckDB keeps
@@ -2591,6 +2742,39 @@ const INDEXES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Tables every DuckDB-mode store must have. An old or partially migrated
+/// database misses one of these and takes the slow migration path on open.
+const REQUIRED_TABLES: &[&str] = &[
+    "batches",
+    "samples",
+    "stacks",
+    "frames",
+    "net_nodes",
+    "net_edges",
+    "meta",
+];
+
+/// Columns added after the first release of each service-map table. Kept at
+/// module scope so the fast-path check and the migration use one definition.
+const NET_EDGE_COLUMNS: &[(&str, &str)] = &[
+    ("tx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
+    ("rx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
+    ("rtt_us_sum", "BIGINT DEFAULT 0 NOT NULL"),
+    ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
+    ("client_container", "VARCHAR DEFAULT '' NOT NULL"),
+    ("server_container", "VARCHAR DEFAULT '' NOT NULL"),
+    ("client_pod", "VARCHAR DEFAULT '' NOT NULL"),
+    ("server_pod", "VARCHAR DEFAULT '' NOT NULL"),
+    ("host", "VARCHAR DEFAULT '' NOT NULL"),
+    ("sql", "VARCHAR DEFAULT '' NOT NULL"),
+];
+const NET_NODE_COLUMNS: &[(&str, &str)] = &[
+    ("pods", "BIGINT DEFAULT 0 NOT NULL"),
+    ("ready", "BIGINT DEFAULT 0 NOT NULL"),
+    ("instances", "VARCHAR DEFAULT '[]' NOT NULL"),
+    ("containers", "VARCHAR DEFAULT '[]' NOT NULL"),
+];
+
 /// Drop the indexes that `create_indexes` owns so a migration can alter their
 /// tables. Only called when a column actually needs adding: doing this on
 /// every open makes concurrent readers fight over DuckDB's WAL.
@@ -2603,9 +2787,13 @@ fn drop_indexes(conn: &Connection) -> Result<()> {
 }
 
 fn create_indexes(conn: &Connection) -> Result<()> {
-    for (_, sql) in INDEXES {
+    let existing = index_names(conn).unwrap_or_default();
+    for (name, sql) in INDEXES {
+        if existing.contains(*name) {
+            continue;
+        }
         if let Err(err) = conn.execute_batch(sql) {
-            warn!("skipping index `{sql}`: {err}");
+            warn!(index = *name, error = %err, "skipping index");
         }
     }
     Ok(())
@@ -2618,25 +2806,6 @@ fn create_indexes(conn: &Connection) -> Result<()> {
 /// is asked rather than relying on `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`,
 /// whose availability depends on the DuckDB build the agent was linked with.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    const NET_EDGE_COLUMNS: &[(&str, &str)] = &[
-        ("tx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
-        ("rx_bytes", "BIGINT DEFAULT 0 NOT NULL"),
-        ("rtt_us_sum", "BIGINT DEFAULT 0 NOT NULL"),
-        ("rtt_samples", "BIGINT DEFAULT 0 NOT NULL"),
-        ("client_container", "VARCHAR DEFAULT '' NOT NULL"),
-        ("server_container", "VARCHAR DEFAULT '' NOT NULL"),
-        ("client_pod", "VARCHAR DEFAULT '' NOT NULL"),
-        ("server_pod", "VARCHAR DEFAULT '' NOT NULL"),
-        ("host", "VARCHAR DEFAULT '' NOT NULL"),
-        ("sql", "VARCHAR DEFAULT '' NOT NULL"),
-    ];
-    const NET_NODE_COLUMNS: &[(&str, &str)] = &[
-        ("pods", "BIGINT DEFAULT 0 NOT NULL"),
-        ("ready", "BIGINT DEFAULT 0 NOT NULL"),
-        ("instances", "VARCHAR DEFAULT '[]' NOT NULL"),
-        ("containers", "VARCHAR DEFAULT '[]' NOT NULL"),
-    ];
-
     let edges = missing_columns(conn, "net_edges", NET_EDGE_COLUMNS)?;
     let nodes = missing_columns(conn, "net_nodes", NET_NODE_COLUMNS)?;
     // The common case — an already-current database — must stay read-only at
@@ -2645,6 +2814,12 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
     if edges.is_empty() && nodes.is_empty() {
         return Ok(());
     }
+    let columns: Vec<&str> = edges
+        .iter()
+        .chain(nodes.iter())
+        .map(|(column, _)| *column)
+        .collect();
+    info!(columns = ?columns, "adding columns to an older DuckDB schema");
 
     drop_indexes(conn)?;
     add_columns(conn, "net_edges", &edges)?;
@@ -4043,6 +4218,28 @@ mod tests {
         assert_eq!(dns[0].rtt_us, 30);
 
         drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A restart against an already-current database must not issue DDL. The
+    /// old code rebuilt six indexes and rewrote `meta.schema_version` on every
+    /// open, which made a large upgraded volume look hung before the first
+    /// dashboard request could get the connection.
+    #[test]
+    fn a_current_schema_is_detected_without_writing() {
+        let (store, dir) = temp_store("schema-current");
+        assert!(
+            schema_is_current(&store.conn.lock()),
+            "a store just created by this binary must be on the fast path"
+        );
+        drop(store);
+
+        let reopened = Store::open(StoreConfig::new(&dir)).unwrap();
+        assert!(
+            schema_is_current(&reopened.conn.lock()),
+            "a reopened store must still be on the fast path"
+        );
+        drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

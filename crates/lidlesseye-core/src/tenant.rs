@@ -26,7 +26,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 use crate::store::{PruneStats, S3Config, Store, StoreConfig, StoreStats};
@@ -190,12 +190,32 @@ impl TenantStore {
         };
         // Index what is already on disk so the first request is not slow and
         // so a corrupt directory is reported at startup rather than at query
-        // time.
-        for id in registry.tenant_ids() {
-            if let Err(err) = registry.open_tenant(&id) {
+        // time. Each store logs its own phases; these lines give the overall
+        // progress so an upgrade on a large volume is not a silent wait.
+        let tenants = registry.tenant_ids();
+        let started = std::time::Instant::now();
+        info!(
+            count = tenants.len(),
+            stage = "tenants",
+            "opening tenant stores"
+        );
+        for (index, id) in tenants.iter().enumerate() {
+            info!(
+                tenant = %id,
+                index = index + 1,
+                total = tenants.len(),
+                stage = "tenant_open",
+                "opening tenant store"
+            );
+            if let Err(err) = registry.open_tenant(id) {
                 warn!(tenant = %id, error = %err, "failed to open tenant");
             }
         }
+        info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            stage = "tenants",
+            "all tenant stores opened"
+        );
         Ok(registry)
     }
 
@@ -273,12 +293,18 @@ impl TenantStore {
         // `a/../a/tenants/x` share one lock.
         let dir = cfg.root.clone();
         std::fs::create_dir_all(&dir)?;
-        let canonical = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         let mutex = open_lock(&canonical);
         let _open_guard = mutex.lock();
+        let opened = std::time::Instant::now();
+        info!(tenant = %tenant, dir = %dir.display(), "tenant store open started");
         let store = Arc::new(Store::open(cfg)?);
         stores.insert(tenant.clone(), store.clone());
-        debug!(tenant = %tenant, batches = store.stats().batch_count, "tenant opened");
+        info!(
+            tenant = %tenant,
+            elapsed_ms = opened.elapsed().as_millis(),
+            "tenant store open finished"
+        );
         Ok(store)
     }
 
@@ -320,9 +346,14 @@ impl TenantStore {
         self.tenant_ids()
             .into_iter()
             .map(|id| {
-                let (stats, series) = match self.tenant(&id) {
-                    Some(store) => (store.stats(), store.series_count()),
-                    None => (StoreStats::default(), 0),
+                // `stats()` and `series_count()` used to be two scans of
+                // `batches` for every tenant, on the dashboard's very first
+                // request. `stats_checked()` computes both in one pass and
+                // caches them; use its checked form so a busy store is not
+                // reported as an empty installation.
+                let (stats, series) = match self.tenant(&id).map(|store| store.stats_checked()) {
+                    Some(Ok(pair)) => pair,
+                    _ => (StoreStats::default(), 0),
                 };
                 TenantInfo {
                     id: id.to_string(),

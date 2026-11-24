@@ -361,7 +361,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    lidlesseye::init_tracing("lidlesseye=info,tower_http=warn");
+    lidlesseye::init_tracing("lidlesseye=info,lidlesseye_core=info,tower_http=warn");
     let labels: BTreeMap<String, String> = args.labels.into_iter().collect();
     let retention = parse_optional_duration(&args.retention)?;
     let max_disk = parse_optional_bytes(&args.max_disk)?;

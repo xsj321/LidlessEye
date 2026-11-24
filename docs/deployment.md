@@ -478,6 +478,16 @@ Check the profile type: agents produce `cpu` and `off_cpu`, the UI defaults to
 `cpu`. A node that is idle for a minute legitimately has almost no CPU samples;
 switch to `wall` to see blocked time.
 
+**The first dashboard request after an upgrade times out**
+The server logs now show each startup stage with an `elapsed_ms` value:
+`opening tenant stores`, `opening DuckDB file`, `DuckDB schema is current;
+skipping migration` (or a `stage=tables|columns|indexes` line when a migration
+really is needed), `store ready`, and `all tenant stores opened`. If a stats
+scan takes more than a second, it is also logged. A database already on the
+current schema no longer rebuilds its indexes or rewrites `meta` on every open,
+and the tenant catalogue computes stats and the distinct-series count in one
+scan instead of two.
+
 **`open_files` / memory grows forever**
 With DuckDB there is one file per tenant, never one per report, so service-name
 cardinality cannot create files — but it does create distinct label strings in

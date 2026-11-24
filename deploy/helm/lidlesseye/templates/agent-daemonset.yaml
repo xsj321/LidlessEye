@@ -88,7 +88,7 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: RUST_LOG
-              value: lidlesseye=info
+              value: lidlesseye=info,lidlesseye_core=info
             {{- if .Values.server.auth.enabled }}
             - name: LIDLESSEYE_AUTH_TOKEN
               valueFrom:
