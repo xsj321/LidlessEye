@@ -1804,7 +1804,19 @@ pub(crate) fn prune_archives(
     }
     let mut files: Vec<LocalFile> = Vec::new();
     for def in TABLES {
-        files.extend(local_files(state, def.name));
+        let dictionary = def.hour_column.is_none();
+        files.extend(local_files(state, def.name).into_iter().map(|mut file| {
+            // `hour=0` is the sentinel for an unsharded dictionary (`frames`,
+            // and `stacks` written before they were sharded by sample hour),
+            // not a timestamp. Left as an hour it is 1970, so every retention
+            // pass deleted the whole frame dictionary and the flamegraph
+            // collapsed to a root node with no children while the samples that
+            // referenced it survived.
+            if dictionary && file.hour == Some(0) {
+                file.hour = None;
+            }
+            file
+        }));
     }
     let mut stats = ArchivePruneStats::default();
     let cutoff_hour =

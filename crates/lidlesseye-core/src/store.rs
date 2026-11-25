@@ -4463,6 +4463,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Retention must not delete the unsharded frame dictionary.
+    ///
+    /// `frames` has no time column, so its files are filed under the `hour=0`
+    /// sentinel. Read as an hour that is 1970, and the first retention pass
+    /// deleted the whole dictionary while the samples that referenced it
+    /// stayed — the flamegraph collapsed to a root node with no children and
+    /// `top` returned nothing, which looks like a broken query rather than
+    /// missing data.
+    #[test]
+    fn retention_keeps_the_unsharded_frame_dictionary() {
+        let dir = std::env::temp_dir().join(format!(
+            "lidlesseye-store-frames-retention-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut cfg = StoreConfig::new(&dir);
+        cfg.retention_ns = Some(3_600_000_000_000);
+        let store = Store::open(cfg).unwrap();
+
+        let start = crate::time::now_ns() - 60_000_000_000;
+        store
+            .append(&report("api", start, "a", &["leaf", "mid", "root"], 10))
+            .unwrap();
+        store.flush_hot().unwrap();
+
+        let frames_dir = dir.join("parquet").join("frames").join("hour=0");
+        let archived = || {
+            std::fs::read_dir(&frames_dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| entry.path().to_string_lossy().ends_with(".parquet"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert!(archived() > 0, "the flush archived no frame file");
+
+        store.prune(crate::time::now_ns()).unwrap();
+        assert!(
+            archived() > 0,
+            "retention deleted the unsharded frame dictionary"
+        );
+
+        // The archived stack must still resolve to its frames.
+        let opts = crate::query::QueryOptions::new(
+            "cpu",
+            start,
+            start + 60_000_000_000,
+            crate::selector::Selector::service("api"),
+        );
+        let graph = crate::query::flamegraph(&store, &opts).unwrap();
+        assert!(graph.total > 0, "the archived stack no longer resolves");
+        assert!(
+            graph.names.iter().any(|name| name == "leaf"),
+            "frames were not joined back onto the stack: {:?}",
+            graph.names
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A retention pass must cut the tier into bounded pieces.
     ///
     /// Deleting everything past retention in one statement is what turned a

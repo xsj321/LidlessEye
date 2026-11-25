@@ -251,6 +251,23 @@ map windows while the server endpoint is briefly absent.
   429 and 5xx are. Final drop warnings now include attempt count and elapsed
   time so a real outage is distinguishable from a bad payload.
 
+## [0.1.21] - 2026-11-25
+
+Retention no longer deletes the frame dictionary, which is what emptied every
+flamegraph and `top` listing in disk mode.
+
+### Fixed
+
+- `frames` is an unsharded dictionary filed under the `hour=0` sentinel. The
+  retention pass read that sentinel as an hour, so its files looked like 1970
+  data and the first sweep removed the whole dictionary while the samples that
+  referenced it stayed. The result was a flamegraph collapsed to a root node,
+  an empty `top`, and a service map that still worked — the data was gone, not
+  the query. `hour=0` is now treated as "no date" for tables without a time
+  column, exactly like a file with no hour tag: retention keeps it and only the
+  disk cap may evict it, last. Legacy `stacks` files written before dictionaries
+  were sharded into sample hours are covered by the same rule.
+
 ## [0.1.20] - 2026-11-25
 
 Tenants are loaded on demand instead of all at start-up, and a cold tenant opens
@@ -923,7 +940,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/xsj321/LidlessEye/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/xsj321/LidlessEye/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/xsj321/LidlessEye/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/xsj321/LidlessEye/compare/v0.1.17...v0.1.18
