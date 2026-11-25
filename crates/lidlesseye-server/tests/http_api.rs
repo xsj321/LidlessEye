@@ -1309,3 +1309,43 @@ async fn an_uncapped_server_hands_out_free_reads() {
     // `None` means "no cap", and callers must not have to care.
     assert!(server.state().read_slot().await.unwrap().is_none());
 }
+
+/// The first write to a cold tenant must not open its store on the runtime
+/// thread.
+///
+/// Opening a tenant in `s3` mode lists the prefix and reads every archive
+/// footer: tens of seconds. Inline, a burst of ingests from a restarted agent
+/// parks every Tokio worker and the liveness probe times out, so Kubernetes
+/// kills a process that is only slow. An open dispatched to the blocking pool
+/// is pending on its first poll; an inline one returns `Ready` immediately.
+#[tokio::test]
+async fn a_cold_tenant_open_is_awaited_off_the_runtime() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = LidlessEye::bind(config(dir.path())).await.unwrap();
+    let state = server.state();
+    let tenant = lidlesseye_core::TenantId::parse("cold-open").unwrap();
+
+    let mut open = Box::pin(state.writable_tenant_async(&tenant));
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(
+        matches!(open.as_mut().poll(&mut cx), Poll::Pending),
+        "a cold tenant was opened inline on the runtime thread"
+    );
+    drop(open);
+
+    // Dropping the handle does not cancel the open, and the next caller joins
+    // it rather than starting a second one.
+    let store = tokio::time::timeout(
+        Duration::from_secs(10),
+        state.writable_tenant_async(&tenant),
+    )
+    .await
+    .expect("opening a cold tenant timed out")
+    .expect("opening a cold tenant failed");
+    assert_eq!(store.config().storage_mode, StorageMode::Disk);
+}

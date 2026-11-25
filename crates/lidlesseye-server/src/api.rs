@@ -183,7 +183,7 @@ pub async fn flush(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let caller = state.authorize(&headers)?;
-    let store = state.writable_tenant(&caller.tenant)?;
+    let store = state.writable_tenant_async(&caller.tenant).await?;
     let mode = store.config().storage_mode.canonical().as_str().to_string();
     let rows = tokio::task::spawn_blocking(move || store.flush_hot())
         .await
@@ -750,7 +750,7 @@ pub async fn servicemap_ingest(
     if batches.len() > 512 {
         return Err(ApiError::bad_request("too many batches in one request"));
     }
-    let store = state.writable_tenant(&caller.tenant)?;
+    let store = state.writable_tenant_async(&caller.tenant).await?;
 
     let accepted = batches.len();
     let (mut nodes, mut edges) = (0usize, 0usize);

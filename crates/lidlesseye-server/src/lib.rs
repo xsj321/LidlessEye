@@ -252,11 +252,36 @@ impl AppState {
     }
 
     /// Store of a tenant, creating it when needed (write path).
+    ///
+    /// Blocking: opening a cold tenant in `s3` mode lists its prefix and reads
+    /// every archive footer, which is tens of seconds. Only call this off an
+    /// async handler — see [`Self::writable_tenant_async`].
     pub fn writable_tenant(&self, tenant: &TenantId) -> Result<Arc<Store>, ApiError> {
         if self.inner.cfg.read_only {
             return Err(ApiError::forbidden("server is read-only"));
         }
         Ok(self.inner.registry.open_tenant(tenant)?)
+    }
+
+    /// [`Self::writable_tenant`] for async handlers, run on the blocking pool.
+    ///
+    /// The first write to a cold tenant opens its store. Doing that inline
+    /// parks the Tokio worker for the whole open; a restarted agent sends a
+    /// burst of ingests, so every worker can end up parked and the liveness
+    /// probe times out — Kubernetes then kills a process that is only slow.
+    /// The open is pure blocking work with no reactor use, so it belongs on the
+    /// blocking pool, where concurrent callers queue on the tenant's open lock
+    /// instead of on the runtime.
+    pub async fn writable_tenant_async(&self, tenant: &TenantId) -> Result<Arc<Store>, ApiError> {
+        if self.inner.cfg.read_only {
+            return Err(ApiError::forbidden("server is read-only"));
+        }
+        let registry = self.inner.registry.clone();
+        let tenant = tenant.clone();
+        tokio::task::spawn_blocking(move || registry.open_tenant(&tenant))
+            .await
+            .map_err(|err| ApiError::internal(format!("opening tenant: {err}")))?
+            .map_err(ApiError::from)
     }
 }
 
@@ -374,7 +399,7 @@ impl AppState {
         if self.inner.cfg.read_only {
             return Err(ApiError::forbidden("server is read-only"));
         }
-        let store = self.writable_tenant(tenant)?;
+        let store = self.writable_tenant_async(tenant).await?;
         // In S3 mode local Parquet files are unconfirmed staging copies. If
         // the archive cannot drain and the staging area exceeds the hard cap,
         // refuse new data instead of deleting the only copy to make room.
@@ -475,7 +500,7 @@ impl AppState {
         if self.inner.cfg.read_only {
             return Err(ApiError::forbidden("server is read-only"));
         }
-        let store = self.writable_tenant(tenant)?;
+        let store = self.writable_tenant_async(tenant).await?;
         tokio::task::spawn_blocking(move || store.append_servicemap(&batch))
             .await
             .map_err(|err| ApiError::internal(format!("service map task failed: {err}")))?

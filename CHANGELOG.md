@@ -251,6 +251,25 @@ map windows while the server endpoint is briefly absent.
   429 and 5xx are. Final drop warnings now include attempt count and elapsed
   time so a real outage is distinguishable from a bad payload.
 
+## [0.1.22] - 2026-11-25
+
+The first write to a cold tenant no longer opens its store on a Tokio worker.
+
+### Fixed
+
+- Ingest, flush and service-map writes called `writable_tenant` inline, and
+  that call opens the tenant when it is not loaded yet. In `s3` mode an open
+  lists the prefix and reads every archive footer — tens of seconds. A
+  restarted agent sends a burst, so all four workers could park inside the same
+  open and the liveness probe timed out: Kubernetes killed a process that was
+  only slow, then restarted it into the same cold open. The write path now
+  awaits `writable_tenant_async`, which runs the open on the blocking pool;
+  concurrent callers queue on the tenant's open lock there instead of on the
+  runtime, and the queue is shared, so only one open ever runs.
+- Dropping the open future does not cancel it: the blocking task finishes and
+  caches the store, and the next caller joins the cached result rather than
+  starting a second open.
+
 ## [0.1.21] - 2026-11-25
 
 Retention no longer deletes the frame dictionary, which is what emptied every
@@ -940,7 +959,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.22...HEAD
+[0.1.22]: https://github.com/xsj321/LidlessEye/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/xsj321/LidlessEye/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/xsj321/LidlessEye/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/xsj321/LidlessEye/compare/v0.1.18...v0.1.19
