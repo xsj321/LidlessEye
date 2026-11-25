@@ -140,9 +140,29 @@ pub async fn ingest(
             }
         }
     }
-    for report in &reports {
-        report.validate()?;
+    // One bad report must not cost the whole upload. An agent retries nine
+    // times and then drops the batch, so refusing all sixty-four reports
+    // because one counter overflowed is how a single malformed row hid an
+    // entire tenant's data. Keep the valid ones and say which were dropped.
+    let mut rejected: Vec<serde_json::Value> = Vec::new();
+    let mut valid = Vec::with_capacity(reports.len());
+    for (index, report) in reports.into_iter().enumerate() {
+        match report.validate() {
+            Ok(()) => valid.push(report),
+            Err(err) => rejected.push(json!({ "index": index, "error": err.to_string() })),
+        }
     }
+    if valid.is_empty() {
+        let first = rejected
+            .first()
+            .and_then(|entry| entry.get("error"))
+            .and_then(|error| error.as_str())
+            .unwrap_or("the report is not valid");
+        return Err(ApiError::bad_request(format!(
+            "no report in the upload was valid: {first}"
+        )));
+    }
+    let reports = valid;
 
     let count = reports.len();
     let samples: usize = reports.iter().map(|r| r.stacks.len()).sum();
@@ -164,6 +184,7 @@ pub async fn ingest(
         "format": format,
         "tenant": caller.tenant.to_string(),
         "ids": batch_ids,
+        "rejected": rejected,
     }))
     .into_response())
 }

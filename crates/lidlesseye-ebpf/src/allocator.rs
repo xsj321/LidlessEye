@@ -555,7 +555,17 @@ impl Allocator {
                 let Ok(value) = map.get(&key, 0) else {
                     continue;
                 };
-                if value.bytes == 0 && value.objects == 0 {
+                // `free` decrements these counters with `0 - size` in BPF, so a
+                // block allocated *before* the probe was attached makes the
+                // running total negative. Read as unsigned and one unmatched
+                // free of a single object turns into `u64::MAX`, which the
+                // server rejects as an implausible value — and it rejects the
+                // whole upload, not just that row.
+                let bytes = live_counter(value.bytes);
+                let objects = live_counter(value.objects);
+                if bytes == 0 && objects == 0 {
+                    // Nothing held: either a genuinely empty slot or one that
+                    // went negative. Keep the map clean either way.
                     dead.push(key);
                     continue;
                 }
@@ -569,7 +579,7 @@ impl Allocator {
                     dead.push(key);
                     continue;
                 }
-                held.insert((key.tgid, key.stack), (value.bytes, value.objects));
+                held.insert((key.tgid, key.stack), (bytes, objects));
             }
             for key in dead {
                 let _ = map.remove(&key);
@@ -660,6 +670,17 @@ impl Allocator {
         }
         out
     }
+}
+
+/// Read a "still live" counter that the kernel decrements.
+///
+/// `free` subtracts with `0 - size`, so a block allocated before the probe was
+/// attached drives the running total negative; as a `u64` that is a number
+/// close to `u64::MAX`. Such a value is not a large allocation, it is a broken
+/// counter — and the server refuses the whole upload over one implausible
+/// value. Clamp at zero, which is what "nothing is held" means.
+fn live_counter(raw: u64) -> u64 {
+    (raw as i64).max(0) as u64
 }
 
 /// Tell the probes which thread group is the agent's own.
@@ -919,6 +940,21 @@ fn start_time(tgid: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A counter that went negative must not be reported as a huge value.
+    ///
+    /// `free` decrements with `0 - size`, so an allocation made before the
+    /// probe attached shows up as `u64::MAX` once it is freed. The server
+    /// rejects a profile whose value exceeds 1e15 and, before it learned to
+    /// drop just that report, refused the whole upload — which is how one
+    /// unmatched free hid a tenant's data.
+    #[test]
+    fn a_negative_live_counter_reads_as_zero() {
+        assert_eq!(live_counter(u64::MAX), 0, "0 - 1 must not be a value");
+        assert_eq!(live_counter(0u64.wrapping_sub(4096)), 0);
+        assert_eq!(live_counter(4096), 4096, "a real total is unchanged");
+        assert_eq!(live_counter(0), 0);
+    }
 
     #[test]
     fn a_maps_line_yields_the_file_it_maps() {

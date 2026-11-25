@@ -1349,3 +1349,70 @@ async fn a_cold_tenant_open_is_awaited_off_the_runtime() {
     .expect("opening a cold tenant failed");
     assert_eq!(store.config().storage_mode, StorageMode::Disk);
 }
+
+/// One invalid report must not cost the rest of the upload.
+///
+/// The agent retries nine times and then drops the batch, so a whole-upload
+/// 400 turns one malformed row into a hole in the tenant's data — which is
+/// exactly how a negative allocation counter (`u64::MAX`) hid every profile
+/// for twenty minutes.
+#[tokio::test]
+async fn one_invalid_report_does_not_reject_the_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(dir.path()).await;
+
+    let mut bad = report("checkout", "cpu", 1_000_000_000);
+    bad["stacks"][0]["value"] = json!(u64::MAX);
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/ingest",
+        Some(json!({
+            "reports": [report("checkout", "cpu", 1_000_000_000), bad],
+        })),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], 1, "{body}");
+    assert_eq!(body["batches"], 1);
+    assert_eq!(body["rejected"][0]["index"], 1, "{body}");
+    assert!(
+        body["rejected"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("value")),
+        "{body}"
+    );
+
+    // The valid report still landed.
+    let (status, graph) = call(
+        &app,
+        "GET",
+        "/api/v1/flamegraph?from=now-1h&type=cpu",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{graph}");
+    assert_eq!(graph["total"], 1_000_000_000i64);
+}
+
+/// An upload with nothing usable in it is still a client error.
+#[tokio::test]
+async fn an_upload_of_only_invalid_reports_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(dir.path()).await;
+
+    let mut bad = report("checkout", "cpu", 1_000_000_000);
+    bad["stacks"][0]["value"] = json!(u64::MAX);
+
+    let (status, body) = call(&app, "POST", "/ingest", Some(bad), &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("value")),
+        "{body}"
+    );
+}

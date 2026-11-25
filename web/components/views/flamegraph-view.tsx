@@ -5,7 +5,7 @@ import { ArrowLeftRight } from "lucide-react";
 import { FlamegraphCanvas } from "@/components/canvas/flamegraph-canvas";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
+import { QueryProgress } from "@/components/ui/query-progress";
 import { formatClockRange, formatDuration, formatValue } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
@@ -91,7 +91,7 @@ export function FlamegraphView() {
   const { flamegraph, empty } = state;
 
   if (empty) return <EmptyState info={empty} />;
-  if (!flamegraph) return <Skeleton className="h-[420px] w-full rounded-lg" />;
+  if (!flamegraph) return <QueryProgress height={420} />;
 
   const range = state.mode === "relative" ? rangeLabel(state.range) : "custom";
   const stem = `lidlesseye-${state.type}-${range}`.replace(/\s+/g, "-").toLowerCase();

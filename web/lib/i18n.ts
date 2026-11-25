@@ -33,6 +33,11 @@ const ZH: Record<string, string> = {
   "Time series": "时序",
   Labels: "标签",
 
+  // Loading
+  "Querying…": "正在查询…",
+  "Building the service map…": "正在构建服务地图…",
+  Elapsed: "已等待",
+
   // Toolbar
   Profile: "性能类型",
   "Profile type": "性能类型",

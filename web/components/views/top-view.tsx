@@ -5,7 +5,7 @@ import { ArrowDown, ArrowUp, ArrowUpDown, Search } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
 import { Input } from "@/components/ui/input";
-import { Skeleton } from "@/components/ui/skeleton";
+import { QueryProgress } from "@/components/ui/query-progress";
 import {
   Table,
   TableBody,
@@ -85,7 +85,7 @@ export function TopView() {
   const [ascending, setAscending] = useState(false);
 
   if (empty) return <EmptyState info={empty} />;
-  if (!top) return <Skeleton className="h-[420px] w-full rounded-lg" />;
+  if (!top) return <QueryProgress height={420} />;
 
   return (
     <TopTable

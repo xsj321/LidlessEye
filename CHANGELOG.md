@@ -251,42 +251,6 @@ map windows while the server endpoint is briefly absent.
   429 and 5xx are. Final drop warnings now include attempt count and elapsed
   time so a real outage is distinguishable from a bad payload.
 
-## [0.1.22] - 2026-11-25
-
-The first write to a cold tenant no longer opens its store on a Tokio worker.
-
-### Fixed
-
-- Ingest, flush and service-map writes called `writable_tenant` inline, and
-  that call opens the tenant when it is not loaded yet. In `s3` mode an open
-  lists the prefix and reads every archive footer — tens of seconds. A
-  restarted agent sends a burst, so all four workers could park inside the same
-  open and the liveness probe timed out: Kubernetes killed a process that was
-  only slow, then restarted it into the same cold open. The write path now
-  awaits `writable_tenant_async`, which runs the open on the blocking pool;
-  concurrent callers queue on the tenant's open lock there instead of on the
-  runtime, and the queue is shared, so only one open ever runs.
-- Dropping the open future does not cancel it: the blocking task finishes and
-  caches the store, and the next caller joins the cached result rather than
-  starting a second open.
-
-## [0.1.21] - 2026-11-25
-
-Retention no longer deletes the frame dictionary, which is what emptied every
-flamegraph and `top` listing in disk mode.
-
-### Fixed
-
-- `frames` is an unsharded dictionary filed under the `hour=0` sentinel. The
-  retention pass read that sentinel as an hour, so its files looked like 1970
-  data and the first sweep removed the whole dictionary while the samples that
-  referenced it stayed. The result was a flamegraph collapsed to a root node,
-  an empty `top`, and a service map that still worked — the data was gone, not
-  the query. `hour=0` is now treated as "no date" for tables without a time
-  column, exactly like a file with no hour tag: retention keeps it and only the
-  disk cap may evict it, last. Legacy `stacks` files written before dictionaries
-  were sharded into sample hours are covered by the same rule.
-
 ## [0.1.20] - 2026-11-25
 
 Tenants are loaded on demand instead of all at start-up, and a cold tenant opens
@@ -320,6 +284,73 @@ fast enough that the first request is not a 40-second stall.
 - A cloned read connection did not inherit the httpfs S3 credentials. They are
   connection-scoped, so a reader that skipped `configure_s3` returned 404 for
   every archived object while the configured writer looked healthy.
+
+## [0.1.21] - 2026-11-25
+
+Retention no longer deletes the frame dictionary, which is what emptied every
+flamegraph and `top` listing in disk mode.
+
+### Fixed
+
+- `frames` is an unsharded dictionary filed under the `hour=0` sentinel. The
+  retention pass read that sentinel as an hour, so its files looked like 1970
+  data and the first sweep removed the whole dictionary while the samples that
+  referenced it stayed. The result was a flamegraph collapsed to a root node,
+  an empty `top`, and a service map that still worked — the data was gone, not
+  the query. `hour=0` is now treated as "no date" for tables without a time
+  column, exactly like a file with no hour tag: retention keeps it and only the
+  disk cap may evict it, last. Legacy `stacks` files written before dictionaries
+  were sharded into sample hours are covered by the same rule.
+
+## [0.1.22] - 2026-11-25
+
+The first write to a cold tenant no longer opens its store on a Tokio worker.
+
+### Fixed
+
+- Ingest, flush and service-map writes called `writable_tenant` inline, and
+  that call opens the tenant when it is not loaded yet. In `s3` mode an open
+  lists the prefix and reads every archive footer — tens of seconds. A
+  restarted agent sends a burst, so all four workers could park inside the same
+  open and the liveness probe timed out: Kubernetes killed a process that was
+  only slow, then restarted it into the same cold open. The write path now
+  awaits `writable_tenant_async`, which runs the open on the blocking pool;
+  concurrent callers queue on the tenant's open lock there instead of on the
+  runtime, and the queue is shared, so only one open ever runs.
+- Dropping the open future does not cancel it: the blocking task finishes and
+  caches the store, and the next caller joins the cached result rather than
+  starting a second open.
+
+## [0.1.23] - 2026-11-25
+
+Ingest writes a whole upload in one transaction, and the UI says when it is
+waiting instead of showing a blank panel.
+
+### Changed
+
+- One upload is one commit. `ingest_many` used to append report by report, so a
+  few hundred reports meant a few hundred transactions on the single writer;
+  the queue never drained and every query then timed out behind it. The batch
+  path prepares every report first (so one bad report costs only itself) and
+  inserts through DuckDB's `Appender`: measured on the same machine, a
+  300-report upload went from 4.4 s to 13 ms at the store and from 4.7 s to
+  66 ms over HTTP.
+- The dashboard shows a spinner and the elapsed time while a query is in flight,
+  and the service map no longer says "no service map yet" while its first
+  window is still loading. A slow tenant used to be indistinguishable from one
+  with no data.
+
+### Fixed
+
+- The allocation counters can go negative: BPF decrements `inuse_*` with
+  `0 - size` on free, so a block allocated before the probe attached reads as
+  `u64::MAX` once it is released. That value was sent as a profile value, the
+  server refused it as implausible, and the agent dropped the whole 64-report
+  batch after nine retries — twenty minutes of a tenant's data could disappear
+  with no error the operator could see. The counters are clamped at zero.
+- One invalid report no longer rejects its whole upload. The server validates
+  per report now and answers with `rejected: [{index, error}]`, keeping the
+  valid ones; an upload where nothing is valid is still a 400.
 
 ## [0.1.19] - 2026-11-24
 
@@ -959,7 +990,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.22...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.23...HEAD
+[0.1.23]: https://github.com/xsj321/LidlessEye/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/xsj321/LidlessEye/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/xsj321/LidlessEye/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/xsj321/LidlessEye/compare/v0.1.19...v0.1.20

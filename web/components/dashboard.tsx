@@ -15,7 +15,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Skeleton } from "@/components/ui/skeleton";
+import { QueryProgress } from "@/components/ui/query-progress";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { FlamegraphView } from "@/components/views/flamegraph-view";
 import { LabelsView } from "@/components/views/labels-view";
@@ -148,7 +148,7 @@ export function Dashboard() {
           {state.ready ? (
             <ViewSwitch view={state.view} />
           ) : (
-            <Skeleton className="h-[420px] w-full rounded-lg" />
+            <QueryProgress height={420} />
           )}
         </main>
       </div>

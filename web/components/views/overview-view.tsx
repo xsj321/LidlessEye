@@ -2,7 +2,7 @@
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Skeleton } from "@/components/ui/skeleton";
+import { QueryProgress } from "@/components/ui/query-progress";
 import {
   Table,
   TableBody,
@@ -31,7 +31,7 @@ function plural(count: number, one: string, many: string) {
 
 export function OverviewView() {
   const { overview } = useDashboard();
-  if (!overview) return <Skeleton className="h-[420px] w-full rounded-lg" />;
+  if (!overview) return <QueryProgress height={420} />;
 
   const { stats, types, series } = overview;
   const store = stats.store ?? {};

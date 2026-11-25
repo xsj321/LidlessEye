@@ -6,7 +6,7 @@ import { Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Skeleton } from "@/components/ui/skeleton";
+import { QueryProgress } from "@/components/ui/query-progress";
 import {
   Table,
   TableBody,
@@ -36,7 +36,7 @@ export function LabelsView() {
   const max = filtered.reduce((acc, row) => Math.max(acc, row.total ?? 0), 0) || 1;
 
   if (!explorerNames.length && loading) {
-    return <Skeleton className="h-[420px] w-full rounded-lg" />;
+    return <QueryProgress height={420} />;
   }
 
   return (

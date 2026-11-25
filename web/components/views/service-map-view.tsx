@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/empty-state";
+import { QueryProgress } from "@/components/ui/query-progress";
 import { Input } from "@/components/ui/input";
 import { formatCount, formatDuration } from "@/lib/format";
 import { useT } from "@/lib/i18n";
@@ -209,6 +210,12 @@ export function ServiceMapView() {
   );
 
   if (!map) {
+    // A query in flight is not an empty map. Saying "no service map yet" while
+    // the first window is still being read turned a slow tenant into a broken
+    // one; the elapsed counter says which is which.
+    if (state.loading) {
+      return <QueryProgress height={560} label={t("Building the service map…")} />;
+    }
     return (
       <EmptyState
         info={

@@ -443,10 +443,10 @@ impl AppState {
             }
             let mut metas = Vec::with_capacity(reports.len());
             let mut errors = Vec::new();
-            for report in reports {
-                // Hand the report over: it is already encoded and nothing else
-                // needs it, and the queued job would otherwise clone it.
-                match store.append_owned(report) {
+            // One transaction for the whole upload: a few hundred reports used
+            // to mean a few hundred commits, and the writer never caught up.
+            for result in store.append_owned_batch(reports) {
+                match result {
                     Ok(meta) => {
                         metrics.ingest_reports.fetch_add(1, Ordering::Relaxed);
                         metas.push(meta);
