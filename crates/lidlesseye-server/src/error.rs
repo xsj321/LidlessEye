@@ -44,6 +44,19 @@ impl ApiError {
 
 impl From<CoreError> for ApiError {
     fn from(err: CoreError) -> Self {
+        // A cancelled query is DuckDB saying `INTERRUPT Error: Interrupted!`,
+        // which reads like a crash and used to be served as a 500. It means the
+        // scan outlived its budget, so it is a retryable 503 with something the
+        // caller can actually do about it.
+        if let CoreError::Db(message) = &err
+            && message.contains("INTERRUPT")
+        {
+            return ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the query ran past its time budget and was cancelled; narrow the time \
+                 range or add filters",
+            );
+        }
         let status = match &err {
             CoreError::InvalidArgument(_)
             | CoreError::InvalidReport(_)

@@ -181,60 +181,21 @@ impl TenantStore {
         let root = data_dir.join("tenants");
         migrate_legacy_layout(&data_dir, &root)?;
         std::fs::create_dir_all(&root)?;
-        let registry = TenantStore {
+        // A tenant is opened only when a request or an ingest names it. Opening
+        // every tenant at start-up gave each of them a writer, a maintenance
+        // connection and a pool of readers: a ten-tenant pod ended up with two
+        // thousand DuckDB threads parked in futexes, and even a tenant with one
+        // row paid seconds for a query that takes milliseconds in a fresh
+        // process. The directory is still cheap to enumerate (`tenant_ids`), so
+        // a catalogue request sees every tenant on disk — only the expensive
+        // store open is deferred to the first real use of that tenant.
+        Ok(TenantStore {
             root,
             base,
             limits: RwLock::new(limits),
             stores: RwLock::new(HashMap::new()),
             max_tenants: max_tenants.max(1),
-        };
-        // Index what is already on disk so the first request is not slow and
-        // so a corrupt directory is reported at startup rather than at query
-        // time. Each store logs its own phases; these lines give the overall
-        // progress so an upgrade on a large volume is not a silent wait.
-        let tenants = registry.tenant_ids();
-        let started = std::time::Instant::now();
-        info!(
-            count = tenants.len(),
-            stage = "tenants",
-            "opening tenant stores"
-        );
-        // In parallel, because opening a tenant is almost entirely waiting on
-        // the object store: discovery globs the prefix and the id counters read
-        // every footer. Ten tenants of that, one after another, is what pushed
-        // a start past the startup probe's budget and put the pod in a restart
-        // loop. Four at a time keeps the pod's memory in check while turning a
-        // serial sum into roughly the slowest single tenant.
-        let workers = tenants.len().clamp(1, 4);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| {
-                    loop {
-                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(id) = tenants.get(index) else {
-                            break;
-                        };
-                        info!(
-                            tenant = %id,
-                            index = index + 1,
-                            total = tenants.len(),
-                            stage = "tenant_open",
-                            "opening tenant store"
-                        );
-                        if let Err(err) = registry.open_tenant(id) {
-                            warn!(tenant = %id, error = %err, "failed to open tenant");
-                        }
-                    }
-                });
-            }
-        });
-        info!(
-            elapsed_ms = started.elapsed().as_millis(),
-            stage = "tenants",
-            "all tenant stores opened"
-        );
-        Ok(registry)
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -322,7 +283,7 @@ impl TenantStore {
         }
         let opened = std::time::Instant::now();
         info!(tenant = %tenant, dir = %dir.display(), "tenant store open started");
-        let store = Arc::new(Store::open(cfg)?);
+        let store = Store::open_shared(cfg)?;
         self.stores.write().insert(tenant.clone(), store.clone());
         info!(
             tenant = %tenant,
@@ -330,6 +291,16 @@ impl TenantStore {
             "tenant store open finished"
         );
         Ok(store)
+    }
+
+    /// The store of a tenant that is already open, if any.
+    ///
+    /// Background passes use this instead of [`Self::tenant`] so maintenance
+    /// never becomes the reason an idle tenant is loaded. With on-demand
+    /// loading, calling `tenant()` from a periodic sweep would silently reopen
+    /// every tenant again and put all their connections back.
+    pub fn loaded_tenant(&self, tenant: &TenantId) -> Option<Arc<Store>> {
+        self.stores.read().get(tenant).cloned()
     }
 
     /// The store of a tenant, if it exists. Never creates one: a read of an
@@ -365,20 +336,18 @@ impl TenantStore {
         ids
     }
 
-    /// Stats for every tenant on disk.
+    /// Stats for every tenant that is currently open.
     ///
-    /// Each entry comes from the tenant's own aggregate, which costs a lock and
-    /// a clone once the tenant has counted its archive, and a one-off recount
-    /// while it has not. Computing the numbers here for every tenant on every
-    /// poll is what turned the dashboard's first request into a fifteen-second
-    /// wait; the server also warms each tenant in the background at start-up so
-    /// that first poll usually finds them counted.
+    /// Listing tenants must not open them: doing so on the dashboard's first
+    /// poll recreated the exact connection storm that on-demand loading removed.
+    /// A tenant that has not been asked for yet is still listed (its directory
+    /// exists), with empty stats until something uses it.
     pub fn tenants(&self) -> Vec<TenantInfo> {
         self.tenant_ids()
             .into_iter()
             .map(|id| {
                 let (stats, series) = self
-                    .tenant(&id)
+                    .loaded_tenant(&id)
                     .map(|store| store.stats_cached())
                     .unwrap_or_default();
                 TenantInfo {
@@ -401,7 +370,7 @@ impl TenantStore {
     pub fn total_stats(&self) -> StoreStats {
         let mut total = StoreStats::default();
         for id in self.tenant_ids() {
-            if let Some(store) = self.tenant(&id) {
+            if let Some(store) = self.loaded_tenant(&id) {
                 let (stats, _) = store.stats_cached();
                 total.batch_count += stats.batch_count;
                 total.total_bytes += stats.total_bytes;
@@ -430,10 +399,10 @@ impl TenantStore {
             return out;
         }
         for id in self.tenant_ids() {
-            let Some(store) = self.tenant(&id) else {
+            let Some(store) = self.loaded_tenant(&id) else {
                 continue;
             };
-            let flushed = match store.flush_hot_when_idle() {
+            let flushed = match store.flush_until_caught_up() {
                 Ok(n) => n,
                 Err(err) => {
                     warn!(tenant = %id, error = %err, "parquet hot flush failed");
@@ -468,7 +437,7 @@ impl TenantStore {
     pub fn prune(&self, now_ns: u64) -> Result<BTreeMap<TenantId, PruneStats>> {
         let mut out = BTreeMap::new();
         for id in self.tenant_ids() {
-            let Some(store) = self.tenant(&id) else {
+            let Some(store) = self.loaded_tenant(&id) else {
                 continue;
             };
             match store.prune(now_ns) {
@@ -586,6 +555,56 @@ mod tests {
         let mut b = ReportBuilder::new(service, "cpu", start, start + 1_000);
         b.add_stack([Frame::new("/bin/app", "main")], 1_000);
         b.finish()
+    }
+
+    /// Opening a registry must not open its tenants. Doing so used to give
+    /// every tenant a set of DuckDB connections at start-up; on a pod with ten
+    /// tenants that was thousands of threads and seconds of latency even for a
+    /// tenant with a single row. Listing tenants and running background passes
+    /// must not quietly bring them all back either.
+    #[test]
+    fn opening_a_registry_does_not_load_any_tenant() {
+        let dir = temp_dir("lazy");
+        // Two tenants on disk, each with a batch, so a preloading registry
+        // would have something to open and the assertion could fail.
+        let ids: Vec<_> = ["acme", "beta"]
+            .iter()
+            .map(|name| TenantId::parse(name).unwrap())
+            .collect();
+        for id in &ids {
+            let store = TenantStore::open(&dir, StoreConfig::new(&dir)).unwrap();
+            let opened = store.open_tenant(id).unwrap();
+            opened.append(&report(id.as_str(), 1_000)).unwrap();
+        }
+
+        let registry = TenantStore::open(&dir, StoreConfig::new(&dir)).unwrap();
+        assert_eq!(registry.tenant_ids(), ids, "both tenants exist on disk");
+        for id in &ids {
+            assert!(
+                registry.loaded_tenant(id).is_none(),
+                "tenant {id} was loaded just by opening the registry"
+            );
+        }
+        // Catalogue and maintenance paths must keep it that way.
+        let listed = registry.tenants();
+        assert_eq!(listed.len(), 2, "unopened tenants are still listed");
+        assert!(
+            listed.iter().all(|info| info.stats.batch_count == 0),
+            "listing tenants must not open them to read their stats"
+        );
+        assert!(registry.compaction_tick(2_000).is_empty());
+        assert!(registry.prune(2_000).unwrap().is_empty());
+        for id in &ids {
+            assert!(
+                registry.loaded_tenant(id).is_none(),
+                "a background pass loaded tenant {id}"
+            );
+        }
+        // The first real request loads only that tenant.
+        registry.tenant(&ids[0]).unwrap();
+        assert!(registry.loaded_tenant(&ids[0]).is_some());
+        assert!(registry.loaded_tenant(&ids[1]).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

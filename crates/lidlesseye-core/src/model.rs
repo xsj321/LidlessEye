@@ -29,6 +29,23 @@ pub const MAX_STACKS: usize = 2_000_000;
 /// Maximum number of labels on one report.
 pub const MAX_LABELS: usize = 64;
 
+/// Largest value a single stack may carry, in the profile's own unit.
+///
+/// One stack is one call path inside one collection window, so its value is
+/// bounded by that window: a 277-hour window at nanosecond resolution, or a
+/// petabyte of allocations. Values above this are not profiles — they are a
+/// corrupt or hostile report, and because the catalogue keeps a running sum of
+/// every batch it ingests, one such value poisons that sum permanently: the
+/// dashboard then divides by `u64::MAX` and every percentage reads zero.
+pub const MAX_STACK_VALUE: u64 = 1_000_000_000_000_000;
+
+/// Largest total value one report may carry.
+///
+/// `MAX_STACKS × MAX_STACK_VALUE` does not fit in `u64`, and the server
+/// accumulates this per batch, so the sum is bounded explicitly rather than
+/// left to overflow.
+pub const MAX_REPORT_VALUE: u64 = 1_000_000_000_000_000_000;
+
 /// Maximum length of a label name.
 pub const MAX_LABEL_KEY_LEN: usize = 128;
 
@@ -316,7 +333,21 @@ impl Report {
             }
         }
         let max_index = self.strings.len() as u32;
+        let mut total: u64 = 0;
         for (i, stack) in self.stacks.iter().enumerate() {
+            if stack.value > MAX_STACK_VALUE {
+                return Err(Error::InvalidReport(format!(
+                    "stack {i} has value {} (max {MAX_STACK_VALUE}); the unit is \
+                     implied by the profile type",
+                    stack.value
+                )));
+            }
+            // Checked, not `sum()`: a raw `sum` wraps in release builds, so an
+            // overflowing report would be stored as a nonsense total and every
+            // later aggregate would inherit it.
+            total = total.checked_add(stack.value).ok_or_else(|| {
+                Error::InvalidReport(format!("the values of report {i} do not fit in 64 bits"))
+            })?;
             if stack.frames.len() > MAX_FRAMES_PER_STACK {
                 return Err(Error::InvalidReport(format!(
                     "stack {i} has {} frames (max {MAX_FRAMES_PER_STACK})",
@@ -333,12 +364,22 @@ impl Report {
                 }
             }
         }
+        if total > MAX_REPORT_VALUE {
+            return Err(Error::InvalidReport(format!(
+                "the report's total value is {total} (max {MAX_REPORT_VALUE})"
+            )));
+        }
         Ok(())
     }
 
     /// Total value of the report, i.e. the sum of all samples.
     pub fn total_value(&self) -> u64 {
-        self.stacks.iter().map(|s| s.value).sum()
+        // Saturating, not `sum()`: the latter panics on overflow in debug and
+        // wraps in release, and either one turns one bad report into a corrupt
+        // catalogue total. `validate` rejects anything large enough to matter.
+        self.stacks
+            .iter()
+            .fold(0u64, |acc, stack| acc.saturating_add(stack.value))
     }
 
     /// Labels including the implicit `service_name`.
@@ -522,6 +563,36 @@ mod tests {
     fn validate_rejects_bad_ranges() {
         let report = ReportBuilder::new("svc", "cpu", 10, 10).finish();
         assert!(report.validate().is_err());
+    }
+
+    /// A report is untrusted input, and its values feed a running total the
+    /// dashboard divides by. One `u64::MAX` value used to saturate that total
+    /// permanently, so every percentage on the page read zero and the tenant
+    /// looked empty even though its data was intact.
+    #[test]
+    fn validate_rejects_values_that_would_poison_the_totals() {
+        let mut b = ReportBuilder::new("svc", "cpu", 0, 1_000_000_000);
+        b.add_stack([Frame::new("bin", "a")], u64::MAX);
+        assert!(
+            b.finish().validate().is_err(),
+            "a single stack cannot be worth more than its window"
+        );
+
+        // The per-stack bound alone would still allow a report to add up past
+        // what a batch total may hold, so the sum is bounded too.
+        let mut b = ReportBuilder::new("svc", "cpu", 0, 1_000_000_000);
+        for i in 0..=1_000u32 {
+            let symbol = format!("frame-{i}");
+            b.add_stack([Frame::new("bin", symbol)], MAX_STACK_VALUE);
+        }
+        assert!(
+            b.finish().validate().is_err(),
+            "1001 maximum stacks exceed what one report may total"
+        );
+
+        let mut b = ReportBuilder::new("svc", "cpu", 0, 1_000_000_000);
+        b.add_stack([Frame::new("bin", "a")], 42);
+        assert!(b.finish().validate().is_ok(), "an ordinary value passes");
     }
 
     #[test]

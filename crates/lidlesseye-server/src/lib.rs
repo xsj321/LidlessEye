@@ -260,26 +260,26 @@ impl AppState {
     }
 }
 
-/// Cancellation guard for one read query.
+/// Watchdog for one read query.
 ///
-/// The handler holds this for the lifetime of the request. When the client
-/// goes away — the user switched view, dragged the time range, or closed the
-/// tab — Axum drops the handler future, this guard drops with it, and DuckDB
-/// is interrupted so the single connection is freed immediately instead of
-/// finishing a scan nobody will read. Normal completion flips `done` first,
-/// so a returned guard is inert.
+/// The handler holds this for the lifetime of the request; if the query is
+/// still running after [`QueryGuard::run`]'s timeout, DuckDB is interrupted so
+/// a single stuck scan cannot pin a read slot until the HTTP deadline.
 ///
-/// Cancelling on "any newer query" would be wrong: several independent
-/// controls (map, histogram, stats) legitimately query the same tenant at
-/// once, and they must not cancel each other.
+/// It deliberately does *not* interrupt when the handler is dropped. That used
+/// to be the "the client went away, stop scanning" path, but an interrupt is
+/// per store, not per request: it aborts every reader on that tenant. Several
+/// controls legitimately query the same tenant at once (map, histogram,
+/// stats), and aborting one request — a browser cancel, a re-render, a
+/// superseded fetch — killed the sibling that had just started. The dashboard
+/// showed `INTERRUPT Error: Interrupted!` instead of a flamegraph. A query
+/// nobody is waiting for now runs to completion, or to the timeout below.
 pub struct QueryGuard {
     store: Arc<Store>,
-    done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl QueryGuard {
-    /// Run a blocking query, interrupting it if this guard is dropped first
-    /// or if it exceeds the safety timeout.
+    /// Run a blocking query, interrupting it if it exceeds the safety timeout.
     pub async fn run<T, F>(&self, query: F) -> T
     where
         T: Send + 'static,
@@ -290,14 +290,18 @@ impl QueryGuard {
         let watchdog_store = self.store.clone();
         let watchdog = tokio::spawn(async move {
             tokio::time::sleep(QUERY_TIMEOUT).await;
-            debug!("query exceeded timeout; interrupting DuckDB");
-            watchdog_store.interrupt();
+            // Only the queries that have already run longer than any request
+            // will wait for. Interrupting the whole pool here used to cancel the
+            // map and the histogram because the flamegraph beside them was slow,
+            // and the browser reported that as `INTERRUPT Error: Interrupted!`
+            // on a panel that had done nothing wrong.
+            debug!("query exceeded timeout; interrupting reads older than the timeout");
+            watchdog_store.interrupt_older_than(QUERY_TIMEOUT);
         });
         let started = Instant::now();
         let result = tokio::task::spawn_blocking(query).await;
         let elapsed = started.elapsed();
         watchdog.abort();
-        self.done.store(true, Ordering::Relaxed);
         if elapsed >= Duration::from_secs(1) {
             info!(
                 stage = "query_exec",
@@ -309,23 +313,11 @@ impl QueryGuard {
     }
 }
 
-impl Drop for QueryGuard {
-    fn drop(&mut self) {
-        if !self.done.load(Ordering::Relaxed) {
-            debug!("client gone; interrupting DuckDB query");
-            self.store.interrupt();
-        }
-    }
-}
-
 impl AppState {
     /// Create a cancellation guard tied to one store connection. Hold it in
     /// the handler until the query result has been produced.
     pub fn query_guard(&self, store: Arc<Store>) -> QueryGuard {
-        QueryGuard {
-            store,
-            done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
+        QueryGuard { store }
     }
 
     /// Take one of the slots a store read is allowed to occupy.
@@ -426,8 +418,10 @@ impl AppState {
             }
             let mut metas = Vec::with_capacity(reports.len());
             let mut errors = Vec::new();
-            for report in &reports {
-                match store.append(report) {
+            for report in reports {
+                // Hand the report over: it is already encoded and nothing else
+                // needs it, and the queued job would otherwise clone it.
+                match store.append_owned(report) {
                     Ok(meta) => {
                         metrics.ingest_reports.fetch_add(1, Ordering::Relaxed);
                         metas.push(meta);
@@ -695,22 +689,12 @@ impl LidlessEye {
         // merges/uploads files. Its cadence must be at least as frequent as
         // the configured flush interval, otherwise the RPO is silently larger
         // than the value the operator chose.
-        let warm = registry.clone();
-        tokio::spawn(async move {
-            // The dashboard's first request is the tenant catalogue, which
-            // describes every tenant. The first tenant to be asked for has to
-            // count its whole archive, and doing that inside the request makes
-            // a cold start look like a hung server. Count it off the request
-            // path so the answer is already there.
-            let _ = tokio::task::spawn_blocking(move || {
-                for id in warm.tenant_ids() {
-                    if let Some(store) = warm.tenant(&id) {
-                        let _ = store.stats_checked();
-                    }
-                }
-            })
-            .await;
-        });
+        //
+        // Tenants are opened on demand. A start-up warm pass would reopen all
+        // of them — and with it their writers, readers and maintenance
+        // connections — which is the connection storm on-demand loading exists
+        // to avoid. Counting a tenant's archive happens on its first real use
+        // instead, on the blocking pool rather than holding up the listener.
         let compact_registry = registry.clone();
         let flush_interval = cfg
             .storage_flush_interval_ns

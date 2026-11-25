@@ -38,7 +38,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::time::Instant;
 
 use duckdb::{Connection, InterruptHandle, params};
@@ -599,6 +602,174 @@ impl Drop for ConnLock<'_> {
     }
 }
 
+/// One unit of work for the store's writer thread.
+///
+/// DuckDB serialises write transactions on a database anyway, so the choice was
+/// never "concurrent writes or not" — only who waits. Doing it with a mutex
+/// meant every caller held a thread and a request slot while it queued, and a
+/// background pass could not get in at all: flushing gave up after 500 ms, so on
+/// a tenant under steady ingest the hot tier never drained and grew until every
+/// query scanned millions of rows. A single owning thread with one FIFO queue
+/// removes the lock from the caller's path entirely: work is *ordered*, and the
+/// background passes are in the same queue, so they take their turn instead of
+/// starving.
+enum WriteJob {
+    Append {
+        report: Report,
+        reply: SyncSender<Result<Arc<BatchMeta>>>,
+    },
+    ServiceMap {
+        batch: ServiceMapBatch,
+        reply: SyncSender<Result<()>>,
+    },
+    /// Run something that needs the writer to itself (flush, prune). The
+    /// closure runs on the writer thread, outside the connection mutex, and
+    /// reports through the channel it captured.
+    Exclusive(Box<dyn FnOnce(&Store) + Send + 'static>),
+}
+
+impl WriteJob {
+    /// Short stable name, for the slow-job log line.
+    fn kind(&self) -> &'static str {
+        match self {
+            WriteJob::Append { .. } => "append",
+            WriteJob::ServiceMap { .. } => "servicemap",
+            WriteJob::Exclusive(_) => "exclusive",
+        }
+    }
+}
+
+/// Handle to the writer thread. Cheap to clone; `Store` holds one.
+struct WriterHandle {
+    tx: SyncSender<WriteJob>,
+}
+
+/// How long a caller queues behind other writes before giving up.
+///
+/// This is not "wait for a slow flush": every job in the queue is bounded, so
+/// the wait is a queue position, and a queue that cannot drain in this window is
+/// genuinely ill. The HTTP layer turns the resulting [`Error::Busy`] into a 503
+/// with `Retry-After`, which an agent retries; a request that waited 30 s and
+/// then timed out at the 60 s ceiling helps nobody.
+const WRITE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a background pass queues behind other writes before giving up.
+///
+/// Longer than [`WRITE_QUEUE_WAIT`] on purpose, because a request and a
+/// maintenance pass want opposite things from a busy writer. A caller holding
+/// an HTTP connection is better served by a 503 it can retry than by waiting;
+/// a flush or a prune that gives up is work that never happens, and the tier it
+/// was supposed to drain keeps growing until every query pays for it.
+///
+/// Two independent producers — the compaction loop and the prune loop — share
+/// this queue, so a pass regularly finds the other one already running. With
+/// the request timeout they timed each other out forever: flush never ran,
+/// the hot tier reached millions of rows, and each dashboard query scanned all
+/// of them. Waiting is the correct behaviour here; nothing is lost but ticks,
+/// and the loop re-arms in seconds.
+const MAINTENANCE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Jobs allowed to queue before producers are made to wait.
+///
+/// Deep enough to absorb a burst from a dozen agents, shallow enough that the
+/// memory held by queued reports stays bounded (a report is the pre-encoded
+/// profile, tens of kilobytes).
+const WRITE_QUEUE_DEPTH: usize = 512;
+
+/// A write job slower than this gets a log line naming its kind.
+///
+/// The threshold sits above what a normal report costs (a few milliseconds) and
+/// below anything a caller would notice as a stall, so the log stays quiet in
+/// steady state and points straight at the job that hogged the writer.
+const WRITE_JOB_SLOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl WriterHandle {
+    /// Queue a job, waiting for room at most [`WRITE_QUEUE_WAIT`].
+    fn submit(&self, mut job: WriteJob) -> Result<()> {
+        let deadline = Instant::now() + WRITE_QUEUE_WAIT;
+        loop {
+            match self.tx.try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(back)) => {
+                    job = back;
+                    if Instant::now() >= deadline {
+                        return Err(Error::Busy(format!(
+                            "the write queue was full for {}s; the disk cannot keep up with \
+                             ingest. Retry the report",
+                            WRITE_QUEUE_WAIT.as_secs()
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(Error::Db("the store's writer thread has stopped".into()));
+                }
+            }
+        }
+    }
+}
+
+/// Body of the writer thread.
+///
+/// Holds a `Weak`, not an `Arc`: the store owns the sender, so an `Arc` here
+/// would keep the store — and this thread — alive forever.
+fn writer_loop(store: Weak<Store>, jobs: Receiver<WriteJob>) {
+    while let Ok(job) = jobs.recv() {
+        let Some(store) = store.upgrade() else {
+            break;
+        };
+        // Every write is serialised through this thread, so one slow job is
+        // every caller's latency. Timing each one is the only way to tell a
+        // big archive pass from a report that should have been microseconds —
+        // and, when the queue starts timing out, which job was holding it.
+        let kind = job.kind();
+        let started = Instant::now();
+        match job {
+            WriteJob::Append { report, reply } => {
+                let result = run_guarded(|| store.append_now(&report));
+                let _ = reply.send(result);
+            }
+            WriteJob::ServiceMap { batch, reply } => {
+                let result = run_guarded(|| store.append_servicemap_now(&batch));
+                let _ = reply.send(result);
+            }
+            WriteJob::Exclusive(task) => {
+                let store = &*store;
+                run_guarded(|| {
+                    task(store);
+                    Ok(())
+                })
+                .ok();
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= WRITE_JOB_SLOW {
+            info!(
+                stage = "write_job",
+                kind,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow write job"
+            );
+        }
+    }
+    debug!("writer thread stopped");
+}
+
+/// Run a write job, turning a panic into an error for its caller.
+///
+/// Without this one poisoned report would take the writer thread down and every
+/// later write would fail with "the writer thread has stopped", which is a much
+/// worse failure than the single request that deserved it.
+fn run_guarded<T>(job: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("a write job panicked; the store keeps serving");
+            Err(Error::Db("the write job panicked".into()))
+        }
+    }
+}
+
 /// Thread-safe profile store.
 ///
 /// DuckDB's Rust binding exposes no separate `Database` handle, but a
@@ -612,6 +783,11 @@ pub struct Store {
     cfg: StoreConfig,
     /// Writer connection: hot-table inserts, flushes, DDL, maintenance.
     conn: Mutex<Connection>,
+    /// Set by [`Store::start_writer`]. While it is set, all writes go through
+    /// that thread's queue and this mutex is only ever taken by the thread
+    /// itself — callers never touch it, so a slow background pass cannot make
+    /// an agent wait behind a lock it is holding.
+    writer: OnceLock<WriterHandle>,
     /// Owner/wait telemetry for the writer lock, so a slow ingest or flush is
     /// attributable. Reads are not tracked here: several run at once.
     telemetry: LockTelemetry,
@@ -646,6 +822,11 @@ pub struct Store {
     /// `(computed_at, distinct series)`. A full scan of the label columns with
     /// no exact incremental form, so it runs on a slow clock instead.
     series_cache: Mutex<Option<(u64, usize)>>,
+    /// How many times [`Store::recount`] has run. A recount reads the whole
+    /// archive under the writer, so "how often" is a property worth pinning:
+    /// doing it on a prune that removed nothing starved ingest into 503s.
+    #[cfg(test)]
+    recounts: std::sync::atomic::AtomicUsize,
 }
 
 /// The row half of [`StoreStats`]: everything that a write path can adjust
@@ -688,6 +869,12 @@ struct ReaderSlot {
     /// consults it so an interrupt cannot land on an idle connection — and
     /// never on the writer, whose transaction must not be aborted.
     active: Mutex<()>,
+    /// When the query currently holding this slot started, or 0 when idle.
+    /// A watchdog needs it to interrupt *its own* runaway query instead of
+    /// every query in the pool: the dashboard runs several at once, and killing
+    /// a healthy sibling because another one ran long is what surfaced as
+    /// `INTERRUPT Error: Interrupted!` in the browser.
+    started_ns: AtomicU64,
     interrupt: Arc<InterruptHandle>,
 }
 
@@ -711,28 +898,29 @@ struct ReaderPool {
 }
 
 impl ReaderPool {
-    /// Clone `count` connections off `conn` and give each the session settings
-    /// it would otherwise lack.
+    /// Clone `count` connections off the already-tuned writer connection.
     ///
-    /// DuckDB's `SET` is session-scoped for most options, so a cloned
-    /// connection starts with the defaults: no metadata cache, a 30-second
-    /// HTTP timeout, one thread. Applying the same tuning here is what makes
-    /// the pool actually fast — and what keeps a stalled S3 read from holding
-    /// a reader for hours.
-    fn new(conn: &Connection, count: usize, cfg: &StoreConfig, temp: &Path) -> Result<Self> {
+    /// `try_clone` shares the DuckDB database instance, so global settings
+    /// (`memory_limit`, `threads`, `temp_directory`, `preserve_insertion_order`)
+    /// and the loaded `httpfs` extension come along. The `s3_*` credentials,
+    /// however, are connection-scoped in httpfs: a cloned reader without them
+    /// sends unauthenticated requests and gets 404s for every archived object.
+    /// Re-running the whole `tune_connection` was redundant; re-applying just
+    /// the S3 settings is not.
+    fn new(conn: &Connection, count: usize, s3: Option<&S3Config>) -> Result<Self> {
         let mut slots = Vec::with_capacity(count);
         for _ in 0..count {
             let reader = conn
                 .try_clone()
                 .map_err(|err| Error::Db(format!("opening a read connection: {err}")))?;
-            tune_connection(&reader, temp, cfg)?;
-            if let Some(s3) = &cfg.s3 {
+            if let Some(s3) = s3 {
                 parquet::configure_s3(&reader, s3)?;
             }
             let interrupt = reader.interrupt_handle();
             slots.push(ReaderSlot {
                 conn: Mutex::new(reader),
                 active: Mutex::new(()),
+                started_ns: AtomicU64::new(0),
                 interrupt,
             });
         }
@@ -785,6 +973,29 @@ impl ReaderPool {
             }
         }
     }
+
+    /// Interrupt only reads that have been running longer than `age_ns`.
+    ///
+    /// A watchdog belongs to one query, but an `InterruptHandle` addresses a
+    /// connection, and interrupting the pool indiscriminately cancelled healthy
+    /// queries that merely happened to run at the same time — the dashboard
+    /// loads the map, the histogram and the flamegraph together, so one slow
+    /// panel used to break the other two. Since a query older than the timeout
+    /// is one the request layer is about to abandon anyway, this is the oldest
+    /// query that can still be usefully stopped and never a younger one.
+    fn interrupt_older_than(&self, age_ns: u64) {
+        let now = now_ns();
+        for slot in &self.slots {
+            // Held `active` means a query owns this slot.
+            if slot.active.try_lock().is_some() {
+                continue;
+            }
+            let started = slot.started_ns.load(Ordering::Acquire);
+            if started != 0 && now.saturating_sub(started) >= age_ns {
+                slot.interrupt.interrupt();
+            }
+        }
+    }
 }
 
 /// A read's exclusive hold on one pool slot.
@@ -797,6 +1008,10 @@ struct ReadConn<'a> {
     conn: parking_lot::MutexGuard<'a, Connection>,
     pool: &'a ReaderPool,
     idx: usize,
+    /// When the slot was handed out. A store call holds this for exactly the
+    /// life of its queries, so the hold time is the query time — the number a
+    /// slow dashboard is actually made of.
+    started: Instant,
 }
 
 impl Deref for ReadConn<'_> {
@@ -815,12 +1030,35 @@ impl DerefMut for ReadConn<'_> {
 
 impl Drop for ReadConn<'_> {
     fn drop(&mut self) {
+        // Mark idle *before* the guards drop, so a watchdog that sees the slot
+        // as still busy reads a timestamp that is about to be irrelevant rather
+        // than one from the query that starts next.
+        self.pool.slots[self.idx]
+            .started_ns
+            .store(0, Ordering::Release);
         // Return the slot after the guards above are gone. The pool hands the
         // id out again only to a caller that immediately blocks on the slot's
         // own mutex, so this cannot race with the connection still in use.
         self.pool.release(self.idx);
+        let elapsed = self.started.elapsed();
+        if elapsed >= READ_SLOW {
+            debug!(
+                stage = "read_conn_held",
+                slot = self.idx,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow read"
+            );
+        }
     }
 }
+
+/// A store read slower than this is worth a log line.
+///
+/// Every dashboard panel is one or two of these, so a `read_conn_held` line
+/// names the exact store call behind a slow page — without it the only visible
+/// number is the whole request, which cannot tell a slow query from five fast
+/// ones and a slow S3 round trip.
+const READ_SLOW: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How long a read waits for the connection before reporting the store busy.
 ///
@@ -841,6 +1079,13 @@ const BACKGROUND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_mill
 /// Long enough for a flush of the current hot tier, short enough that a wedged
 /// writer cannot pin every ingest request in the server until the HTTP deadline.
 const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the one-off catalogue recount waits for the writer.
+///
+/// A recount reads the whole archive, so this is not a case for patience: if
+/// the writer is busy with a flush, answer this poll from a read snapshot
+/// instead and let the background warm install the exact number.
+const AGG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Store {
     /// Whether this store keeps rows in a DuckDB file or in Parquet/S3.
@@ -865,11 +1110,13 @@ impl Store {
         let slot = &self.readers.slots[idx];
         let active = slot.active.lock();
         let conn = slot.conn.lock();
+        slot.started_ns.store(now_ns(), Ordering::Release);
         Ok(ReadConn {
             _active: active,
             conn,
             pool: &self.readers,
             idx,
+            started: Instant::now(),
         })
     }
 
@@ -1030,17 +1277,9 @@ impl Store {
             parquet::configure_s3(&maintenance_conn, cfg.s3.as_ref().expect("validated above"))?;
         }
         // Readers share the same in-memory database through cloned
-        // connections, so queries no longer serialise on the writer. Each one
-        // is tuned again: DuckDB's SET is session-scoped.
-        let readers = ReaderPool::new(
-            &conn,
-            cfg.read_connections(),
-            &cfg,
-            &parquet_state.dir.join(".duckdb-tmp"),
-        )?;
-        // Opening connections is not free: each read slot re-runs `LOAD httpfs`
-        // and the whole session tuning, so this is worth attributing when a
-        // ten-tenant start runs past its probe budget.
+        // connections, so queries no longer serialise on the writer. The
+        // settings above are database-wide and come along with the clone.
+        let readers = ReaderPool::new(&conn, cfg.read_connections(), cfg.s3.as_ref())?;
         info!(
             stage = "connections",
             readers = cfg.read_connections(),
@@ -1051,13 +1290,13 @@ impl Store {
         info!(stage = "id_counters", "loading store id counters");
         let ids_started = std::time::Instant::now();
         let ids = {
-            // Ids are allocated across the *whole* dataset, so these three
-            // lookups must span the hot tier and every Parquet file. They are
-            // one `MAX` per table; DuckDB answers each from file statistics
-            // without reading any row groups.
-            let frames_span = parquet::table_span_all(&parquet_state, "frames");
-            let stacks_span = parquet::table_span_all(&parquet_state, "stacks");
-            let batches_span = parquet::table_span_all(&parquet_state, "batches");
+            // Ids are monotonic and archived by hour, so the newest shard plus
+            // the hot tier already contains the maximum. Mounting every file
+            // in a large archive for three `MAX` lookups used to cost tens of
+            // seconds on the first request to a cold tenant.
+            let frames_span = parquet::table_span_newest(&parquet_state, "frames");
+            let stacks_span = parquet::table_span_newest(&parquet_state, "stacks");
+            let batches_span = parquet::table_span_newest(&parquet_state, "batches");
             let max_frame: i64 = conn
                 .query_row(
                     &format!("SELECT COALESCE(MAX(frame_id), 0) FROM {frames_span}"),
@@ -1098,6 +1337,7 @@ impl Store {
         let store = Store {
             cfg,
             conn: Mutex::new(conn),
+            writer: OnceLock::new(),
             telemetry: LockTelemetry::default(),
             readers,
             frame_cache: Mutex::new(HashMap::new()),
@@ -1108,6 +1348,8 @@ impl Store {
             last_flush_ns: std::sync::atomic::AtomicU64::new(now_ns()),
             agg: Mutex::new(None),
             series_cache: Mutex::new(None),
+            #[cfg(test)]
+            recounts: std::sync::atomic::AtomicUsize::new(0),
         };
         info!(
             root = %store.cfg.root.display(),
@@ -1115,6 +1357,82 @@ impl Store {
             "store ready"
         );
         Ok(store)
+    }
+
+    /// Open a store and start its writer thread.
+    ///
+    /// This is the form every long-lived process uses. [`Store::open`] alone
+    /// leaves writes on the direct, mutex-guarded path, which is what the unit
+    /// tests want — they assert on a single-threaded timeline and do not need a
+    /// second thread's worth of scheduling noise.
+    pub fn open_shared(cfg: StoreConfig) -> Result<Arc<Self>> {
+        let store = Arc::new(Self::open(cfg)?);
+        store.start_writer();
+        Ok(store)
+    }
+
+    /// Hand all writes to one dedicated thread.
+    ///
+    /// Idempotent and safe to call once per store. After this returns, `append`,
+    /// `append_servicemap`, `flush` and `prune` queue instead of locking, and
+    /// the writer connection is only ever touched by the thread.
+    pub fn start_writer(self: &Arc<Self>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_DEPTH);
+        let weak = Arc::downgrade(self);
+        let handle = WriterHandle { tx };
+        if self.writer.set(handle).is_err() {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name(format!("store-writer-{}", self.cfg.root.display()))
+            .spawn(move || writer_loop(weak, rx));
+        if let Err(err) = spawned {
+            // A store without its thread is still correct, just slower under
+            // contention: writes fall back to the mutex path.
+            warn!(error = %err, "could not start the store writer thread");
+        }
+    }
+
+    /// Queue a job on the writer thread and wait for its answer.
+    fn queue<T: Send + 'static>(&self, job: WriteJob, answer: Receiver<Result<T>>) -> Result<T> {
+        let Some(writer) = self.writer.get() else {
+            return Err(Error::Db("this store has no writer thread".into()));
+        };
+        writer.submit(job)?;
+        match answer.recv_timeout(WRITE_QUEUE_WAIT) {
+            Ok(result) => result,
+            Err(_) => Err(Error::Busy(format!(
+                "a write job did not finish within {}s; retry",
+                WRITE_QUEUE_WAIT.as_secs()
+            ))),
+        }
+    }
+
+    /// Run `task` on the writer thread, with the writer to itself.
+    ///
+    /// Background passes use this instead of trying to take a lock with a
+    /// deadline: as a queued job they are guaranteed a turn, and as short jobs
+    /// they do not hold ingest up long enough to matter. That combination is
+    /// what replaced a flush that gave up after 500 ms and therefore never ran.
+    fn run_exclusive<T, F>(&self, task: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Store) -> Result<T> + Send + 'static,
+    {
+        let Some(writer) = self.writer.get() else {
+            return task(self);
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        writer.submit(WriteJob::Exclusive(Box::new(move |store| {
+            let _ = tx.send(task(store));
+        })))?;
+        match rx.recv_timeout(MAINTENANCE_QUEUE_WAIT) {
+            Ok(result) => result,
+            Err(_) => Err(Error::Busy(format!(
+                "a background pass did not finish within {}s; retry",
+                MAINTENANCE_QUEUE_WAIT.as_secs()
+            ))),
+        }
     }
 
     /// Interrupt the read currently running on this store's connection.
@@ -1131,6 +1449,16 @@ impl Store {
         // signalled: a watchdog tick that lands inside its transaction leaves
         // DuckDB aborted, and every later ingest fails with the same error.
         self.readers.interrupt_all();
+    }
+
+    /// Interrupt reads that have been running for at least `age`.
+    ///
+    /// This is what a per-request watchdog should call. [`Store::interrupt`]
+    /// stops every query in the pool, which turns one slow request into failures
+    /// for whatever else the page was loading at the time.
+    pub fn interrupt_older_than(&self, age: std::time::Duration) {
+        let age_ns = age.as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.readers.interrupt_older_than(age_ns);
     }
 
     pub fn config(&self) -> &StoreConfig {
@@ -1238,9 +1566,40 @@ impl Store {
     }
 
     /// Persist a report as one batch.
+    ///
+    /// When the store has a writer thread this queues the report and waits for
+    /// that thread to commit it — no lock on the caller's path, and the wait is
+    /// a queue position rather than "however long a background pass holds the
+    /// connection". Validation happens here so an invalid report is rejected
+    /// before it occupies a queue slot.
     pub fn append(&self, report: &Report) -> Result<Arc<BatchMeta>> {
         report.validate()?;
+        if self.writer.get().is_none() {
+            return self.append_now(report);
+        }
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        self.queue(
+            WriteJob::Append {
+                report: report.clone(),
+                reply,
+            },
+            answer,
+        )
+    }
 
+    /// [`Store::append`] taking ownership, so the queued job does not clone a
+    /// profile that the caller is done with. Ingest uses this.
+    pub fn append_owned(&self, report: Report) -> Result<Arc<BatchMeta>> {
+        report.validate()?;
+        if self.writer.get().is_none() {
+            return self.append_now(&report);
+        }
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        self.queue(WriteJob::Append { report, reply }, answer)
+    }
+
+    /// Commit one batch on whichever thread called this.
+    fn append_now(&self, report: &Report) -> Result<Arc<BatchMeta>> {
         let labels_text = encode_labels(&report.all_labels());
         let batch_id = {
             let mut ids = self.ids.lock();
@@ -1261,7 +1620,7 @@ impl Store {
             + pending.frames.len() as u64 * 48;
 
         let created_ns = now_ns();
-        let total_value: u64 = report.stacks.iter().map(|s| s.value).sum();
+        let total_value = report.total_value();
 
         let frames_t = self.wtable("frames");
         let stacks_t = self.wtable("stacks");
@@ -1809,18 +2168,18 @@ impl Store {
         if let Some(agg) = *self.agg.lock() {
             return Ok(agg);
         }
-        let conn = match self.write_conn() {
-            Ok(conn) => conn,
-            Err(err) => {
-                // A flush or a compaction owns the writer. Answering "0
-                // batches" would show an empty install, so fall back to a read
-                // snapshot — but do not install it: a batch committing during
-                // that scan may be missing from it, and the deltas added later
-                // would be added to a number that already lost rows.
-                warn!(error = %err, "counted the catalogue without the writer");
-                let conn = self.read_conn()?;
-                return self.recount(&conn);
-            }
+        // Wait briefly, not for the full write budget: a recount reads the whole
+        // archive, so queueing a dashboard poll behind a flush for 30 s is
+        // worse than answering this one poll approximately.
+        let Some(conn) = self.try_lock_conn(ConnUser::Write, AGG_LOCK_WAIT) else {
+            // Somebody else holds the writer. Answer from a read snapshot —
+            // a consistent one — but do not install it: a batch committing
+            // during that scan may be missing, and the deltas added later would
+            // be added to a number that already lost rows. The background warm
+            // (and the next poll) will count it properly.
+            debug!("counting the catalogue from a read snapshot; the writer is busy");
+            let conn = self.read_conn()?;
+            return self.recount(&conn);
         };
         // Nothing can append while this thread owns the writer, so a re-check
         // under the guard is enough — no other thread can be counting.
@@ -1845,6 +2204,9 @@ impl Store {
     /// The caller must own `conn` — the writer, or a maintenance connection
     /// that already holds it — so the recount cannot interleave with an append.
     fn recount(&self, conn: &Connection) -> Result<RowAgg> {
+        #[cfg(test)]
+        self.recounts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let span = self.span_all("batches");
         let row = conn
             .query_row(
@@ -1894,28 +2256,83 @@ impl Store {
         Ok(moved)
     }
 
-    /// [`Store::flush_hot`] that yields to queries.
+    /// Move one bounded slice of the hot tier to Parquet.
     ///
-    /// Unlike merge/upload, a flush is short and bounds the data-loss window
-    /// (`--flush-interval`), so it must not wait for a 60-second "idle" period.
-    /// It waits at most [`BACKGROUND_LOCK_WAIT`] and skips this tick if a query
-    /// owns the connection; the next tick is seconds away.
+    /// The slice is what makes the queue work: a job that moves 200k rows hands
+    /// the writer back in a fraction of a second, so the reports queued behind
+    /// it still commit promptly. An all-or-nothing flush had the opposite
+    /// problem — on a tenant with a backlog it would own the writer for minutes,
+    /// which is why the pass that ran on a timer could never afford to start.
+    ///
+    /// Rows move between tiers; the catalogue's counts, sums and time bounds do
+    /// not change, so nothing invalidates.
+    fn flush_chunk(&self) -> Result<usize> {
+        let conn = self.lock_conn(ConnUser::Flush);
+        let moved = parquet::flush_hot_bounded(&conn, &self.parquet, parquet::FLUSH_CHUNK_ROWS)?;
+        self.last_flush_ns.store(now_ns(), Ordering::Relaxed);
+        Ok(moved)
+    }
+
+    /// Flush on the configured cadence, on the writer thread's queue.
+    ///
+    /// This used to try the writer lock for 500 ms and skip the tick, to stay
+    /// out of the way of queries. Under steady ingest the writer is never free
+    /// for 500 ms — every append is a writer transaction — so the pass never
+    /// ran at all, the hot tier grew to millions of rows, and each query paid to
+    /// scan them. As a queued job it always gets a turn, and because it is now
+    /// sliced it does not monopolise that turn.
     pub fn flush_hot_when_idle(&self) -> Result<usize> {
         let now = now_ns();
-        let last = self
-            .last_flush_ns
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let last = self.last_flush_ns.load(Ordering::Relaxed);
         if now.saturating_sub(last) < self.cfg.flush_interval_ns() {
             return Ok(0);
         }
-        let Some(conn) = self.try_lock_conn(ConnUser::Flush, BACKGROUND_LOCK_WAIT) else {
-            return Ok(0);
-        };
-        let moved = parquet::flush_hot(&conn, &self.parquet)?;
-        self.last_flush_ns
-            .store(now, std::sync::atomic::Ordering::Relaxed);
-        // Row counts survive a flush; see `flush_hot`.
-        Ok(moved)
+        self.flush_until_caught_up()
+    }
+
+    /// [`Store::flush_hot_when_idle`], repeated until the backlog is gone.
+    ///
+    /// One pass per tick would leave a multi-million-row backlog draining for
+    /// half an hour, and until it is gone every query scans it. Each iteration
+    /// is a separate job, so appends interleave between slices instead of
+    /// waiting behind the whole drain. The cadence check lives in the caller:
+    /// once a drain has started it must not stop after one slice because the
+    /// clock says the next flush is ten seconds away.
+    pub fn flush_until_caught_up(&self) -> Result<usize> {
+        const MAX_SLICES: usize = 8;
+        let mut total = 0usize;
+        let mut slices = 0usize;
+        for _ in 0..MAX_SLICES {
+            let moved = self.run_exclusive(Store::flush_chunk)?;
+            total += moved;
+            slices += 1;
+            if moved < parquet::FLUSH_CHUNK_ROWS {
+                break;
+            }
+        }
+        // A backlog that never drains is invisible without this: the pass
+        // reports success every tick, and the only symptom is that every query
+        // keeps scanning the tier it was supposed to shrink.
+        if total > 0 {
+            info!(
+                stage = "flush_drain",
+                slices,
+                moved = total,
+                "moved hot rows to Parquet"
+            );
+        }
+        Ok(total)
+    }
+
+    /// Run one bounded flush slice.
+    ///
+    /// Tests only. Production reaches this through the writer thread, which is
+    /// also what makes the slice size observable: a slice is the unit of time an
+    /// ingest can be made to wait.
+    #[cfg(test)]
+    pub(crate) fn flush_slice(&self, budget: usize) -> Result<usize> {
+        let conn = self.lock_conn(ConnUser::Flush);
+        parquet::flush_hot_bounded(&conn, &self.parquet, budget)
     }
 
     /// Merge each completed hour's local Parquet files into one final file.
@@ -2132,7 +2549,15 @@ impl Store {
 
     /// Drop data older than the retention window and, if configured, evict the
     /// oldest batches until the database fits in `max_disk_bytes`.
+    ///
+    /// Runs on the writer thread's queue: pruning deletes rows and recounts the
+    /// catalogue, so it needs the writer to itself, and queueing is what gives
+    /// it a turn without a deadline it can miss.
     pub fn prune(&self, now_ns: u64) -> Result<PruneStats> {
+        self.run_exclusive(move |store| store.prune_now(now_ns))
+    }
+
+    fn prune_now(&self, now_ns: u64) -> Result<PruneStats> {
         let mut stats = PruneStats::default();
         let before = self.stats();
         let archive_bytes: u64;
@@ -2162,38 +2587,78 @@ impl Store {
             stats.removed_files = archives.files_removed;
             // `prune_archives` already rescanned the file index; there are no
             // views left to rebuild.
+            // What this pass deletes, so the catalogue aggregate can be adjusted
+            // by subtraction. Recounting the whole archive instead is O(all
+            // data) on every pass, and a retention pass runs every interval: a
+            // catch-up deleted rows on each one and spent the writer on an
+            // 8-second scan each time, which is why ingest started answering
+            // 503. Subtracting is O(what is going away).
+            let mut deleted = (0usize, 0u64, 0u64);
             if let Some(retention) = self.cfg.retention_ns {
                 let cutoff = now_ns.saturating_sub(retention);
-                let removed: i64 = conn
-                    .query_row(
-                        &format!("SELECT COUNT(*) FROM {batches_t} WHERE end_ns < ?"),
-                        params![ts(cutoff)],
-                        |row| row.get(0),
+                // One pass removes at most `PRUNE_BATCH_ROWS` batches, oldest
+                // first, and the rest goes on the next tick.
+                //
+                // The delete used to be the whole expired range in one
+                // statement. On a database whose hot tier had grown to millions
+                // of rows — which is exactly what happens after a while of
+                // failed flushes — that single delete dirtied enough of the
+                // file that the CHECKPOINT below rewrote all of it: minutes
+                // inside one queued job. Every other producer timed out behind
+                // it, including the flush that would have shrunk the tier, so
+                // the state that caused the long delete was the state it
+                // preserved. A bounded delete converges in a few ticks instead
+                // and never costs more than one tick's worth of work.
+                //
+                // `<=` is deliberate. With `<` the boundary row itself stayed
+                // behind, so a tier whose last expired row was also its newest
+                // row deleted nothing on every subsequent pass: retention would
+                // stall one row short of done, forever.
+                if let Some(pass_cutoff) =
+                    expired_cutoff(&conn, &batches_t, cutoff, PRUNE_BATCH_ROWS)?
+                {
+                    let row = conn
+                        .query_row(
+                            &format!(
+                                "SELECT COUNT(*), COALESCE(SUM(total_value), 0), \
+                                 COALESCE(SUM(bytes), 0) FROM {batches_t} WHERE end_ns <= ?"
+                            ),
+                            params![ts(pass_cutoff)],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0).unwrap_or(0),
+                                    row.get::<_, i64>(1).unwrap_or(0),
+                                    row.get::<_, i64>(2).unwrap_or(0),
+                                ))
+                            },
+                        )
+                        .unwrap_or((0, 0, 0));
+                    let removed = row.0.max(0);
+                    deleted = (removed as usize, row.1.max(0) as u64, row.2.max(0) as u64);
+                    conn.execute(
+                        &format!("DELETE FROM {samples_t} WHERE end_ns <= ?"),
+                        params![ts(pass_cutoff)],
                     )
-                    .unwrap_or(0);
-                conn.execute(
-                    &format!("DELETE FROM {samples_t} WHERE end_ns < ?"),
-                    params![ts(cutoff)],
-                )
-                .map_err(db_err)?;
-                conn.execute(
-                    &format!("DELETE FROM {batches_t} WHERE end_ns < ?"),
-                    params![ts(cutoff)],
-                )
-                .map_err(db_err)?;
-                // The map is a second, independent table family: it has no
-                // batches, so it needs its own cutoff.
-                conn.execute(
-                    &format!("DELETE FROM {nodes_t} WHERE bucket_ns < ?"),
-                    params![ts(cutoff)],
-                )
-                .map_err(db_err)?;
-                conn.execute(
-                    &format!("DELETE FROM {edges_t} WHERE bucket_ns < ?"),
-                    params![ts(cutoff)],
-                )
-                .map_err(db_err)?;
-                stats.removed_batches += removed.max(0) as usize;
+                    .map_err(db_err)?;
+                    conn.execute(
+                        &format!("DELETE FROM {batches_t} WHERE end_ns <= ?"),
+                        params![ts(pass_cutoff)],
+                    )
+                    .map_err(db_err)?;
+                    // The map is a second, independent table family: it has
+                    // no batches, so it needs its own cutoff.
+                    conn.execute(
+                        &format!("DELETE FROM {nodes_t} WHERE bucket_ns <= ?"),
+                        params![ts(pass_cutoff)],
+                    )
+                    .map_err(db_err)?;
+                    conn.execute(
+                        &format!("DELETE FROM {edges_t} WHERE bucket_ns <= ?"),
+                        params![ts(pass_cutoff)],
+                    )
+                    .map_err(db_err)?;
+                    stats.removed_batches += removed as usize;
+                }
             }
 
             // In canonical modes the cap is enforced by removing whole
@@ -2218,17 +2683,19 @@ impl Store {
                         break;
                     }
                     guard += 1;
-                    let oldest: Option<i64> = conn
+                    let oldest: Option<(i64, i64, i64)> = conn
                         .query_row(
                             &format!(
-                                "SELECT batch_id FROM {legacy_span} \
+                                "SELECT batch_id, total_value, bytes FROM {legacy_span} \
                                  ORDER BY start_ns ASC, batch_id ASC LIMIT 1"
                             ),
                             [],
-                            |row| row.get(0),
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )
                         .ok();
-                    let Some(batch_id) = oldest else { break };
+                    let Some((batch_id, value, bytes)) = oldest else {
+                        break;
+                    };
                     conn.execute(
                         &format!("DELETE FROM {samples_t} WHERE batch_id = ?"),
                         params![batch_id],
@@ -2240,14 +2707,49 @@ impl Store {
                     )
                     .map_err(db_err)?;
                     stats.removed_batches += 1;
+                    deleted.0 += 1;
+                    deleted.1 = deleted.1.saturating_add(value.max(0) as u64);
+                    deleted.2 = deleted.2.saturating_add(bytes.max(0) as u64);
                 }
             }
 
-            conn.execute_batch("CHECKPOINT").map_err(db_err)?;
-            // The counts just changed. Recount while the writer is still held,
-            // so both this pass and the next reader observe the pruned state
-            // and no append can slip in between.
-            *self.agg.lock() = Some(self.recount(&conn)?);
+            // Only rewrite the database file when this pass actually removed
+            // rows from it. Retention fires on its own interval whether or not
+            // there is anything to do, and an unconditional `CHECKPOINT` made
+            // every quiet pass rewrite the whole file — seconds of writer time
+            // to reclaim nothing, which is time the flush behind it waits for.
+            if deleted.0 > 0 {
+                conn.execute_batch("CHECKPOINT").map_err(db_err)?;
+            }
+            // Two ways to keep the catalogue honest after a prune, and the
+            // choice is about cost, not accuracy:
+            //
+            // - Rows deleted from the hot tables were counted by the aggregate,
+            //   and this pass already knows how many and how much, so subtract.
+            //   That is O(what is going away) and it is exact.
+            // - Whole Parquet files deleted by retention or the disk cap were
+            //   counted too, but their rows are not readable any more, so the
+            //   only exact answer is a recount. That is O(the whole archive) and
+            //   it runs while holding the writer, so it is confined to the case
+            //   that needs it.
+            //
+            // Recounting unconditionally — the obvious version — made every
+            // retention pass read 4 million batches under the writer, eight
+            // seconds at a time, and ingest answered 503 throughout.
+            if stats.removed_files > 0 {
+                *self.agg.lock() = Some(self.recount(&conn)?);
+            } else if deleted.0 > 0 {
+                let mut slot = self.agg.lock();
+                if let Some(agg) = slot.as_mut() {
+                    agg.batch_count = agg.batch_count.saturating_sub(deleted.0);
+                    agg.total_value = agg.total_value.saturating_sub(deleted.1);
+                    agg.logical_bytes = agg.logical_bytes.saturating_sub(deleted.2);
+                    // The time bounds are left alone. They only move when the
+                    // oldest rows leave, and when they do it is retention that
+                    // took them — which also deletes their file, so the branch
+                    // above fixes the bounds in the same pass.
+                }
+            }
         }
 
         let after = self.stats();
@@ -2454,6 +2956,20 @@ impl Store {
         if batch.nodes.is_empty() && batch.edges.is_empty() {
             return Ok(());
         }
+        if self.writer.get().is_none() {
+            return self.append_servicemap_now(batch);
+        }
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        self.queue(
+            WriteJob::ServiceMap {
+                batch: batch.clone(),
+                reply,
+            },
+            answer,
+        )
+    }
+
+    fn append_servicemap_now(&self, batch: &ServiceMapBatch) -> Result<()> {
         let bucket = ts(batch.start_ns);
         let nodes_t = self.wtable("net_nodes");
         let edges_t = self.wtable("net_edges");
@@ -3597,6 +4113,39 @@ fn db_err(err: duckdb::Error) -> Error {
     Error::Db(err.to_string())
 }
 
+/// Batches one retention pass may delete from the hot tier.
+///
+/// Retention is expressed in days, but a pass is a unit of work the writer has
+/// to fit between two reports. Catching up after a backlog is spread over as
+/// many ticks as it takes instead of landing as one delete that rewrites the
+/// whole database file.
+const PRUNE_BATCH_ROWS: i64 = 100_000;
+
+/// The effective `end_ns` boundary for one retention pass.
+///
+/// `None` means nothing is older than `cutoff`. Otherwise the returned value is
+/// the largest `end_ns` of the `limit` oldest expired rows, so deleting
+/// everything strictly below it removes at most that many batches. `end_ns` is
+/// the same column every hot table is cut on, so one boundary keeps the tiers
+/// consistent.
+fn expired_cutoff(
+    conn: &Connection,
+    batches: &str,
+    cutoff: u64,
+    limit: i64,
+) -> Result<Option<u64>> {
+    let sql = format!(
+        "SELECT max(end_ns) FROM (\
+         SELECT end_ns FROM {batches} WHERE end_ns < ? ORDER BY end_ns LIMIT ?)"
+    );
+    let value: Option<i64> = conn
+        .query_row(&sql, params![ts(cutoff), limit.max(1)], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .map_err(db_err)?;
+    Ok(value.map(|ns| ns.max(0) as u64))
+}
+
 /// Run `f` as one explicit transaction on the shared connection.
 ///
 /// DuckDB aborts a transaction on *any* statement failure — including a
@@ -3843,6 +4392,180 @@ mod tests {
         assert_eq!(stats.earliest_ns, Some(1_000));
         assert_eq!(stats.latest_ns, Some(1_099 + 10_000_000_000));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A prune that removes nothing must not re-read the archive.
+    ///
+    /// Retention pruning runs on a timer against a window that is usually still
+    /// inside retention, so most passes find nothing to delete. Recounting
+    /// unconditionally made every pass read the whole archive *while holding the
+    /// writer* — on a 4-million-batch tenant that is half a minute of the writer
+    /// per pass, and ingest answered 503 the whole time.
+    #[test]
+    fn a_prune_that_removes_nothing_does_not_recount() {
+        let (store, dir) = temp_store("prune-no-recount");
+        for i in 0..3u64 {
+            store
+                .append(&report("svc", 1_000 + i, "a", &["hot"], 10))
+                .unwrap();
+        }
+        // The first read counts the archive; after that it is arithmetic.
+        assert_eq!(store.stats().batch_count, 3);
+        let recounts = store.recounts.load(std::sync::atomic::Ordering::Relaxed);
+
+        for _ in 0..5 {
+            let pruned = store.prune(now_ns()).unwrap();
+            assert_eq!(pruned.removed_batches, 0, "nothing is older than retention");
+        }
+        assert_eq!(
+            store.recounts.load(std::sync::atomic::Ordering::Relaxed),
+            recounts,
+            "pruning deleted nothing, so nothing had to be recounted"
+        );
+        assert_eq!(store.stats().batch_count, 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A retention catch-up subtracts what it deleted; it does not rescan.
+    ///
+    /// When retention is shortened (or a pod was down long enough to fall
+    /// behind), every prune pass deletes rows. Recounting the archive on each
+    /// pass meant the writer was reading 4 million batches more often than not,
+    /// and ingest timed out against it — 503s for the whole catch-up.
+    #[test]
+    fn a_prune_catch_up_subtracts_instead_of_rescanning() {
+        let dir =
+            std::env::temp_dir().join(format!("lidlesseye-store-catchup-{}", uuid::Uuid::new_v4()));
+        let mut cfg = StoreConfig::new(&dir);
+        // Everything is already older than retention, so each pass has work.
+        cfg.retention_ns = Some(1);
+        let store = Store::open(cfg).unwrap();
+
+        for i in 0..2u64 {
+            store
+                .append(&report("svc", 1_000 + i, "a", &["hot"], 10 + i))
+                .unwrap();
+        }
+        assert_eq!(store.stats().batch_count, 2);
+        let counted = store.recounts.load(std::sync::atomic::Ordering::Relaxed);
+
+        let pruned = store.prune(now_ns()).unwrap();
+        assert_eq!(pruned.removed_batches, 2, "both batches are past retention");
+        // Exact, from what the pass deleted — not from a second scan.
+        assert_eq!(store.stats().batch_count, 0);
+        assert_eq!(store.stats().total_value, 0);
+        assert_eq!(
+            store.recounts.load(std::sync::atomic::Ordering::Relaxed),
+            counted,
+            "deleting rows must not re-read the archive"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A retention pass must cut the tier into bounded pieces.
+    ///
+    /// Deleting everything past retention in one statement is what turned a
+    /// catch-up into a minute-long job inside the writer queue: the delete
+    /// dirtied enough of the database file that the checkpoint after it rewrote
+    /// all of it, and every other producer — including the flush that would
+    /// have made room — timed out behind it. The boundary has to advance the
+    /// retained edge by at most `limit` rows per pass, and leave the rest for
+    /// the next tick.
+    #[test]
+    fn a_retention_pass_cuts_the_tier_into_bounded_pieces() {
+        let (store, dir) = temp_store("prune-bounded");
+        for i in 0..5u64 {
+            store
+                .append(&report("svc", 1_000 + i, "a", &["hot"], 10 + i))
+                .unwrap();
+        }
+        let conn = store.lock_conn(ConnUser::Maintenance);
+
+        // Nothing is expired below the oldest row: nothing to cut.
+        let none = expired_cutoff(&conn, "batches_hot", 1_000, 2).unwrap();
+        assert_eq!(none, None, "no row is older than the cutoff");
+
+        // Everything is expired: the boundary is the second-oldest `end_ns`,
+        // and rows *at* the boundary are included — that is what lets the last
+        // pass finish instead of stalling on the newest expired row.
+        let boundary = expired_cutoff(&conn, "batches_hot", u64::MAX, 2)
+            .unwrap()
+            .expect("rows are expired");
+        let oldest: Vec<i64> = conn
+            .prepare("SELECT end_ns FROM batches_hot ORDER BY end_ns LIMIT 2")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(
+            boundary, oldest[1] as u64,
+            "the boundary is the limit-th oldest row"
+        );
+
+        let removed = conn
+            .execute(
+                "DELETE FROM batches_hot WHERE end_ns <= ?",
+                params![ts(boundary)],
+            )
+            .unwrap();
+        assert_eq!(removed, 2, "one pass removes at most `limit` rows");
+        // A second pass over what is left must find a boundary again: a stale
+        // one would mean retention never finishes.
+        assert!(
+            expired_cutoff(&conn, "batches_hot", u64::MAX, 2)
+                .unwrap()
+                .is_some(),
+            "the remaining rows are still expired"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The writer thread is the only thing that touches the writer connection,
+    /// and every caller that queues gets an answer. If that hand-off lost a job,
+    /// or answered before the commit, an agent would be told "stored" about a
+    /// batch that is not there — the exact failure a queue has to avoid.
+    #[test]
+    fn the_writer_thread_commits_every_queued_report() {
+        let dir =
+            std::env::temp_dir().join(format!("lidlesseye-store-writer-{}", uuid::Uuid::new_v4()));
+        // Flush on every tick: the cadence guard would otherwise answer "not
+        // due" and the test would never see the queued pass run.
+        let mut cfg = StoreConfig::new(&dir);
+        cfg.flush_interval_ns = Some(1);
+        let store = Store::open_shared(cfg).unwrap();
+
+        let threads: Vec<_> = (0..4)
+            .map(|_worker| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..10u64 {
+                        let start = 1_000_000_000 + i * 100_000_000;
+                        store
+                            .append_owned(report("svc", start, "a", &["hot"], 3))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(store.stats().batch_count, 40, "every queued batch landed");
+
+        // A background pass is a job in the same queue, so it cannot starve and
+        // cannot be starved: it runs to completion between two ingests.
+        let moved = store.flush_hot_when_idle().unwrap();
+        assert!(moved > 0, "the queued flush ran");
+        assert_eq!(
+            store.stats().batch_count,
+            40,
+            "a flush moves rows between tiers; nothing is lost"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5003,6 +5726,36 @@ mod tests {
         assert_eq!(dns[0].rtt_us, 30);
 
         drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ids must keep increasing after a tenant with several archived hours is
+    /// reopened. Finding the counter by opening only the newest shard is what
+    /// keeps a cold open fast; this test makes sure that shortcut is exact.
+    #[test]
+    fn ids_keep_increasing_after_a_multi_hour_reopen() {
+        let (store, dir) = temp_store("ids-multi-hour");
+        let hour = 3_600_000_000_000u64;
+        let first = store
+            .append(&report("api", 1_000, "a", &["hot"], 10))
+            .unwrap();
+        let second = store
+            .append(&report("api", 1_000 + hour, "a", &["hot"], 10))
+            .unwrap();
+        store.flush_hot().unwrap();
+        assert!(first.batch_id < second.batch_id);
+        drop(store);
+
+        let reopened = Store::open(StoreConfig::new(&dir)).unwrap();
+        assert_eq!(reopened.stats().batch_count, 2);
+        let third = reopened
+            .append(&report("api", 1_000 + 2 * hour, "a", &["hot"], 10))
+            .unwrap();
+        assert!(
+            third.batch_id > second.batch_id,
+            "the reopened store reused an archived batch id"
+        );
+        drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

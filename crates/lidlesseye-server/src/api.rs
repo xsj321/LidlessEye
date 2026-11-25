@@ -224,8 +224,19 @@ fn ingest_format(headers: &HeaderMap, params: &Params) -> &'static str {
 }
 
 /// Store of the caller's tenant, or `None` when the tenant has no data yet.
-fn maybe_store(state: &AppState, caller: &Caller) -> Option<Arc<Store>> {
-    state.registry().tenant(&caller.tenant)
+///
+/// Tenants are opened on demand, and a first open can spend tens of seconds
+/// discovering S3 objects. Doing that on a Tokio worker starves the server:
+/// with four workers, four cold requests leave no thread to answer the
+/// liveness probe, and Kubernetes kills a perfectly healthy process. The open
+/// therefore runs on the blocking pool, where it cannot stall the listener.
+async fn maybe_store(state: &AppState, caller: &Caller) -> Option<Arc<Store>> {
+    let registry = state.registry().clone();
+    let tenant = caller.tenant.clone();
+    tokio::task::spawn_blocking(move || registry.tenant(&tenant))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// `GET /api/v1/flamegraph`
@@ -242,7 +253,7 @@ pub async fn flamegraph(
         .with_max_nodes(params.usize_param("max_nodes", 1024))
         .with_group_by(params.group_by());
 
-    let Some(store) = maybe_store(&state, &caller) else {
+    let Some(store) = maybe_store(&state, &caller).await else {
         return Ok(Json(Flamegraph::empty(profile_type.unit())).into_response());
     };
     let _slot = state.read_slot().await?;
@@ -298,7 +309,7 @@ pub async fn diff(
         max_nodes: params.usize_param("max_nodes", 1024).clamp(16, 50_000),
     };
 
-    let Some(store) = maybe_store(&state, &caller) else {
+    let Some(store) = maybe_store(&state, &caller).await else {
         return Ok(Json(DiffFlamegraph {
             names: vec!["root".into()],
             levels: vec![-1],
@@ -337,7 +348,7 @@ pub async fn top(
     // the whole tree, which is a cheap way for one client to stall a replica.
     let limit = params.usize_param("limit", 50).clamp(1, 1_000);
 
-    let Some(store) = maybe_store(&state, &caller) else {
+    let Some(store) = maybe_store(&state, &caller).await else {
         return Ok(Json(json!({
             "unit": profile_type.unit().as_str(),
             "total_value": 0,
@@ -390,7 +401,7 @@ pub async fn timeseries(
         group_by: params.group_by(),
     };
 
-    let Some(store) = maybe_store(&state, &caller) else {
+    let Some(store) = maybe_store(&state, &caller).await else {
         return Ok(Json(TimeSeries {
             from_ns: from,
             until_ns: until,
@@ -420,7 +431,7 @@ pub async fn series(
     let now = now_ns();
     let (from, until) = params.range(now)?;
     let selector = params.selector()?;
-    let rows = match maybe_store(&state, &caller) {
+    let rows = match maybe_store(&state, &caller).await {
         Some(store) => {
             let slot = state.read_slot().await?;
             let rows = state
@@ -449,7 +460,7 @@ pub async fn label_names(
     let now = now_ns();
     let (from, until) = params.range(now)?;
     let selector = params.selector()?;
-    let names = match maybe_store(&state, &caller) {
+    let names = match maybe_store(&state, &caller).await {
         Some(store) => {
             let slot = state.read_slot().await?;
             let names = state
@@ -475,7 +486,7 @@ pub async fn label_values(
     let now = now_ns();
     let (from, until) = params.range(now)?;
     let selector = params.selector()?;
-    let values: Vec<Value> = match maybe_store(&state, &caller) {
+    let values: Vec<Value> = match maybe_store(&state, &caller).await {
         Some(store) => {
             let label = name.clone();
             let slot = state.read_slot().await?;
@@ -504,7 +515,7 @@ pub async fn profile_types(
     let now = now_ns();
     let (from, until) = params.range(now)?;
     let selector: Selector = params.selector()?;
-    let rows = match maybe_store(&state, &caller) {
+    let rows = match maybe_store(&state, &caller).await {
         Some(store) => {
             let slot = state.read_slot().await?;
             let rows = state
@@ -644,7 +655,7 @@ pub async fn stats(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let caller = state.authorize(&headers)?;
-    let store = maybe_store(&state, &caller);
+    let store = maybe_store(&state, &caller).await;
     // Both numbers are full scans of `batches`, and the dashboard polls this
     // every few seconds. They share one read slot and one blocking task.
     let (summary, series_count, locks) = match store {
@@ -775,7 +786,7 @@ pub async fn servicemap(
     let caller = state.authorize(&headers)?;
     let now = now_ns();
     let (from, until) = params.range(now)?;
-    let Some(store) = maybe_store(&state, &caller) else {
+    let Some(store) = maybe_store(&state, &caller).await else {
         return Ok(Json(ServiceMap {
             from_ns: from,
             until_ns: until,
@@ -820,7 +831,7 @@ pub async fn servicemap_history(
         .map(str::trim)
         .filter(|value| !value.is_empty() && value.len() <= 64)
         .map(str::to_string);
-    let Some(store) = maybe_store(&state, &caller) else {
+    let Some(store) = maybe_store(&state, &caller).await else {
         return Ok(Json(MapHistory {
             node,
             from_ns: from,
@@ -873,7 +884,7 @@ pub async fn servicemap_histogram(
         .get("metric")
         .and_then(lidlesseye_core::NetMetric::parse)
         .unwrap_or_default();
-    let Some(store) = maybe_store(&state, &caller) else {
+    let Some(store) = maybe_store(&state, &caller).await else {
         return Ok(Json(MapHistogram {
             from_ns: from,
             until_ns: until,

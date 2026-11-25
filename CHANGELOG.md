@@ -251,6 +251,40 @@ map windows while the server endpoint is briefly absent.
   429 and 5xx are. Final drop warnings now include attempt count and elapsed
   time so a real outage is distinguishable from a bad payload.
 
+## [0.1.20] - 2026-11-25
+
+Tenants are loaded on demand instead of all at start-up, and a cold tenant opens
+fast enough that the first request is not a 40-second stall.
+
+### Changed
+
+- Tenant stores are no longer preloaded at start-up. A server with ten tenants
+  used to open ten writers, ten maintenance connections and forty readers before
+  answering its first request; the process ended up with around two thousand
+  DuckDB threads parked in futexes, and even a tenant with a single row took
+  seconds to query. A tenant is now opened the first time a request or an
+  ingest names it. Catalogue and background passes use only tenants that are
+  already open, so a periodic sweep cannot reopen the ones that were never
+  asked for.
+- Opening a tenant on the request path runs on the blocking pool, not on a
+  Tokio worker. Four cold requests used to occupy all four workers and leave
+  the liveness probe unanswered, which made Kubernetes kill a healthy process
+  in a restart loop.
+- Finding the id counters at open time reads the newest Parquet shard plus the
+  hot tier rather than every archived object. With a few hundred objects this
+  was thirty seconds of footer reads per cold open; ids are monotonic and
+  archived by hour, so the maximum is in the newest shard.
+
+### Fixed
+
+- A failed S3 discovery left stale objects in the index. The bucket is now the
+  source of truth: a successful LIST replaces the remote half of the index, so
+  an object deleted by retention can no longer be named by a query and fail the
+  whole panel with a 404. An empty or failed LIST keeps the previous index.
+- A cloned read connection did not inherit the httpfs S3 credentials. They are
+  connection-scoped, so a reader that skipped `configure_s3` returned 404 for
+  every archived object while the configured writer looked healthy.
+
 ## [0.1.19] - 2026-11-24
 
 Queries no longer pay for the whole retention window. The canonical tables stopped
@@ -259,8 +293,42 @@ the catalogue endpoints stopped scanning every tenant on every poll. Together th
 were why the dashboard went blank: a 60-second HTTP timeout on `/api/v1/stats`,
 `/api/v1/tenants` and `/metrics` while `/api/v1/version` answered in 10 ms.
 
+The write path was restructured on top of that. Writes no longer contend for a
+lock: one thread owns the writer connection and takes jobs from a queue, so an
+agent waits in line instead of behind whatever background pass happens to hold the
+connection — and flushing is one of those jobs, sliced small enough to take its
+turn. On the local cluster a ten-tenant install went from "the hot tier never
+drains, queries scan four million rows and the browser shows `INTERRUPT Error:
+Interrupted!`" to a one-hour map in under a second.
+
 ### Fixed
 
+- The hot tier could not drain on a tenant that kept receiving reports. Flushing
+  tried the writer for 500 ms and skipped the tick "to stay out of the way of
+  queries", but under steady ingest the writer is never free for 500 ms — every
+  append is a writer transaction — so the pass never ran. The tier grew to four
+  million rows, every query had to scan them (11–14 s for one hour of data on the
+  local cluster), wide windows hit the 60 s HTTP ceiling, and the queue of agents
+  waiting for the writer reached 30 s and answered 503. Flushing is now a job on
+  the same queue as ingest, so it always gets a turn, and it moves at most 200 000
+  rows per turn so the reports behind it still commit promptly. Dictionaries
+  (`stacks`, `frames`) stay hot while a backlog remains — they are deduplicated by
+  id, and deleting one that a published sample still names would lose a symbol —
+  and are flushed whole by the pass that finishes the backlog.
+- One slow query cancelled every other query in flight. The per-request watchdog
+  interrupted *all* read connections, so the dashboard's map and histogram died
+  with `INTERRUPT Error: Interrupted!` whenever the flamegraph next to them ran
+  long. An interrupt now only reaches reads that have been running for the
+  watchdog's full timeout, which are exactly the ones the request layer is about
+  to abandon. An interrupted query also answers `503` with an explanation instead
+  of `500 database error: INTERRUPT Error: Interrupted!`.
+- A single report could poison the catalogue's running total. `StackSample.value`
+  was never bounded and the per-report sum was a plain `u64` addition, which wraps
+  in a release build; one value at `u64::MAX` saturated the tenant's `total_value`
+  for the life of the process. The dashboard divides by that number, so every
+  percentage read zero and the tenant looked empty while its data was intact.
+  Validation now bounds one stack (1e15 in the profile's own unit) and the report
+  total (1e18), and reports are summed with `checked_add`.
 - A canonical table was
   `SELECT * FROM t_hot UNION ALL BY NAME SELECT * FROM read_parquet([every file])`.
   DuckDB must open the footer of every path it is given — over the network for S3 —
@@ -286,20 +354,22 @@ were why the dashboard went blank: a 60-second HTTP timeout on `/api/v1/stats`,
   `COUNT(DISTINCT …)` over the full archive on the request path. The counts,
   sums and time bounds are now a per-tenant aggregate that is read once and then
   *maintained*: an append folds its own row in before it gives the writer back, a
-  prune recounts while it still holds it, and flushing, compaction, archiving and
-  service-map windows leave it alone (they move the same rows, or touch tables
-  the aggregate does not cover). Reading it is a mutex and a clone — no scan, no
-  TTL. Counting under the writer is what makes it exact: there is no instant in
-  which a batch is committed but not yet counted, so the recount cannot overlap
-  an append and lose it. An earlier cut of this counted on a read clone and
-  cached the result afterwards, which dropped exactly those batches (the
-  dashboard was one short until the cache expired);
-  `a_poll_during_ingest_never_undercounts` now pins it. The distinct-series
-  count has no exact incremental form, so it stays a scan on a ten-minute clock
-  — that scan alone measured 11 s on a 4-million-row tenant and used to stall one
-  poll per minute. `bind()` no longer computes tenant totals before it starts
-  serving, which was failing the liveness probe in a ten-tenant cluster; a
-  background task warms the aggregate of each tenant after startup instead.
+  prune subtracts the rows it just deleted (and recounts only when retention
+  removed whole files, whose rows cannot be read any more), and flushing,
+  compaction, archiving and service-map windows leave it alone (they move the
+  same rows, or touch tables the aggregate does not cover). Reading it is a
+  mutex and a clone — no scan, no TTL. Counting under
+  the writer is what makes it exact: there is no instant in which a batch is
+  committed but not yet counted, so the recount cannot overlap an append and
+  lose it. An earlier cut of this counted on a read clone and cached the result
+  afterwards, which dropped exactly those batches (the dashboard was one short
+  until the cache expired); `a_poll_during_ingest_never_undercounts` now pins
+  it. The distinct-series count has no exact incremental form, so it stays a
+  scan on a ten-minute clock — that scan alone measured 11 s on a
+  4-million-row tenant and used to stall one poll per minute. `bind()` no longer
+  computes tenant totals before it starts serving, which was failing the
+  liveness probe in a ten-tenant cluster; a background task warms the aggregate
+  of each tenant after startup instead.
 - Starting a server with ten tenants took longer than the startup probe's budget,
   so the pod was killed and restarted in a loop before it ever served. Two causes:
   object discovery issued twelve LISTs per tenant (two patterns per table), and
@@ -325,6 +395,31 @@ were why the dashboard went blank: a 60-second HTTP timeout on `/api/v1/stats`,
 
 ### Changed
 
+- `stacks` is sharded by the hour of the samples that name it, like every other
+  table. It is a dictionary with no timestamp of its own, so it used to be
+  written to `hour=0` and mounted for *every* window — a one-hour flamegraph read
+  the entire dictionary history, 57 MB across 63 objects for the eight-day tenant
+  on the local cluster, which is where the extra ten seconds per flamegraph and
+  per `top` went. Stack ids are allocated per batch rather than deduplicated
+  across batches, so a stack row is only ever referenced by samples from the same
+  flush: filing it under the same hour is exact, not an approximation. Rows stay
+  in the hot tier while later slices still need to resolve them and are cleared
+  by the pass that drains the tier. Files written by earlier releases remain in
+  `hour=0` and are mounted for any window that reaches back to the hour the first
+  sharded file was written, so an upgrade loses no symbols; they age out with
+  retention.
+- Writes go through one writer thread and a FIFO queue instead of a mutex.
+  DuckDB serialises write transactions anyway, so the only real choice is who
+  waits, and a mutex made every caller hold a thread and a request slot while it
+  queued — while a background pass could not get in at all. `Store::append` and
+  `append_servicemap` now enqueue and wait for the answer, so the commit is still
+  synchronous and a caller that gets `Ok` has its batch on disk; what changed is
+  that the wait is a queue position rather than "however long a flush holds the
+  connection". The queue is bounded at 512 jobs and a producer that cannot be
+  admitted in 30 s gets `503` with `Retry-After`, which is the same signal the
+  agent already retries on. `Store::open` keeps the direct path for tests and
+  embedded use; `Store::open_shared` — what the tenant registry uses — starts the
+  thread.
 - New Parquet writes are sharded into `hour=<n>/` directories locally, and named
   `hour=<n>-part-<stamp>.parquet` on S3 — flat, because a `glob()` resolves one
   directory at a time and an `hour=<n>/` prefix cost one LIST per archived hour
@@ -828,7 +923,8 @@ service map.
 - User stacks need frame pointers; heap profiling covers Go's own buckets and
   native allocator uprobes, not JVM/Python runtime-level heap layouts.
 
-[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/xsj321/LidlessEye/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/xsj321/LidlessEye/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/xsj321/LidlessEye/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/xsj321/LidlessEye/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/xsj321/LidlessEye/compare/v0.1.16...v0.1.17

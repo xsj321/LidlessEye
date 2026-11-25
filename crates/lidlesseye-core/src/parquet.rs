@@ -60,44 +60,64 @@ pub(crate) struct TableDef {
     /// Nanosecond column whose epoch hour forms the Parquet partition. Dictionaries
     /// have no time column and are written into the current hour.
     pub hour_column: Option<&'static str>,
+    /// Shard by the hour of the samples that reference the rows, not by a
+    /// column of the row itself.
+    ///
+    /// `stacks` is a dictionary: it has no timestamp, yet a row is only ever
+    /// referenced by samples from the same flush (stack ids are allocated per
+    /// batch, not deduplicated across batches). Filing those rows under the hour
+    /// of the samples that name them is therefore exact, and it is what turns
+    /// the flamegraph's dictionary read from "every object since install" into
+    /// "this hour's object". A global dictionary file made every flamegraph read
+    /// 57 MB over S3 to render one hour of data.
+    pub hour_from_samples: bool,
 }
 
 pub(crate) const TABLES: &[TableDef] = &[
-    TableDef {
-        name: "batches",
-        columns: "batch_id, profile_type, service_name, labels, start_ns, end_ns, total_value, sample_count, bytes, created_ns",
-        ddl: "CREATE TABLE {t} (batch_id BIGINT PRIMARY KEY, profile_type VARCHAR NOT NULL, service_name VARCHAR NOT NULL, labels VARCHAR NOT NULL, start_ns BIGINT NOT NULL, end_ns BIGINT NOT NULL, total_value BIGINT NOT NULL, sample_count BIGINT NOT NULL, bytes BIGINT NOT NULL, created_ns BIGINT NOT NULL)",
-        hour_column: Some("start_ns"),
-    },
-    TableDef {
-        name: "samples",
-        columns: "batch_id, profile_type, service_name, labels, start_ns, end_ns, stack_id, value",
-        ddl: "CREATE TABLE {t} (batch_id BIGINT NOT NULL, profile_type VARCHAR NOT NULL, service_name VARCHAR NOT NULL, labels VARCHAR NOT NULL, start_ns BIGINT NOT NULL, end_ns BIGINT NOT NULL, stack_id BIGINT NOT NULL, value BIGINT NOT NULL)",
-        hour_column: Some("start_ns"),
-    },
+    // Dictionaries first: a stack row must be durable before the sample that
+    // names it, so a crash between the two writes loses nothing that a reader
+    // would try to resolve.
     TableDef {
         name: "stacks",
         columns: "stack_id, frames",
         ddl: "CREATE TABLE {t} (stack_id BIGINT PRIMARY KEY, frames BLOB NOT NULL)",
         hour_column: None,
+        hour_from_samples: true,
     },
     TableDef {
         name: "frames",
         columns: "frame_id, module, symbol, file, line",
         ddl: "CREATE TABLE {t} (frame_id INTEGER PRIMARY KEY, module VARCHAR NOT NULL, symbol VARCHAR NOT NULL, file VARCHAR NOT NULL, line INTEGER NOT NULL)",
         hour_column: None,
+        hour_from_samples: false,
+    },
+    TableDef {
+        name: "batches",
+        columns: "batch_id, profile_type, service_name, labels, start_ns, end_ns, total_value, sample_count, bytes, created_ns",
+        ddl: "CREATE TABLE {t} (batch_id BIGINT PRIMARY KEY, profile_type VARCHAR NOT NULL, service_name VARCHAR NOT NULL, labels VARCHAR NOT NULL, start_ns BIGINT NOT NULL, end_ns BIGINT NOT NULL, total_value BIGINT NOT NULL, sample_count BIGINT NOT NULL, bytes BIGINT NOT NULL, created_ns BIGINT NOT NULL)",
+        hour_column: Some("start_ns"),
+        hour_from_samples: false,
+    },
+    TableDef {
+        name: "samples",
+        columns: "batch_id, profile_type, service_name, labels, start_ns, end_ns, stack_id, value",
+        ddl: "CREATE TABLE {t} (batch_id BIGINT NOT NULL, profile_type VARCHAR NOT NULL, service_name VARCHAR NOT NULL, labels VARCHAR NOT NULL, start_ns BIGINT NOT NULL, end_ns BIGINT NOT NULL, stack_id BIGINT NOT NULL, value BIGINT NOT NULL)",
+        hour_column: Some("start_ns"),
+        hour_from_samples: false,
     },
     TableDef {
         name: "net_nodes",
         columns: "bucket_ns, node_id, namespace, workload, service, kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready, instances, containers",
         ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, node_id VARCHAR NOT NULL, namespace VARCHAR NOT NULL, workload VARCHAR NOT NULL, service VARCHAR NOT NULL, kind VARCHAR NOT NULL, k8s_node VARCHAR NOT NULL, rx_bytes BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, pods BIGINT DEFAULT 0 NOT NULL, ready BIGINT DEFAULT 0 NOT NULL, instances VARCHAR DEFAULT '[]' NOT NULL, containers VARCHAR DEFAULT '[]' NOT NULL)",
         hour_column: Some("bucket_ns"),
+        hour_from_samples: false,
     },
     TableDef {
         name: "net_edges",
         columns: "bucket_ns, client_id, server_id, protocol, client_container, server_container, client_pod, server_pod, connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples, host, sql",
         ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, client_id VARCHAR NOT NULL, server_id VARCHAR NOT NULL, protocol VARCHAR NOT NULL, client_container VARCHAR DEFAULT '' NOT NULL, server_container VARCHAR DEFAULT '' NOT NULL, client_pod VARCHAR DEFAULT '' NOT NULL, server_pod VARCHAR DEFAULT '' NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, rx_bytes BIGINT NOT NULL, rtt_us_sum BIGINT NOT NULL, rtt_samples BIGINT NOT NULL, host VARCHAR DEFAULT '' NOT NULL, sql VARCHAR DEFAULT '' NOT NULL)",
         hour_column: Some("bucket_ns"),
+        hour_from_samples: false,
     },
 ];
 
@@ -167,6 +187,21 @@ impl TableFiles {
     fn all(&self) -> Vec<String> {
         let mut out = self.unknown.clone();
         for files in self.by_hour.values() {
+            out.extend(files.iter().cloned());
+        }
+        out
+    }
+
+    /// Paths that can hold the highest id in the table.
+    ///
+    /// Ids are allocated in arrival order and archived by hour, so the newest
+    /// hour holds the newest ids. Untagged files are included because their
+    /// contents cannot be placed in time. This is for `MAX(id)` at open time:
+    /// opening every footer in a large archive just to find a counter costs
+    /// tens of seconds per tenant.
+    fn newest(&self) -> Vec<String> {
+        let mut out = self.unknown.clone();
+        if let Some((_, files)) = self.by_hour.last_key_value() {
             out.extend(files.iter().cloned());
         }
         out
@@ -499,8 +534,15 @@ pub(crate) fn discover_s3_objects(
     s3: &S3Config,
 ) -> Result<usize> {
     let base = state.s3_base(); // s3://bucket[/prefix]
-    let mut index = state.load_index();
-    let mut added = 0usize;
+    let mut old = state.load_index();
+    // The bucket, not the cached index, is the source of truth. Rebuild the
+    // remote half from the LIST result: appending to the old one kept objects
+    // that retention had already deleted, and a query naming one of those
+    // failed the whole panel with a 404 instead of skipping a stale row.
+    // Local files stay untouched — they are scanned from the directory tree.
+    let mut discovered: std::collections::BTreeMap<String, TableFiles> =
+        std::collections::BTreeMap::new();
+    let mut found = 0usize;
 
     // Every layout this reads is flat under the table:
     // `<table>/hour=<n>-part-<stamp>.parquet` (current),
@@ -524,32 +566,29 @@ pub(crate) fn discover_s3_objects(
                 continue;
             };
             let hour = hour_from_key(&uri);
-            let entry = index.s3_mut(table);
-            let already = match hour {
-                Some(hour) => entry
-                    .by_hour
-                    .get(&hour)
-                    .is_some_and(|files| files.iter().any(|f| f == &uri)),
-                None => entry.unknown.iter().any(|f| f == &uri),
-            };
-            if already {
-                continue;
-            }
-            entry.push(hour, uri);
-            added += 1;
+            discovered
+                .entry(table.to_string())
+                .or_default()
+                .push(hour, uri);
+            found += 1;
         }
     }
 
-    if added > 0 {
-        for files in index.s3.values_mut() {
+    // A LIST that returns nothing must not be treated as proof that the bucket
+    // was emptied: a transient S3 outage must keep the last known index rather
+    // than hide the whole archive. Any non-empty result is authoritative and
+    // replaces the remote half, including entries that have since vanished.
+    if found > 0 {
+        for files in discovered.values_mut() {
             for group in files.by_hour.values_mut() {
                 group.sort();
             }
             files.unknown.sort();
         }
-        state.save_index(&index)?;
+        old.s3 = discovered;
+        state.save_index(&old)?;
     }
-    Ok(added)
+    Ok(found)
 }
 
 /// The table an object belongs to: the first key segment after the tenant
@@ -712,6 +751,19 @@ pub(crate) fn reindex_local(state: &ParquetState) {
     let _ = state.save_index(&index);
 }
 
+/// The oldest hour a dictionary was sharded into, if it ever was.
+///
+/// `hour=0` holds dictionary rows written before sharding, which any sample can
+/// name. Once a sharded file exists, a window that begins after that hour no
+/// longer needs the unsharded ones.
+fn first_sharded_hour(index: &FileIndex, table: &str) -> Option<u64> {
+    [index.local.get(table), index.s3.get(table)]
+        .into_iter()
+        .flatten()
+        .filter_map(|files| files.by_hour.range(1..).next().map(|(hour, _)| *hour))
+        .min()
+}
+
 /// SQL for the relation a query should read for `table`, restricted to the
 /// hours that can possibly hold data in `[from_ns, until_ns)`.
 ///
@@ -726,16 +778,28 @@ pub(crate) fn reindex_local(state: &ParquetState) {
 /// would make the binder reject those files and every query that touches them.
 pub(crate) fn table_span(state: &ParquetState, table: &str, from_ns: u64, until_ns: u64) -> String {
     let index = state.load_index();
-    let sharded = TABLES
-        .iter()
-        .find(|def| def.name == table)
-        .map(|def| def.hour_column.is_some())
+    let def = TABLES.iter().find(|def| def.name == table);
+    let sharded = def
+        .map(|def| def.hour_column.is_some() || def.hour_from_samples)
         .unwrap_or(false);
+    // A dictionary sharded by the samples that reference it has no time column
+    // of its own, but its files are still named by an hour, so a window can
+    // name only the hours it needs — that is the whole point of sharding it.
+    let by_samples = def.map(|def| def.hour_from_samples).unwrap_or(false);
     let (lo, hi) = if sharded {
         hour_window(from_ns, until_ns)
     } else {
         // Dictionaries have no time column; they are always mounted whole.
         (0, u64::MAX)
+    };
+    // Files written before dictionaries were sharded sit in `hour=0` and can be
+    // named by a sample from any hour. Mount them until the window is entirely
+    // past the hour the first sharded file was written: from then on, every
+    // sample's dictionary rows live in the same hour as the sample itself.
+    let switch = if by_samples {
+        first_sharded_hour(&index, table)
+    } else {
+        None
     };
     let mut paths: Vec<String> = Vec::new();
     for files in [index.local.get(table), index.s3.get(table)]
@@ -758,6 +822,13 @@ pub(crate) fn table_span(state: &ParquetState, table: &str, from_ns: u64, until_
             (lo, hi)
         };
         paths.extend(files.window(lo, hi));
+        let needs_unsharded = match switch {
+            Some(switch) => lo <= switch,
+            None => true,
+        };
+        if by_samples && needs_unsharded {
+            paths.extend(files.by_hour.get(&0).cloned().unwrap_or_default());
+        }
     }
     if paths.is_empty() {
         return format!("{table}_hot");
@@ -780,6 +851,40 @@ pub(crate) fn table_span(state: &ParquetState, table: &str, from_ns: u64, until_
 /// have no time window of their own.
 pub(crate) fn table_span_all(state: &ParquetState, table: &str) -> String {
     table_span(state, table, 0, u64::MAX)
+}
+
+/// Relation for finding the highest id in `table` at open time.
+///
+/// Ids are monotonic and archived by hour, so the highest one lives in the
+/// newest shard (or still in the hot tier). Opening every Parquet footer in a
+/// tenant with hundreds of objects just to evaluate `MAX(id)` dominated cold
+/// starts; naming the newest shard keeps the counter correct while touching a
+/// handful of files. Untagged files are included because they cannot be placed
+/// in time, and dictionaries that live entirely in `hour=0` get that directory.
+pub(crate) fn table_span_newest(state: &ParquetState, table: &str) -> String {
+    let index = state.load_index();
+    let mut paths: Vec<String> = Vec::new();
+    for files in [index.local.get(table), index.s3.get(table)]
+        .into_iter()
+        .flatten()
+    {
+        paths.extend(files.newest());
+    }
+    if paths.is_empty() {
+        return format!("{table}_hot");
+    }
+    paths.sort();
+    paths.dedup();
+    let list = paths
+        .iter()
+        .map(|p| format!("'{}'", esc(p)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "(SELECT * FROM {table}_hot \
+         UNION ALL BY NAME \
+         SELECT * FROM read_parquet([{list}], hive_partitioning=false, union_by_name=true))"
+    )
 }
 
 /// How many Parquet objects a window would name, for diagnostics and tests.
@@ -821,41 +926,233 @@ pub(crate) fn hour_tag() -> String {
     format!("h{}", secs / 3600)
 }
 
-/// Copy all rows currently in the hot tables into one small Parquet file per
-/// table and clear them. Called on a cadence; holds the connection lock at the
-/// call site so no reader observes a partially flushed state.
+/// Rows one flush job may move before it hands the writer back.
+///
+/// Ingest and flushing share one writer connection, so the size of one flush
+/// decides how long a report waits. A fraction of a second of `COPY` keeps the
+/// transient tier small; an all-or-nothing flush of a backlog holds the writer
+/// for minutes, and every report queued behind it fails its timeout.
+///
+/// The budget is counted in **samples**, not batches. A batch is one report and
+/// a report carries many samples, so a budget of N batches is N × (samples per
+/// report) rows: 200 000 batches was over ten million samples, which is not a
+/// slice but minutes of `COPY`. Counting the table that dominates the cost is
+/// what makes the slice actually bounded.
+pub(crate) const FLUSH_CHUNK_ROWS: usize = 1_000_000;
+
+/// Copy every row currently in the hot tables into one Parquet file per table
+/// and hour, then clear them.
+///
+/// The caller owns the writer connection, so no reader observes a partially
+/// flushed state.
 pub(crate) fn flush_hot(conn: &Connection, state: &ParquetState) -> Result<usize> {
+    flush_tables(conn, state, None, None)
+}
+
+/// Move at most `budget` rows out of the hot tier, oldest hours first.
+///
+/// A flush used to be all-or-nothing: it copied every hot row and cleared the
+/// tables, which meant it needed the writer for the whole archive at once. On a
+/// tenant taking a steady stream of reports that window never arrived — ingest
+/// always had the writer — so the tier grew to millions of rows and every query
+/// had to scan them. This moves the oldest hours that fit the budget instead:
+/// one pass is a fraction of a second, the writer comes straight back, and the
+/// backlog drains a slice per tick.
+///
+/// `stacks`/`frames` deliberately stay in the hot tier while a backlog remains.
+/// They are dictionaries keyed by id, so deduplication bounds them, and
+/// deleting one while a published Parquet sample still names it would lose a
+/// symbol. The final, untruncated pass flushes them whole.
+pub(crate) fn flush_hot_bounded(
+    conn: &Connection,
+    state: &ParquetState,
+    budget: usize,
+) -> Result<usize> {
+    let budget = budget.max(1) as i64;
+    // `samples` is the table every query scans, and it is one to two orders of
+    // magnitude larger than `batches`. Measuring the budget on batches made a
+    // "slice" ten hours wide and held the writer for the whole of it, which is
+    // exactly the failure the bounded flush exists to prevent — so gate and
+    // slice on the expensive table.
+    let samples = hot_rows(conn, "samples");
+    let batches = hot_rows(conn, "batches");
+    if samples <= budget && batches <= budget {
+        return flush_hot(conn, state);
+    }
+    // Plan the slice on whichever table is actually over budget. `samples` is
+    // normally the one, but a tier can hold batches whose samples already went
+    // to Parquet (or a profile with no samples at all). Asking an empty table
+    // for its hours yields no hours, and the slice then moves nothing — a
+    // backlog that never drains while every pass reports success.
+    let plan = if samples > budget {
+        "samples"
+    } else {
+        "batches"
+    };
+    // `batches` and `samples` move together: one hour of one without the other
+    // would leave a Parquet sample whose batch row is still hot, or a batch
+    // whose samples are still hot, and neither is a state a query expects.
+    let hours = oldest_hours(conn, plan, budget)?;
+    // `stacks` rides along: its rows are filed under the hour of the samples
+    // that name them, so a slice has to publish the dictionary rows for the
+    // same hours it publishes samples for.
+    let mut moved = flush_tables(
+        conn,
+        state,
+        Some(&["stacks", "batches", "samples"]),
+        Some(&hours),
+    )?;
+    // The map tables carry no batches and have their own clock, so they get a
+    // budget of their own instead of waiting for the report backlog to clear.
+    for name in ["net_nodes", "net_edges"] {
+        moved += flush_table_bounded(conn, state, name, budget)?;
+    }
+    Ok(moved)
+}
+
+/// Rows in one table's hot tier. A missing table is zero, not an error: the
+/// hot tables are created on open, and a partially migrated store may not
+/// have all of them yet.
+fn hot_rows(conn: &Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}_hot"), [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .unwrap_or(0)
+}
+
+/// The oldest hours of `table` whose rows fit in `budget`, never fewer than one.
+///
+/// Grouping in SQL rather than fetching rows keeps this to one scan of a column
+/// and returns at most one row per archived hour.
+fn oldest_hours(conn: &Connection, table: &str, budget: i64) -> Result<Vec<i64>> {
+    let column = TABLES
+        .iter()
+        .find(|def| def.name == table)
+        .and_then(|def| def.hour_column)
+        .ok_or_else(|| Error::InvalidArgument(format!("{table} has no hour column")))?;
+    let sql = format!(
+        "SELECT ({column} // 1_000_000_000 // 3600) AS h, COUNT(*) AS n \
+         FROM {table}_hot GROUP BY 1 ORDER BY 1"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| Error::Db(format!("listing {table} hours: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| Error::Db(format!("listing {table} hours: {e}")))?;
+    let mut picked = Vec::new();
+    let mut total = 0i64;
+    for row in rows.flatten() {
+        picked.push(row.0);
+        total += row.1;
+        if total >= budget {
+            break;
+        }
+    }
+    Ok(picked)
+}
+
+/// [`flush_tables`] for one table, truncated to `budget` rows if it is over.
+fn flush_table_bounded(
+    conn: &Connection,
+    state: &ParquetState,
+    name: &str,
+    budget: i64,
+) -> Result<usize> {
+    if hot_rows(conn, name) <= budget {
+        return flush_tables(conn, state, Some(&[name]), None);
+    }
+    let hours = oldest_hours(conn, name, budget)?;
+    flush_tables(conn, state, Some(&[name]), Some(&hours))
+}
+
+/// Flush `only` (or every table) restricted to `hours` (or every hour present).
+fn flush_tables(
+    conn: &Connection,
+    state: &ParquetState,
+    only: Option<&[&str]>,
+    hours: Option<&[i64]>,
+) -> Result<usize> {
     let mut moved = 0usize;
-    // One stamp for the whole flush: the files written for every table belong
-    // to the same logical generation. Retention and the disk cap evict by
-    // stamp, so per-table stamps could delete `batches` while leaving their
-    // `samples` (or vice versa), breaking referential integrity.
+    // One stamp for the whole pass: the files written for every table belong to
+    // the same logical generation. Retention and the disk cap evict by stamp,
+    // so per-table stamps could delete `batches` while leaving their `samples`
+    // (or vice versa), breaking referential integrity.
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    // The hour plan for dictionary-sharded tables has to be taken *before* the
+    // samples leave the hot tier, because that is the only place the mapping
+    // from a stack id to an hour exists.
+    let sample_hours: Vec<i64> = if TABLES.iter().any(|def| def.hour_from_samples) {
+        match hours {
+            Some(hours) => hours.to_vec(),
+            None => all_hours(conn, "samples")?,
+        }
+    } else {
+        Vec::new()
+    };
     for def in TABLES {
-        let hot = format!("{}_hot", def.name);
-        // Partition by the data's own timestamp, not the wall clock at flush
-        // time. Backfilled or delayed reports must land in the hour they
-        // describe, otherwise retention and the disk cap evict the wrong rows.
-        let mut hours: Vec<i64> = Vec::new();
-        if let Some(column) = def.hour_column {
+        if let Some(only) = only
+            && !only.contains(&def.name)
+        {
+            continue;
+        }
+        moved += flush_one(conn, state, def, hours, &sample_hours, stamp)?;
+    }
+    if moved > 0 {
+        reindex_local(state);
+    }
+    Ok(moved)
+}
+
+/// One table, one pass.
+///
+/// Partition by the data's own timestamp, not the wall clock at flush time:
+/// backfilled or delayed reports must land in the hour they describe, or
+/// retention and the disk cap evict the wrong rows.
+fn flush_one(
+    conn: &Connection,
+    state: &ParquetState,
+    def: &TableDef,
+    only: Option<&[i64]>,
+    sample_hours: &[i64],
+    stamp: u128,
+) -> Result<usize> {
+    let hot = format!("{}_hot", def.name);
+    // A dictionary-sharded table owns no time column: its files are named after
+    // the hour of the samples that reference the rows. A slice writes the same
+    // hours it writes samples for, and the rows stay hot until nothing hot
+    // references them any more.
+    if def.hour_from_samples {
+        return flush_by_sample_hours(conn, state, def, &hot, sample_hours, only, stamp);
+    }
+    let mut hours: Vec<i64> = Vec::new();
+    match (def.hour_column, only) {
+        (Some(column), Some(only)) => {
             // `//` — integer division. `/` in DuckDB is floating point, and
             // `CAST(double AS BIGINT)` rounds to nearest, so an event at 13:43
             // became hour 14 and every query whose window ended at "now" missed
             // it. Half of every hour's data was filed under the next hour.
+            let sql = format!(
+                "SELECT DISTINCT ({column} // 1_000_000_000 // 3600) FROM {hot} \
+                 WHERE ({column} // 1_000_000_000 // 3600) IN ({})",
+                hour_list(only)
+            );
+            collect_hours(conn, &sql, &hot, &mut hours)?;
+        }
+        (Some(column), None) => {
             let sql = format!("SELECT DISTINCT ({column} // 1_000_000_000 // 3600) FROM {hot}");
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| Error::Db(format!("listing {hot} hours: {e}")))?;
-            let rows = stmt
-                .query_map([], |row| row.get::<_, i64>(0))
-                .map_err(|e| Error::Db(format!("listing {hot} hours: {e}")))?;
-            for row in rows.flatten() {
-                hours.push(row);
-            }
-        } else {
+            collect_hours(conn, &sql, &hot, &mut hours)?;
+        }
+        (None, Some(_)) => {
+            // A dictionary cannot be sliced by hour. Refusing here is what keeps
+            // a truncated pass from deleting a frame that a Parquet sample still
+            // references.
+            return Ok(0);
+        }
+        (None, _) => {
             // Dictionaries have no time column, so they cannot be sharded by
             // data hour. They all go into `hour=0`: every scan mounts that
             // single directory, and compaction can merge its files. Sharding
@@ -864,65 +1161,167 @@ pub(crate) fn flush_hot(conn: &Connection, state: &ParquetState) -> Result<usize
             // dictionary scan grow without bound.
             hours.push(0);
         }
-        hours.sort_unstable();
-        for hour in hours {
-            let filter = def
-                .hour_column
-                .map(|column| format!("WHERE ({column} // 1_000_000_000 // 3600) = {hour}"))
-                .unwrap_or_default();
-            let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {hot} {filter}"), [], |r| {
-                    r.get(0)
-                })
-                .unwrap_or(0);
-            if count <= 0 {
-                continue;
-            }
-            // Shard on disk by the hour the rows describe, so a query can name
-            // only the hours it asks for. Dictionaries have no time column and
-            // land in hour 0.
-            let dir = state.table_dir(def.name).join(format!("hour={hour}"));
-            std::fs::create_dir_all(&dir).map_err(Error::Io)?;
-            let name = format!("part-{stamp}-{count}.parquet");
-            let file = dir.join(&name);
-            let tmp = dir.join(format!("{name}.tmp"));
-            let sql = format!(
-                "COPY (SELECT {cols} FROM {hot} {filter}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
-                tmp.to_string_lossy().replace('\\', "/"),
-                cols = def.columns,
-            );
-            conn.execute_batch(&sql)
-                .map_err(|e| Error::Db(format!("flushing {}: {e}", def.name)))?;
-            // Publish only a file we have read back. A partial COPY is then a
-            // harmless `.tmp` that startup recovery removes, never a VIEW entry.
-            let rows: i64 = conn
-                .query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM read_parquet('{}')",
-                        tmp.to_string_lossy().replace('\\', "/")
-                    ),
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            if rows != count {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(Error::Db(format!(
-                    "flushing {}: wrote {rows} rows, expected {count}",
-                    def.name
-                )));
-            }
-            std::fs::rename(&tmp, &file).map_err(Error::Io)?;
-            moved += count.max(0) as usize;
+    }
+    hours.sort_unstable();
+
+    let mut moved = 0usize;
+    for hour in &hours {
+        let hour = *hour;
+        let filter = def
+            .hour_column
+            .map(|column| format!("WHERE ({column} // 1_000_000_000 // 3600) = {hour}"))
+            .unwrap_or_default();
+        moved += write_hour_file(conn, state, def, &hot, hour, &filter, stamp)?;
+    }
+    if moved == 0 {
+        return Ok(0);
+    }
+    // Clear exactly what was written, after every hour's file is published.
+    let filter = match (def.hour_column, only) {
+        (Some(column), Some(_)) => format!(
+            "WHERE ({column} // 1_000_000_000 // 3600) IN ({})",
+            hour_list(&hours)
+        ),
+        _ => String::new(),
+    };
+    conn.execute_batch(&format!("DELETE FROM {hot} {filter}"))
+        .map_err(|e| Error::Db(format!("clearing hot {}: {e}", def.name)))?;
+    Ok(moved)
+}
+
+/// Write the rows matching `filter` into `hour=<hour>/` and return how many.
+///
+/// Sharding on disk by the hour the rows describe is what lets a query name
+/// only the hours it asks for.
+fn write_hour_file(
+    conn: &Connection,
+    state: &ParquetState,
+    def: &TableDef,
+    hot: &str,
+    hour: i64,
+    filter: &str,
+    stamp: u128,
+) -> Result<usize> {
+    let count: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {hot} {filter}"), [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    if count <= 0 {
+        return Ok(0);
+    }
+    let dir = state.table_dir(def.name).join(format!("hour={hour}"));
+    std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+    let name = format!("part-{stamp}-{count}.parquet");
+    let file = dir.join(&name);
+    let tmp = dir.join(format!("{name}.tmp"));
+    let sql = format!(
+        "COPY (SELECT {cols} FROM {hot} {filter}) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)",
+        tmp.to_string_lossy().replace('\\', "/"),
+        cols = def.columns,
+    );
+    conn.execute_batch(&sql)
+        .map_err(|e| Error::Db(format!("flushing {}: {e}", def.name)))?;
+    // Publish only a file we have read back. A partial COPY is then a harmless
+    // `.tmp` that startup recovery removes, never a VIEW entry.
+    let rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM read_parquet('{}')",
+                tmp.to_string_lossy().replace('\\', "/")
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if rows != count {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Db(format!(
+            "flushing {}: wrote {rows} rows, expected {count}",
+            def.name
+        )));
+    }
+    std::fs::rename(&tmp, &file).map_err(Error::Io)?;
+    Ok(count.max(0) as usize)
+}
+
+/// Write a dictionary's rows into the hours of the samples that name them.
+///
+/// Only the rows a given hour's samples reference go into that hour's file:
+/// writing the whole dictionary into every hour would multiply the archive by
+/// the number of archived hours. Rows are cleared from the hot tier only when
+/// the pass is draining everything (`only` is `None`), because a slice leaves
+/// later hours still needing to resolve the same ids.
+fn flush_by_sample_hours(
+    conn: &Connection,
+    state: &ParquetState,
+    def: &TableDef,
+    hot: &str,
+    sample_hours: &[i64],
+    only: Option<&[i64]>,
+    stamp: u128,
+) -> Result<usize> {
+    let draining = only.is_none();
+    if sample_hours.is_empty() {
+        // Nothing hot references these rows: either they were published by an
+        // earlier slice, or the store has no samples at all.
+        if draining && hot_rows(conn, def.name) > 0 {
+            conn.execute_batch(&format!("DELETE FROM {hot}"))
+                .map_err(|e| Error::Db(format!("clearing hot {}: {e}", def.name)))?;
         }
-        // Clear once per table, after every hour's file is safely published.
+        return Ok(0);
+    }
+    let mut moved = 0usize;
+    for hour in sample_hours {
+        // Stack ids are allocated per batch rather than deduplicated across
+        // batches, so a stack row is only ever named by samples from the same
+        // flush generation. That is what makes this filter exact.
+        let filter = format!(
+            "WHERE stack_id IN (SELECT DISTINCT stack_id FROM samples_hot \
+             WHERE (start_ns // 1_000_000_000 // 3600) = {hour})"
+        );
+        moved += write_hour_file(conn, state, def, hot, *hour, &filter, stamp)?;
+    }
+    if draining && hot_rows(conn, def.name) > 0 {
         conn.execute_batch(&format!("DELETE FROM {hot}"))
             .map_err(|e| Error::Db(format!("clearing hot {}: {e}", def.name)))?;
     }
-    if moved > 0 {
-        reindex_local(state);
-    }
     Ok(moved)
+}
+
+/// Every hour present in a table's hot tier.
+fn all_hours(conn: &Connection, table: &str) -> Result<Vec<i64>> {
+    let column = TABLES
+        .iter()
+        .find(|def| def.name == table)
+        .and_then(|def| def.hour_column)
+        .ok_or_else(|| Error::InvalidArgument(format!("{table} has no hour column")))?;
+    let mut hours = Vec::new();
+    let sql = format!("SELECT DISTINCT ({column} // 1_000_000_000 // 3600) FROM {table}_hot");
+    collect_hours(conn, &sql, &format!("{table}_hot"), &mut hours)?;
+    hours.sort_unstable();
+    Ok(hours)
+}
+
+fn hour_list(hours: &[i64]) -> String {
+    hours
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn collect_hours(conn: &Connection, sql: &str, hot: &str, out: &mut Vec<i64>) -> Result<()> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| Error::Db(format!("listing {hot} hours: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| Error::Db(format!("listing {hot} hours: {e}")))?;
+    for row in rows.flatten() {
+        out.push(row);
+    }
+    Ok(())
 }
 
 /// Result of one archival pass, useful for logging/metrics.
@@ -1638,6 +2037,128 @@ mod tests {
             flame_total(&store),
             42,
             "flushed rows readable zero-copy from parquet"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A flush must be able to move part of the hot tier.
+    ///
+    /// The old flush was all-or-nothing, which is why a background pass could
+    /// never afford to start on a tenant under steady ingest: it needed the
+    /// writer for the entire backlog. A slice has to move the oldest hour and
+    /// leave everything else readable, or the fix does not buy anything.
+    #[test]
+    fn a_flush_slice_moves_only_the_oldest_hour() {
+        let (store, dir) = parquet_store("slice", u64::MAX);
+        const HOUR: u64 = 3_600_000_000_000;
+        let base = 5_000 * HOUR; // an hour boundary, so the shard names are exact
+        let rows = [
+            (base, 1u64),
+            (base + 1, 1),
+            (base + HOUR, 1),
+            (base + 2 * HOUR, 1),
+        ];
+        for (start, value) in rows {
+            store.append(&report("checkout", start, value)).unwrap();
+        }
+        assert_eq!(store.stats().batch_count, 4);
+
+        let moved = store.flush_slice(2).unwrap();
+        // `moved` counts rows across tables: two batches, their two samples and
+        // the two stack rows that now travel with them. The hour directories
+        // below are what prove the slice boundary.
+        assert_eq!(moved, 6, "the two rows of the oldest hour, and only those");
+
+        let stacks = dir.join("parquet").join("stacks");
+        assert!(
+            stacks
+                .join(format!("hour={}", base / HOUR))
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_some(),
+            "the stack rows follow the hour of the samples that name them"
+        );
+
+        let batches = dir.join("parquet").join("batches");
+        let oldest = batches.join(format!("hour={}", base / HOUR));
+        assert!(
+            oldest.read_dir().unwrap().next().is_some(),
+            "the oldest hour became a file"
+        );
+        assert!(
+            !batches.join(format!("hour={}", base / HOUR + 1)).exists(),
+            "a newer hour must still be hot: one slice is not a full flush"
+        );
+        assert_eq!(
+            store.stats().batch_count,
+            4,
+            "moving rows between tiers does not change the count"
+        );
+
+        // The canonical span has to union the file and the remaining hot rows,
+        // otherwise slicing would hide data instead of relocating it.
+        let q = crate::QueryOptions::new(
+            ProfileType::cpu(),
+            base,
+            base + 3 * HOUR,
+            Selector::default(),
+        );
+        assert_eq!(crate::flamegraph(&store, &q).unwrap().total as u64, 4);
+
+        // The flushed hour on its own must resolve its symbols through the
+        // hour's dictionary file: a sharded stack that a query cannot find is
+        // the same as a missing symbol on the flamegraph.
+        let q =
+            crate::QueryOptions::new(ProfileType::cpu(), base, base + HOUR, Selector::default());
+        let flushed = crate::flamegraph(&store, &q).unwrap();
+        assert_eq!(flushed.total as u64, 2);
+        assert!(
+            flushed.names.iter().any(|name| name == "main"),
+            "the frame dictionary resolved from the hour the samples belong to"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Upgrading must not lose symbols.
+    ///
+    /// Before dictionaries were sharded by sample hour, every `stacks` file was
+    /// written into `hour=0` regardless of the data it described. Those files
+    /// are still referenced by samples from any hour, so a window that predates
+    /// the first sharded file has to mount them — a query that cannot find a
+    /// stack renders a flamegraph full of address placeholders.
+    #[test]
+    fn an_unsharded_stack_file_stays_visible_after_the_switch() {
+        let (store, dir) = parquet_store("stack-legacy", u64::MAX);
+        const HOUR: u64 = 3_600_000_000_000;
+        let base = 6_000 * HOUR;
+        store.append(&report("checkout", base, 3)).unwrap();
+        store.append(&report("checkout", base + HOUR, 5)).unwrap();
+        assert!(store.flush_slice(1).unwrap() > 0);
+
+        // Rewrite the first hour's dictionary as the old release would have:
+        // one file, in `hour=0`, for samples that live in `hour=6000`.
+        let stacks = dir.join("parquet").join("stacks");
+        let shard = stacks.join(format!("hour={}", base / HOUR));
+        let mut moved = 0;
+        for entry in std::fs::read_dir(&shard).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            std::fs::rename(entry.path(), stacks.join(format!("hour=0-{name}"))).unwrap();
+            moved += 1;
+        }
+        assert!(moved > 0, "the hour had a dictionary file to move");
+        std::fs::remove_dir_all(&shard).unwrap();
+        store.reindex();
+
+        let q =
+            crate::QueryOptions::new(ProfileType::cpu(), base, base + HOUR, Selector::default());
+        let fg = crate::flamegraph(&store, &q).unwrap();
+        assert_eq!(fg.total as u64, 3);
+        assert!(
+            fg.names.iter().any(|name| name == "main"),
+            "the unsharded dictionary file is still mounted for old windows"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
