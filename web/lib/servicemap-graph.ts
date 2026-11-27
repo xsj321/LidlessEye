@@ -537,16 +537,15 @@ export function edgePath(a: Box, b: Box, bow?: EdgeBow): EdgePath {
 export function mergeParallelEdges(edges: ServiceMapEdge[]): ServiceMapEdge[] {
   const groups = new Map<string, ServiceMapEdge>();
   for (const edge of edges) {
-    const key = `${edge.client}\u0000${edge.server}`;
+    // One stroke per container pair, not per workload pair: a pod with nine
+    // containers has nine conversations and the map has to show which one is
+    // talking. The container names were blanked here because the drawing then
+    // anchored every edge to the card; the anchors now follow the container
+    // rows, so keeping them is what makes the edges land where they belong.
+    const key = `${edge.client}\u0000${edge.client_container}\u0000${edge.server}\u0000${edge.server_container}`;
     const current = groups.get(key);
     if (!current) {
-      groups.set(key, {
-        ...edge,
-        client_container: "",
-        server_container: "",
-        client_pod: "",
-        server_pod: "",
-      });
+      groups.set(key, { ...edge });
       continue;
     }
     const before = current.connections;

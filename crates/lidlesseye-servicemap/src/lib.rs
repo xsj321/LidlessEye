@@ -664,6 +664,31 @@ pub fn servicemap<S: ServiceMapStore>(
     let mut truncated = nodes.len() > MAX_NODES;
     let mut edges = store.net_edges(from_ns, until_ns)?;
 
+    // An agent only names the container on its own side: the one that opened
+    // the socket. The container that accepted it lives in the other pod, so it
+    // is that pod's agent, writing the reverse direction, that names it. The
+    // two directed edges are therefore complementary, and a missing
+    // `server_container` can be filled from the peer's `client_container`
+    // without inventing anything: same address pair, opposite direction.
+    {
+        let mut declared: HashMap<(String, String), String> = HashMap::new();
+        for edge in &edges {
+            if !edge.client_container.is_empty() {
+                declared.insert(
+                    (edge.client.clone(), edge.server.clone()),
+                    edge.client_container.clone(),
+                );
+            }
+        }
+        for edge in edges.iter_mut() {
+            if edge.server_container.is_empty() {
+                if let Some(container) = declared.get(&(edge.server.clone(), edge.client.clone())) {
+                    edge.server_container = container.clone();
+                }
+            }
+        }
+    }
+
     // External traffic is split by the destination the client asked for.
     //
     // One grey "external" blob answers nothing: a page that calls three APIs

@@ -61,9 +61,15 @@ function hashString(text: string): number {
 }
 
 function frameColor(name: string, depth: number): string {
-  const hue = HUES[hashString(name) % HUES.length] + (depth % 3) * 1.5;
-  const light = 34 + ((hashString(name) >> 8) % 14);
-  return `hsl(${hue} 58% ${light}%)`;
+  const hash = hashString(name);
+  // Cool hues have to stay cool — a warm frame would read as a diff finding —
+  // but 34–48 % lightness on a near-black canvas left the fills as smudges
+  // barely separated from the grooves between rows. 48–58 % keeps the labels
+  // legible while giving each frame an edge; the hue still derives from the
+  // name, so the same function keeps the same colour across views.
+  const hue = HUES[hash % HUES.length] + (depth % 3) * 1.5;
+  const light = 48 + ((hash >> 8) % 11);
+  return `hsl(${hue} 62% ${light}%)`;
 }
 
 export interface Crumb {

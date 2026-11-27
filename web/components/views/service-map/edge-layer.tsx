@@ -276,8 +276,21 @@ export function EdgeLayer({
   const onCanvas = (box: { x: number; y: number }) =>
     box.x >= 0 && box.y >= 0 && box.x <= width && box.y <= height;
   const drawn = edges.flatMap((edge) => {
-    const from = boxes.get(edge.client);
-    const to = boxes.get(edge.server);
+    // A conversation belongs to two containers, so it leaves and lands on the
+    // rows that name them; the card anchors are the fallback for edges whose
+    // containers the graph does not have a row for (a peer outside the
+    // neighbourhood, or a container the agent could not name).
+    // Row anchors are `${owner}/${container}@out|@in` (see `rowId` in
+    // neighborhood.tsx). A peer outside the neighbourhood, or a container the
+    // agent could not name, has no row, so the card anchor stays the fallback.
+    const from =
+      (edge.client_container
+        ? boxes.get(`${edge.client}/${edge.client_container}@out`)
+        : undefined) ?? boxes.get(edge.client);
+    const to =
+      (edge.server_container
+        ? boxes.get(`${edge.server}/${edge.server_container}@in`)
+        : undefined) ?? boxes.get(edge.server);
     if (!from || !to) return [];
     if (!onCanvas(from) || !onCanvas(to)) return [];
     const path = edgePath(from, to, bow?.(edge));

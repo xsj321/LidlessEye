@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [0.3.0] - 2026-11-27
+
+### Added
+
+- **The receiving container is resolved from the reverse edge.** An agent can
+  only name the container that opened a socket, so `server_container` arrived
+  empty and curves ended at the peer's card. Each pod's agent also reports the
+  opposite direction, whose `client_container` is exactly the container that
+  accepted the connection here, so the service map now fills the missing side
+  from it. Measured on the local cluster: 55 edges, 17 with a named sender and
+  30 with a named receiver, up from 0 before this change.
+
+## [0.2.9] - 2026-11-27
+
+### Changed
+
+- **The neighbourhood graph draws container-to-container edges.** Edges were
+  merged by node pair and their `client_container`/`server_container` fields
+  were blanked, so every curve anchored to the card and a pod with nine
+  containers looked like a single conversation. They are merged per container
+  pair now, and the drawing prefers the row anchors (`<workload>/<pod>/<container>@out|@in`)
+  that `neighborhood.tsx` has always created, falling back to the card anchor
+  when a container cannot be named.
+
+### Note
+
+- The receiving side often has no `server_container`: an agent can only name the
+  container that opened the socket, not the one that accepted it. Those edges
+  leave the client row and land on the peer's card, which is why a few curves
+  end at a header rather than at a row. Resolving the peer would need a reverse
+  lookup by address:port on the server, which changes the aggregation semantics
+  and is not part of this release.
+
 ## [0.2.7] - 2026-11-27
 
 ### Added
