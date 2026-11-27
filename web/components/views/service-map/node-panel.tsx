@@ -19,10 +19,19 @@ import { Crosshair, GripVertical, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useT } from "@/lib/i18n";
+import { api } from "@/lib/api";
 import { KIND, healthTone, nodeLabel } from "@/lib/servicemap-graph";
 import type { ServiceMapEdge, ServiceMapNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -115,6 +124,59 @@ export function NodePanel({
   const current = node ?? shown;
   const open = Boolean(node);
   const data = useNodeData(current, range);
+  // Memory profiling is not something to switch on for the cluster, so the
+  // answer is per workload and the switch for the node that is open is drawn
+  // from the same list every agent polls.
+  const [directives, setDirectives] = useState<string[]>([]);
+  // Two switches on the same workload: reading a JVM asks it for a dump, while
+  // the native one injects a shared library into the process. Different risk,
+  // so they are drawn and confirmed separately.
+  const [allocDirectives, setAllocDirectives] = useState<string[]>([]);
+  // The native reader is only offered when the server says it can deliver
+  // samples; the switch would otherwise promise data that never arrives.
+  const [nativeSupported, setNativeSupported] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [confirmingNative, setConfirmingNative] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const workload = current?.id ?? "";
+  const memoryOn = workload !== "" && directives.includes(workload);
+  const nativeOn = workload !== "" && allocDirectives.includes(workload);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .profilingDirectives()
+      .then((reply) => {
+        if (cancelled) return;
+        setDirectives(reply.workloads ?? []);
+        setAllocDirectives(reply.alloc_workloads ?? []);
+        setNativeSupported(reply.native_memory?.supported === true);
+      })
+      .catch(() => {
+        /* the switch stays off; the panel is still usable */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workload]);
+  const applyDirective = useCallback(
+    async (enabled: boolean, kind: "jvm" | "alloc" = "jvm") => {
+      if (!workload) return;
+      setSaving(true);
+      try {
+        const reply = await api.setProfilingDirective(workload, enabled, kind);
+        setDirectives(reply.workloads ?? []);
+        setAllocDirectives(reply.alloc_workloads ?? []);
+        setNativeSupported(reply.native_memory?.supported === true);
+      } catch {
+        /* the list is re-read on the next open; nothing to undo locally */
+      } finally {
+        setSaving(false);
+        setConfirming(false);
+        setConfirmingNative(false);
+      }
+    },
+    [workload],
+  );
   const panel = useRef<HTMLElement | null>(null);
   const returnTo = useRef<HTMLElement | null>(null);
 
@@ -281,8 +343,19 @@ export function NodePanel({
     ? edges.filter((edge) => edge.client === current.id)
     : [];
 
+  // Pods and containers arrive with the map node itself; `data` carries the
+  // same lists for the history response, so prefer the map's own copy and fall
+  // back to the history's when the map had no names to send.
+  const detailed: ServiceMapNode | null = current
+    ? (current.instances?.length ?? 0) > 0 || (current.containers?.length ?? 0) > 0
+      ? current
+      : data.instances.length > 0 || data.containers.length > 0
+        ? { ...current, instances: data.instances, containers: data.containers }
+        : current
+    : null;
+
   const tabProps: TabProps | null = current
-    ? { node: current, data, inbound, outbound, windowSec, nodes, onSelect }
+    ? { node: detailed ?? current, data, inbound, outbound, windowSec, nodes, onSelect }
     : null;
 
   const palette = current ? (KIND[current.kind ?? "workload"] ?? KIND.workload) : KIND.workload;
@@ -387,6 +460,56 @@ export function NodePanel({
             {/* Focus lives here rather than on the map: selecting a node is
                 what opens this drawer, and the drawer covers the corner of the
                 map where a floating control would sit. */}
+            {/* Memory profiling is a per-workload decision with a cost the
+                operator should see before it is switched on, so the switch
+                asks first and says what it does. */}
+            <Button
+              variant={memoryOn ? "secondary" : "ghost"}
+              size="xs"
+              data-testid="map-memory"
+              aria-pressed={memoryOn}
+              aria-label={t("JVM memory profiling")}
+              title={t("Read this workload's JVM heap through the JVM's own recorder")}
+              disabled={saving}
+              onClick={() => {
+                if (memoryOn) {
+                  void applyDirective(false);
+                } else {
+                  setConfirming(true);
+                }
+              }}
+              className="shrink-0 gap-1"
+            >
+              <span className="hidden sm:inline">{memoryOn ? t("Memory: on") : t("Memory")}</span>
+            </Button>
+            {/* The native switch injects a shared library into the target's
+                process, so it is a second, separately confirmed control. It is
+                only drawn when the server reports that the reader delivers
+                samples — a switch that silently collects nothing is worse than
+                no switch. */}
+            {nativeSupported && (
+              <Button
+                variant={nativeOn ? "secondary" : "ghost"}
+                size="xs"
+                data-testid="map-native-memory"
+                aria-pressed={nativeOn}
+                aria-label={t("Native memory profiling")}
+                title={t("Hook malloc inside this workload's processes with the userspace eBPF runtime")}
+                disabled={saving}
+                onClick={() => {
+                  if (nativeOn) {
+                    void applyDirective(false, "alloc");
+                  } else {
+                    setConfirmingNative(true);
+                  }
+                }}
+                className="shrink-0 gap-1"
+              >
+                <span className="hidden sm:inline">
+                  {nativeOn ? t("Native: on") : t("Native")}
+                </span>
+              </Button>
+            )}
             <Button
               variant={focus ? "secondary" : "ghost"}
               size="xs"
@@ -416,7 +539,7 @@ export function NodePanel({
               inside a box rather than as two regions. */}
           <div className="px-3 py-2">
             <Neighborhood
-              node={current}
+              node={detailed ?? current}
               nodes={nodes}
               edges={edges}
               windowSec={windowSec}
@@ -474,6 +597,83 @@ export function NodePanel({
           <footer className="px-3 py-1.5 text-[9.5px] text-muted-foreground/70">
             {t("Window from the toolbar · the same one the flamegraph uses")}
           </footer>
+          <Dialog open={confirming} onOpenChange={setConfirming}>
+            <DialogContent className="max-w-md" data-testid="map-memory-confirm">
+              <DialogHeader>
+                <DialogTitle>{t("Read this workload's JVM heap?")}</DialogTitle>
+                <DialogDescription>
+                  {t("Profiling a JVM asks it for a flight recording, so it is switched on per workload and only for Java processes.")}
+                </DialogDescription>
+              </DialogHeader>
+              <ul className="list-disc space-y-1.5 pl-4 text-xs text-muted-foreground">
+                <li>
+                  {t("The image must be a JDK: the reader calls jcmd and jfr, and skips a JRE silently.")}
+                </li>
+                <li>
+                  {t("Once per collection interval the JVM pauses briefly to dump and read a recording; expect a few megabytes of churn.")}
+                </li>
+                <li>
+                  {t("Allocation bytes come from the JVM's own sampling, so compare stacks rather than trusting absolute totals.")}
+                </li>
+                <li>{t("Other runtimes need their own reader; this switch only reaches Java.")}</li>
+              </ul>
+              <DialogFooter>
+                <Button variant="ghost" size="sm" onClick={() => setConfirming(false)}>
+                  {t("Cancel")}
+                </Button>
+                <Button
+                  size="sm"
+                  data-testid="map-memory-enable"
+                  disabled={saving}
+                  onClick={() => void applyDirective(true)}
+                >
+                  {saving ? t("Switching on…") : t("Switch on")}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          {/* The native switch is the one that touches the target: it injects a
+              shared library into every matching process, so it says so. */}
+          <Dialog open={confirmingNative} onOpenChange={setConfirmingNative}>
+            <DialogContent className="max-w-md" data-testid="map-native-confirm">
+              <DialogHeader>
+                <DialogTitle>{t("Inject the native memory reader?")}</DialogTitle>
+                <DialogDescription>
+                  {t("This adds a helper container to the pod and loads a shared library into every matching process to hook malloc. The bytes are real allocations, but the hook lives in the target from now on.")}
+                </DialogDescription>
+              </DialogHeader>
+              <ul className="list-disc space-y-1.5 pl-4 text-xs text-muted-foreground">
+                <li>
+                  {t("A helper (ephemeral) container is added to the pod; the library is injected into its processes, which are not restarted. Ephemeral containers cannot be removed — delete the pod to undo.")}
+                </li>
+                <li>
+                  {t("The target must link libc dynamically, run glibc 2.38 or newer (Ubuntu 24.04+, Debian trixie+), and ship libelf.so.1. Static and musl binaries are skipped with a warning.")}
+                </li>
+                <li>
+                  {t("The agent needs permission to patch pods/ephemeralcontainers in this namespace.")}
+                </li>
+                <li>
+                  {t("An injected hook can crash a process that is already fragile. Switch it on for one workload while you are watching it, not everywhere.")}
+                </li>
+                <li>
+                  {t("Only alloc_space is measured: free is not hooked, so there is no live-heap number, and the totals are relative between stacks. Frames inside the C library resolve to its nearest exported symbol unless the image ships debug symbols.")}
+                </li>
+              </ul>
+              <DialogFooter>
+                <Button variant="ghost" size="sm" onClick={() => setConfirmingNative(false)}>
+                  {t("Cancel")}
+                </Button>
+                <Button
+                  size="sm"
+                  data-testid="map-native-enable"
+                  disabled={saving}
+                  onClick={() => void applyDirective(true, "alloc")}
+                >
+                  {saving ? t("Injecting…") : t("Inject and switch on")}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </>
       ) : null}
     </aside>

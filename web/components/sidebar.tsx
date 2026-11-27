@@ -19,6 +19,7 @@ import {
   GitCompare,
   LayoutDashboard,
   ListOrdered,
+  MemoryStick,
   Network,
   PanelLeftClose,
   PanelLeftOpen,
@@ -49,6 +50,7 @@ export const NAV: ReadonlyArray<NavItem> = [
   { value: "compare", label: "Compare", icon: GitCompare },
   { value: "top", label: "Top functions", icon: ListOrdered },
   { value: "timeseries", label: "Time series", icon: Activity },
+  { value: "memory", label: "Memory", icon: MemoryStick },
   { value: "labels", label: "Labels", icon: Tags },
 ];
 

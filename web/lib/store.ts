@@ -62,6 +62,23 @@ export interface OverviewData {
   series: SeriesRow[];
 }
 
+/**
+ * How the allocator filter reads a stack.
+ *
+ * `inclusive` counts a sample when any frame on its path is inside the
+ * allocator (what the allocation path costs the caller); `self` counts a sample
+ * only when the leaf frame is (what the allocator itself spends).
+ */
+export type AllocatorMode = "inclusive" | "self";
+
+/**
+ * Allocator families the server can recognise.
+ *
+ * A value of "any" matches every family it knows, which is what "some allocator
+ * is on this path" means before you care which one.
+ */
+export const ALLOCATORS = ["any", "glibc", "jemalloc", "tcmalloc", "mimalloc"] as const;
+
 export interface DashboardState {
   view: View;
   type: string;
@@ -75,6 +92,16 @@ export interface DashboardState {
   baseUntilNs: number;
   filters: LabelFilter[];
   groupBy: string;
+  /**
+   * Allocator view of the CPU profile: empty means "off".
+   *
+   * It is a query-side filter over the frames that are already stored, so it
+   * needs no extra collection and applies retroactively to old windows.
+   */
+  allocator: string;
+  allocatorMode: AllocatorMode;
+  /** Unfiltered total for the same window, so the share can be stated. */
+  allocatorTotal: number | null;
   tenant: string;
   auto: boolean;
   unit: string;
@@ -130,6 +157,9 @@ function initialState(): DashboardState {
     baseUntilNs: 0,
     filters: [],
     groupBy: "",
+    allocator: "",
+    allocatorMode: "inclusive",
+    allocatorTotal: null,
     // Never empty: the header renders this as the current tenant, and a blank
     // one is what "there is nothing here, not even a default" looks like while
     // the tenant list is still loading (or when it cannot be read at all).
@@ -431,6 +461,23 @@ export class DashboardStore {
   }
 
   /**
+   * Switch the CPU profile to the allocator view.
+   *
+   * This only changes query parameters: the allocator frames are already in the
+   * stored stacks, so the filter costs nothing to collect and works on every
+   * window that was ever recorded.
+   */
+  setAllocator(allocator: string, mode?: AllocatorMode) {
+    this.commit({ allocator, ...(mode ? { allocatorMode: mode } : {}) });
+    void this.reload();
+  }
+
+  setAllocatorMode(allocatorMode: AllocatorMode) {
+    this.commit({ allocatorMode });
+    void this.reload();
+  }
+
+  /**
    * Switch what the map's time brush plots.
    *
    * Only the brush changes, not the map: the three counters describe the same
@@ -713,6 +760,13 @@ export class DashboardStore {
     if (this.state.groupBy && this.state.view !== "compare") {
       params.group_by = this.state.groupBy;
     }
+    // Off means "absent", not `allocator=none`: the server treats a missing
+    // parameter as the unfiltered profile, and inventing a value for "off"
+    // would make the two sides disagree about what the default is.
+    if (this.state.allocator) {
+      params.allocator = this.state.allocator;
+      params.mode = this.state.allocatorMode;
+    }
     return params;
   }
 
@@ -757,16 +811,25 @@ export class DashboardStore {
       }
 
       if (view === "flamegraph") {
-        const result = await api.flamegraph({
-          ...params,
-          max_nodes: settingsStore.getSnapshot().flamegraphMaxNodes,
-        }, signal);
+        const maxNodes = settingsStore.getSnapshot().flamegraphMaxNodes;
+        const result = await api.flamegraph({ ...params, max_nodes: maxNodes }, signal);
         if (id !== this.requestId) return;
+        // With the allocator filter on, the share ("0.8 % of CPU") is the part
+        // that decides whether a Hook is worth its budget, so the unfiltered
+        // total for the same window is fetched too. One extra query, only when
+        // the filter is on, and only the total is kept.
+        let allocatorTotal: number | null = null;
+        if (this.state.allocator) {
+          const { allocator: _allocator, mode: _mode, ...plain } = params;
+          const all = await api.flamegraph({ ...plain, max_nodes: 16 }, signal);
+          if (id !== this.requestId) return;
+          allocatorTotal = all.total ?? null;
+        }
         if (!result.total) {
-          this.commit({ flamegraph: null, empty: this.emptyFlamegraph() });
+          this.commit({ flamegraph: null, empty: this.emptyFlamegraph(), allocatorTotal });
           return;
         }
-        this.commit({ flamegraph: result });
+        this.commit({ flamegraph: result, allocatorTotal });
         return;
       }
 

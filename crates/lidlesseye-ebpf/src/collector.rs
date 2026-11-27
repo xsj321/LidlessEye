@@ -33,7 +33,9 @@ use tracing::{debug, info, warn};
 
 use crate::UnknownReasons;
 use crate::allocator::Allocator;
+use crate::bpftime::Bpftime;
 use crate::goheap::GoHeap;
+use crate::jvmheap::JvmHeap;
 use crate::procfs;
 use crate::symbolizer::FrameResolver;
 
@@ -80,6 +82,40 @@ pub struct CollectorConfig {
     /// i.e. `CAP_SYS_PTRACE`. Processes that cannot be read are counted, not
     /// guessed at.
     pub collect_heap: bool,
+    /// Collect JVM heap profiles by reading the recorder the JVM already runs.
+    ///
+    /// A third kind of reader, and the same bargain as the Go one: a recording is
+    /// started on the running JVM through the attach mechanism, dumped to a
+    /// temporary file, read back with `jfr`, and stopped again. Nothing is
+    /// injected and no application code changes, but it needs `jcmd` and `jfr`
+    /// (a JDK, not a JRE) and permission to attach. Reports carry
+    /// `profile_source=jvm-jfr` and `runtime=java`.
+    pub collect_jvm: bool,
+    /// Workloads (`namespace/workload`) the server has switched JVM profiling
+    /// on for.
+    ///
+    /// Reading a JVM is not free: every interval starts a recording, dumps it,
+    /// and reads the dump back, which costs the target a pause and the agent a
+    /// few megabytes. That is why it is not on for every Java process on the
+    /// node. The server keeps the list, the API edits it, and this node polls
+    /// it; a workload that is not in here is not attached to at all.
+    pub jvm_workloads: Arc<parking_lot::RwLock<HashMap<String, bool>>>,
+    /// Workloads (`namespace/workload`) the server has switched *native* memory
+    /// profiling on for, by injecting the bpftime agent into their processes.
+    ///
+    /// Separate from [`Self::jvm_workloads`] because the cost and the risk are
+    /// different: reading a JVM asks it for a dump, while this one replaces the
+    /// allocator's entry point inside a running process. Nothing is injected
+    /// until a workload appears here.
+    pub alloc_workloads: Arc<parking_lot::RwLock<HashMap<String, bool>>>,
+    /// Collect native memory profiles through bpftime instead of kernel uprobes.
+    ///
+    /// The kernel uprobe variant ([`Self::collect_alloc`]) measured 79 µs of
+    /// system time per 64-byte allocation on this cluster; the userspace runtime
+    /// brings that down to hundreds of nanoseconds by running the hook inside
+    /// the process. It costs a shared library injected into the target, so it is
+    /// gated on a per-workload switch like the JVM reader.
+    pub collect_bpftime: bool,
     /// Also store object counts (`alloc_objects`, `inuse_objects`), not only
     /// bytes. Two extra reports per process per interval is real storage, and
     /// the bytes are what a heap question is usually about.
@@ -125,6 +161,13 @@ impl Default for CollectorConfig {
             collect_cpu: true,
             collect_off_cpu: true,
             collect_heap: true,
+            collect_jvm: true,
+            // Empty means nothing is switched on, which is the safe default: a
+            // JVM is not read until someone asks for it on the service map.
+            jvm_workloads: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            // Same rule for native memory: no workload, no injection.
+            alloc_workloads: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            collect_bpftime: true,
             heap_objects: false,
             collect_alloc: true,
             exclude_pids: Vec::new(),
@@ -151,10 +194,15 @@ impl CollectorConfig {
         if self.flush_interval > Duration::from_secs(3600) {
             return Err("flush_interval must be at most 1h".to_string());
         }
-        if !self.collect_cpu && !self.collect_off_cpu && !self.collect_heap && !self.collect_alloc {
+        if !self.collect_cpu
+            && !self.collect_off_cpu
+            && !self.collect_heap
+            && !self.collect_jvm
+            && !self.collect_alloc
+        {
             return Err(
-                "at least one of collect_cpu / collect_off_cpu / collect_heap / collect_alloc \
-                 must be enabled"
+                "at least one of collect_cpu / collect_off_cpu / collect_heap / collect_jvm / \
+                 collect_alloc must be enabled"
                     .to_string(),
             );
         }
@@ -207,6 +255,15 @@ pub struct CollectorStats {
     pub heap_disabled: AtomicU64,
     /// Buckets that failed validation, cumulative.
     pub heap_invalid: AtomicU64,
+    /// Allocation stacks read out of JVMs through Java Flight Recorder,
+    /// cumulative.
+    pub jvm_samples: AtomicU64,
+    /// JVMs that produced a profile on the last scan.
+    pub jvm_processes: AtomicU64,
+    /// JVMs that could not be attached to, cumulative. A JRE-only image, a
+    /// disabled attach mechanism and a recording another tool already owns all
+    /// land here.
+    pub jvm_attach_failed: AtomicU64,
     /// Allocator samples drained, cumulative.
     pub alloc_samples: AtomicU64,
     /// Reports emitted for them, cumulative.
@@ -215,6 +272,10 @@ pub struct CollectorStats {
     pub alloc_probes: AtomicU64,
     /// Bytes whose stack could not be captured or was evicted, cumulative.
     pub alloc_lost: AtomicU64,
+    /// Allocation stacks drained from the userspace runtime, cumulative.
+    pub bpftime_samples: AtomicU64,
+    /// Processes the bpftime agent could not be injected into, cumulative.
+    pub bpftime_attach_failed: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -260,10 +321,15 @@ pub struct StatsSnapshot {
     pub heap_unreadable: u64,
     pub heap_disabled: u64,
     pub heap_invalid: u64,
+    pub jvm_samples: u64,
+    pub jvm_processes: u64,
+    pub jvm_attach_failed: u64,
     pub alloc_samples: u64,
     pub alloc_reports: u64,
     pub alloc_probes: u64,
     pub alloc_lost: u64,
+    pub bpftime_samples: u64,
+    pub bpftime_attach_failed: u64,
 }
 
 /// Handle to a running collector. Dropping it stops the collector.
@@ -307,10 +373,15 @@ impl CollectorHandle {
             heap_unreadable: self.stats.heap_unreadable.load(Ordering::Relaxed),
             heap_disabled: self.stats.heap_disabled.load(Ordering::Relaxed),
             heap_invalid: self.stats.heap_invalid.load(Ordering::Relaxed),
+            jvm_samples: self.stats.jvm_samples.load(Ordering::Relaxed),
+            jvm_processes: self.stats.jvm_processes.load(Ordering::Relaxed),
+            jvm_attach_failed: self.stats.jvm_attach_failed.load(Ordering::Relaxed),
             alloc_samples: self.stats.alloc_samples.load(Ordering::Relaxed),
             alloc_reports: self.stats.alloc_reports.load(Ordering::Relaxed),
             alloc_probes: self.stats.alloc_probes.load(Ordering::Relaxed),
             alloc_lost: self.stats.alloc_lost.load(Ordering::Relaxed),
+            bpftime_samples: self.stats.bpftime_samples.load(Ordering::Relaxed),
+            bpftime_attach_failed: self.stats.bpftime_attach_failed.load(Ordering::Relaxed),
         }
     }
 
@@ -491,7 +562,12 @@ where
     // The perf-event and kprobe programs are the sampled half; the two memory
     // readers do not need them, and running memory-only is a supported setup
     // (it is how a memory question is asked without the sampler's overhead).
-    if cpu_events == 0 && !offcpu_attached && !config.collect_heap && !config.collect_alloc {
+    if cpu_events == 0
+        && !offcpu_attached
+        && !config.collect_heap
+        && !config.collect_jvm
+        && !config.collect_alloc
+    {
         return Err("no eBPF program could be attached".to_string());
     }
 
@@ -499,9 +575,14 @@ where
     // Heap state lives across flushes: the deltas are differences of cumulative
     // bucket counters, so the previous scan is part of the next one's answer.
     let mut heap = GoHeap::new();
+    // The JVM reader keeps the same kind of state: which processes already have
+    // a recording, so a scan dumps and restarts instead of accumulating.
+    let mut jvm = JvmHeap::new();
     // Allocator probes are process-wide and long-lived; the state they need
     // (which files are instrumented, what each pid is) outlives a flush.
     let mut alloc = Allocator::new();
+    // The bpftime reader keeps the loader process and the injected pids.
+    let mut bpftime = Bpftime::new();
     let mut last_flush = now_ns();
     let mut ticker = Instant::now();
 
@@ -524,7 +605,9 @@ where
             &mut ebpf,
             &mut resolver,
             &mut heap,
+            &mut jvm,
             &mut alloc,
+            &mut bpftime,
             &config,
             last_flush,
             now,
@@ -593,7 +676,9 @@ fn flush<F>(
     ebpf: &mut Ebpf,
     resolver: &mut FrameResolver,
     heap: &mut GoHeap,
+    jvm: &mut crate::jvmheap::JvmHeap,
     alloc: &mut Allocator,
+    bpftime: &mut Bpftime,
     config: &CollectorConfig,
     start_ns: u64,
     end_ns: u64,
@@ -630,6 +715,7 @@ where
     if cpu_records.is_empty()
         && offcpu_records.is_empty()
         && !config.collect_heap
+        && !config.collect_jvm
         && !config.collect_alloc
     {
         return Ok(());
@@ -810,6 +896,11 @@ where
                         // and the UI must not add them together.
                         .label("profile_source", "go-runtime")
                         .label("sampling", "runtime")
+                        // The runtime reports what the process has allocated since
+                        // it started, not what happened inside this window. Without
+                        // this the same profile type would be summed as if it were
+                        // a delta and a long-lived process would report terabytes.
+                        .label("temporality", "cumulative")
                         // The same label the allocator path writes, so a
                         // selector on `runtime` covers both readers instead of
                         // silently matching only half the memory series.
@@ -825,6 +916,163 @@ where
             let mut report = builder.finish();
             report.profile_type = ProfileType::new(name);
             stats.heap_reports.fetch_add(1, Ordering::Relaxed);
+            emit(on_report, report, stats, &mut emitted);
+        }
+    }
+
+    // ---- JVM heaps, through the runtime's own recorder --------------------
+    //
+    // The third reader, same bargain as the Go one: a JVM samples its own
+    // allocations into Java Flight Recorder, and this only asks for a dump and
+    // reads it back. Nothing is injected into the target, but it needs a JDK's
+    // `jcmd`/`jfr` and permission to attach, so it is skipped silently when the
+    // image has neither.
+    let mut jvm_alive: Vec<u32> = Vec::new();
+    if config.collect_jvm && jvm.available() {
+        let skip: Vec<u32> = excluded.iter().copied().collect();
+        // JVM reading pauses the target and moves a few megabytes per interval,
+        // so it runs only for the workloads the server has switched on.
+        let requested = config.jvm_workloads.read();
+        let allowed = |tgid: u32| match workload_key(config, tgid) {
+            Some(key) => requested.get(&key).copied().unwrap_or(false),
+            None => false,
+        };
+        let records = jvm.scan(&skip, &mut jvm_alive, &allowed);
+        stats
+            .jvm_samples
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        stats
+            .jvm_processes
+            .store(jvm_alive.len() as u64, Ordering::Relaxed);
+        stats
+            .jvm_attach_failed
+            .store(jvm.attach_failed, Ordering::Relaxed);
+        if jvm.attach_failed > 0 || !jvm.skipped.is_empty() {
+            debug!(
+                attach_failed = jvm.attach_failed,
+                empty = jvm.empty,
+                skipped = ?jvm.skipped,
+                "JVM targets left out"
+            );
+        }
+
+        let mut builders: HashMap<(GroupKey, String), ReportBuilder> = HashMap::new();
+        for record in &records {
+            let Some(group) = resolve_group(config, record.tgid) else {
+                continue;
+            };
+            if record.frames.is_empty() {
+                continue;
+            }
+            let mut metrics: Vec<(&'static str, u64)> = vec![
+                (ProfileType::ALLOC_SPACE, record.alloc_bytes),
+                (ProfileType::INUSE_SPACE, record.inuse_bytes),
+            ];
+            if config.heap_objects {
+                // JFR samples carry bytes only; objects are not derivable from
+                // them without the allocation size of each sample.
+            }
+            for (name, value) in metrics {
+                if value == 0 {
+                    continue;
+                }
+                let builder = builders
+                    .entry((group.clone(), name.to_string()))
+                    .or_insert_with(|| {
+                        ReportBuilder::new(
+                            group.service.clone(),
+                            ProfileType::new(name),
+                            start_ns,
+                            end_ns,
+                        )
+                        .with_labels(group.labels.clone())
+                        .label("profile_source", "jvm-jfr")
+                        .label("sampling", "runtime")
+                        .label("temporality", "cumulative")
+                        .label("runtime", "java")
+                    });
+                builder.add_stack(record.frames.clone(), value);
+            }
+        }
+        for ((_group, name), builder) in builders {
+            if builder.is_empty() {
+                continue;
+            }
+            let mut report = builder.finish();
+            report.profile_type = ProfileType::new(name);
+            emit(on_report, report, stats, &mut emitted);
+        }
+    }
+
+    // ---- native memory, through the userspace runtime ---------------------
+    //
+    // The measurement the allocator probes make, with the hook running inside
+    // the target instead of in the kernel. A kernel uprobe cost 79 µs of system
+    // time per allocation on this cluster; here the same call costs hundreds of
+    // nanoseconds. The bargain is a shared library injected into the process,
+    // so this too is switched on per workload and stays off otherwise.
+    if config.collect_bpftime && bpftime.available() {
+        let requested = config.alloc_workloads.read();
+        let allowed = |tgid: u32| match workload_key(config, tgid) {
+            Some(key) => requested.get(&key).copied().unwrap_or(false),
+            None => false,
+        };
+        let interval = config.flush_interval.as_secs().max(1);
+        let records = bpftime.scan(&allowed, resolver, interval);
+        stats
+            .bpftime_samples
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        stats
+            .bpftime_attach_failed
+            .store(bpftime.attach_failed, Ordering::Relaxed);
+        if bpftime.attach_failed > 0 || !bpftime.skipped.is_empty() {
+            debug!(
+                attach_failed = bpftime.attach_failed,
+                skipped = ?bpftime.skipped,
+                "bpftime targets left out"
+            );
+        }
+
+        let mut builders: HashMap<(GroupKey, String), ReportBuilder> = HashMap::new();
+        for record in &records {
+            let Some(group) = resolve_group(config, record.tgid) else {
+                continue;
+            };
+            if record.frames.is_empty() {
+                continue;
+            }
+            let mut metrics: Vec<(&'static str, u64)> =
+                vec![(ProfileType::ALLOC_SPACE, record.alloc_bytes)];
+            if config.heap_objects {
+                metrics.push((ProfileType::ALLOC_OBJECTS, record.alloc_count));
+            }
+            for (name, value) in metrics {
+                if value == 0 {
+                    continue;
+                }
+                let builder = builders
+                    .entry((group.clone(), name.to_string()))
+                    .or_insert_with(|| {
+                        ReportBuilder::new(
+                            group.service.clone(),
+                            ProfileType::new(name),
+                            start_ns,
+                            end_ns,
+                        )
+                        .with_labels(group.labels.clone())
+                        .label("profile_source", "bpftime-userspace")
+                        .label("sampling", "instrumented")
+                        .label("runtime", "native")
+                    });
+                builder.add_stack(record.frames.clone(), value);
+            }
+        }
+        for ((_group, name), builder) in builders {
+            if builder.is_empty() {
+                continue;
+            }
+            let mut report = builder.finish();
+            report.profile_type = ProfileType::new(name);
             emit(on_report, report, stats, &mut emitted);
         }
     }
@@ -1106,6 +1354,25 @@ fn resolve_group(config: &CollectorConfig, tgid: u32) -> Option<GroupKey> {
             .or_insert_with(|| comm.clone());
     }
     Some(GroupKey { service, labels })
+}
+
+/// `namespace/workload` for the pod this thread belongs to.
+///
+/// The same identifier the service map draws a card with, so the switch the
+/// user flips on a map node names exactly one entry here. A bare pod has no
+/// workload, and it is named by its own pod name instead — that number is still
+/// stable for the life of the pod, which is all a switch can promise.
+fn workload_key(config: &CollectorConfig, tgid: u32) -> Option<String> {
+    if !config.enrich_kubernetes_labels {
+        return None;
+    }
+    let cgroup = procfs::read_cgroup(tgid)?;
+    let labels = procfs::kubernetes_labels(&cgroup);
+    let uid = labels.get("k8s_pod_uid")?;
+    let index = config.pods.as_ref()?;
+    let meta = index.lookup(uid)?;
+    let name = meta.workload.clone().unwrap_or_else(|| meta.name.clone());
+    Some(format!("{}/{}", meta.namespace, name))
 }
 
 fn drain_map(ebpf: &mut Ebpf, name: &str) -> Result<Vec<RawRecord>, String> {

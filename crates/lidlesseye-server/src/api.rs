@@ -18,14 +18,34 @@ use lidlesseye_core::model::{Report, Unit};
 use lidlesseye_core::pprof::PprofOptions;
 use lidlesseye_core::servicemap::ServiceMapBatch;
 use lidlesseye_core::{
-    DiffFlamegraph, DiffOptions, Flamegraph, MapHistogram, MapHistory, ProfileType, QueryOptions,
-    Selector, ServiceMap, Store, TenantId, TenantInfo, TimeSeries, TimeSeriesOptions, TopResult,
-    now_ns,
+    AllocatorKind, DiffFlamegraph, DiffOptions, Flamegraph, MapHistogram, MapHistory, ProfileType,
+    QueryOptions, Selector, ServiceMap, Store, TenantId, TenantInfo, TimeSeries, TimeSeriesOptions,
+    TopResult, now_ns,
 };
 
 use crate::error::ApiError;
 use crate::params::Params;
 use crate::{AppState, Caller, HealthResponse, StatsResponse, VERSION};
+
+/// `?allocator=glibc&mode=self` for a CPU profile.
+///
+/// The filter runs on the frames that are already stored, so it costs one pass
+/// over the distinct frames of the window and works for every window that was
+/// ever collected — no second collection path, nothing injected into the target.
+fn allocator_filter(params: &Params) -> Result<(Option<AllocatorKind>, bool), ApiError> {
+    let Some(raw) = params.get("allocator") else {
+        return Ok((None, false));
+    };
+    let Some(kind) = AllocatorKind::parse(raw) else {
+        return Err(ApiError::bad_request(
+            "`allocator` must be one of `any`, `glibc`, `jemalloc`, `tcmalloc`, `mimalloc`",
+        ));
+    };
+    let self_only = params
+        .get("mode")
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("self"));
+    Ok((Some(kind), self_only))
+}
 
 /// Ingestion accepts a single report or a batch.
 #[derive(Debug, Deserialize)]
@@ -50,8 +70,52 @@ pub async fn ingest(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let caller = state.authorize(&headers)?;
+    // A replica started with `--read-only` is a query frontend: it must say so
+    // plainly rather than redirect, because there may be no writer behind it at
+    // all (that is the whole point of a read-only deployment).
     if state.config().read_only {
-        return Err(ApiError::forbidden("server is read-only"));
+        return Err(ApiError::forbidden(
+            "this replica is read-only; send writes to the writer deployment",
+        ));
+    }
+    // A standby must not accept writes: two replicas flushing into one data
+    // directory is precisely the double-writer this deployment exists to avoid.
+    // The caller is told to retry against the active replica instead of being
+    // handed a queue that would never drain.
+    if !state.inner.lease.is_active() {
+        // Redirecting is better than failing: whoever balances writes across
+        // both replicas (a Service, a load balancer) then still delivers every
+        // batch to the writer in one extra round trip, and the client keeps
+        // using its normal retry-free path. 307 preserves method and body.
+        let active = state.inner.lease.active_addr();
+        if !active.is_empty() {
+            let path = format!("/ingest{}", params.query_string());
+            let location = format!("http://{active}{path}");
+            return Ok((
+                axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, location)],
+            )
+                .into_response());
+        }
+        return Err(ApiError::unavailable(format!(
+            "this replica is a standby (fence {}); send writes to the active one",
+            state.inner.lease.fence()
+        )));
+    }
+    // A replayed batch must not be counted twice: the agent's spool re-sends
+    // anything it did not get a 2xx for, and a reply lost on the way back is
+    // indistinguishable from a failed request.
+    if let Some(batch) = headers
+        .get("x-lidlesseye-batch")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        && state.inner.dedupe.seen(batch)
+    {
+        return Ok((
+            StatusCode::OK,
+            Json(json!({ "duplicate": true, "batch": batch, "accepted": 0 })),
+        )
+            .into_response());
     }
     state
         .metrics()
@@ -103,7 +167,16 @@ pub async fn ingest(
                         "folded ingestion needs `?service_name=<name>` (or `?name=`)",
                     )
                 })?;
-            let (from, until) = params.range(now)?;
+            // A folded upload that names no window describes *now*, not the last
+            // hour. `params.range` falls back to the query default (one hour of
+            // history), which parked every sample an hour in the past: the
+            // dashboard's five-minute view never looked there, and a freshly
+            // ingested batch appeared to be missing while it was on disk.
+            let (from, until) = if params.get("from").is_some() || params.get("until").is_some() {
+                params.range(now)?
+            } else {
+                (now.saturating_sub(1_000_000_000), now)
+            };
             let text = std::str::from_utf8(&body).map_err(|err| {
                 ApiError::bad_request(format!("folded stacks are not UTF-8: {err}"))
             })?;
@@ -112,7 +185,19 @@ pub async fn ingest(
                 profile_type: params.profile_type(),
                 start_ns: from,
                 end_ns: until,
-                labels: params.labels(),
+                labels: {
+                    // `service_name` is a column, but every dashboard filter
+                    // arrives as a label selector (`selector=service_name="x"`),
+                    // and a folded upload carried no such label, so its stacks
+                    // were invisible to the very filter the UI sends. Mirroring
+                    // the column into the labels costs one small string per
+                    // report and makes the reader addressable like any other.
+                    let mut labels = params.labels();
+                    labels
+                        .entry("service_name".to_string())
+                        .or_insert_with(|| service_name.to_string());
+                    labels
+                },
             };
             vec![lidlesseye_core::decode_folded(text, &opts).map_err(bad_payload)?]
         }
@@ -166,27 +251,67 @@ pub async fn ingest(
 
     let count = reports.len();
     let samples: usize = reports.iter().map(|r| r.stacks.len()).sum();
-    let metas = state.ingest_many(&caller.tenant, reports).await?;
+    let want_durable = params
+        .get("sync")
+        .is_some_and(|value| matches!(value, "1" | "true" | "yes"));
+    let outcome = state
+        .ingest_many_with(&caller.tenant, reports, want_durable)
+        .await?;
+    // Only now is the batch really in: a failure above leaves the id unclaimed,
+    // so the agent's spool can still deliver it later.
+    if let Some(batch) = headers
+        .get("x-lidlesseye-batch")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        state.inner.dedupe.remember(batch);
+    }
     state
         .metrics()
         .ingest_bytes
         .fetch_add(body.len() as u64, Ordering::Relaxed);
 
-    let batch_ids: Vec<String> = metas
-        .iter()
-        .map(|m| format!("batch-{}", m.batch_id))
-        .collect();
-    Ok(Json(json!({
-        "accepted": count,
-        "batches": batch_ids.len(),
-        "samples": samples,
-        "bytes": body.len(),
-        "format": format,
-        "tenant": caller.tenant.to_string(),
-        "ids": batch_ids,
-        "rejected": rejected,
-    }))
-    .into_response())
+    // `202 Accepted` is the honest status for the asynchronous path: the data
+    // is on stable storage (within the group-commit window) but not yet
+    // queryable, because the converter has not written its Parquet file. The
+    // segment name and `durable` flag let a client tell the two apart.
+    let (status, body) = match outcome {
+        crate::IngestOutcome::Queued(appended) => (
+            StatusCode::ACCEPTED,
+            json!({
+                "accepted": count,
+                "samples": samples,
+                "bytes": body.len(),
+                "format": format,
+                "tenant": caller.tenant.to_string(),
+                "queued": true,
+                "segment": format!("seg-{:012}", appended.segment),
+                "durable": appended.synced,
+                "rejected": rejected,
+            }),
+        ),
+        crate::IngestOutcome::Committed(metas) => {
+            let batch_ids: Vec<String> = metas
+                .iter()
+                .map(|m| format!("batch-{}", m.batch_id))
+                .collect();
+            (
+                StatusCode::OK,
+                json!({
+                    "accepted": count,
+                    "batches": batch_ids.len(),
+                    "samples": samples,
+                    "bytes": body.len(),
+                    "format": format,
+                    "tenant": caller.tenant.to_string(),
+                    "queued": false,
+                    "ids": batch_ids,
+                    "rejected": rejected,
+                }),
+            )
+        }
+    };
+    Ok((status, Json(body)).into_response())
 }
 
 fn bad_payload(err: lidlesseye_core::Error) -> ApiError {
@@ -206,7 +331,7 @@ pub async fn flush(
     let caller = state.authorize(&headers)?;
     let store = state.writable_tenant_async(&caller.tenant).await?;
     let mode = store.config().storage_mode.canonical().as_str().to_string();
-    let rows = tokio::task::spawn_blocking(move || store.flush_hot())
+    let rows = tokio::task::spawn_blocking(move || store.flush_durable())
         .await
         .map_err(|err| ApiError::internal(format!("flush task failed: {err}")))?
         .map_err(ApiError::from)?;
@@ -270,9 +395,11 @@ pub async fn flamegraph(
     let now = now_ns();
     let (from, until) = params.range(now)?;
     let profile_type = params.profile_type();
+    let (allocator, allocator_self) = allocator_filter(&params)?;
     let opts = QueryOptions::new(profile_type.clone(), from, until, params.selector()?)
         .with_max_nodes(params.usize_param("max_nodes", 1024))
-        .with_group_by(params.group_by());
+        .with_group_by(params.group_by())
+        .with_allocator(allocator, allocator_self);
 
     let Some(store) = maybe_store(&state, &caller).await else {
         return Ok(Json(Flamegraph::empty(profile_type.unit())).into_response());
@@ -363,8 +490,10 @@ pub async fn top(
     let now = now_ns();
     let (from, until) = params.range(now)?;
     let profile_type = params.profile_type();
+    let (allocator, allocator_self) = allocator_filter(&params)?;
     let opts = QueryOptions::new(profile_type.clone(), from, until, params.selector()?)
-        .with_group_by(params.group_by());
+        .with_group_by(params.group_by())
+        .with_allocator(allocator, allocator_self);
     // Clamped: without a ceiling `limit=999999999` would sort and serialize
     // the whole tree, which is a cheap way for one client to stall a replica.
     let limit = params.usize_param("limit", 50).clamp(1, 1_000);
@@ -729,14 +858,121 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     let registry = state.registry();
     let ids = registry.tenant_ids();
     let store = registry.total_stats();
+    // Ingest health is a backlog, not a queue: the log holds what the converter
+    // has not written yet, and `convert_failures` is the only signal that it is
+    // stuck rather than busy.
+    let mut pending_bytes = 0u64;
+    let mut pending_segments = 0u64;
+    let mut converted_segments = 0u64;
+    let mut converted_reports = 0u64;
+    let mut convert_nanos = 0u64;
+    let mut convert_failures = 0u64;
+    for id in &ids {
+        let Some(loaded) = registry.loaded_tenant(id) else {
+            continue;
+        };
+        let (bytes, segments) = loaded.wal_stats();
+        pending_bytes += bytes;
+        pending_segments += segments as u64;
+        let (segments, reports, nanos, failures) = loaded.convert_stats();
+        converted_segments += segments;
+        converted_reports += reports;
+        convert_nanos += nanos;
+        convert_failures += failures;
+    }
+    let cache = state.inner.cache.stats();
+    let fsck = state.inner.fsck.last();
     let extra = vec![
         ("lidlesseye_batches", store.batch_count.to_string()),
         ("lidlesseye_storage_bytes", store.total_bytes.to_string()),
         ("lidlesseye_stored_value", store.total_value.to_string()),
         ("lidlesseye_tenants", ids.len().to_string()),
+        ("lidlesseye_ingest_log_bytes", pending_bytes.to_string()),
+        (
+            "lidlesseye_ingest_log_segments",
+            pending_segments.to_string(),
+        ),
+        (
+            "lidlesseye_ingest_converted_segments_total",
+            converted_segments.to_string(),
+        ),
+        (
+            "lidlesseye_ingest_converted_reports_total",
+            converted_reports.to_string(),
+        ),
+        (
+            "lidlesseye_ingest_convert_nanos_total",
+            convert_nanos.to_string(),
+        ),
+        (
+            "lidlesseye_ingest_convert_failures_total",
+            convert_failures.to_string(),
+        ),
+        // Replica role and cache/fsck state: the three things an operator
+        // cannot otherwise see without opening the JSON endpoints by hand.
+        (
+            "lidlesseye_replica_active",
+            if state.inner.lease.is_active() { "1" } else { "0" }.to_string(),
+        ),
+        (
+            "lidlesseye_lease_fence",
+            state.inner.lease.fence().to_string(),
+        ),
+        (
+            "lidlesseye_cache_entries",
+            cache.entries.to_string(),
+        ),
+        ("lidlesseye_cache_hits_total", cache.hits.to_string()),
+        ("lidlesseye_cache_misses_total", cache.misses.to_string()),
+        (
+            "lidlesseye_fsck_findings",
+            fsck
+                .as_ref()
+                .map(|r| {
+                    r.tenants
+                        .iter()
+                        .map(|t| {
+                            (t.unreadable.len() + t.vanished.len() + t.empty_hours.len()) as u64
+                        })
+                        .sum::<u64>()
+                })
+                .unwrap_or(0)
+                .to_string(),
+        ),
+        (
+            "lidlesseye_fsck_elapsed_seconds",
+            fsck.as_ref()
+                .map(|r| format!("{:.3}", r.elapsed_ms as f64 / 1000.0))
+                .unwrap_or_else(|| "0".to_string()),
+        ),
+        ("lidlesseye_process_rss_bytes", self_metric("VmRSS", 1024)),
+        ("lidlesseye_process_threads", self_metric("Threads", 1)),
     ];
     let body = state.metrics().render(&extra, state.uptime().as_secs());
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
+}
+
+/// One number out of `/proc/self/status`, or `0` when it is not there.
+///
+/// The server is the only process whose memory an operator can see through the
+/// dashboard, so it reports its own footprint on the same endpoint as the
+/// workload counters. `scale` turns a kB value into bytes.
+fn self_metric(key: &str, scale: u64) -> String {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return "0".to_string();
+    };
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix(key).and_then(|r| r.strip_prefix(':')) else {
+            continue;
+        };
+        let value = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        return (value * scale).to_string();
+    }
+    "0".to_string()
 }
 
 /// Service-map ingestion accepts one window or a batch of them.
@@ -937,4 +1173,553 @@ impl AppState {
             .query_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
+}
+
+/// `GET /api/v1/profiling/directives`
+///
+/// Which workloads the operator switched runtime memory profiling on for. The
+/// agents poll this; the service map writes it.
+pub async fn profiling_directives(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    state.authorize(&headers)?;
+    let all = state.inner.directives.list();
+    let jvm: Vec<String> = all
+        .iter()
+        .filter(|(_, kind)| kind == crate::directives::KIND_JVM)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let alloc: Vec<String> = all
+        .iter()
+        .filter(|(_, kind)| kind == crate::directives::KIND_ALLOC)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let entries: Vec<Value> = all
+        .iter()
+        .map(|(name, kind)| json!({ "workload": name, "kind": kind }))
+        .collect();
+    Ok(Json(json!({
+        "workloads": jvm,
+        "alloc_workloads": alloc,
+        "directives": entries,
+        // The userspace malloc reader is wired end to end: an ephemeral
+        // container is added to the workload's pod, the probe is injected into
+        // its glibc processes, and the samples land as `alloc_space` with
+        // `profile_source=bpftime-userspace`. Switching it on is still a
+        // deliberate act, because the agent writes into another container's
+        // processes, so the panel asks for confirmation first.
+        "native_memory": {
+            "supported": true,
+            "requirements": [
+                "the target image needs a dynamic glibc (musl and static binaries are skipped)",
+                "glibc 2.38 or newer, and libelf.so.1 present in the target image",
+                "the agent needs RBAC for pods/ephemeralcontainers in the target namespace",
+            ],
+            "risk": "the reader injects a library into the target processes; a fragile process can crash",
+        },
+    })))
+}
+
+/// `PUT /api/v1/profiling/directives`
+///
+/// Switch one workload on or off. The body is `{"workload": "ns/name",
+/// "enabled": true}`; the reply is the resulting list, so a caller does not
+/// have to guess whether its edit landed.
+pub async fn profiling_directive_set(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DirectiveEdit>,
+) -> Result<Json<Value>, ApiError> {
+    state.authorize(&headers)?;
+    let workload = body.workload.trim().to_string();
+    if workload.is_empty() || workload.len() > 256 || workload.matches('/').count() != 1 {
+        return Err(ApiError::bad_request(
+            "`workload` must be `namespace/name`",
+        ));
+    }
+    let kind = body.kind.unwrap_or_else(|| crate::directives::KIND_JVM.to_string());
+    if kind != crate::directives::KIND_JVM && kind != crate::directives::KIND_ALLOC {
+        return Err(ApiError::bad_request(
+            "`kind` must be `jvm` or `alloc`",
+        ));
+    }
+    let list = state
+        .inner
+        .directives
+        .set(&workload, &kind, body.enabled)
+        .map_err(|err| ApiError::internal(format!("saving the directive: {err}")))?;
+    let entries: Vec<Value> = list
+        .iter()
+        .map(|(name, kind)| json!({ "workload": name, "kind": kind }))
+        .collect();
+    Ok(Json(json!({ "directives": entries })))
+}
+
+/// `GET /api/v1/memory/coverage`
+///
+/// The numbers behind a native allocation figure. A dashboard that shows
+/// "12 GB" and nothing else asks to be trusted; this endpoint answers the
+/// questions a reader should ask instead: how many samples the number rests on,
+/// what interval the reader sampled at, how many allocations that implies per
+/// second, and whether the workload is still switched on.
+/// Live reports (capabilities, coverage, processes) are posted by readers that
+/// talk to the Service, so either replica can end up holding half of the picture
+/// and the two would disagree about what is running right now. Rather than keep
+/// two copies in sync, both directions of these endpoints go to the writer: the
+/// replica holding the lease is the only one allowed to answer, and a 307 keeps
+/// the method and body intact for `reqwest`.
+///
+/// Returns `None` when this replica *is* the writer, or when it is a standby
+/// with no writer address to redirect to — the caller then decides whether that
+/// means "serve locally" (reads) or "refuse" (writes).
+fn writer_redirect(state: &AppState, path: &str, query: Option<String>) -> Option<Response> {
+    if state.inner.lease.is_active() {
+        return None;
+    }
+    let active = state.inner.lease.active_addr();
+    if active.is_empty() {
+        return None;
+    }
+    // `query` is `Params::query_string()`, which already carries the leading
+    // `?` (or is empty when there is nothing to forward).
+    let target = match query {
+        Some(query) => format!("{path}{query}"),
+        None => path.to_string(),
+    };
+    let location = format!("http://{active}{target}");
+    Some(
+        (
+            axum::http::StatusCode::TEMPORARY_REDIRECT,
+            [(axum::http::header::LOCATION, location)],
+        )
+            .into_response(),
+    )
+}
+
+pub async fn memory_coverage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Params,
+) -> Result<Response, ApiError> {
+    let caller = state.authorize(&headers)?;
+    let now = now_ns();
+    let (from, until) = params.range(now)?;
+    let selector = params.selector()?;
+
+    let enabled: Vec<String> = state
+        .inner
+        .directives
+        .list()
+        .into_iter()
+        .filter(|(_, kind)| kind == crate::directives::KIND_ALLOC)
+        .map(|(name, _)| name)
+        .collect();
+
+    let rows = match maybe_store(&state, &caller).await {
+        Some(store) => {
+            let slot = state.read_slot().await?;
+            let rows = state
+                .query_guard(store.clone())
+                .run(move || store.series(from, until, &selector))
+                .await;
+            drop(slot);
+            rows?
+        }
+        None => Vec::new(),
+    };
+
+    // One workload can arrive as several series (the Go runtime reports one per
+    // allocation class, and a label change splits a series in two), so the rows
+    // are folded by workload before they leave. `batches` is the number of
+    // ingested reports, not the number of recorded stacks: the two differ by
+    // whatever the reader batched up, and calling it "samples" would overstate
+    // what this endpoint knows.
+    let mut folded: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for row in rows {
+        if row.profile_type != "alloc_space" {
+            continue;
+        }
+        // The reader writes `alloc.sampling=poisson-1/64` and
+        // `alloc.reader=bpftime-userspace`. Parsing the interval out of the
+        // label keeps the endpoint honest when an older sample arrives without
+        // it: the field is then null rather than invented.
+        let sampling_label = row.labels.get("alloc.sampling").cloned();
+        let sampling_interval = sampling_label
+            .as_deref()
+            .and_then(|label| label.rsplit_once('/'))
+            .and_then(|(_, tail)| tail.parse::<u64>().ok())
+            .filter(|interval| *interval > 0);
+        let reader = row.labels.get("alloc.reader").cloned();
+
+        let entry = folded.entry(row.service_name.clone()).or_insert_with(|| {
+            json!({
+                "workload": row.service_name,
+                "enabled": enabled.iter().any(|name| *name == row.service_name),
+                "requested_alloc_bytes": 0u64,
+                "batches": 0u64,
+                "sampling_interval": Value::Null,
+                "sampling_label": Value::Null,
+                "reader": Value::Null,
+                "first_seen_ns": row.start_ns,
+                "last_seen_ns": row.end_ns,
+                // Which processes were seen, which were injected, and why the
+                // rest were skipped lives in the agent: it holds the target pod
+                // and the injection result. Until it reports that back, the
+                // field says so instead of guessing.
+                "coverage": Value::Null,
+                "coverage_note": "the reader has not reported how many processes it reached",
+            })
+        });
+        let bytes = entry["requested_alloc_bytes"].as_u64().unwrap_or(0) + row.total_value;
+        entry["requested_alloc_bytes"] = json!(bytes);
+        let batches = entry["batches"].as_u64().unwrap_or(0) + row.batch_count as u64;
+        entry["batches"] = json!(batches);
+        entry["first_seen_ns"] =
+            json!(entry["first_seen_ns"].as_u64().unwrap_or(row.start_ns).min(row.start_ns));
+        entry["last_seen_ns"] =
+            json!(entry["last_seen_ns"].as_u64().unwrap_or(row.end_ns).max(row.end_ns));
+        if entry["sampling_interval"].is_null()
+            && let Some(interval) = sampling_interval
+        {
+            entry["sampling_interval"] = json!(interval);
+            entry["sampling_label"] = json!(sampling_label);
+        }
+        if entry["reader"].is_null()
+            && let Some(reader) = reader
+        {
+            entry["reader"] = json!(reader);
+        }
+    }
+
+    let mut workloads: Vec<Value> = folded.into_values().collect();
+    // A workload the reader reported on but that produced no samples yet still
+    // belongs on the page: "switched on, nothing received" is a state an
+    // operator needs to see, and it is exactly the state a broken injection
+    // leaves behind.
+    for (workload, report) in state.inner.coverage.all() {
+        if workloads.iter().any(|row| row["workload"] == json!(workload)) {
+            continue;
+        }
+        workloads.push(json!({
+            "workload": workload,
+            "enabled": enabled.iter().any(|name| *name == workload),
+            "requested_alloc_bytes": 0u64,
+            "batches": 0u64,
+            "sampling_interval": Value::Null,
+            "sampling_label": Value::Null,
+            "reader": Value::Null,
+            "first_seen_ns": report.at_ns,
+            "last_seen_ns": report.at_ns,
+            "coverage": Value::Null,
+            "coverage_note": "",
+        }));
+    }
+    // Attach the latest coverage report. The entry is created above with a null
+    // `coverage` so its shape is stable; here it is filled from the last report
+    // the shim sent, if any.
+    for row in workloads.iter_mut() {
+        let workload = row["workload"].as_str().unwrap_or_default().to_string();
+        let Some(report) = state.inner.coverage.get(&workload) else {
+            continue;
+        };
+        row["coverage"] = json!({
+            "detected": report.detected,
+            "attached": report.attached,
+            "uncovered": report.uncovered(),
+            "skipped": report.skipped,
+            "memory_bytes": report.memory_bytes,
+            "process_count": report.process_count,
+            "process_rss_bytes": report.process_rss_bytes,
+            "process_pss_bytes": report.process_pss_bytes,
+            "at_ns": report.at_ns,
+        });
+        row["coverage_note"] = json!("");
+        let points = state.inner.coverage.history(&workload);
+        if !points.is_empty() {
+            row["history"] = json!(points);
+        }
+    }
+    workloads.sort_by(|a, b| {
+        let left = a["requested_alloc_bytes"].as_u64().unwrap_or(0);
+        let right = b["requested_alloc_bytes"].as_u64().unwrap_or(0);
+        right.cmp(&left)
+    });
+
+    Ok(Json(json!({
+        "tenant": caller.tenant.to_string(),
+        "workloads": workloads,
+        "enabled_workloads": enabled,
+    }))
+    .into_response())
+}
+
+/// `POST /api/v1/memory/coverage`
+///
+/// The shim inside a target pod reports how many of the workload's processes the
+/// native reader actually reached. The server cannot see that from the outside:
+/// it knows a workload is switched on, not whether the injection landed on three
+/// processes or none. The shim sends this every flush, so the memory page can
+/// show the difference.
+pub async fn memory_coverage_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::coverage::CoverageBody>,
+) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
+    if let Some(redirect) = writer_redirect(&state, "/api/v1/memory/coverage", None) {
+        return Ok(redirect);
+    }
+    if !state.inner.lease.is_active() {
+        return Err(ApiError::unavailable(
+            "this replica is a standby; live reports go to the active one",
+        ));
+    }
+    let workload = body.workload.trim().to_string();
+    if workload.is_empty() || workload.len() > 256 || workload.matches('/').count() != 1 {
+        return Err(ApiError::bad_request(
+            "`workload` must be `namespace/name`",
+        ));
+    }
+    let report = crate::coverage::CoverageReport {
+        detected: body.detected,
+        attached: body.attached,
+        skipped: body.skipped,
+        memory_bytes: body.memory_bytes,
+        process_count: body.process_count,
+        process_rss_bytes: body.process_rss_bytes,
+        process_pss_bytes: body.process_pss_bytes,
+        at_ns: 0,
+    };
+    state.inner.coverage.record(&workload, report.clone());
+    // The live map answers "what is it now"; the store answers "what was it an
+    // hour ago, after the process exited". Recording the same numbers as gauge
+    // samples is what makes the second question answerable: the map keeps two
+    // hours and dies with the process, Parquet does not.
+    let at_ns = if report.at_ns == 0 {
+        lidlesseye_core::now_ns()
+    } else {
+        report.at_ns
+    };
+    let mut gauges = Vec::new();
+    let readings = [
+        ("process_rss", report.process_rss_bytes),
+        ("process_pss", report.process_pss_bytes),
+        ("pod_cgroup_memory", report.memory_bytes),
+    ];
+    for (kind, value) in readings {
+        let Some(value) = value else { continue };
+        let opts = FoldedOptions {
+            service_name: workload.clone(),
+            profile_type: ProfileType::new(kind),
+            start_ns: at_ns,
+            end_ns: at_ns.saturating_add(1),
+            labels: {
+                let mut labels = std::collections::BTreeMap::new();
+                // Same mirroring as the ingest path: dashboards filter by
+                // `service_name` as a label, and a gauge without it would be
+                // invisible to the very selector the memory page sends.
+                labels.insert("service_name".to_string(), workload.clone());
+                labels.insert("temporality".to_string(), "gauge".to_string());
+                labels
+            },
+        };
+        // The stack is a label in its own right: these samples have no call
+        // chain, and an empty one would be dropped as unparseable.
+        let text = format!("{kind};{workload} {value}\n");
+        if let Ok(parsed) = lidlesseye_core::decode_folded(&text, &opts) {
+            gauges.push(parsed);
+        }
+    }
+    if !gauges.is_empty() {
+        let caller = state.authorize(&headers)?;
+        // A failed write must not fail the report: the shim retries every tick,
+        // and the live map is already updated.
+        if let Err(error) = state.ingest_many_with(&caller.tenant, gauges, false).await {
+            tracing::debug!(error = %error, workload = %workload, "cannot store the memory gauges");
+        }
+    }
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+/// `GET /api/v1/capabilities`
+///
+/// What each workload can profile and whether it currently is. The state and
+/// the reason travel together: `unsupported` with `unsupported_libc` tells a
+/// user to stop looking, while `disabled` tells them to flip a switch.
+pub async fn capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Params,
+) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
+    let workload = params.get("workload");
+    let rows = state.inner.capabilities.list(workload);
+    Ok(Json(json!({ "capabilities": rows })).into_response())
+}
+
+/// `GET /api/v1/role`
+///
+/// Which replica may write, and the fencing token that says how many handovers
+/// have happened. A dashboard that only reads does not need it; an operator
+/// deciding "is this pair actually a pair" does.
+pub async fn role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
+    let lease = &state.inner.lease;
+    Ok(Json(json!({
+        "holder": lease.holder(),
+        "active": lease.is_active(),
+        "fence": lease.fence(),
+        "passive": lease.is_passive(),
+        "lease_file": lease.path().display().to_string(),
+    }))
+    .into_response())
+}
+
+/// `GET /api/v1/cache`
+///
+/// What the read cache is holding and how often it answered. It exists because
+/// a cache nobody can see is a cache nobody can trust: a sudden drop in hits is
+/// the first sign that queries stopped being shaped the way the UI thinks.
+pub async fn cache_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
+    let stats = state.inner.cache.stats();
+    Ok(Json(json!({
+        "entries": stats.entries,
+        "hits": stats.hits,
+        "misses": stats.misses,
+        "skipped": stats.skipped,
+        "ttl_seconds": crate::cache::TTL.as_secs(),
+    }))
+    .into_response())
+}
+
+/// `GET /api/v1/fsck`
+///
+/// The last on-disk check, or `null` before the first one runs. It answers the
+/// question the index cannot: the query layer always describes whatever files
+/// it finds, so only a check that remembers the previous run can say a file
+/// disappeared.
+pub async fn fsck(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
+    let report = state.inner.fsck.last();
+    Ok(Json(json!({ "fsck": report })).into_response())
+}
+
+/// `POST /api/v1/fsck`
+///
+/// Run the check now. It reads directory entries and file headers and never
+/// takes a read slot, so it is safe to call while queries are running.
+pub async fn fsck_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
+    let registry = state.inner.registry.clone();
+    let fsck = state.inner.fsck.clone();
+    let data_dir = registry.root().to_path_buf();
+    let tenants: Vec<String> = registry
+        .tenant_ids()
+        .into_iter()
+        .map(|tenant| tenant.to_string())
+        .collect();
+    let report = tokio::task::spawn_blocking(move || fsck.run(&data_dir, &tenants))
+        .await
+        .map_err(|err| ApiError::internal(format!("fsck task failed: {err}")))?;
+    Ok(Json(json!({ "fsck": report })).into_response())
+}
+
+/// `POST /api/v1/capabilities`
+///
+/// Readers report from inside the cluster, where the truth is: whether a
+/// process is musl, whether `jcmd` exists, whether the injection landed. The
+/// server only knows what the switchboard asked for, so it stores what it is
+/// told and never infers a state it cannot see.
+pub async fn capabilities_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Vec<crate::capabilities::Capability>>,
+) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
+    if let Some(redirect) = writer_redirect(&state, "/api/v1/capabilities", None) {
+        return Ok(redirect);
+    }
+    if !state.inner.lease.is_active() {
+        return Err(ApiError::unavailable(
+            "this replica is a standby; live reports go to the active one",
+        ));
+    }
+    let mut accepted = 0;
+    for capability in body {
+        if capability.workload.is_empty() || capability.reader.is_empty() {
+            continue;
+        }
+        accepted += state.inner.capabilities.record(vec![capability]);
+    }
+    Ok(Json(json!({ "accepted": accepted })).into_response())
+}
+/// `GET /api/v1/memory/processes?workload=&limit=`
+///
+/// The processes a pod's own `/proc` walk found, merged across the workload's
+/// pods and cut to the top `limit` by RSS. Merging happens before truncating,
+/// so the second-largest process of a pod is not lost behind a larger sibling.
+pub async fn memory_processes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Params,
+) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
+    let workload = params
+        .get("workload")
+        .ok_or_else(|| ApiError::bad_request("`workload` is required"))?;
+    let limit = params.usize_param("limit", 20).clamp(1, 200);
+    let (processes, omitted, pods) = state.inner.processes.top(workload, limit);
+    Ok(Json(json!({
+        "workload": workload,
+        "pods": pods,
+        "omitted": omitted,
+        "processes": processes,
+    }))
+    .into_response())
+}
+
+/// `POST /api/v1/memory/processes`
+///
+/// The shim walks the pod's `/proc` every flush and sends the top of the list.
+pub async fn memory_processes_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::processes::ProcessReport>,
+) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
+    if let Some(redirect) = writer_redirect(&state, "/api/v1/memory/processes", None) {
+        return Ok(redirect);
+    }
+    if !state.inner.lease.is_active() {
+        return Err(ApiError::unavailable(
+            "this replica is a standby; live reports go to the active one",
+        ));
+    }
+    if body.workload.is_empty() {
+        return Err(ApiError::bad_request("`workload` is required"));
+    }
+    let stored = state.inner.processes.record(body);
+    Ok(Json(json!({ "stored": stored })).into_response())
+}
+
+/// One edit to the profiling switchboard.
+#[derive(Debug, Deserialize)]
+pub struct DirectiveEdit {
+    pub workload: String,
+    pub enabled: bool,
+    /// `jvm` (read the JVM's recorder) or `alloc` (inject bpftime). Defaults to
+    /// `jvm` so a client written before this field existed keeps working.
+    #[serde(default)]
+    pub kind: Option<String>,
 }

@@ -33,7 +33,9 @@ agent 同时采集 CPU、off-CPU 和内存。内存有两个读取器，默认�
 | `alloc_objects` | 个数 | 速率 | 需要 `--heap-objects` |
 | `inuse_objects` | 个数 | 水平量 | 需要 `--heap-objects` |
 
-开关：`--no-alloc` 关掉分配器 uprobe，`--no-heap` 关掉 Go 堆读取器，`--heap-objects` 额外输出两个对象计数。同一个进程只会被一个读取器度量——Go 二进制的 `malloc` 已经由运行时自己的 profile 表示。内存相关的标签回答「谁测的」：`node`、`service_name`、`profile_source`（`go-runtime` 或 `allocator-uprobe`）、`sampling`（`runtime` 或 `uprobe`）、`runtime`（`go`、`c`、`c++`、`rust`……）以及 `allocator`（`glibc`、`musl`、`jemalloc`、`mimalloc`、`tcmalloc`、`static`）。
+开关：`--alloc` 打开分配器 uprobe（默认关闭，原因见下），`--no-heap` 关掉 Go 堆读取器，`--heap-objects` 额外输出两个对象计数。同一个进程只会被一个读取器度量——Go 二进制的 `malloc` 已经由运行时自己的 profile 表示。内存相关的标签回答「谁测的」：`node`、`service_name`、`profile_source`（`go-runtime` 或 `allocator-uprobe`）、`sampling`（`runtime` 或 `uprobe`）、`runtime`（`go`、`c`、`c++`、`rust`……）以及 `allocator`（`glibc`、`musl`、`jemalloc`、`mimalloc`、`tcmalloc`、`static`）。
+
+两个读取器的成本差着量级，所以只有一个是默认开启的。Go 读取器靠运行时自己在每次分配时采样（每 `MemProfileRate` 字节记一次），探针只是通过 `/proc/<pid>/mem` 读 `runtime.mbuckets`，成本就是扫一遍桶。分配器 uprobe 则在节点上**每个** glibc 进程的**每次** `malloc`/`free` 上触发，一次命中就要几十微秒：在一个 Kubernetes 节点上，同一次 64 字节分配，不挂探针是 2.6 µs，挂上是 79 µs。这是采样器本身的代价，由被采样的程序承担，不是被分析程序的属性。
 
 两个读取器都**不**测量的东西 —— 看数字之前先知道边界：
 

@@ -244,7 +244,7 @@ lidlesseye fsck     # verify database integrity
 lidlesseye info     # build and platform information
 ```
 
-`collect` accepts `--frequency`, `--flush`, `--label k=v`, `--service-name`, `--no-cpu`, `--no-offcpu`, `--no-heap`, `--no-alloc`, `--heap-objects`, `--no-k8s-labels`, `--no-k8s-pod-metadata`, `--k8s-pod-refresh`, `--server`, `--tenant`, `--auth-token` and `--duration`. Set `LIDLESSEYE_NODE_NAME` (the Helm chart passes `spec.nodeName`) so the `node` label stays stable across rollouts.
+`collect` accepts `--frequency`, `--flush`, `--label k=v`, `--service-name`, `--no-cpu`, `--no-offcpu`, `--no-heap`, `--alloc`, `--heap-objects`, `--no-k8s-labels`, `--no-k8s-pod-metadata`, `--k8s-pod-refresh`, `--server`, `--tenant`, `--auth-token` and `--duration`. Set `LIDLESSEYE_NODE_NAME` (the Helm chart passes `spec.nodeName`) so the `node` label stays stable across rollouts.
 
 Full reference: [HTTP API](docs/api.md) · [MCP for AI](docs/mcp.md) · [Architecture](docs/architecture.md) · [Deployment](docs/deployment.md) · [UI](docs/ui.md).
 
@@ -266,7 +266,7 @@ The browser test seeds two tenants and fails on any console error, so a renderin
 - **Symbolized at ingest**: modules that cannot be opened become `[unknown]` frames; agents need `hostPID` and read access to the binaries.
 - **One PID namespace per agent**: processes in other containers are counted as `in another PID namespace`, never misattributed.
 - **Per-host storage**: one server per volume; no clustering or replication.
-- **uprobes are opt-in and narrow**: TLS plaintext capture stays behind `LIDLESSEYE_SSL_UPROBE=1`. Allocation profiling is on by default (`--no-alloc` disables it) and instruments one file per allocator per container — glibc, musl, jemalloc, mimalloc or tcmalloc, whichever the process maps.
+- **uprobes are opt-in and narrow**: TLS plaintext capture stays behind `LIDLESSEYE_SSL_UPROBE=1`, and native heap profiling behind `--alloc`. The allocator uprobes are **off by default** because they fire on every allocation of every glibc process on the node, and a hit costs tens of microseconds: the same 64-byte allocation measured 79 µs with the probes attached and 2.6 µs without them. With profiling on, one file per allocator per container is instrumented — glibc, musl, jemalloc, mimalloc or tcmalloc, whichever the process maps.
 - **User stacks need frame pointers** (`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`). The profiled time is still correct without them.
 - **Memory profiling sees allocations, not memory**: `inuse_*` counts blocks a probe saw allocated and not yet freed, so allocations made before attach, `mmap`-backed arenas and allocators that never call `malloc` are out of scope, and there is no RSS/PSS series to compare a heap level against.
 

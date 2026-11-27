@@ -19,6 +19,7 @@ import { QueryProgress } from "@/components/ui/query-progress";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { FlamegraphView } from "@/components/views/flamegraph-view";
 import { LabelsView } from "@/components/views/labels-view";
+import { MemoryView } from "@/components/views/memory-view";
 import { OverviewView } from "@/components/views/overview-view";
 import { ServiceMapView } from "@/components/views/service-map-view";
 import { TimeseriesView } from "@/components/views/timeseries-view";
@@ -44,6 +45,8 @@ function ViewSwitch({ view }: { view: View }) {
       return <TimeseriesView />;
     case "labels":
       return <LabelsView />;
+    case "memory":
+      return <MemoryView />;
     case "servicemap":
       return <ServiceMapView />;
     case "overview":

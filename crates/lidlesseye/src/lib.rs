@@ -58,6 +58,8 @@ pub mod k8s;
 #[cfg(target_os = "linux")]
 pub mod netmap;
 pub mod publisher;
+#[cfg(target_os = "linux")]
+pub mod shim;
 
 pub use publisher::{PublisherConfig, PublisherHandle};
 
@@ -105,11 +107,18 @@ pub struct Builder {
     retention: Option<Duration>,
     max_disk_bytes: Option<u64>,
     duckdb_threads: Option<usize>,
+    duckdb_memory_limit: Option<String>,
     query_concurrency: Option<usize>,
     storage_mode: Option<lidlesseye_core::StorageMode>,
     s3: Option<lidlesseye_core::S3Config>,
     parquet_local_ttl: Option<Duration>,
     storage_flush_interval: Option<Duration>,
+    ingest_mode: lidlesseye_core::IngestMode,
+    wal_segment_bytes: Option<u64>,
+    wal_sync_interval_ms: Option<u64>,
+    wal_max_pending_bytes: Option<u64>,
+    wal_segment_age_ms: Option<u64>,
+    wal_converters: Option<usize>,
     auth_token: Option<String>,
     read_only: bool,
     cors: Option<String>,
@@ -129,6 +138,7 @@ pub struct Builder {
     collect_cpu: bool,
     collect_off_cpu: bool,
     collect_heap: bool,
+    collect_jvm: bool,
     heap_objects: bool,
     collect_alloc: bool,
     enrich_kubernetes_labels: bool,
@@ -150,11 +160,18 @@ impl Default for Builder {
             retention: Some(Duration::from_secs(7 * 24 * 3600)),
             max_disk_bytes: Some(50 * 1024 * 1024 * 1024),
             duckdb_threads: None,
+            duckdb_memory_limit: None,
             query_concurrency: None,
             storage_mode: None,
             s3: None,
             parquet_local_ttl: None,
             storage_flush_interval: None,
+            ingest_mode: lidlesseye_core::IngestMode::Async,
+            wal_segment_bytes: None,
+            wal_sync_interval_ms: None,
+            wal_max_pending_bytes: None,
+            wal_segment_age_ms: None,
+            wal_converters: None,
             auth_token: None,
             read_only: false,
             cors: None,
@@ -172,6 +189,7 @@ impl Default for Builder {
             collect_cpu: true,
             collect_off_cpu: true,
             collect_heap: true,
+            collect_jvm: true,
             heap_objects: false,
             collect_alloc: true,
             enrich_kubernetes_labels: true,
@@ -218,6 +236,16 @@ impl Builder {
         self
     }
 
+    /// DuckDB `memory_limit`, e.g. `"4GB"`. `None` keeps the store default.
+    ///
+    /// This bounds the hash tables behind a wide `GROUP BY`, so it has to fit
+    /// inside the pod's memory limit: DuckDB will use up to this much before it
+    /// spills, and an OOM kill takes the whole server down with it.
+    pub fn duckdb_memory_limit(mut self, limit: Option<String>) -> Self {
+        self.duckdb_memory_limit = limit;
+        self
+    }
+
     /// How many store reads may run at once (`None` leaves it uncapped).
     pub fn query_concurrency(mut self, limit: Option<usize>) -> Self {
         self.query_concurrency = limit;
@@ -246,6 +274,38 @@ impl Builder {
     /// data-loss window if the process is killed.
     pub fn storage_flush_interval(mut self, interval: Duration) -> Self {
         self.storage_flush_interval = Some(interval);
+        self
+    }
+
+    /// Choose how an ingest is acknowledged (`async` writes the segment log and
+    /// answers 202; `sync` waits for the DuckDB commit).
+    pub fn ingest_mode(mut self, mode: lidlesseye_core::IngestMode) -> Self {
+        self.ingest_mode = mode;
+        self
+    }
+
+    /// Segment log size, group-commit interval and backlog cap.
+    pub fn wal(
+        mut self,
+        segment_bytes: Option<u64>,
+        sync_interval_ms: Option<u64>,
+        max_pending_bytes: Option<u64>,
+    ) -> Self {
+        self.wal_segment_bytes = segment_bytes;
+        self.wal_sync_interval_ms = sync_interval_ms;
+        self.wal_max_pending_bytes = max_pending_bytes;
+        self
+    }
+
+    /// How long a segment may stay open before the converter picks it up.
+    pub fn wal_segment_age(mut self, millis: u64) -> Self {
+        self.wal_segment_age_ms = Some(millis);
+        self
+    }
+
+    /// Number of converter threads per tenant.
+    pub fn wal_converters(mut self, count: Option<usize>) -> Self {
+        self.wal_converters = count;
         self
     }
 
@@ -357,6 +417,17 @@ impl Builder {
         self
     }
 
+    /// Read JVM heap profiles out of Java Flight Recorder.
+    ///
+    /// A JVM samples its own allocations, so this starts a recording on the
+    /// running process, dumps it and reads it back: nothing is injected into
+    /// the target. It needs jcmd and jfr on PATH (a JDK, not a JRE) and
+    /// permission to attach, and is skipped silently where either is missing.
+    pub fn collect_jvm(mut self, enabled: bool) -> Self {
+        self.collect_jvm = enabled;
+        self
+    }
+
     /// Profile native heaps (C, C++, Rust, ...) by hooking the allocator's
     /// `malloc`/`free` family with uprobes.
     pub fn collect_alloc(mut self, enabled: bool) -> Self {
@@ -418,11 +489,18 @@ impl Builder {
             retention: self.retention,
             max_disk_bytes: self.max_disk_bytes,
             duckdb_threads: self.duckdb_threads,
+            duckdb_memory_limit: self.duckdb_memory_limit.clone(),
             query_concurrency: self.query_concurrency,
             storage_mode: self.storage_mode,
             s3: self.s3.clone(),
             parquet_local_ttl_ns: self.parquet_local_ttl.map(|d| d.as_nanos() as u64),
             storage_flush_interval_ns: self.storage_flush_interval.map(|d| d.as_nanos() as u64),
+            ingest_mode: self.ingest_mode,
+            wal_segment_bytes: self.wal_segment_bytes,
+            wal_sync_interval_ms: self.wal_sync_interval_ms,
+            wal_max_pending_bytes: self.wal_max_pending_bytes,
+            wal_segment_age_ms: self.wal_segment_age_ms,
+            wal_converters: self.wal_converters,
             auth_token: self.auth_token.clone(),
             tenant_tokens,
             allowed_tenants: self.allowed_tenants.clone(),
@@ -461,6 +539,7 @@ impl Builder {
                 collect_cpu: self.collect_cpu,
                 collect_off_cpu: self.collect_off_cpu,
                 collect_heap: self.collect_heap,
+                collect_jvm: self.collect_jvm,
                 heap_objects: self.heap_objects,
                 collect_alloc: self.collect_alloc,
                 enrich_kubernetes_labels: self.enrich_kubernetes_labels,
@@ -614,10 +693,13 @@ impl LidlessEye {
             .map_err(|err| Error::Server(err.to_string()))
     }
 
-    /// Ingest a batch of reports.
+    /// Ingest a batch of reports, waiting for the commit.
+    ///
+    /// This is the in-process path used by tests and by callers that want the
+    /// batch ids back; the HTTP listener uses the configurable ingest mode.
     pub async fn ingest_many(&self, reports: Vec<Report>) -> Result<Vec<Arc<BatchMeta>>> {
         self.http
-            .ingest_many(&self.tenant, reports)
+            .ingest_committed(&self.tenant, reports)
             .await
             .map_err(|err| Error::Server(err.to_string()))
     }

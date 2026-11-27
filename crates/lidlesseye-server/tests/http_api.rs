@@ -25,6 +25,10 @@ fn config(dir: &Path) -> ServerConfig {
     ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         data_dir: dir.to_path_buf(),
+        // These tests assert on the result of the write that precedes them, so
+        // they need the commit-before-answer mode. The asynchronous default is
+        // covered separately by `ingest_is_queued_and_becomes_visible`.
+        ingest_mode: lidlesseye_core::IngestMode::Sync,
         ..Default::default()
     }
 }
@@ -1415,4 +1419,92 @@ async fn an_upload_of_only_invalid_reports_is_rejected() {
             .is_some_and(|error| error.contains("value")),
         "{body}"
     );
+}
+
+/// The asynchronous ingest path acknowledges before the data is queryable.
+///
+/// This is the production mode: an upload is appended to the segment log and
+/// answered with 202, and the converter turns it into Parquet a moment later.
+/// The old shape — one writer thread, one queue, the request waiting for the
+/// commit — is what filled up and started returning 503 on a busy cluster.
+#[tokio::test]
+async fn ingest_is_queued_then_becomes_visible() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.ingest_mode = lidlesseye_core::IngestMode::Async;
+    // Keep the test fast: seal and convert within a couple of hundred
+    // milliseconds instead of waiting for the production cadence.
+    cfg = cfg.wal_segment_age(50).wal(None, Some(0), None);
+    let app = router_with(dir.path(), cfg).await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/ingest",
+        Some(json!({ "reports": [report("checkout", "cpu", 1_000_000_000)] })),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["accepted"], 1);
+    assert_eq!(body["queued"], true, "{body}");
+    assert!(body["segment"].as_str().is_some(), "{body}");
+
+    // The write is not queryable until the converter has run.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, graph) = call(
+            &app,
+            "GET",
+            "/api/v1/flamegraph?from=now-1h&type=cpu",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{graph}");
+        if graph["total"] == 1_000_000_000i64 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the converter never made the upload queryable: {graph}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// An explicit flush makes an asynchronous upload visible immediately.
+#[tokio::test]
+async fn flush_converts_pending_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.ingest_mode = lidlesseye_core::IngestMode::Async;
+    cfg = cfg.wal(None, Some(0), None);
+    let app = router_with(dir.path(), cfg).await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/ingest",
+        Some(json!({ "reports": [report("checkout", "cpu", 2_000_000_000)] })),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    let (status, body) = call(&app, "POST", "/api/v1/flush", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, graph) = call(
+        &app,
+        "GET",
+        "/api/v1/flamegraph?from=now-1h&type=cpu",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{graph}");
+    assert_eq!(graph["total"], 2_000_000_000i64, "{graph}");
 }

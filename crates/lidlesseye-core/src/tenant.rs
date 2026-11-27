@@ -262,6 +262,13 @@ impl TenantStore {
             // Per-tenant read connections, sized process-wide: the pool is
             // what lets one slow panel stop blocking the others.
             read_connections: self.base.read_connections,
+            ingest_mode: self.base.ingest_mode,
+            wal_segment_bytes: self.base.wal_segment_bytes,
+            wal_sync_interval_ms: self.base.wal_sync_interval_ms,
+            wal_max_pending_bytes: self.base.wal_max_pending_bytes,
+            wal_segment_age_ms: self.base.wal_segment_age_ms,
+            max_series: limits.max_series,
+            wal_converters: self.base.wal_converters,
         };
         // Another registry over the same directory may be opening this tenant
         // right now. DuckDB writes its file header during open, so the two

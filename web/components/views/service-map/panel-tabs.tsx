@@ -10,10 +10,11 @@
 // flat is worse than an honest gap.
 
 import { ArrowUpRight, Flame, HardDrive, Network } from "lucide-react";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { FlamegraphCanvas } from "@/components/canvas/flamegraph-canvas";
 import { Button } from "@/components/ui/button";
+import { api } from "@/lib/api";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatBytes, formatCount, formatDuration, formatPercent, formatValue } from "@/lib/format";
@@ -27,6 +28,7 @@ import {
 import { dashboardStore } from "@/lib/store";
 import type {
   LabelFilter,
+  MemoryProcessRow,
   ServiceInstance,
   ServiceMapEdge,
   ServiceMapNode,
@@ -1180,18 +1182,34 @@ export function ProfilingTab({ node, data }: TabProps) {
       </Section>
 
       {filters ? (
-        <Button
-          size="sm"
-          className="w-full"
-          data-testid="map-profile"
-          onClick={() => dashboardStore.showProfile(filters, data.profileType ?? undefined)}
-        >
-          <ArrowUpRight />
-          Open full flamegraph view
-        </Button>
+        <div className="flex flex-col gap-2">
+          <Button
+            size="sm"
+            className="w-full"
+            data-testid="map-profile"
+            onClick={() => dashboardStore.showProfile(filters, data.profileType ?? undefined)}
+          >
+            <ArrowUpRight />
+            Open full flamegraph view
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="w-full"
+            data-testid="map-profile-alloc"
+            onClick={() => dashboardStore.showProfile(filters, "alloc_space")}
+          >
+            <ArrowUpRight />
+            Open allocation flamegraph
+          </Button>
+        </div>
       ) : (
         <Note>Traffic to or from outside the cluster has no profiles behind it.</Note>
       )}
+
+      <Section title="Processes" hint="resident memory of the processes behind this node">
+        <ProcessList node={node} />
+      </Section>
 
       <Separator />
       <Section title="Query context" hint="same as the charts above">
@@ -1205,6 +1223,88 @@ export function ProfilingTab({ node, data }: TabProps) {
           full view. Changing the type here changes all three.
         </Note>
       </Section>
+    </div>
+  );
+}
+
+/**
+ * The processes behind a workload, with their resident memory.
+ *
+ * The Memory page answers "how much is this workload allocating"; this answers
+ * "which process is holding it". Same source (`/api/v1/memory/processes`), but
+ * scoped to the node already open, so a drill-down never makes the operator
+ * find the workload again somewhere else.
+ */
+function ProcessList({ node }: { node: ServiceMapNode }) {
+  // A workload node carries `workload`; a service node in front of one carries
+  // `service` and an empty `workload`, so this must fall back on truthiness,
+  // not on nullish-ness. Both are reported by the reader as `<namespace>/<name>`.
+  const name = node.workload || node.service;
+  const workload = node.namespace && name ? `${node.namespace}/${name}` : null;
+  const [rows, setRows] = useState<MemoryProcessRow[] | null>(null);
+  const [pods, setPods] = useState(0);
+  const [failed, setFailed] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!workload) {
+      setRows([]);
+      return;
+    }
+    const controller = new AbortController();
+    api
+      .memoryProcesses({ workload, limit: "8" }, controller.signal)
+      .then((payload) => {
+        setRows(payload.processes ?? []);
+        setPods(payload.pods ?? 0);
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        setFailed(error instanceof Error ? error.message : String(error));
+      });
+    return () => controller.abort();
+  }, [workload]);
+
+  if (!workload) {
+    return <Note>This node is not a workload, so it has no processes of its own.</Note>;
+  }
+  if (failed) {
+    return <Note>The process list could not be read: {failed}</Note>;
+  }
+  if (!rows) {
+    return <Skeleton className="h-16 w-full rounded-md" data-testid="map-processes-loading" />;
+  }
+  if (!rows.length) {
+    return (
+      <Note>
+        {pods > 0
+          ? `No process reported for ${workload} in this window.`
+          : `No reader is reporting processes for ${workload}. Switch on native memory profiling for it and the list fills on the next report.`}
+      </Note>
+    );
+  }
+
+  return (
+    <div className="space-y-1" data-testid="map-processes">
+      {rows.map((row) => (
+        <div
+          key={`${row.pid}-${row.start_ns ?? 0}`}
+          className="flex items-baseline justify-between gap-2 text-[11px]"
+        >
+          <span className="truncate" title={row.executable ?? row.comm ?? String(row.pid)}>
+            <span className="text-muted-foreground tabular-nums">{row.pid}</span>{" "}
+            {row.comm ?? "process"}
+          </span>
+          <span className="shrink-0 tabular-nums">
+            {row.rss_bytes ? formatBytes(row.rss_bytes) : "—"}
+            {row.pss_bytes ? (
+              <span className="text-muted-foreground"> / {formatBytes(row.pss_bytes)} PSS</span>
+            ) : null}
+          </span>
+        </div>
+      ))}
+      <div className="pt-1 text-[9.5px] text-muted-foreground/70">
+        RSS first, PSS where the kernel exposes it.
+      </div>
     </div>
   );
 }

@@ -33,6 +33,8 @@ mod collector;
 pub mod conntrack;
 #[cfg(target_os = "linux")]
 pub mod goheap;
+pub mod jvmheap;
+pub mod bpftime;
 #[cfg(target_os = "linux")]
 mod gopclntab;
 /// Pod metadata, keyed by UID, that names the series of a pod.
@@ -61,6 +63,19 @@ mod symbolizer;
 
 #[cfg(target_os = "linux")]
 pub use collector::{CollectorConfig, CollectorHandle, StatsSnapshot, start};
+
+/// Resolve a user-space stack of instruction pointers (leaf first) for `tgid`.
+///
+/// The collector symbolises as part of its own pipeline, but a caller that
+/// already has raw addresses — the bpftime allocator reader, which is handed
+/// them by the loader — needs only address-to-frame mapping. Keeping it here
+/// means the `/proc/<pid>/root` handling and the symbol caches stay in one
+/// place instead of being reimplemented next to every new reader.
+#[cfg(target_os = "linux")]
+pub fn resolve_user_stack(tgid: u32, ips: &[u64]) -> Vec<lidlesseye_core::Frame> {
+    let mut resolver = symbolizer::FrameResolver::new();
+    resolver.resolve_user(tgid, ips)
+}
 
 /// Why addresses could not be symbolized, split by cause.
 ///

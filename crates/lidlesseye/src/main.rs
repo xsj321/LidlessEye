@@ -1,6 +1,8 @@
 //! The `lidlesseye` command line tool.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -8,6 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use lidlesseye::core::{ProfileType, QueryOptions, Selector, StoreConfig};
+use lidlesseye::ebpf::k8s::PodMeta;
+use lidlesseye::k8s::ShimOutcome;
 use lidlesseye::{Builder, PublisherConfig};
 
 #[derive(Debug, Parser)]
@@ -41,8 +45,34 @@ enum Command {
     Query(QueryArgs),
     /// Verify every tenant database and its stack/frame references.
     Fsck(FsckArgs),
+    /// Read allocator samples from bpftime and post them as folded profiles.
+    ///
+    /// Runs inside the profiled pod as an ephemeral container: bpftime needs
+    /// the target's PID namespace, `/dev/shm` and libc image, and an ephemeral
+    /// container is the only way to get all three without injecting into a
+    /// separate address space.
+    BpftimeShim(ShimArgs),
     /// Print build and platform information.
     Info,
+}
+
+#[derive(Debug, Args)]
+struct ShimArgs {
+    /// Server base URL, e.g. `http://le-disk-lidlesseye:4040`.
+    #[arg(long, default_value = "http://127.0.0.1:4040")]
+    server: String,
+    /// Tenant the reports belong to (`X-Scope-OrgID`).
+    #[arg(long)]
+    tenant: Option<String>,
+    /// `service_name` stored with every stack, usually the workload.
+    #[arg(long)]
+    service: String,
+    /// How often the loader drains its maps, in seconds.
+    #[arg(long, default_value_t = 30)]
+    interval: u64,
+    /// How often to post what has accumulated, in seconds.
+    #[arg(long, default_value_t = 15)]
+    flush: u64,
 }
 
 #[derive(Debug, Args)]
@@ -60,6 +90,13 @@ struct ServeArgs {
     /// Worker threads DuckDB may use per tenant (default: all cores).
     #[arg(long)]
     duckdb_threads: Option<usize>,
+    /// DuckDB `memory_limit`, e.g. `4GB` (default: 1GB).
+    ///
+    /// Caps the hash tables behind a wide `GROUP BY`. It must fit inside the
+    /// container's memory limit: DuckDB will use this much before spilling, and
+    /// the OOM killer takes the whole server with it.
+    #[arg(long)]
+    duckdb_memory_limit: Option<String>,
     /// How many store reads may run at once (default 4, `0` for no limit).
     ///
     /// Reads run on blocking threads, so an uncapped number of them turns a
@@ -68,6 +105,29 @@ struct ServeArgs {
     /// process keep answering `/api/v1/health` while a wide scan runs.
     #[arg(long, env = "LIDLESSEYE_QUERY_CONCURRENCY", default_value = "4")]
     query_concurrency: usize,
+    /// How an ingest is acknowledged: `async` writes it to the segment log and
+    /// answers 202, `sync` waits for the DuckDB commit (useful for tests and
+    /// ad-hoc `curl` uploads that query immediately).
+    #[arg(long, env = "LIDLESSEYE_INGEST_MODE", default_value = "async")]
+    ingest_mode: String,
+    /// Roll the active segment log file at this many bytes.
+    #[arg(long, env = "LIDLESSEYE_WAL_SEGMENT_BYTES")]
+    wal_segment_bytes: Option<u64>,
+    /// Group-commit interval for the segment log, in milliseconds. This is the
+    /// maximum data loss on an unclean shutdown.
+    #[arg(long, env = "LIDLESSEYE_WAL_SYNC_MS", default_value = "100")]
+    wal_sync_ms: u64,
+    /// Refuse uploads once this many bytes of segment log are unconverted.
+    #[arg(long, env = "LIDLESSEYE_WAL_MAX_PENDING_BYTES")]
+    wal_max_pending_bytes: Option<u64>,
+    /// Seal the active segment once it is this old (milliseconds), so a quiet
+    /// tenant's last upload becomes queryable without waiting for the next one.
+    #[arg(long, env = "LIDLESSEYE_WAL_SEGMENT_AGE_MS", default_value = "2000")]
+    wal_segment_age_ms: u64,
+    /// Converter threads per tenant (default: half the cores, at most four).
+    /// DuckDB appends do not conflict, so these run in parallel.
+    #[arg(long, env = "LIDLESSEYE_WAL_CONVERTERS")]
+    wal_converters: Option<usize>,
     /// Physical storage backend: `disk` (in-memory hot tier + local Parquet,
     /// default) or `s3` (same hot tier, verified S3 archive). Legacy values
     /// `duckdb` and `parquet` are mapped with a warning; migrate old data first.
@@ -163,9 +223,34 @@ struct ServeArgs {
     /// Do not read Go heap profiles out of each process's runtime.
     #[arg(long)]
     no_heap: bool,
-    /// Do not profile native heaps (C, C++, Rust) through the allocator.
+    /// Do not read JVM heap profiles out of Java Flight Recorder.
+    ///
+    /// On by default where it can work: a JVM records its own allocation
+    /// samples, and this only starts a recording, dumps it and reads it back,
+    /// so nothing is injected into the target. It needs `jcmd` and `jfr` on
+    /// `PATH` (a JDK, not a JRE); images without them are skipped silently.
     #[arg(long)]
-    no_alloc: bool,
+    no_jvm: bool,
+    /// Do not inject the userspace eBPF runtime (bpftime) into native processes.
+    ///
+    /// On by default where the image ships the runtime: the malloc hook then
+    /// runs inside the target, at hundreds of nanoseconds, instead of paying a
+    /// kernel uprobe trap (79 microseconds measured on this cluster). Nothing is
+    /// injected until a workload is switched on from the service map.
+    #[arg(long)]
+    no_bpftime: bool,
+    /// Profile native heaps (C, C++, Rust) by uprobing the allocator's
+    /// `malloc`/`free` for every process on the node.
+    ///
+    /// Off by default. The probe fires on every allocation of every glibc
+    /// process on the machine, and a hit costs tens of microseconds: measured
+    /// on this cluster, one 64-byte allocation took 79 s with the probes
+    /// attached against 2.6 s without them. A node running anything
+    /// allocation-heavy  including this server pays that on every object it
+    /// creates, so the sampler's own cost becomes the thing being measured.
+    /// Enable it for a deliberate heap investigation, not permanently.
+    #[arg(long)]
+    alloc: bool,
     /// Also store allocation and in-use object counts, not only bytes.
     #[arg(long)]
     heap_objects: bool,
@@ -213,9 +298,34 @@ struct CollectArgs {
     /// Do not read Go heap profiles out of each process's runtime.
     #[arg(long)]
     no_heap: bool,
-    /// Do not profile native heaps (C, C++, Rust) through the allocator.
+    /// Do not read JVM heap profiles out of Java Flight Recorder.
+    ///
+    /// On by default where it can work: a JVM records its own allocation
+    /// samples, and this only starts a recording, dumps it and reads it back,
+    /// so nothing is injected into the target. It needs `jcmd` and `jfr` on
+    /// `PATH` (a JDK, not a JRE); images without them are skipped silently.
     #[arg(long)]
-    no_alloc: bool,
+    no_jvm: bool,
+    /// Do not inject the userspace eBPF runtime (bpftime) into native processes.
+    ///
+    /// On by default where the image ships the runtime: the malloc hook then
+    /// runs inside the target, at hundreds of nanoseconds, instead of paying a
+    /// kernel uprobe trap (79 microseconds measured on this cluster). Nothing is
+    /// injected until a workload is switched on from the service map.
+    #[arg(long)]
+    no_bpftime: bool,
+    /// Profile native heaps (C, C++, Rust) by uprobing the allocator's
+    /// `malloc`/`free` for every process on the node.
+    ///
+    /// Off by default. The probe fires on every allocation of every glibc
+    /// process on the machine, and a hit costs tens of microseconds: measured
+    /// on this cluster, one 64-byte allocation took 79 s with the probes
+    /// attached against 2.6 s without them. A node running anything
+    /// allocation-heavy  including this server pays that on every object it
+    /// creates, so the sampler's own cost becomes the thing being measured.
+    /// Enable it for a deliberate heap investigation, not permanently.
+    #[arg(long)]
+    alloc: bool,
     /// Also store allocation and in-use object counts, not only bytes.
     #[arg(long)]
     heap_objects: bool,
@@ -359,6 +469,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Query(args) => query(args),
         Command::Flush(args) => flush(args).await,
         Command::Fsck(args) => fsck(args),
+    #[cfg(target_os = "linux")]
+    Command::BpftimeShim(args) => lidlesseye::shim::run(lidlesseye::shim::ShimArgs {
+        server: args.server,
+        tenant: args.tenant,
+        service: args.service,
+        interval_secs: args.interval,
+        flush_secs: args.flush,
+    })
+    .await,
+    #[cfg(not(target_os = "linux"))]
+    Command::BpftimeShim(_) => anyhow::bail!("bpftime-shim is only available on Linux"),
         Command::Info => {
             println!("lidlesseye {}", env!("CARGO_PKG_VERSION"));
             println!(
@@ -423,6 +544,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .retention(retention)
         .max_disk_bytes(max_disk)
         .duckdb_threads(args.duckdb_threads)
+        .duckdb_memory_limit(args.duckdb_memory_limit)
         .query_concurrency(Some(args.query_concurrency))
         .storage_mode(storage_mode);
     if let Some(s3) = s3 {
@@ -443,7 +565,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .collect_cpu(!args.no_cpu)
         .collect_off_cpu(!args.no_offcpu)
         .collect_heap(!args.no_heap)
-        .collect_alloc(!args.no_alloc)
+        .collect_jvm(!args.no_jvm)
+        .collect_alloc(args.alloc)
         .heap_objects(args.heap_objects)
         .enrich_kubernetes_labels(!args.no_k8s_labels)
         .k8s_pod_metadata(!args.no_k8s_pod_metadata)
@@ -451,7 +574,19 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .collect_netmap(!args.no_netmap)
         .tenant(args.tenant)
         .tenant_header(args.tenant_header)
-        .max_tenants(args.max_tenants);
+        .max_tenants(args.max_tenants)
+        .ingest_mode(match args.ingest_mode.to_ascii_lowercase().as_str() {
+            "async" => lidlesseye::core::IngestMode::Async,
+            "sync" => lidlesseye::core::IngestMode::Sync,
+            other => bail!("unknown --ingest-mode `{other}`; expected `async` or `sync`"),
+        })
+        .wal(
+            args.wal_segment_bytes,
+            Some(args.wal_sync_ms),
+            args.wal_max_pending_bytes,
+        )
+        .wal_segment_age(args.wal_segment_age_ms)
+        .wal_converters(args.wal_converters);
     for (token, tenant) in args.tenant_tokens {
         builder = builder.tenant_token(token, tenant);
     }
@@ -538,6 +673,8 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
     } else {
         None
     };
+    let jvm_workloads = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let alloc_workloads = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let collector_cfg = lidlesseye::ebpf::CollectorConfig {
         service_name: args.service_name,
         labels,
@@ -546,13 +683,183 @@ async fn collect(args: CollectArgs) -> anyhow::Result<()> {
         collect_cpu: !args.no_cpu,
         collect_off_cpu: !args.no_offcpu,
         collect_heap: !args.no_heap,
-        collect_alloc: !args.no_alloc,
+        collect_jvm: !args.no_jvm,
+        jvm_workloads: jvm_workloads.clone(),
+        alloc_workloads: alloc_workloads.clone(),
+        // The injected runtime is the replacement for the kernel uprobe reader,
+        // not an addition; `--alloc` still exists for hosts where injection is
+        // not allowed and a kernel probe is the only option.
+        collect_bpftime: !args.no_bpftime,
+        collect_alloc: args.alloc,
         heap_objects: args.heap_objects,
         enrich_kubernetes_labels: !args.no_k8s_labels,
         pods: pods.clone(),
         ..Default::default()
     };
     let sink = publisher.clone();
+    // Follow the server's switchboard. It is polled rather than pushed so an
+    // agent that was down when a workload was switched on still picks it up,
+    // and the interval is the same order as the collection window: a switch
+    // that takes effect within one flush is quick enough to feel immediate.
+    {
+        let publisher = publisher.clone();
+        let jvm_workloads = jvm_workloads.clone();
+        let alloc_workloads = alloc_workloads.clone();
+        let index = pods.clone();
+        let cluster = lidlesseye::k8s::ClusterApi::in_cluster();
+        let tenant = args.tenant.clone();
+        // The shim image cannot be discovered from inside the pod: the agent
+        // knows its own version, not the tag it was pushed under. Operators set
+        // this once in the DaemonSet, next to the image they deploy.
+        let shim_image = std::env::var("LIDLESSEYE_SIDECAR_IMAGE").ok();
+        if shim_image.is_none() {
+            tracing::warn!(
+                "LIDLESSEYE_SIDECAR_IMAGE is unset: native allocator profiling cannot start"
+            );
+        }
+        tokio::spawn(async move {
+            loop {
+                match publisher.directives().await {
+                    Ok((jvm, alloc)) => {
+                        // The guards are scoped tightly: a parking_lot guard is
+                        // not `Send`, so holding one across an await makes the
+                        // whole task non-Send and `tokio::spawn` refuses it.
+                        {
+                            let mut guard = jvm_workloads.write();
+                            guard.clear();
+                            for workload in jvm {
+                                guard.insert(workload, true);
+                            }
+                        }
+                        {
+                            let mut guard = alloc_workloads.write();
+                            guard.clear();
+                            for workload in &alloc {
+                                guard.insert(workload.clone(), true);
+                            }
+                        }
+                        // One shim per enabled workload, added to a running pod
+                        // of that workload. Ephemeral containers cannot be
+                        // removed, so `ensure_alloc_shim` is idempotent and the
+                        // pod keeps its copy after the switch is turned off
+                        // it sees an empty allow list and goes quiet.
+                        if alloc.is_empty() {
+                            continue;
+                        }
+                        let Some(api) = cluster.as_ref() else {
+                            tracing::warn!("no cluster API: cannot add allocator shims");
+                            continue;
+                        };
+                        let Some(image) = shim_image.as_ref() else {
+                            tracing::warn!(
+                                upstream = 0,
+                                "LIDLESSEYE_SIDECAR_IMAGE is unset; no allocator shims"
+                            );
+                            continue;
+                        };
+                        let Some(index) = index.as_ref() else {
+                            tracing::warn!("no pod index: cannot place allocator shims");
+                            continue;
+                        };
+                        {
+                            // The pod index only knows pods that have been sampled,
+                            // so a workload that is idle (a `sleep` sidecar, a
+                            // service between requests) is missing from it and the
+                            // switch would never reach it. Fall back to the API's
+                            // own pod list before giving up.
+                            let pods = index.snapshot();
+                            let mut api_pods: Option<HashMap<String, PodMeta>> = None;
+                            for workload in &alloc {
+                                let Some((namespace, name)) = workload.split_once('/') else {
+                                    continue;
+                                };
+                                let wanted = |pod: &&PodMeta| {
+                                    pod.namespace == namespace
+                                        && pod.workload.as_deref() == Some(name)
+                                        && pod.phase == "Running"
+                                };
+                                let mut pod = pods.values().find(wanted);
+                                if pod.is_none() {
+                                    if api_pods.is_none() {
+                                        match api.list_all_pods().await {
+                                            Ok(found) => api_pods = Some(found),
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    error = %err,
+                                                    "cannot list pods from the API to place allocator shims"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    pod = api_pods
+                                        .as_ref()
+                                        .and_then(|pods| pods.values().find(wanted));
+                                }
+                                let Some(pod) = pod else {
+                                    tracing::warn!(
+                                        workload = %workload,
+                                        pods = pods.len(),
+                                        "no running pod for the workload"
+                                    );
+                                    continue;
+                                };
+                                match api
+                                    .ensure_alloc_shim(
+                                        pod,
+                                        image,
+                                        publisher.endpoint(),
+                                        Some(tenant.as_str()),
+                                        workload,
+                                    )
+                                    .await
+                                {
+                                    Ok(ShimOutcome::Started) => {
+                                        tracing::info!(workload = %workload, "allocator shim added")
+                                    }
+                                    Ok(ShimOutcome::Running) => {}
+                                    Ok(ShimOutcome::Exhausted { exit_code, reason }) => {
+                                        // An ephemeral container is never restarted and
+                                        // never removed, so a dead shim cannot be fixed
+                                        // from here -- the pod has to be replaced.
+                                        tracing::warn!(
+                                            workload = %workload,
+                                            pod = %pod.name,
+                                            exit_code,
+                                            reason = %reason,
+                                            "allocator shim is dead and cannot be rebuilt; replace the pod"
+                                        );
+                                        // Saying it only in this log leaves the
+                                        // workload looking switched on and quiet,
+                                        // which is the worst of both answers.
+                                        if let Err(err) = publisher
+                                            .report_reader_degraded(
+                                                workload,
+                                                &pod.name,
+                                                "runtime_dead",
+                                                lidlesseye::core::now_ns(),
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                "reporting the dead reader for {workload}: {err}"
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("allocator shim for {workload}: {err}")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!("profiling directives: {err}");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
     let handle = lidlesseye::ebpf::start(collector_cfg, move |report| {
         sink.send(report);
     })
@@ -936,7 +1243,7 @@ fn print_tree(node: &lidlesseye::core::TreeNode, depth: usize, total: i64, min_p
     }
     let indent = "  ".repeat(depth);
     println!(
-        "{indent}{} — {} ({:.1}%)",
+        "{indent}{} {} ({:.1}%)",
         truncate(&node.name, 60),
         format_value(node.value, "nanoseconds"),
         percent
@@ -959,10 +1266,10 @@ fn format_value(value: i64, unit: &str) -> String {
             } else if nanos >= 1e6 {
                 format!("{:.1}ms", nanos / 1e6)
             } else if nanos >= 1e3 {
-                format!("{:.1}µs", nanos / 1e3)
+                format!("{:.1}s", nanos / 1e3)
             } else {
                 // Sub-microsecond values are normal for a 99 Hz sampler, and
-                // rounding them to `0µs` would read as "no time at all".
+                // rounding them to `0s` would read as "no time at all".
                 format!("{:.0}ns", nanos)
             }
         }
@@ -988,8 +1295,10 @@ fn truncate(input: &str, max: usize) -> String {
     if input.chars().count() <= max {
         return input.to_string();
     }
-    let mut out: String = input.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
+    let mut out: String = input.chars().take(max.saturating_sub(3)).collect();
+    // ASCII ellipsis: the terminal width counts characters, and a three-byte
+    // ellipsis would still be one column.
+    out.push_str("...");
     out
 }
 

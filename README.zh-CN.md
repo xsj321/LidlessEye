@@ -239,7 +239,7 @@ lidlesseye fsck     # 校验数据库完整性
 lidlesseye info     # 构建与平台信息
 ```
 
-`collect` 支持 `--frequency`、`--flush`、`--label k=v`、`--service-name`、`--no-cpu`、`--no-offcpu`、`--no-heap`、`--no-alloc`、`--heap-objects`、`--no-k8s-labels`、`--no-k8s-pod-metadata`、`--k8s-pod-refresh`、`--server`、`--tenant`、`--auth-token` 和 `--duration`。设置 `LIDLESSEYE_NODE_NAME`（Helm chart 传入 `spec.nodeName`）可让 `node` 标签在滚动更新后保持稳定。
+`collect` 支持 `--frequency`、`--flush`、`--label k=v`、`--service-name`、`--no-cpu`、`--no-offcpu`、`--no-heap`、`--alloc`、`--heap-objects`、`--no-k8s-labels`、`--no-k8s-pod-metadata`、`--k8s-pod-refresh`、`--server`、`--tenant`、`--auth-token` 和 `--duration`。设置 `LIDLESSEYE_NODE_NAME`（Helm chart 传入 `spec.nodeName`）可让 `node` 标签在滚动更新后保持稳定。
 
 完整参考：[HTTP API](docs/api.md) · [MCP](docs/mcp.zh-CN.md) · [架构](docs/architecture.md) · [部署](docs/deployment.md) · [界面](docs/ui.md)。
 
@@ -261,7 +261,7 @@ cargo fmt --all --check
 - **在导入时符号化**：无法读取模块的帧会显示为 `[unknown]`；agent 需要 `hostPID` 和二进制文件的读权限。
 - **每个 agent 只能覆盖一个 PID namespace**：其他容器中的进程会被计为 `in another PID namespace`，不会被错误归属。
 - **单机存储**：一个存储卷对应一个服务端，没有集群或复制。
-- **uprobe 需要显式开启且范围有限**：TLS 明文捕获仍在 `LIDLESSEYE_SSL_UPROBE=1` 之后；分配分析默认开启（`--no-alloc` 关闭），每个容器每种分配器只挂一个文件——glibc、musl、jemalloc、mimalloc 或 tcmalloc，取进程实际映射的那一个。
+- **uprobe 需要显式开启且范围有限**：TLS 明文捕获在 `LIDLESSEYE_SSL_UPROBE=1` 之后；原生堆分配分析在 `--alloc` 之后。分配器 uprobe **默认关闭**，因为它对节点上每个 glibc 进程的每次分配都要进内核：实测同一次 64 字节分配，挂上探针后是 79 µs，不挂是 2.6 µs。开着它，采样器自身就成了被测对象。开启后每个容器每种分配器只挂一个文件——glibc、musl、jemalloc、mimalloc 或 tcmalloc，取进程实际映射的那一个。
 - **用户态调用栈需要 frame pointers**（`-C force-frame-pointers=yes` / `-fno-omit-frame-pointer`）。没有它们时耗时统计依然正确。
 - **内存分析看的是「分配」，不是「内存」**：`inuse_*` 只统计探针看到分配过、且还没释放的块，所以挂载之前分配的内存、`mmap` 出来的 arena、以及完全绕过 `malloc` 的分配器都不在范围内；也没有 RSS / PSS 序列可以拿来跟堆的水平量对照。
 

@@ -33,7 +33,11 @@ crates/lidlesseye-server/ui
 # Not needed by the image
 docs/
 examples/
-deploy/
+# Excluding the directory itself would also drop the re-include below; Docker
+# does not descend into an excluded parent, so this has to be `deploy/*`.
+deploy/*
+# ... except the C files the bpftime stage compiles into the agent.
+!deploy/bpftime
 scripts/
 .devcontainer/
 

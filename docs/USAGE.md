@@ -36,13 +36,24 @@ every other language is counted at the allocator's `malloc`, `calloc`,
 | `alloc_objects` | count | rate | `--heap-objects` |
 | `inuse_objects` | count | level | `--heap-objects` |
 
-Flags: `--no-alloc` drops the allocator uprobes, `--no-heap` drops the Go heap
+Flags: `--alloc` turns on the allocator uprobes (they are off by default; see
+the cost below), `--no-heap` drops the Go heap
 reader, `--heap-objects` adds the two object counts. A process is measured by
 one reader, never both — a Go binary's `malloc` is already represented by the
 runtime's own profile. Memory labels answer "who measured this": `node`,
 `service_name`, `profile_source` (`go-runtime` or `allocator-uprobe`),
 `sampling` (`runtime` or `uprobe`), `runtime` (`go`, `c`, `c++`, `rust`, …) and
 `allocator` (`glibc`, `musl`, `jemalloc`, `mimalloc`, `tcmalloc`, `static`).
+
+The two readers cost wildly different amounts, which is why only one of them is
+on by default. The Go reader samples inside the runtime (one allocation every
+`MemProfileRate` bytes) and only *reads* `runtime.mbuckets` through
+`/proc/<pid>/mem`, so a profile costs one pass over the buckets. The allocator
+uprobe fires on **every** `malloc`/`free` of **every** glibc process on the
+node, and a hit costs tens of microseconds: on a Kubernetes node where one
+64-byte allocation measured 2.6 µs without the probes, the same allocation
+measured 79 µs with them attached. That is the overhead of the sampler, paid by
+the sampled programs, not a property of the program being profiled.
 
 What neither reader measures — worth knowing before trusting a number:
 

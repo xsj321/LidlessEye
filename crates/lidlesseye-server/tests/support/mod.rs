@@ -29,6 +29,10 @@ pub fn config(dir: &Path) -> ServerConfig {
     ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         data_dir: dir.to_path_buf(),
+        // The suites assert on the write that precedes the query, so they need
+        // the commit-before-answer mode. The asynchronous default has its own
+        // tests.
+        ingest_mode: lidlesseye_core::IngestMode::Sync,
         ..Default::default()
     }
 }

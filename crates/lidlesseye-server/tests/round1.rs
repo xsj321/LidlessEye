@@ -345,7 +345,7 @@ async fn invalid_reports_are_rejected() {
 /// A batch is all-or-nothing: one bad report must not leave the good ones
 /// behind, otherwise a retry duplicates them.
 #[tokio::test]
-async fn a_batch_with_one_bad_report_stores_nothing() {
+async fn a_batch_keeps_the_valid_reports_when_one_is_bad() {
     let dir = tempfile::tempdir().unwrap();
     let app = router(dir.path()).await;
     let now = now_ns();
@@ -354,6 +354,37 @@ async fn a_batch_with_one_bad_report_stores_nothing() {
     bad.add_stack(vec![Frame::new("/a", "b")], 1);
     let payload = json!({
         "reports": [report("svc", "cpu", 1_000), serde_json::to_value(bad.finish()).unwrap()],
+    });
+    // One malformed report must not cost the upload: the agent retries nine
+    // times and then drops the batch, so failing all of it turns a single bad
+    // row into a hole in the tenant's data. The response says which index was
+    // refused and the valid report is stored.
+    let (status, body) = call(&app, "POST", "/ingest", Some(payload), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], 1, "{body}");
+    assert_eq!(body["rejected"][0]["index"], 1, "{body}");
+
+    let (_, fg) = call(
+        &app,
+        "GET",
+        "/api/v1/flamegraph?profile_type=cpu&from=now-1h",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(fg["total"], 1_000, "the valid report was dropped: {fg}");
+}
+
+#[tokio::test]
+async fn an_upload_where_every_report_is_bad_stores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(dir.path()).await;
+    let now = now_ns();
+
+    let mut bad = ReportBuilder::new("svc", ProfileType::cpu(), now, now - 5);
+    bad.add_stack(vec![Frame::new("/a", "b")], 1);
+    let payload = json!({
+        "reports": [serde_json::to_value(bad.finish()).unwrap()],
     });
     let (status, body) = call(&app, "POST", "/ingest", Some(payload), &[]).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -366,7 +397,7 @@ async fn a_batch_with_one_bad_report_stores_nothing() {
         &[],
     )
     .await;
-    assert_eq!(fg["total"], 0, "a rejected batch left data behind: {fg}");
+    assert_eq!(fg["total"], 0, "a rejected upload left data behind: {fg}");
 }
 
 #[tokio::test]

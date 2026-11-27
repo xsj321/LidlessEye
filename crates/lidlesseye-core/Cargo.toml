@@ -12,6 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+bincode = { workspace = true }
+crc32fast = { workspace = true }
 duckdb = { workspace = true }
 flate2 = { workspace = true }
 lidlesseye-servicemap = { workspace = true }

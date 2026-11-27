@@ -13,6 +13,14 @@
 
 mod api;
 mod config;
+mod capabilities;
+mod cache;
+mod lease;
+mod dedupe;
+mod fsck;
+mod processes;
+mod coverage;
+mod directives;
 mod error;
 mod metrics;
 mod params;
@@ -53,6 +61,24 @@ pub struct AppState {
 
 struct Inner {
     registry: Arc<TenantStore>,
+    /// Workloads whose runtime memory profiling the operator switched on.
+    directives: Arc<directives::Directives>,
+    /// The last coverage report each workload's native reader sent in: how many
+    /// processes it saw, how many it is attached to, and what it skipped.
+    coverage: Arc<coverage::Coverage>,
+    /// The last capability report each workload's readers sent in. A reader
+    /// that is enabled but not active says so here, with a reason.
+    capabilities: Arc<capabilities::Capabilities>,
+    /// Batch ids already accepted, so a replayed delivery does not count twice.
+    dedupe: Arc<dedupe::Dedupe>,
+    /// The last on-disk check, and the file set it compared against.
+    fsck: Arc<fsck::Fsck>,
+    /// Short-lived answers for the read endpoints.
+    pub cache: Arc<cache::Cache>,
+    /// Which replica may write. See [`lease`].
+    pub lease: Arc<lease::Lease>,
+    /// Latest per-process memory report per (workload, pod).
+    processes: Arc<processes::Processes>,
     cfg: ServerConfig,
     metrics: Arc<Metrics>,
     started: Instant,
@@ -338,6 +364,15 @@ impl QueryGuard {
     }
 }
 
+/// What an ingest call did.
+#[derive(Debug, Clone)]
+pub enum IngestOutcome {
+    /// Written to the segment log; the converter will turn it into Parquet.
+    Queued(lidlesseye_core::wal::Appended),
+    /// Committed to DuckDB before returning.
+    Committed(Vec<Arc<BatchMeta>>),
+}
+
 impl AppState {
     /// Create a cancellation guard tied to one store connection. Hold it in
     /// the handler until the query result has been produced.
@@ -390,16 +425,83 @@ impl AppState {
         }
     }
 
-    /// Persist several reports of one tenant in a single blocking task.
+    /// Persist several reports of one tenant.
+    ///
+    /// In [`IngestMode::Async`] the upload goes to the segment log and the
+    /// answer is `Queued` the moment it is written — no DuckDB, no queue, no
+    /// writer latency. In [`IngestMode::Sync`] it is committed before the
+    /// answer, which is what tests and ad-hoc `curl` uploads need.
     pub async fn ingest_many(
         &self,
+        tenant: &TenantId,
+        reports: Vec<Report>,
+    ) -> Result<IngestOutcome, ApiError> {
+        self.ingest_many_with(tenant, reports, false).await
+    }
+
+    /// [`AppState::ingest_many`], optionally waiting for the `fsync`.
+    ///
+    /// `durable` is what `?sync=1` asks for: the upload is already accepted
+    /// either way, but a caller that is about to kill the process — a test, a
+    /// script, a pprof push — can ask for the bytes to be on the platter first.
+    pub async fn ingest_many_with(
+        &self,
+        tenant: &TenantId,
+        reports: Vec<Report>,
+        durable: bool,
+    ) -> Result<IngestOutcome, ApiError> {
+        if self.inner.cfg.read_only {
+            return Err(ApiError::forbidden("server is read-only"));
+        }
+        let store = self.writable_tenant_async(tenant).await?;
+        if store.config().ingest_mode == lidlesseye_core::IngestMode::Async {
+            // One encoded append; the fsync happens on its own thread. Only the
+            // log is touched, so a flush or a merge can no longer delay an
+            // agent's upload.
+            let appended = tokio::task::spawn_blocking(move || {
+                let appended = store.append_durable(&reports)?;
+                if durable {
+                    let appended = lidlesseye_core::wal::Appended {
+                        synced: store.await_durable(&appended, std::time::Duration::from_secs(5)),
+                        ..appended
+                    };
+                    return Ok::<_, lidlesseye_core::Error>(appended);
+                }
+                Ok(appended)
+            })
+            .await
+            .map_err(|err| ApiError::internal(format!("ingest task failed: {err}")))??;
+            self.inner
+                .metrics
+                .ingest_reports
+                .fetch_add(appended.reports as u64, Ordering::Relaxed);
+            return Ok(IngestOutcome::Queued(appended));
+        }
+        self.ingest_committed_with(store, tenant, reports)
+            .await
+            .map(IngestOutcome::Committed)
+    }
+
+    /// Commit several reports before returning. Used by the synchronous mode
+    /// and by callers that bypass HTTP and need a batch id back.
+    pub async fn ingest_committed(
+        &self,
+        tenant: &TenantId,
+        reports: Vec<Report>,
+    ) -> Result<Vec<Arc<BatchMeta>>, ApiError> {
+        let store = self.writable_tenant_async(tenant).await?;
+        self.ingest_committed_with(store, tenant, reports).await
+    }
+
+    async fn ingest_committed_with(
+        &self,
+        store: Arc<Store>,
         tenant: &TenantId,
         reports: Vec<Report>,
     ) -> Result<Vec<Arc<BatchMeta>>, ApiError> {
         if self.inner.cfg.read_only {
             return Err(ApiError::forbidden("server is read-only"));
         }
-        let store = self.writable_tenant_async(tenant).await?;
         // In S3 mode local Parquet files are unconfirmed staging copies. If
         // the archive cannot drain and the staging area exceeds the hard cap,
         // refuse new data instead of deleting the only copy to make room.
@@ -573,6 +675,15 @@ impl LidlessEye {
             // queue on the semaphore instead, a smaller one would make the
             // semaphore pointless.
             read_connections: cfg.query_concurrency(),
+            ingest_mode: cfg.ingest_mode,
+            wal_segment_bytes: cfg.wal_segment_bytes,
+            wal_sync_interval_ms: cfg.wal_sync_interval_ms,
+            wal_max_pending_bytes: cfg.wal_max_pending_bytes,
+            wal_segment_age_ms: cfg.wal_segment_age_ms,
+            // The per-tenant cap moves into the store so the converter can
+            // enforce it in one batch instead of one query per report.
+            max_series: None,
+            wal_converters: cfg.wal_converters,
         };
         let registry = TenantStore::open_with_limits(
             &cfg.data_dir,
@@ -626,6 +737,39 @@ impl LidlessEye {
             state: AppState {
                 inner: Arc::new(Inner {
                     registry,
+                    directives: Arc::new(directives::Directives::load(&cfg.data_dir)),
+                    coverage: Arc::new(coverage::Coverage::with_path(
+                        cfg.data_dir.join("coverage.json"),
+                    )),
+            capabilities: Arc::new(capabilities::Capabilities::with_path(
+                cfg.data_dir.join("capabilities.json"),
+            )),
+            dedupe: dedupe::Dedupe::new(),
+            fsck: Arc::new(fsck::Fsck::default()),
+            cache: Arc::new(cache::Cache::default()),
+            lease: if cfg.read_only {
+                // A replica that has decided not to write must not compete for
+                // the lease: holding it while refusing writes would redirect
+                // every write to itself.
+                lease::Lease::passive(
+                    std::env::var("LIDLESSEYE_POD_NAME")
+                        .unwrap_or_else(|_| format!("lidlesseye-{}", std::process::id())),
+                )
+            } else {
+                lease::Lease::open_with_addr(
+                    &cfg.data_dir,
+                    std::env::var("LIDLESSEYE_POD_NAME")
+                        .unwrap_or_else(|_| format!("lidlesseye-{}", std::process::id())),
+                    // The address writers are redirected to. Without a pod IP the
+                    // record stays empty and a standby falls back to a plain 503.
+                    std::env::var("LIDLESSEYE_POD_IP")
+                        .map(|ip| format!("{ip}:{}", cfg.listen.port()))
+                        .unwrap_or_default(),
+                )
+            },
+            processes: Arc::new(processes::Processes::with_path(
+                cfg.data_dir.join("processes.json"),
+            )),
                     cfg,
                     metrics: Arc::new(Metrics::default()),
                     started: Instant::now(),
@@ -667,6 +811,15 @@ impl LidlessEye {
         build_router(self.state.clone())
     }
 
+    /// Persist several reports, waiting for the commit.
+    pub async fn ingest_committed(
+        &self,
+        tenant: &TenantId,
+        reports: Vec<Report>,
+    ) -> Result<Vec<Arc<BatchMeta>>, ApiError> {
+        self.state.ingest_committed(tenant, reports).await
+    }
+
     /// Persist a report for the default tenant, bypassing HTTP.
     pub async fn ingest(&self, report: Report) -> Result<Arc<BatchMeta>, ApiError> {
         self.ingest_for(&TenantId::default_tenant(), report).await
@@ -678,7 +831,7 @@ impl LidlessEye {
         tenant: &TenantId,
         report: Report,
     ) -> Result<Arc<BatchMeta>, ApiError> {
-        self.ingest_many(tenant, vec![report])
+        self.ingest_committed(tenant, vec![report])
             .await?
             .into_iter()
             .next()
@@ -690,7 +843,7 @@ impl LidlessEye {
         &self,
         tenant: &TenantId,
         reports: Vec<Report>,
-    ) -> Result<Vec<Arc<BatchMeta>>, ApiError> {
+    ) -> Result<IngestOutcome, ApiError> {
         self.state.ingest_many(tenant, reports).await
     }
 
@@ -710,6 +863,41 @@ impl LidlessEye {
         let cfg = self.state.inner.cfg.clone();
         let metrics = self.state.inner.metrics.clone();
 
+        // The first request for an idle tenant pays for opening it: its archive
+        // index, its connections and its id counters. On a tenant with real
+        // history that is minutes of work, and it happens inside whichever
+        // HTTP request arrives first, which then runs into the request timeout.
+        // Open the tenants that already have directories in the background
+        // instead — one at a time, so their connections never arrive as the
+        // storm that on-demand loading exists to prevent, and strictly after
+        // the listener is up, so a slow archive never delays a restart.
+        let warm_registry = registry.clone();
+        let inner_lease = self.state.inner.lease.clone();
+        let _warm = tokio::spawn(async move {
+            let ids = warm_registry.tenant_ids();
+            if ids.is_empty() {
+                return;
+            }
+            info!(tenants = ids.len(), "warming tenant stores in the background");
+            for id in ids {
+                let name = id.to_string();
+                let registry = warm_registry.clone();
+                let started = std::time::Instant::now();
+                match tokio::task::spawn_blocking(move || registry.open_tenant(&id)).await {
+                    Ok(Ok(_)) => info!(
+                        tenant = %name,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "tenant store warm"
+                    ),
+                    Ok(Err(err)) => {
+                        warn!(tenant = %name, error = %err, "could not warm a tenant store")
+                    }
+                    Err(err) => warn!(tenant = %name, error = %err, "tenant warm task failed"),
+                }
+            }
+            info!("tenant stores warmed");
+        });
+
         // This loop moves the hot tier to Parquet and, past the local TTL,
         // merges/uploads files. Its cadence must be at least as frequent as
         // the configured flush interval, otherwise the RPO is silently larger
@@ -720,7 +908,66 @@ impl LidlessEye {
         // connections — which is the connection storm on-demand loading exists
         // to avoid. Counting a tenant's archive happens on its first real use
         // instead, on the blocking pool rather than holding up the listener.
+        // A replica that is not writing never refreshes its Parquet index: the
+        // writer's index advances as a side effect of every flush, but a standby
+        // (and a read-only query frontend) opens the tree once and would then
+        // answer from a snapshot that never moves. That is a silent wrong answer,
+        // not a slow one — two replicas behind one Service would disagree about
+        // the same query. Re-scan on a short timer whenever this replica is not
+        // the writer; the gate is inside the loop because the role can change.
+        {
+            let refresh_registry = registry.clone();
+            let refresh_lease = inner_lease.clone();
+            let _refresh = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    if refresh_lease.is_active() {
+                        continue;
+                    }
+                    for id in refresh_registry.tenant_ids() {
+                        if let Some(store) = refresh_registry.loaded_tenant(&id) {
+                            store.refresh_parquet_index();
+                        }
+                    }
+                }
+            });
+        }
+
+        let lease_tick = inner_lease.clone();
+        let coverage_for_lease = self.state.inner.coverage.clone();
+        let _lease = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(lease::TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let changed = lease_tick.tick();
+                // Only the writer rewrites the shared trend file: a standby that
+                // saved its own smaller map would erase the writer's points.
+                coverage_for_lease.set_persistent(lease_tick.is_active());
+                if changed {
+                    if lease_tick.is_active() {
+                        info!(
+                            holder = lease_tick.holder(),
+                            fence = lease_tick.fence(),
+                            "this replica is now the writer"
+                        );
+                    } else {
+                        warn!(
+                            holder = lease_tick.holder(),
+                            fence = lease_tick.fence(),
+                            "another replica holds the lease; serving reads only"
+                        );
+                    }
+                }
+            }
+        });
+
         let compact_registry = registry.clone();
+        // Only the lease holder maintains storage; a standby keeps its readers
+        // warm and refuses writes, so the two can never rotate the same files.
+        let lease_for_tasks = inner_lease.clone();
         let flush_interval = cfg
             .storage_flush_interval_ns
             .map(Duration::from_nanos)
@@ -734,6 +981,9 @@ impl LidlessEye {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                if !lease_for_tasks.is_active() {
+                    continue;
+                }
                 let registry = compact_registry.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let now = lidlesseye_core::now_ns();
@@ -751,11 +1001,15 @@ impl LidlessEye {
             }
         });
 
+        let lease_for_prune = inner_lease.clone();
         let prune = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(cfg.prune_interval.max(Duration::from_secs(1)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                if !lease_for_prune.is_active() {
+                    continue;
+                }
                 let registry = registry.clone();
                 let metrics = metrics.clone();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -785,12 +1039,65 @@ impl LidlessEye {
             }
         });
 
+        // The on-disk check runs on its own clock and never blocks a query: it
+        // only reads directory entries and file headers.
+        let fsck_task = {
+            let fsck = self.state.inner.fsck.clone();
+            // The prune task below takes the local `registry`, so this one takes
+            // its own handle from the state.
+            let registry = self.state.inner.registry.clone();
+            let data_dir = registry.root().to_path_buf();
+            let every = cfg.fsck_interval.max(Duration::from_secs(60));
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(every);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let tenants: Vec<String> = registry
+                        .tenant_ids()
+                        .into_iter()
+                        .map(|tenant| tenant.to_string())
+                        .collect();
+                    if tenants.is_empty() {
+                        continue;
+                    }
+                    let fsck = fsck.clone();
+                    let data_dir = data_dir.clone();
+                    let ran = tokio::task::spawn_blocking(move || fsck.run(&data_dir, &tenants))
+                        .await;
+                    match ran {
+                        Ok(report) if report.has_findings() => {
+                            for tenant in &report.tenants {
+                                if tenant.empty_hours.is_empty()
+                                    && tenant.unreadable.is_empty()
+                                    && tenant.vanished.is_empty()
+                                {
+                                    continue;
+                                }
+                                warn!(
+                                    tenant = %tenant.tenant,
+                                    files = tenant.files,
+                                    vanished = tenant.vanished.len(),
+                                    unreadable = tenant.unreadable.len(),
+                                    empty_hours = tenant.empty_hours.len(),
+                                    "on-disk check found a problem"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => warn!(error = %err, "on-disk check failed"),
+                    }
+                }
+            })
+        };
+
         info!(addr = %addr, "LidlessEye listening");
         let result = axum::serve(self.listener, app)
             .with_graceful_shutdown(shutdown)
             .await;
         prune.abort();
         compact.abort();
+        fsck_task.abort();
         result.map_err(|err| format!("server error: {err}"))
     }
 
@@ -840,6 +1147,7 @@ impl RunningServer {
 
 fn build_router(state: AppState) -> Router {
     let max_body = state.inner.cfg.max_body_bytes;
+    let cache_state = state.clone();
     let cors_origin = state.inner.cfg.cors_allow_origin.clone();
     let mut router = Router::new()
         .route("/", get(ui::index))
@@ -865,10 +1173,33 @@ fn build_router(state: AppState) -> Router {
             get(api::servicemap_histogram),
         )
         .route("/api/v1/servicemap/ingest", post(api::servicemap_ingest))
+        .route(
+            "/api/v1/profiling/directives",
+            get(api::profiling_directives).put(api::profiling_directive_set),
+        )
+        .route(
+            "/api/v1/memory/coverage",
+            get(api::memory_coverage).post(api::memory_coverage_report),
+        )
+        .route(
+            "/api/v1/capabilities",
+            get(api::capabilities).post(api::capabilities_report),
+        )
+        .route(
+            "/api/v1/memory/processes",
+            get(api::memory_processes).post(api::memory_processes_report),
+        )
+        .route(
+            "/api/v1/fsck",
+            get(api::fsck).post(api::fsck_run),
+        )
+        .route("/api/v1/cache", get(api::cache_stats))
+        .route("/api/v1/role", get(api::role))
         .route("/api/v1/version", get(api::version))
         .route("/metrics", get(api::metrics))
         .fallback(ui::fallback)
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(cache_state, crate::cache::layer))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(RequestDecompressionLayer::new())
         .layer(CompressionLayer::new())

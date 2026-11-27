@@ -25,6 +25,7 @@ import type {
   FlamegraphPayload,
   LabelFilter,
   MapHistoryPayload,
+  ServiceInstance,
   ServiceMapNode,
   TimeseriesPayload,
   TopPayload,
@@ -42,6 +43,10 @@ export interface NodeData {
   history: MapHistoryPayload | null;
   /** The same window restricted to `protocol=dns`, for the DNS tab. */
   dnsHistory: MapHistoryPayload | null;
+  /** Pods behind the node; read with the history, not with the map. */
+  instances: ServiceInstance[];
+  /** Container names behind the node, for the per-container rows. */
+  containers: string[];
   /** Profile type behind `profile`, `top` and `flamegraph`. */
   profileType: string | null;
   /** All types with data behind this node in the selected window. */
@@ -58,6 +63,8 @@ export interface NodeData {
 interface BaseData {
   history: MapHistoryPayload | null;
   dnsHistory: MapHistoryPayload | null;
+  instances: ServiceInstance[];
+  containers: string[];
   units: ProfileUnit[];
 }
 
@@ -70,6 +77,8 @@ interface ProfileData {
 const EMPTY: NodeData = {
   history: null,
   dnsHistory: null,
+  instances: [],
+  containers: [],
   profileType: null,
   units: [],
   profile: null,
@@ -229,6 +238,8 @@ export function useNodeData(
       return {
         history,
         dnsHistory,
+        instances: history.instances ?? [],
+        containers: history.containers ?? [],
         units: (types.profile_types ?? []).map((row) => ({
           name: row.name,
           unit: row.unit,
@@ -319,6 +330,8 @@ export function useNodeData(
   return {
     history: base?.history ?? null,
     dnsHistory: base?.dnsHistory ?? null,
+    instances: base?.instances ?? [],
+    containers: base?.containers ?? [],
     profileType,
     units: base?.units ?? [],
     profile: profileData?.profile ?? null,

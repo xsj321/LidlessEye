@@ -7,8 +7,10 @@
 //! are specific to profiling and would be slower as SQL.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::model::{Frame, ProfileType, Unit};
@@ -112,6 +114,11 @@ pub struct QueryOptions {
     /// frame directly under the root, which is how Pyroscope's "group by"
     /// renders.
     pub group_by: Option<String>,
+    /// Restrict a CPU profile to stacks that touch an allocator.
+    pub allocator: Option<AllocatorKind>,
+    /// Count only samples whose *leaf* frame is inside the allocator, i.e. the
+    /// allocator's own CPU cost rather than everything that allocated.
+    pub allocator_self: bool,
 }
 
 impl QueryOptions {
@@ -128,6 +135,8 @@ impl QueryOptions {
             selector,
             max_nodes: 1024,
             group_by: None,
+            allocator: None,
+            allocator_self: false,
         }
     }
 
@@ -138,6 +147,14 @@ impl QueryOptions {
 
     pub fn with_group_by(mut self, label: Option<String>) -> Self {
         self.group_by = label.filter(|label| !label.trim().is_empty());
+        self
+    }
+
+    /// Restrict the profile to stacks that touch `allocator`. `self_only` keeps
+    /// just the samples taken inside the allocator itself.
+    pub fn with_allocator(mut self, allocator: Option<AllocatorKind>, self_only: bool) -> Self {
+        self.allocator = allocator;
+        self.allocator_self = self_only;
         self
     }
 
@@ -152,10 +169,166 @@ impl QueryOptions {
     }
 }
 
+/// Which allocator the caller wants a CPU profile restricted to.
+///
+/// This is a *view* over the CPU profile that is already stored: the collector
+/// keeps leaf IPs and stacks for every process, and the allocator frames are
+/// ordinary frames in those stacks. Filtering here means the answer is available
+/// for every window that was ever collected, without a second collection path
+/// and without touching the target process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocatorKind {
+    /// Any of the allocators below, plus the C++ allocation wrappers.
+    Any,
+    Glibc,
+    Jemalloc,
+    Tcmalloc,
+    Mimalloc,
+}
+
+impl AllocatorKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("any") || value.eq_ignore_ascii_case("all") {
+            return Some(AllocatorKind::Any);
+        }
+        if value.eq_ignore_ascii_case("glibc") || value.eq_ignore_ascii_case("libc") {
+            return Some(AllocatorKind::Glibc);
+        }
+        if value.eq_ignore_ascii_case("jemalloc") {
+            return Some(AllocatorKind::Jemalloc);
+        }
+        if value.eq_ignore_ascii_case("tcmalloc") {
+            return Some(AllocatorKind::Tcmalloc);
+        }
+        if value.eq_ignore_ascii_case("mimalloc") {
+            return Some(AllocatorKind::Mimalloc);
+        }
+        None
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AllocatorKind::Any => "any",
+            AllocatorKind::Glibc => "glibc",
+            AllocatorKind::Jemalloc => "jemalloc",
+            AllocatorKind::Tcmalloc => "tcmalloc",
+            AllocatorKind::Mimalloc => "mimalloc",
+        }
+    }
+
+    /// True when `frame` is a function inside this allocator.
+    ///
+    /// The module decides first, because the same symbol name (`malloc`) exists
+    /// in every allocator and in the application's own wrappers. Symbols are
+    /// then matched against the allocator's internal entry points as well as its
+    /// exported ones: for glibc the time is spent in `_int_malloc`, not in the
+    /// `malloc` the caller sees.
+    pub fn matches(self, frame: &Frame) -> bool {
+        match self {
+            AllocatorKind::Any => {
+                AllocatorKind::Glibc.matches(frame)
+                    || AllocatorKind::Jemalloc.matches(frame)
+                    || AllocatorKind::Tcmalloc.matches(frame)
+                    || AllocatorKind::Mimalloc.matches(frame)
+                    || is_cxx_allocator_wrapper(frame)
+            }
+            AllocatorKind::Glibc => {
+                (contains_ci(&frame.module, "libc.so") || contains_ci(&frame.module, "libc-"))
+                    && is_glibc_allocator_symbol(&frame.symbol)
+            }
+            AllocatorKind::Jemalloc => {
+                (contains_ci(&frame.module, "jemalloc") || frame.symbol.starts_with("je_"))
+                    && is_named_allocator_symbol(&frame.symbol)
+            }
+            AllocatorKind::Tcmalloc => {
+                (contains_ci(&frame.module, "tcmalloc") || frame.symbol.starts_with("tc_"))
+                    && is_named_allocator_symbol(&frame.symbol)
+            }
+            AllocatorKind::Mimalloc => {
+                (contains_ci(&frame.module, "mimalloc") || frame.symbol.starts_with("mi_"))
+                    && is_named_allocator_symbol(&frame.symbol)
+            }
+        }
+    }
+}
+
+/// ASCII-case-insensitive substring test that does not allocate: this runs once
+/// per distinct frame in a query, and lowercasing a module name per frame is
+/// exactly the kind of allocation that showed up as milliseconds before.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    let hay = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || hay.len() < needle.len() {
+        return false;
+    }
+    hay.windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// glibc's allocation entry points and the internal functions that do the work.
+fn is_glibc_allocator_symbol(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "malloc"
+            | "free"
+            | "calloc"
+            | "realloc"
+            | "memalign"
+            | "posix_memalign"
+            | "aligned_alloc"
+            | "valloc"
+            | "pvalloc"
+            | "__libc_malloc"
+            | "__libc_free"
+            | "__libc_calloc"
+            | "__libc_realloc"
+            | "__libc_memalign"
+            | "__libc_valloc"
+            | "__libc_pvalloc"
+            | "_int_malloc"
+            | "_int_free"
+            | "_int_realloc"
+            | "malloc_consolidate"
+            | "tcache_init"
+    )
+}
+
+/// A symbol that names an allocation or a release, for the allocators whose
+/// module already told us which one it is.
+fn is_named_allocator_symbol(symbol: &str) -> bool {
+    contains_ci(symbol, "alloc") || contains_ci(symbol, "free") || contains_ci(symbol, "new")
+}
+
+/// `operator new`/`delete` live in the C++ runtime, not in the allocator.
+fn is_cxx_allocator_wrapper(frame: &Frame) -> bool {
+    (contains_ci(&frame.module, "libstdc++") || contains_ci(&frame.module, "libc++"))
+        && (frame.symbol.starts_with("operator new") || frame.symbol.starts_with("operator delete")
+            || frame.symbol.starts_with("_Znwm")
+            || frame.symbol.starts_with("_ZdlPv"))
+}
+
 /// Interns frames across batches so identical functions collapse.
 struct FrameDict {
     frames: Vec<Frame>,
-    index: HashMap<(String, String, String, u32), u32>,
+    /// Content hash -> the dictionary ids carrying it. Almost always one, but
+    /// kept as a bucket so a hash collision can never merge two functions.
+    ///
+    /// Hashing instead of keeping the three strings as the key is what makes
+    /// this cheap: a wide window interns every frame a stack references, and
+    /// cloning three `String`s per *lookup* — not just per miss — was
+    /// megabytes of allocator traffic per query.
+    index: HashMap<u64, Vec<u32>>,
+}
+
+fn frame_hash(module: &str, symbol: &str, file: &str, line: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    module.hash(&mut hasher);
+    symbol.hash(&mut hasher);
+    file.hash(&mut hasher);
+    line.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl FrameDict {
@@ -166,19 +339,23 @@ impl FrameDict {
         }
     }
 
-    fn intern(&mut self, frame: Frame) -> u32 {
-        let key = (
-            frame.module.clone(),
-            frame.symbol.clone(),
-            frame.file.clone(),
-            frame.line,
-        );
-        if let Some(&id) = self.index.get(&key) {
-            return id;
+    fn intern(&mut self, frame: &Frame) -> u32 {
+        let key = frame_hash(&frame.module, &frame.symbol, &frame.file, frame.line);
+        if let Some(ids) = self.index.get(&key) {
+            for &id in ids {
+                let existing = &self.frames[id as usize];
+                if existing.line == frame.line
+                    && existing.module == frame.module
+                    && existing.symbol == frame.symbol
+                    && existing.file == frame.file
+                {
+                    return id;
+                }
+            }
         }
         let id = self.frames.len() as u32;
-        self.index.insert(key, id);
-        self.frames.push(frame);
+        self.frames.push(frame.clone());
+        self.index.entry(key).or_default().push(id);
         id
     }
 
@@ -209,7 +386,7 @@ impl Frame {
 fn intern_scan(scan: &ScanResult, dict: &mut FrameDict) -> HashMap<u32, u32> {
     let mut remap = HashMap::with_capacity(scan.frames.len());
     for (&frame_id, frame) in &scan.frames {
-        remap.insert(frame_id, dict.intern(frame.clone()));
+        remap.insert(frame_id, dict.intern(frame));
     }
     remap
 }
@@ -234,7 +411,13 @@ struct TreeBuilder {
     /// sample weighs a fixed amount, so a frame can hold 10% of the time in
     /// 2% of the samples, and that gap is what a reader wants to see.
     self_samples: Vec<u64>,
-    children: Vec<HashMap<u32, usize>>,
+    /// `(parent << 32) | frame` -> child node.
+    ///
+    /// One flat map rather than a `HashMap` per node: a wide window allocates
+    /// up to [`MAX_NODES`] nodes, and a heap-allocated map for each of them was
+    /// several hundred thousand allocator round-trips per query — seconds of
+    /// wall time spent in `malloc`, not in the fold.
+    children: HashMap<u64, u32>,
     truncated_node: Option<usize>,
     truncated: bool,
     /// Nodes whose display name is not derived from a frame (group-by nodes).
@@ -251,7 +434,7 @@ impl TreeBuilder {
             parent: vec![-1],
             self_value: vec![0],
             self_samples: vec![0],
-            children: vec![HashMap::new()],
+            children: HashMap::new(),
             truncated_node: None,
             truncated: false,
             overrides: HashMap::new(),
@@ -276,9 +459,9 @@ impl TreeBuilder {
         self.parent.push(parent as i32);
         self.self_value.push(0);
         self.self_samples.push(0);
-        self.children.push(HashMap::new());
         if frame != u32::MAX {
-            self.children[parent].insert(frame, idx);
+            self.children
+                .insert(((parent as u64) << 32) | frame as u64, idx as u32);
         }
         idx
     }
@@ -294,9 +477,12 @@ impl TreeBuilder {
             if frame == u32::MAX {
                 continue;
             }
-            let existing = self.children[node].get(&frame).copied();
+            let existing = self
+                .children
+                .get(&(((node as u64) << 32) | frame as u64))
+                .copied();
             node = match existing {
-                Some(child) => child,
+                Some(child) => child as usize,
                 None => {
                     if self.node_frame.len() >= MAX_NODES {
                         self.truncated = true;
@@ -371,10 +557,17 @@ impl TreeBuilder {
         let was_pruned = alive_count < value.len();
 
         // ---- emit --------------------------------------------------------
-        let mut children_alive: Vec<Vec<usize>> = vec![Vec::new(); value.len()];
-        for i in 1..value.len() {
+        // Children as a linked list over two flat arrays: `vec![Vec::new();
+        // n]` also allocated one `Vec` per node, which on a wide window is a
+        // few hundred thousand allocations to build a tree we are about to
+        // prune down to `max_nodes` anyway.
+        let mut first_child = vec![u32::MAX; value.len()];
+        let mut next_sibling = vec![u32::MAX; value.len()];
+        for i in (1..value.len()).rev() {
             if alive[i] {
-                children_alive[self.parent[i] as usize].push(i);
+                let parent = self.parent[i] as usize;
+                next_sibling[i] = first_child[parent];
+                first_child[parent] = i as u32;
             }
         }
 
@@ -386,6 +579,7 @@ impl TreeBuilder {
 
         // Iterative DFS, children sorted by value descending.
         let mut stack: Vec<(usize, i64)> = vec![(0, -1)];
+        let mut kids: Vec<usize> = Vec::new();
         while let Some((node, parent_new)) = stack.pop() {
             let new_idx = names.len();
             index_map[node] = new_idx as u32;
@@ -403,8 +597,14 @@ impl TreeBuilder {
             values.push(value[node] as i64);
             sample_counts.push(samples[node] as i64);
 
-            children_alive[node].sort_unstable_by(|a, b| value[*b].cmp(&value[*a]));
-            for &child in children_alive[node].iter().rev() {
+            kids.clear();
+            let mut child = first_child[node];
+            while child != u32::MAX {
+                kids.push(child as usize);
+                child = next_sibling[child as usize];
+            }
+            kids.sort_unstable_by(|a, b| value[*b].cmp(&value[*a]));
+            for &child in kids.iter().rev() {
                 stack.push((child, new_idx as i64));
             }
         }
@@ -425,6 +625,24 @@ impl TreeBuilder {
     }
 }
 
+/// Frame ids in `scan` that belong to `kind`.
+fn allocator_frames(scan: &ScanResult, kind: AllocatorKind) -> std::collections::HashSet<u32> {
+    scan.frames
+        .iter()
+        .filter(|(_, frame)| kind.matches(frame))
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// Whether one stack should survive the allocator filter.
+fn stack_touches(stack: &[u32], matched: &std::collections::HashSet<u32>, self_only: bool) -> bool {
+    if self_only {
+        stack.first().is_some_and(|id| matched.contains(id))
+    } else {
+        stack.iter().any(|id| matched.contains(id))
+    }
+}
+
 /// Build a flamegraph from every stored sample matching `opts`.
 pub fn flamegraph(store: &Store, opts: &QueryOptions) -> Result<Flamegraph> {
     opts.validate()?;
@@ -442,19 +660,50 @@ pub fn flamegraph(store: &Store, opts: &QueryOptions) -> Result<Flamegraph> {
     }
 
     let mut builder = TreeBuilder::new();
+    let fold_started = Instant::now();
     let remap = intern_scan(&scan, &mut builder.dict);
+    let intern_ms = fold_started.elapsed().as_millis() as u64;
+    let rows_started = Instant::now();
+    let allocator_keep = opts.allocator.map(|kind| allocator_frames(&scan, kind));
     let mut stack_buf: Vec<u32> = Vec::with_capacity(160);
     for row in &scan.rows {
         let Some(stack) = scan.stacks.get(&row.stack_id) else {
             continue;
         };
+        if let Some(keep) = allocator_keep.as_ref() {
+            if !stack_touches(stack, keep, opts.allocator_self) {
+                continue;
+            }
+        }
         map_stack(stack, &remap, &mut stack_buf);
         builder.add_stack(row.group.as_deref(), &stack_buf, row.value, row.samples);
     }
+    let rows_ms = rows_started.elapsed().as_millis() as u64;
+    let finish_started = Instant::now();
 
     let mut fg = builder.finish(opts.max_nodes);
+    let finish_ms = finish_started.elapsed().as_millis() as u64;
     fg.unit = opts.profile_type.unit().as_str().to_string();
     fg.truncated |= scan.truncated;
+    // Split the fold from the scan: the scan's own `slow scan` line says how
+    // long DuckDB took, this one says how long the tree cost. Without both,
+    // "the query is slow" cannot be attributed to a layer.
+    let fold_ms = fold_started.elapsed().as_millis() as u64;
+    if fold_ms >= 200 {
+        info!(
+            stage = "fold",
+            kind = "flamegraph",
+            rows = scan.rows.len(),
+            stacks = scan.stacks.len(),
+            frames_in = scan.frames.len(),
+            nodes = fg.names.len(),
+            intern_ms,
+            rows_ms,
+            finish_ms,
+            fold_ms,
+            "slow fold"
+        );
+    }
     Ok(fg)
 }
 
@@ -491,16 +740,23 @@ pub fn top(store: &Store, opts: &QueryOptions, limit: usize) -> Result<TopResult
         opts.until_ns,
         &opts.selector,
     ))?;
+    let fold_started = Instant::now();
     let mut dict = FrameDict::new();
     let remap = intern_scan(&scan, &mut dict);
     let mut self_values: Vec<u64> = vec![0; dict.frames.len()];
     let mut total_values: Vec<u64> = vec![0; dict.frames.len()];
     let mut stack_buf: Vec<u32> = Vec::with_capacity(160);
+    let allocator_keep = opts.allocator.map(|kind| allocator_frames(&scan, kind));
 
     for row in &scan.rows {
         let Some(stack) = scan.stacks.get(&row.stack_id) else {
             continue;
         };
+        if let Some(keep) = allocator_keep.as_ref() {
+            if !stack_touches(stack, keep, opts.allocator_self) {
+                continue;
+            }
+        }
         map_stack(stack, &remap, &mut stack_buf);
         for (pos, &frame) in stack_buf.iter().enumerate() {
             if frame == u32::MAX {
@@ -536,6 +792,18 @@ pub fn top(store: &Store, opts: &QueryOptions, limit: usize) -> Result<TopResult
             .then_with(|| a.name.cmp(&b.name))
     });
     rows.truncate(limit);
+    let fold_ms = fold_started.elapsed().as_millis() as u64;
+    if fold_ms >= 200 {
+        info!(
+            stage = "fold",
+            kind = "top",
+            rows = scan.rows.len(),
+            stacks = scan.stacks.len(),
+            frames = dict.frames.len(),
+            fold_ms,
+            "slow fold"
+        );
+    }
     Ok(TopResult {
         items: rows,
         total_value: total_value as i64,
@@ -730,7 +998,9 @@ struct DiffTree {
     parent: Vec<i32>,
     left_self: Vec<u64>,
     right_self: Vec<u64>,
-    children: Vec<HashMap<u32, usize>>,
+    /// `(parent << 32) | frame` -> child node; flat for the same reason as
+    /// [`TreeBuilder`]'s map.
+    children: HashMap<u64, u32>,
 }
 
 impl DiffTree {
@@ -741,7 +1011,7 @@ impl DiffTree {
             parent: vec![-1],
             left_self: vec![0],
             right_self: vec![0],
-            children: vec![HashMap::new()],
+            children: HashMap::new(),
         }
     }
 
@@ -751,9 +1021,12 @@ impl DiffTree {
             if frame == u32::MAX {
                 continue;
             }
-            let existing = self.children[node].get(&frame).copied();
+            let existing = self
+                .children
+                .get(&(((node as u64) << 32) | frame as u64))
+                .copied();
             node = match existing {
-                Some(child) => child,
+                Some(child) => child as usize,
                 None => {
                     if self.node_frame.len() >= MAX_NODES {
                         // Stop growing the tree; the value still lands on the
@@ -765,8 +1038,8 @@ impl DiffTree {
                     self.parent.push(node as i32);
                     self.left_self.push(0);
                     self.right_self.push(0);
-                    self.children.push(HashMap::new());
-                    self.children[node].insert(frame, idx);
+                    self.children
+                        .insert(((node as u64) << 32) | frame as u64, idx as u32);
                     idx
                 }
             };
@@ -818,10 +1091,14 @@ impl DiffTree {
             }
         }
 
-        let mut children_alive: Vec<Vec<usize>> = vec![Vec::new(); left.len()];
-        for i in 1..left.len() {
+        // Linked-list children, as in `TreeBuilder::finish`.
+        let mut first_child = vec![u32::MAX; left.len()];
+        let mut next_sibling = vec![u32::MAX; left.len()];
+        for i in (1..left.len()).rev() {
             if alive[i] {
-                children_alive[self.parent[i] as usize].push(i);
+                let parent = self.parent[i] as usize;
+                next_sibling[i] = first_child[parent];
+                first_child[parent] = i as u32;
             }
         }
         let mut names = Vec::with_capacity(alive_count);
@@ -829,6 +1106,7 @@ impl DiffTree {
         let mut left_out = Vec::with_capacity(alive_count);
         let mut right_out = Vec::with_capacity(alive_count);
         let mut stack: Vec<(usize, i64)> = vec![(0, -1)];
+        let mut kids: Vec<usize> = Vec::new();
         while let Some((node, parent_new)) = stack.pop() {
             let new_idx = names.len();
             names.push(if node == 0 {
@@ -839,9 +1117,14 @@ impl DiffTree {
             levels.push(parent_new);
             left_out.push(left[node] as i64);
             right_out.push(right[node] as i64);
-            children_alive[node]
-                .sort_unstable_by(|a, b| (left[*b] + right[*b]).cmp(&(left[*a] + right[*a])));
-            for &child in children_alive[node].iter().rev() {
+            kids.clear();
+            let mut child = first_child[node];
+            while child != u32::MAX {
+                kids.push(child as usize);
+                child = next_sibling[child as usize];
+            }
+            kids.sort_unstable_by(|a, b| (left[*b] + right[*b]).cmp(&(left[*a] + right[*a])));
+            for &child in kids.iter().rev() {
                 stack.push((child, new_idx as i64));
             }
         }

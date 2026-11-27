@@ -475,8 +475,8 @@ tenant isolation, the diff endpoint, and that `/metrics` carries no tenant ids.
 | `--frequency` | 99 | samples per second per CPU. 99 is plenty for flamegraphs; 999 gives finer detail at ~10x the samples and proportional storage |
 | `--flush` | 10s | how often the kernel maps are drained. Shorter = fresher data, more batches (one transaction per batch) |
 | `--no-cpu` / `--no-offcpu` | both on | off-CPU needs kprobes; disable it on locked-down kernels |
-| `--no-alloc` | allocation profiling on | the allocator uprobes; disable where uprobes are not permitted |
-| `--no-heap` | Go heap reader on | reads `runtime.mbuckets` through `/proc/<pid>/mem`; needs no probe |
+| `--alloc` | native heap profiling **off** | the allocator uprobes; off by default because they fire on every `malloc` of every glibc process on the node (~79 µs per allocation measured against 2.6 µs without). Turn on for a deliberate heap investigation |
+| `--no-heap` | Go heap reader on | reads `runtime.mbuckets` through `/proc/<pid>/mem`; needs no probe, cheap enough to leave on |
 | `--heap-objects` | off | also report `alloc_objects` and `inuse_objects`; doubles the series count per stack |
 | `--service-name` | process name | set it to aggregate a node under one service; the process name stays as a `process_name` label |
 | `--max-disk` | 50GB | soft cap on retained data; oldest batches are dropped first |

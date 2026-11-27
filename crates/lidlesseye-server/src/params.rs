@@ -28,6 +28,26 @@ impl Params {
             .map(|(_, v)| v.as_str())
     }
 
+    /// The original query string, still percent-encoded, ready to be appended to
+    /// a redirect target. Empty when there are no parameters.
+    pub fn query_string(&self) -> String {
+        if self.0.is_empty() {
+            return String::new();
+        }
+        let body: Vec<String> = self
+            .0
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    urlencode(k),
+                    urlencode(v)
+                )
+            })
+            .collect();
+        format!("?{}", body.join("&"))
+    }
+
     pub fn usize_param(&self, key: &str, default: usize) -> usize {
         self.get(key)
             .and_then(|v| v.parse::<usize>().ok())
@@ -255,4 +275,20 @@ mod tests {
         assert_eq!(s.matchers.len(), 2);
         assert_eq!(p.profile_type(), ProfileType::cpu());
     }
+}
+
+/// Percent-encode everything outside the unreserved set. Query values here come
+/// from axum, i.e. already decoded, so a redirect has to encode them again —
+/// label values routinely contain `=`, `;` and `/`.
+fn urlencode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }

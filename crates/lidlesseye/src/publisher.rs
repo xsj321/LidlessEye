@@ -14,6 +14,115 @@ use tokio::sync::mpsc;
 
 use crate::{Error, Result};
 
+/// How many parked batches the spool keeps before the oldest are discarded.
+///
+/// A batch is one flush window — five minutes of profiles at the default
+/// settings — so 720 files is about two days of an outage, which is well past
+/// the point where an operator would rather have disk space back.
+const SPOOL_KEEP: usize = 720;
+
+/// Batches that could not be uploaded, parked on disk.
+///
+/// An outage has three possible answers: drop the window (data is gone), keep
+/// it in memory (an agent grows until the OOM killer picks an answer), or write
+/// it down. The third is the only one that survives both a long outage and a
+/// restart of the agent, which is exactly when the server is most likely to be
+/// down as well.
+///
+/// Disabled when `LIDLESSEYE_SPOOL` is unset: a host install has no data
+/// directory to own, and silently inventing one is worse than not buffering.
+struct Spool {
+    dir: std::path::PathBuf,
+    counter: AtomicU64,
+}
+
+impl Spool {
+    fn from_env() -> Option<Arc<Self>> {
+        let dir = std::env::var_os("LIDLESSEYE_SPOOL")?;
+        let dir = std::path::PathBuf::from(dir);
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %err, "cannot use the spool directory");
+            return None;
+        }
+        Some(Arc::new(Self {
+            dir,
+            counter: AtomicU64::new(0),
+        }))
+    }
+
+    /// Park one batch, replacing the oldest file when the budget is spent.
+    fn save(&self, reports: &[Report], batch: &str) -> Result<std::path::PathBuf> {
+        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
+        let name = format!("{:020}-{:08}.json", lidlesseye_core::now_ns(), seq);
+        let path = self.dir.join(&name);
+        let temporary = self.dir.join(format!("{name}.tmp"));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "batch": batch,
+            "reports": reports
+        }))
+        .map_err(|err| Error::Http(format!("encoding a parked batch: {err}")))?;
+        // Write and rename: a half-written file would be read back as a
+        // truncated batch and rejected forever.
+        std::fs::write(&temporary, &body)
+            .and_then(|()| std::fs::rename(&temporary, &path))
+            .map_err(|err| Error::Http(format!("parking a batch in {}: {err}", path.display())))?;
+        self.trim();
+        Ok(path)
+    }
+
+    fn pending(&self) -> Vec<std::path::PathBuf> {
+        let mut files: Vec<_> = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+                .collect(),
+            Err(err) => {
+                tracing::warn!(dir = %self.dir.display(), error = %err, "cannot list the spool");
+                return Vec::new();
+            }
+        };
+        files.sort();
+        files
+    }
+
+    fn load(&self, path: &std::path::Path) -> Result<(Vec<Report>, Option<String>)> {
+        let body = std::fs::read(path)
+            .map_err(|err| Error::Http(format!("reading {}: {err}", path.display())))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|err| Error::Http(format!("parsing {}: {err}", path.display())))?;
+        let batch = value
+            .get("batch")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let reports = value
+            .get("reports")
+            .cloned()
+            .ok_or_else(|| Error::Http(format!("{} has no reports", path.display())))?;
+        let reports = serde_json::from_value(reports)
+            .map_err(|err| Error::Http(format!("decoding {}: {err}", path.display())))?;
+        Ok((reports, batch))
+    }
+
+    fn trim(&self) {
+        let files = self.pending();
+        if files.len() <= SPOOL_KEEP {
+            return;
+        }
+        let excess = files.len() - SPOOL_KEEP;
+        for path in files.into_iter().take(excess) {
+            if let Err(err) = std::fs::remove_file(&path) {
+                tracing::warn!(path = %path.display(), error = %err, "cannot discard an old batch");
+            }
+        }
+        tracing::warn!(
+            discarded = excess,
+            keep = SPOOL_KEEP,
+            "the spool is full; the oldest parked batches are gone"
+        );
+    }
+}
+
 /// How the publisher talks to the server.
 #[derive(Debug, Clone)]
 pub struct PublisherConfig {
@@ -113,6 +222,12 @@ pub struct PublisherHandle {
     map_tx: mpsc::Sender<ServiceMapBatch>,
     client: reqwest::Client,
     url: String,
+    /// Headers every request carries: the tenant and, when configured, the
+    /// bearer token. Kept so a read like [`PublisherHandle::directives`] uses
+    /// the same identity as the uploads.
+    headers: reqwest::header::HeaderMap,
+    /// Server root, without the ingest path: the reads are built from it.
+    base: String,
     dropped_reports: Arc<AtomicU64>,
     dropped_maps: Arc<AtomicU64>,
     report_warned: Arc<AtomicU64>,
@@ -176,6 +291,42 @@ impl PublisherHandle {
     /// get dropped, so the caller waits here first. Returns `false` when the
     /// budget expired; the caller starts collecting anyway and the uploader
     /// keeps retrying per batch.
+    /// Report that a reader inside a pod is dead.
+    ///
+    /// A shim that stopped existing cannot report its own capability, and the
+    /// workload would otherwise look switched on and merely quiet. The agent
+    /// knows which pod it was and why it went away, so it says so instead.
+    pub async fn report_reader_degraded(
+        &self,
+        workload: &str,
+        pod: &str,
+        reason: &str,
+        at_ns: u64,
+    ) -> Result<(), String> {
+        let base = self.url.trim_end_matches("/ingest").trim_end_matches('/');
+        let body = serde_json::json!([{
+            "workload": workload,
+            "pod": pod,
+            "reader": "native_alloc",
+            "state": "degraded",
+            "reason": reason,
+            "detected": 0,
+            "attached": 0,
+            "at_ns": at_ns,
+        }]);
+        let response = self
+            .client
+            .post(format!("{base}/api/v1/capabilities"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("capabilities answered {}", response.status()));
+        }
+        Ok(())
+    }
+
     pub async fn wait_until_ready(&self, budget: Duration) -> bool {
         let health = format!(
             "{}/api/v1/health",
@@ -205,6 +356,49 @@ impl PublisherHandle {
 
     pub fn endpoint(&self) -> &str {
         &self.url
+    }
+
+    /// Which workloads the server has switched runtime memory profiling on
+    /// for.
+    ///
+    /// Polled by the agent rather than pushed for a reason: an agent that was
+    /// down when the switch flipped must still learn about it, and a poll is
+    /// the simplest thing that cannot miss the state — it reads the current
+    /// answer, not a stream of changes.
+    /// One probe of the server's switchboard.
+    ///
+    /// Two lists, because the two kinds cost the target differently: `jvm` asks
+    /// a runtime for a dump, `alloc` injects a library into the process. A
+    /// server that predates the split answers with `workloads` only, which is
+    /// read as "JVM" so an old server and a new agent still agree.
+    pub async fn directives(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let url = format!("{}/api/v1/profiling/directives", self.base);
+        let reply = self
+            .client
+            .get(&url)
+            .headers(self.headers.clone())
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|err| Error::Http(err.to_string()))?
+            .error_for_status()
+            .map_err(|err| Error::Http(err.to_string()))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|err| Error::Http(err.to_string()))?;
+        let list = |key: &str| -> Vec<String> {
+            reply
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Ok((list("workloads"), list("alloc_workloads")))
     }
 }
 
@@ -239,7 +433,7 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
         .connect_timeout(Duration::from_secs(5))
         .timeout(cfg.timeout)
         .user_agent(format!("lidlesseye/{}", env!("CARGO_PKG_VERSION")))
-        .default_headers(headers)
+        .default_headers(headers.clone())
         .build()
         .map_err(|err| Error::Http(err.to_string()))?;
 
@@ -254,6 +448,8 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
         map_tx,
         client: client.clone(),
         url: url.clone(),
+        headers: headers.clone(),
+        base: base.clone(),
         dropped_reports: Arc::clone(&dropped_reports),
         dropped_maps: Arc::clone(&dropped_maps),
         report_warned: Arc::new(AtomicU64::new(0)),
@@ -330,8 +526,66 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
         });
     }
 
+    // Parked batches drain on their own clock: while the report task is stuck
+    // retrying one batch, this task is what turns a recovered server back into
+    // a recovered pipeline.
+    if let Some(spool) = Spool::from_env() {
+        let client = client.clone();
+        let url = url.clone();
+        tokio::spawn(async move {
+            let mut quiet_rounds = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let pending = spool.pending();
+                if pending.is_empty() {
+                    continue;
+                }
+                let mut sent = 0usize;
+                for path in &pending {
+                    let (reports, batch) = match spool.load(path) {
+                        Ok(parked) => parked,
+                        Err(err) => {
+                            // A file that cannot be decoded will never decode:
+                            // keeping it would block the queue behind it.
+                            tracing::warn!(path = %path.display(), error = %err, "discarding an unreadable parked batch");
+                            let _ = std::fs::remove_file(path);
+                            continue;
+                        }
+                    };
+                    // Re-send under the id it was parked with, so a delivery
+                    // whose reply was lost on the first attempt is not counted
+                    // twice now.
+                    match post_batch_with(&client, &url, &reports, batch.as_deref()).await {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(path);
+                            sent += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if sent > 0 {
+                    quiet_rounds = 0;
+                    tracing::info!(
+                        parked = pending.len() - sent,
+                        delivered = sent,
+                        "drained parked reports"
+                    );
+                } else {
+                    quiet_rounds += 1;
+                    if quiet_rounds == 40 {
+                        tracing::warn!(
+                            parked = pending.len(),
+                            "the spool has been undeliverable for twenty minutes"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let task = tokio::spawn(async move {
         let max_batch = cfg.max_batch.max(1);
+        let spool = Spool::from_env();
         let mut buffer: Vec<Report> = Vec::with_capacity(max_batch);
         loop {
             // Wait for the first report of a batch, then coalesce whatever
@@ -356,6 +610,9 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
 
             let batch = std::mem::take(&mut buffer);
             let count = batch.len();
+            // One id for every attempt at this batch, retries included: the
+            // server uses it to ignore a delivery whose reply was lost.
+            let batch_id = format!("{}-{}", lidlesseye_core::now_ns(), count);
             // A rolling upgrade is not a 12 s blip: the old pod terminates,
             // the new one opens every tenant store before it listens, and the
             // Service endpoint only comes back afterwards. Retry transient
@@ -365,7 +622,7 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
             let mut attempt = 0u32;
             let started = tokio::time::Instant::now();
             loop {
-                match post_batch(&client, &url, None, &batch).await {
+                match post_batch_with(&client, &url, &batch, Some(&batch_id)).await {
                     Ok(()) => {
                         tracing::debug!(reports = count, "uploaded reports");
                         break;
@@ -381,13 +638,32 @@ pub fn start(cfg: PublisherConfig) -> Result<(PublisherHandle, tokio::task::Join
                         }
                         attempt += 1;
                         if started.elapsed() >= UPLOAD_RETRY_BUDGET {
-                            tracing::warn!(
-                                reports = count,
-                                attempts = attempt,
-                                elapsed_ms = started.elapsed().as_millis(),
-                                error = %err,
-                                "dropping reports after repeated upload failures"
-                            );
+                            // Giving up on the network must not mean giving up
+                            // on the window: park it, and the drain loop will
+                            // ship it once the server answers again.
+                            match spool.as_ref().map(|spool| spool.save(&batch, &batch_id)) {
+                                Some(Ok(path)) => tracing::warn!(
+                                    reports = count,
+                                    attempts = attempt,
+                                    elapsed_ms = started.elapsed().as_millis(),
+                                    path = %path.display(),
+                                    error = %err,
+                                    "parked reports on disk after repeated upload failures"
+                                ),
+                                Some(Err(save_err)) => tracing::warn!(
+                                    reports = count,
+                                    error = %err,
+                                    save_error = %save_err,
+                                    "dropping reports after repeated upload failures"
+                                ),
+                                None => tracing::warn!(
+                                    reports = count,
+                                    attempts = attempt,
+                                    elapsed_ms = started.elapsed().as_millis(),
+                                    error = %err,
+                                    "dropping reports after repeated upload failures"
+                                ),
+                            }
                             break;
                         }
                         let backoff = retry_backoff(attempt);
@@ -416,13 +692,25 @@ async fn post_batch(
     _token: Option<&str>,
     reports: &[Report],
 ) -> Result<()> {
+    post_batch_with(client, url, reports, None).await
+}
+
+/// Post one batch, optionally naming it so the server can drop a replay.
+///
+/// The id has to survive retries and the spool: it is the only thing that tells
+/// the server "you already counted this" when a `2xx` was lost on the way back.
+async fn post_batch_with(
+    client: &reqwest::Client,
+    url: &str,
+    reports: &[Report],
+    batch: Option<&str>,
+) -> Result<()> {
     let body = serde_json::json!({ "reports": reports });
-    let response = client
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|err| Error::Http(err.to_string()))?;
+    let mut request = client.post(url).json(&body);
+    if let Some(batch) = batch {
+        request = request.header("x-lidlesseye-batch", batch);
+    }
+    let response = request.send().await.map_err(|err| Error::Http(err.to_string()))?;
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();

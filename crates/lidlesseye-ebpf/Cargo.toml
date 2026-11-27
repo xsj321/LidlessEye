@@ -16,6 +16,8 @@ lidlesseye-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 num_cpus = { workspace = true }
+parking_lot = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { workspace = true }

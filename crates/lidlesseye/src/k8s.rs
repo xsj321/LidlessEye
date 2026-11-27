@@ -254,7 +254,267 @@ impl ClusterApi {
     pub fn node(&self) -> Option<&str> {
         self.node.as_deref()
     }
+
+    /// Add the allocator shim to `pod` as an ephemeral container.
+    ///
+    /// The shim has to run *inside* the pod: bpftime passes counters from the
+    /// injected agent to its server through POSIX shared memory in `/dev/shm`,
+    /// and Kubernetes gives every pod its own tmpfs, so a loader in the
+    /// DaemonSet never sees the target's segment. An ephemeral container shares
+    /// the target's PID namespace, `/dev/shm` and libc image, which is what the
+    /// userspace reader needs (see `crates/lidlesseye/src/shim.rs`).
+    ///
+    /// Returns `true` when the container was added, `false` when the pod
+    /// already carries one from this image. Ephemeral containers cannot be
+    /// removed, so a restart of the agent must not stack a second copy.
+    pub async fn ensure_alloc_shim(
+        &self,
+        pod: &PodMeta,
+        image: &str,
+        server: &str,
+        tenant: Option<&str>,
+        service: &str,
+    ) -> Result<ShimOutcome> {
+        let token = std::fs::read_to_string(&self.token)
+            .map_err(|err| Error::Http(format!("reading {}: {err}", self.token.display())))?;
+        let token = token.trim().to_string();
+        let pod_url = format!(
+            "{}/api/v1/namespaces/{}/pods/{}",
+            self.base, pod.namespace, pod.name
+        );
+        let response = self
+            .client
+            .get(&pod_url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|err| Error::Http(format!("reading pod {}: {err}", pod.name)))?;
+        if !response.status().is_success() {
+            return Err(Error::Http(format!(
+                "reading pod {}: {}",
+                pod.name,
+                response.status()
+            )));
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|err| Error::Http(format!("parsing pod {}: {err}", pod.name)))?;
+        let existing = body
+            .pointer("/spec/ephemeralContainers")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // Ephemeral containers are append-only: one that exited can never be
+        // restarted or removed, but a *new* one may be added to a running pod.
+        // Rebuilding is therefore the only recovery, and it has to be bounded —
+        // a workload whose shim dies on start would otherwise add a container
+        // every 30 s until the pod is saturated.
+        let shims: Vec<&serde_json::Value> = existing
+            .iter()
+            .filter(|container| {
+                container
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .is_some_and(|name| name == SHIM_CONTAINER || name.starts_with(SHIM_PREFIX))
+            })
+            .collect();
+        if let Some(latest) = shims.last() {
+            let latest_name = latest
+                .get("name")
+                .and_then(|name| name.as_str())
+                .unwrap_or(SHIM_CONTAINER);
+            let terminated = body
+                .pointer("/status/ephemeralContainerStatuses")
+                .and_then(|value| value.as_array())
+                .and_then(|statuses| {
+                    statuses.iter().find(|status| {
+                        status.get("name").and_then(|name| name.as_str()) == Some(latest_name)
+                    })
+                })
+                .and_then(|status| status.pointer("/state/terminated"))
+                .map(|terminated| {
+                    (
+                        terminated
+                            .get("exitCode")
+                            .and_then(|code| code.as_i64())
+                            .unwrap_or(-1),
+                        terminated
+                            .get("reason")
+                            .and_then(|reason| reason.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    )
+                });
+            let Some((code, reason)) = terminated else {
+                return Ok(ShimOutcome::Running);
+            };
+            if shims.len() > MAX_SHIM_REBUILDS {
+                warn!(
+                    namespace = %pod.namespace,
+                    pod = %pod.name,
+                    attempts = shims.len(),
+                    exit_code = code,
+                    reason = %reason,
+                    "the allocator shim keeps dying; not adding another one to this pod"
+                );
+                return Ok(ShimOutcome::Exhausted { exit_code: code, reason });
+            }
+            warn!(
+                namespace = %pod.namespace,
+                pod = %pod.name,
+                attempt = shims.len(),
+                exit_code = code,
+                reason = %reason,
+                "the allocator shim exited; adding a fresh one"
+            );
+            return self
+                .add_shim(&body, pod, image, server, tenant, service, Some(shims.len() as u32 + 1))
+                .await;
+        }
+
+        self.add_shim(&body, pod, image, server, tenant, service, None)
+            .await
+    }
+
+    /// Append one allocator shim to a running pod.
+    ///
+    /// `rebuild` is `Some(n)` when this replaces a shim that already exited: the
+    /// container name has to differ, because names are immutable and the dead
+    /// container keeps its slot in the spec forever.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_shim(
+        &self,
+        body: &serde_json::Value,
+        pod: &PodMeta,
+        image: &str,
+        server: &str,
+        tenant: Option<&str>,
+        service: &str,
+        rebuild: Option<u32>,
+    ) -> Result<ShimOutcome> {
+        let token = std::fs::read_to_string(&self.token)
+            .map_err(|err| Error::Http(format!("reading {}: {err}", self.token.display())))?;
+        let token = token.trim().to_string();
+        let pod_url = format!(
+            "{}/api/v1/namespaces/{}/pods/{}",
+            self.base, pod.namespace, pod.name
+        );
+        // An ephemeral container must name the container it shares namespaces
+        // with, and it has to be one that exists in the spec, not a sidecar
+        // the API invented.
+        let target = pod
+            .containers
+            .first()
+            .map(|container| container.name.clone())
+            .or_else(|| {
+                body.pointer("/spec/containers/0/name")
+                    .and_then(|name| name.as_str())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| Error::Http(format!("pod {} declares no container", pod.name)))?;
+
+        let mut command = vec![
+            "/usr/local/bin/lidlesseye".to_string(),
+            "bpftime-shim".to_string(),
+            "--server".to_string(),
+            server.to_string(),
+            "--service".to_string(),
+            service.to_string(),
+            "--interval".to_string(),
+            "30".to_string(),
+            "--flush".to_string(),
+            "15".to_string(),
+        ];
+        if let Some(tenant) = tenant {
+            command.push("--tenant".to_string());
+            command.push(tenant.to_string());
+        }
+
+        let name = match rebuild {
+            Some(attempt) => format!("{SHIM_PREFIX}{attempt}"),
+            None => SHIM_CONTAINER.to_string(),
+        };
+        let shim = serde_json::json!({
+            "name": name,
+            "image": image,
+            "imagePullPolicy": "IfNotPresent",
+            "command": command,
+            "targetContainerName": target,
+            // The shim's own log is the only place the attach results are
+            // visible: the pod's app containers say nothing about it.
+            // `HOSTNAME` is not reliable inside an ephemeral container, and the
+            // pod name is what coverage counts pods by, so it travels as an env
+            // var we set rather than one we hope for.
+            "env": [
+                { "name": "RUST_LOG", "value": "lidlesseye=info" },
+                { "name": "LIDLESSEYE_POD", "value": pod.name },
+            ],
+            // Attaching to another process needs ptrace; the reader also loads
+            // BPF programs, which needs the same capabilities the agent has.
+            //
+            // No `resources`: the API rejects them on ephemeral containers
+            // ("cannot be set for an Ephemeral Container"), so the shim is
+            // charged to the pod's own accounting.
+            "securityContext": { "privileged": true },
+        });
+        let mut containers = body
+            .pointer("/spec/ephemeralContainers")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        containers.push(shim);
+        let patch = serde_json::json!({ "spec": { "ephemeralContainers": containers } });
+
+        let response = self
+            .client
+            .patch(format!("{pod_url}/ephemeralcontainers"))
+            .bearer_auth(&token)
+            .header("content-type", "application/merge-patch+json")
+            .json(&patch)
+            .send()
+            .await
+            .map_err(|err| Error::Http(format!("adding the shim to {}: {err}", pod.name)))?;
+        let status = response.status();
+        if !status.is_success() {
+            let reason = response.text().await.unwrap_or_default();
+            return Err(Error::Http(format!(
+                "adding the shim to {}: {status}: {reason}",
+                pod.name
+            )));
+        }
+        info!(
+            pod = %pod.name,
+            namespace = %pod.namespace,
+            service,
+            rebuild = rebuild.is_some(),
+            "added the allocator shim"
+        );
+        Ok(ShimOutcome::Started)
+    }
 }
+
+/// What happened to a workload's allocator shim this tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShimOutcome {
+    /// A shim is already in the pod's spec and has not exited.
+    Running,
+    /// A new ephemeral container was added (first time or after a death).
+    Started,
+    /// The shim keeps dying and the rebuild budget is spent. The pod cannot be
+    /// fixed from here — an ephemeral container is never restarted and never
+    /// removed — so the reader is dead until the pod is replaced.
+    Exhausted { exit_code: i64, reason: String },
+}
+
+/// Name of the first ephemeral container that runs the allocator shim.
+const SHIM_CONTAINER: &str = "lidlesseye-alloc";
+
+/// Prefix shared by the shim and its rebuilds (`lidlesseye-alloc-2`, …).
+const SHIM_PREFIX: &str = "lidlesseye-alloc-";
+
+/// How many times a dying shim may be replaced inside one pod.
+const MAX_SHIM_REBUILDS: usize = 3;
 
 /// Start refreshing the pod index in the background.
 ///

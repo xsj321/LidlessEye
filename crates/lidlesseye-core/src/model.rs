@@ -91,6 +91,17 @@ impl ProfileType {
     pub const ALLOC_OBJECTS: &'static str = "alloc_objects";
     pub const INUSE_SPACE: &'static str = "inuse_space";
     pub const INUSE_OBJECTS: &'static str = "inuse_objects";
+    /// Resident bytes held by the processes of one workload, as the reader saw
+    /// them. Reported by the native reader next to `alloc_space`, which counts
+    /// what was *requested*, and never added to it: the two answer different
+    /// questions and their sum answers none.
+    pub const PROCESS_RSS: &'static str = "process_rss";
+    /// Resident bytes after shared pages are charged once, to the process that
+    /// maps them. Always smaller than the sum of RSS across processes.
+    pub const PROCESS_PSS: &'static str = "process_pss";
+    /// Memory charged to the pod's cgroup, page cache included — which is why it
+    /// is larger than the processes inside it.
+    pub const POD_CGROUP_MEMORY: &'static str = "pod_cgroup_memory";
 
     pub fn new(name: impl Into<String>) -> Self {
         ProfileType(name.into())
@@ -146,12 +157,22 @@ impl ProfileType {
     /// held now" view means. Queries therefore keep only the newest batch per
     /// series for these types.
     pub fn is_gauge(&self) -> bool {
-        matches!(self.0.as_str(), Self::INUSE_SPACE | Self::INUSE_OBJECTS)
+        matches!(
+            self.0.as_str(),
+            Self::INUSE_SPACE
+                | Self::INUSE_OBJECTS
+                | Self::PROCESS_RSS
+                | Self::PROCESS_PSS
+                | Self::POD_CGROUP_MEMORY
+        )
     }
 
     pub fn unit(&self) -> Unit {
         match self.0.as_str() {
             Self::ALLOC_SPACE | Self::INUSE_SPACE => Unit::Bytes,
+            // Bytes, not nanoseconds: a page that formats `process_rss` as a
+            // duration says "1.2 s" about a hundred megabytes.
+            Self::PROCESS_RSS | Self::PROCESS_PSS | Self::POD_CGROUP_MEMORY => Unit::Bytes,
             Self::ALLOC_OBJECTS | Self::INUSE_OBJECTS => Unit::Count,
             _ => Unit::Nanoseconds,
         }

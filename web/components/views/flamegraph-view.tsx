@@ -85,6 +85,56 @@ function CompareHeader() {
   );
 }
 
+/**
+ * What share of the window the allocator filter actually accounts for.
+ *
+ * The number is the point: a filter that matches 0.8 % of the CPU says the
+ * allocator is not the bottleneck, and that is exactly the evidence a user
+ * needs before deciding whether a native allocation reader is worth its cost.
+ * The hint is advice, not a lock — the filtered profile stays on screen.
+ */
+function AllocatorSummary() {
+  const state = useDashboard();
+  const t = useT();
+  const payload = state.flamegraph as FlamegraphPayload | null;
+  const filtered = payload?.total ?? 0;
+  const total = state.allocatorTotal ?? 0;
+  const unit = payload?.unit ?? "ns";
+  const share = total > 0 ? (filtered / total) * 100 : null;
+
+  const advice =
+    share === null
+      ? null
+      : share < 1
+        ? t("Allocator is unlikely to be the bottleneck — check other CPU hotspots first.")
+        : share >= 5
+          ? t("The allocator is a real share of this workload — a native reader may pay off.")
+          : t("The allocator is a small share — weigh the reader's cost against what it can find.");
+
+  return (
+    <div
+      className="flex flex-wrap items-baseline gap-x-2 rounded-md bg-secondary/40 px-2.5 py-1.5 text-[11px]"
+      data-testid="allocator-summary"
+    >
+      <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+        {t("Allocator CPU")}
+      </span>
+      <span className="font-mono">{formatValue(filtered, unit)}</span>
+      <span className="text-muted-foreground">
+        {t("of")} <span className="font-mono">{formatValue(total, unit)}</span>
+      </span>
+      <span className="font-mono text-foreground/80">
+        {share === null ? "—" : `${share.toFixed(2)} %`}
+      </span>
+      <span className="text-muted-foreground">
+        {state.allocatorMode === "self" ? t("(self)") : t("(inclusive)")}
+        {state.allocator && state.allocator !== "any" ? ` · ${state.allocator}` : ""}
+      </span>
+      {advice ? <span className="flex-1 text-muted-foreground italic">{advice}</span> : null}
+    </div>
+  );
+}
+
 /** Flamegraph and compare share this: both payloads flow through one canvas. */
 export function FlamegraphView() {
   const state = useDashboard();
@@ -98,11 +148,17 @@ export function FlamegraphView() {
   const diff = flamegraph as DiffPayload;
   const isDiff = Array.isArray(diff.diff) && Array.isArray(diff.left);
 
+  const header = isDiff ? (
+    <CompareHeader />
+  ) : state.allocator ? (
+    <AllocatorSummary />
+  ) : null;
+
   return (
     <FlamegraphCanvas
       payload={flamegraph as FlamegraphPayload | DiffPayload}
       fileStem={isDiff ? `${stem}-compare` : stem}
-      header={isDiff ? <CompareHeader /> : null}
+      header={header}
     />
   );
 }

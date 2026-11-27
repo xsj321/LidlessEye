@@ -1,0 +1,30 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lidlesseye-ephemeral-containers
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Ephemeral containers are a subresource: the agent needs to read the pod and
+  # then patch this subresource, because the allocator reader has to run inside
+  # the target's PID namespace and share its /dev/shm.
+  - apiGroups: [""]
+    resources: ["pods/ephemeralcontainers"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lidlesseye-ephemeral-containers
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lidlesseye-ephemeral-containers
+subjects:
+  - kind: ServiceAccount
+    name: le-disk-lidlesseye
+    namespace: disk
+  - kind: ServiceAccount
+    name: lidlesseye
+    namespace: lidlesseye

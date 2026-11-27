@@ -11,6 +11,7 @@ export type View =
   | "timeseries"
   | "labels"
   | "servicemap"
+  | "memory"
   | "overview";
 
 export const VIEWS: readonly View[] = [
@@ -20,6 +21,7 @@ export const VIEWS: readonly View[] = [
   "timeseries",
   "labels",
   "servicemap",
+  "memory",
   "overview",
 ];
 
@@ -41,7 +43,8 @@ export interface FlamegraphPayload {
   levels: number[];
   values?: number[];
   /**
-   * Sample rows under each node, parallel to `names`. Present on new
+   * Sample rows under each node, parallel to 
+ames`. Present on new
    * responses; older servers omit it, and the UI then hides the column
    * instead of pretending the count is zero.
    */
@@ -190,6 +193,15 @@ export interface MapHistoryPayload {
   protocol?: string;
   points: MapHistoryPoint[];
   edges: MapHistoryPoint[];
+  /**
+   * Pods behind this node, read only when a panel asks for one node.
+   *
+   * The map payload carries counts and nothing else, so a pod name is not
+   * repeated in every bucket of every node the map draws.
+   */
+  instances?: ServiceInstance[];
+  /** Container names behind this node, for the per-container rows. */
+  containers?: string[];
 }
 
 /**
@@ -274,3 +286,111 @@ export interface LabelValuesPayload {
 export interface VersionPayload {
   version: string;
 }
+
+/**
+ * The workloads whose runtime memory profiling is switched on.
+ *
+ * Names are 
+amespace/workload`, the same identifier a map node carries, so a
+ * switch flipped on a node names exactly one entry.
+ */
+export interface DirectivesPayload {
+  /** Workloads whose JVM Flight Recorder is read. */
+  workloads: string[];
+  /** Workloads whose processes get the bpftime agent injected. */
+  alloc_workloads?: string[];
+  /** Every entry with its kind. */
+  directives?: { workload: string; kind: "jvm" | "alloc" }[];
+  /**
+   * Whether the native reader behind `alloc_workloads` can actually report
+   * samples. When it cannot, the panel keeps its switch hidden.
+   */
+  native_memory?: { supported: boolean; reason?: string };
+}
+
+/** One workload's allocation profile and the evidence behind it. */
+export interface MemoryCoverageRow {
+  workload: string;
+  /** Whether the operator still has this workload's reader switched on. */
+  enabled: boolean;
+  /** Estimated bytes allocated in the window (samples × interval, summed). */
+  requested_alloc_bytes: number;
+  /** Ingested reports, not recorded stacks: the reader batches those up. */
+  batches: number;
+  sampling_interval: number | null;
+  sampling_label: string | null;
+  reader: string | null;
+  first_seen_ns: number;
+  last_seen_ns: number;
+  /** Process-level coverage; null until the agent reports it back. */
+  coverage: MemoryCoverage | null;
+  coverage_note?: string;
+  /** Process memory over time, oldest first. */
+  history?: MemoryPoint[];
+}
+
+/** One point on the process memory trend. */
+export interface MemoryPoint {
+  at_ns: number;
+  rss_bytes: number;
+  pss_bytes: number;
+  cgroup_bytes: number;
+}
+
+/** What the reader in the pod reported about its own reach. */
+export interface MemoryCoverage {
+  detected: number;
+  attached: number;
+  uncovered: number;
+  skipped: Record<string, number>;
+  /** The pod's cgroup memory usage in bytes, when the shim could read it. */
+  memory_bytes: number | null;
+  /** Processes summed for the RSS/PSS figures. */
+  process_count: number | null;
+  /** Resident set summed over the pod's processes, in bytes. */
+  process_rss_bytes: number | null;
+  /** Proportional set summed over the pod's processes, in bytes. */
+  process_pss_bytes: number | null;
+  at_ns: number;
+}
+
+export interface MemoryCoveragePayload {
+  tenant: string;
+  enabled_workloads: string[];
+  workloads: MemoryCoverageRow[];
+}
+
+/** One reader's state for one workload, as the agent last reported it. */
+export type CapabilityRow = {
+  workload: string;
+  reader: string;
+  state?: "supported" | "attaching" | "active" | "degraded" | "unsupported" | "disabled";
+  reason?: string;
+  pod?: string;
+  detected?: number;
+  attached?: number;
+  pods_reported?: number;
+  pods_active?: number;
+  at_ns?: number;
+};
+
+export type CapabilityPayload = { capabilities: CapabilityRow[] };
+/** One process as the target pod's own /proc reported it. */
+export type MemoryProcessRow = {
+  pid: number;
+  start_ns?: number;
+  comm?: string;
+  executable?: string;
+  rss_bytes?: number;
+  pss_bytes?: number | null;
+  private_dirty_bytes?: number | null;
+  swap_bytes?: number | null;
+  missing?: string;
+};
+
+export type MemoryProcessPayload = {
+  workload: string;
+  pods: number;
+  omitted: number;
+  processes: MemoryProcessRow[];
+};

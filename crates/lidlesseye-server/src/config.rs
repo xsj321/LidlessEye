@@ -45,6 +45,9 @@ pub struct ServerConfig {
     pub cors_allow_origin: Option<String>,
     /// How often retention/eviction runs.
     pub prune_interval: Duration,
+    /// How often the on-disk check walks the Parquet tree. Defaults to an hour:
+    /// it exists to notice a slow disappearance, and it competes with nothing.
+    pub fsck_interval: Duration,
     /// Worker threads DuckDB may use per connection (i.e. per tenant).
     /// Defaults to 4: on hosts with many cores DuckDB's thread coordination
     /// costs more than it saves on the GROUP BY scans behind flamegraphs and
@@ -81,6 +84,32 @@ pub struct ServerConfig {
     /// This is the maximum data-loss window on an unclean shutdown.
     #[serde(default)]
     pub storage_flush_interval_ns: Option<u64>,
+    /// Acknowledge an ingest before it reaches DuckDB (default) or after.
+    ///
+    /// `async` appends the upload to the segment log and answers 202; the
+    /// converter turns segments into Parquet within a second or two. `sync`
+    /// waits for the commit, which is what tests and `curl` scripts want.
+    #[serde(default)]
+    pub ingest_mode: lidlesseye_core::IngestMode,
+    /// Roll the active segment file at this size (bytes).
+    #[serde(default)]
+    pub wal_segment_bytes: Option<u64>,
+    /// Segment log group-commit interval in milliseconds. This is the maximum
+    /// data loss on an unclean shutdown.
+    #[serde(default)]
+    pub wal_sync_interval_ms: Option<u64>,
+    /// Refuse uploads above this many bytes of unconverted segment log.
+    #[serde(default)]
+    pub wal_max_pending_bytes: Option<u64>,
+    /// Seal the active segment once it is this old, so a quiet tenant's upload
+    /// becomes queryable without waiting for the next one.
+    #[serde(default)]
+    pub wal_segment_age_ms: Option<u64>,
+    /// Converter threads per tenant. DuckDB documents that concurrent appends
+    /// never conflict, so segments can be decoded and inserted in parallel;
+    /// `None` derives a small number from the available cores.
+    #[serde(default)]
+    pub wal_converters: Option<usize>,
 }
 
 fn default_duckdb_threads() -> Option<usize> {
@@ -115,6 +144,7 @@ impl Default for ServerConfig {
             read_only: false,
             cors_allow_origin: None,
             prune_interval: Duration::from_secs(60),
+            fsck_interval: Duration::from_secs(3600),
             duckdb_threads: default_duckdb_threads(),
             duckdb_memory_limit: None,
             query_concurrency: default_query_concurrency(),
@@ -122,6 +152,12 @@ impl Default for ServerConfig {
             s3: None,
             parquet_local_ttl_ns: None,
             storage_flush_interval_ns: None,
+            ingest_mode: lidlesseye_core::IngestMode::Async,
+            wal_segment_bytes: None,
+            wal_sync_interval_ms: None,
+            wal_max_pending_bytes: None,
+            wal_segment_age_ms: None,
+            wal_converters: None,
         }
     }
 }
@@ -140,6 +176,37 @@ impl ServerConfig {
             .parse()
             .map_err(|err| format!("invalid listen address: {err}"))?;
         Ok(self)
+    }
+
+    /// Choose how an ingest is acknowledged.
+    pub fn ingest_mode(mut self, mode: lidlesseye_core::IngestMode) -> Self {
+        self.ingest_mode = mode;
+        self
+    }
+
+    /// Segment log size, group-commit interval and backlog cap.
+    pub fn wal(
+        mut self,
+        segment_bytes: Option<u64>,
+        sync_interval_ms: Option<u64>,
+        max_pending_bytes: Option<u64>,
+    ) -> Self {
+        self.wal_segment_bytes = segment_bytes;
+        self.wal_sync_interval_ms = sync_interval_ms;
+        self.wal_max_pending_bytes = max_pending_bytes;
+        self
+    }
+
+    /// How long a segment may stay open before the converter picks it up.
+    pub fn wal_segment_age(mut self, millis: u64) -> Self {
+        self.wal_segment_age_ms = Some(millis);
+        self
+    }
+
+    /// Number of converter threads per tenant.
+    pub fn wal_converters(mut self, count: Option<usize>) -> Self {
+        self.wal_converters = count;
+        self
     }
 
     pub fn with_retention(mut self, retention: Duration) -> Self {

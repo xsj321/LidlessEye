@@ -86,6 +86,11 @@ fn serve_env(args: &[&str], env: &[(&str, &str)]) -> Serving {
             "0",
             "--max-disk",
             "0",
+            // These tests assert on the write that precedes the query, so they
+            // need the commit-before-answer mode. The asynchronous default is
+            // covered by the server's own HTTP tests.
+            "--ingest-mode",
+            "sync",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

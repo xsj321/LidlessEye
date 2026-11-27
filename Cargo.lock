@@ -407,6 +407,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1421,13 +1430,14 @@ dependencies = [
 
 [[package]]
 name = "lidlesseye"
-version = "0.1.23"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "lidlesseye-core",
  "lidlesseye-ebpf",
  "lidlesseye-server",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
@@ -1439,8 +1449,10 @@ dependencies = [
 
 [[package]]
 name = "lidlesseye-core"
-version = "0.1.23"
+version = "0.2.0"
 dependencies = [
+ "bincode",
+ "crc32fast",
  "duckdb",
  "flate2",
  "lidlesseye-servicemap",
@@ -1454,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "lidlesseye-ebpf"
-version = "0.1.23"
+version = "0.2.0"
 dependencies = [
  "aya",
  "blazesym",
@@ -1462,13 +1474,15 @@ dependencies = [
  "lidlesseye-core",
  "num_cpus",
  "object 0.41.0",
+ "parking_lot",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
 
 [[package]]
 name = "lidlesseye-mcp"
-version = "0.1.23"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1485,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "lidlesseye-server"
-version = "0.1.23"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1509,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "lidlesseye-servicemap"
-version = "0.1.23"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]

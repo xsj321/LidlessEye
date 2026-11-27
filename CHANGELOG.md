@@ -6,6 +6,67 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [0.2.0] - 2026-11-27
+
+The product release: trusted data, reliability, persistence, active/standby and
+an operations manual. The HTTP surface gains read/write role separation, a
+capability matrix, process-level memory and self-monitoring metrics.
+
+### Added
+
+- Profile data contract: every report carries `temporality` (`cumulative` for
+  runtime-reported Go/JVM profiles, `delta` for the userspace allocator reader)
+  and `gauge` for process and cgroup memory, so `/series` takes the last value
+  instead of summing a running total. Memory series are now typed in bytes
+  rather than falling back to nanoseconds.
+- Capability matrix: `GET/POST /api/v1/capabilities` reports, per workload and
+  pod, whether a reader is `supported`, `attaching`, `active`, `degraded`,
+  `unsupported` or `disabled`, with a machine-readable reason and the attached
+  and detected process counts.
+- Global coverage: `GET/POST /api/v1/memory/coverage` folds allocation series
+  and reader reports per workload into requested bytes, batches, sampling
+  interval, reader, coverage and pod/process RSS, PSS and cgroup memory, and
+  keeps a 480-point trend.
+- Process-level memory: `GET/POST /api/v1/memory/processes` returns the top
+  processes of a workload (RSS first, PSS and private dirty for the top N) from
+  the reader inside the target pod.
+- Memory page with three layers: process memory (L0), native allocation (L1)
+  and an explicit placeholder for allocator-native profiling (L2).
+- Native runtime manager: the agent creates the allocator reader as an
+  ephemeral container, rebuilds it at most three times, and reports
+  `degraded`/`runtime_dead` once the budget is spent.
+- Agent disk spool: failed uploads are written to `LIDLESSEYE_SPOOL` and
+  drained later; batches are idempotent through `x-lidlesseye-batch`.
+- Periodic fsck (`GET/POST /api/v1/fsck`): proves the files it finds are
+  readable Parquet and reports files that vanished between passes.
+- Query cache for the four heavy GET endpoints, with `x-lidlesseye-cache` and
+  `?fresh=1`.
+- Active/standby through a lease file on the shared volume, with fencing
+  tokens, 307 redirects to the writer, and a `read-only` role that neither
+  votes nor serves writes.
+- `GET /api/v1/role`, `GET /api/v1/cache` and new `/metrics` gauges for
+  replica state, lease fence, cache and fsck findings, process RSS and threads.
+- Helm chart 0.2.0 with the ephemeral-container RBAC the allocator reader
+  needs.
+
+### Changed
+
+- Non-writer replicas refresh the Parquet index every five seconds, so two
+  replicas behind one Service no longer disagree about which files exist.
+- `--read-only` is a real role: it reports `passive`, refuses writes with 403
+  and never acquires the lease.
+- The agent lists pods through the Kubernetes API when the sampled pod index
+  has no entry, which fixes allocator readers for idle workloads.
+
+### Fixed
+
+- Gauge series were summed instead of resolving to their last value.
+- Live capability, coverage and process reports landed on whichever replica
+  the Service picked, so the two replicas showed different numbers; they are
+  redirected to the writer and mirrored through the shared volume.
+- Folded uploads without an explicit window were stored one hour in the past.
+- `strip = "symbols"` removed the symbol table user-space frames need.
+
 ## [0.1.6] - 2026-11-23
 
 A failed write no longer wedges the tenant's DuckDB connection.

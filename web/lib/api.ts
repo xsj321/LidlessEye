@@ -10,7 +10,11 @@ import type {
   LabelNamesPayload,
   LabelValuesPayload,
   MapHistogramPayload,
+  DirectivesPayload,
   MapHistoryPayload,
+  CapabilityPayload,
+  MemoryCoveragePayload,
+  MemoryProcessPayload,
   ProfileTypesPayload,
   SeriesPayload,
   ServiceMapPayload,
@@ -105,7 +109,7 @@ async function request<T>(
       // real network failure, so callers can ignore it instead of showing an
       // error banner.
       if (err instanceof Error && err.name === "AbortError") throw err;
-      throw new ApiError(`network error: ${(err as Error).message}`, 0);
+      throw new ApiError(`Network error: ${(err as Error).message}`, 0);
     }
   };
   response = await send();
@@ -181,4 +185,38 @@ export const api = {
   // Whole-map request counts for the histogram brush above the map.
   serviceMapHistogram: (params: QueryParams, signal?: AbortSignal) =>
     request<MapHistogramPayload>("/api/v1/servicemap/histogram", params, { signal }),
+
+  // The numbers behind a native allocation figure: bytes, batches, sampling
+  // interval, reader, and whether the workload is still switched on.
+  memoryCoverage: (params: QueryParams, signal?: AbortSignal) =>
+    request<MemoryCoveragePayload>("/api/v1/memory/coverage", params, { signal }),
+  // Workloads whose runtime memory profiling is switched on. The map draws the
+  // switch from this list and every agent polls the same answer, so what the
+  // panel shows is what the agents are doing.
+  profilingDirectives: (signal?: AbortSignal) =>
+    request<DirectivesPayload>("/api/v1/profiling/directives", undefined, { signal }),
+  capabilities: (signal?: AbortSignal) =>
+    request<CapabilityPayload>("/api/v1/capabilities", undefined, { signal }),
+  memoryProcesses: (
+    params: { workload: string; limit?: string },
+    signal?: AbortSignal,
+  ) =>
+    request<MemoryProcessPayload>(
+      `/api/v1/memory/processes?workload=${encodeURIComponent(params.workload)}${
+        params.limit ? `&limit=${params.limit}` : ""
+      }`,
+      undefined,
+      { signal },
+    ),  setProfilingDirective: (
+    workload: string,
+    enabled: boolean,
+    kind: "jvm" | "alloc" = "jvm",
+    signal?: AbortSignal,
+  ) =>
+    request<DirectivesPayload>("/api/v1/profiling/directives", undefined, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workload, enabled, kind }),
+      signal,
+    }),
 };

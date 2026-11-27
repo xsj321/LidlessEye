@@ -37,6 +37,11 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, message)
     }
 
+    /// 503: this replica can answer reads but must not take this write.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }

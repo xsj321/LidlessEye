@@ -108,14 +108,14 @@ pub(crate) const TABLES: &[TableDef] = &[
     TableDef {
         name: "net_nodes",
         columns: "bucket_ns, node_id, namespace, workload, service, kind, k8s_node, rx_bytes, tx_bytes, connections, retransmits, pods, ready, instances, containers",
-        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, node_id VARCHAR NOT NULL, namespace VARCHAR NOT NULL, workload VARCHAR NOT NULL, service VARCHAR NOT NULL, kind VARCHAR NOT NULL, k8s_node VARCHAR NOT NULL, rx_bytes BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, pods BIGINT DEFAULT 0 NOT NULL, ready BIGINT DEFAULT 0 NOT NULL, instances VARCHAR DEFAULT '[]' NOT NULL, containers VARCHAR DEFAULT '[]' NOT NULL)",
+        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, node_id VARCHAR NOT NULL, namespace VARCHAR NOT NULL, workload VARCHAR NOT NULL, service VARCHAR NOT NULL, kind VARCHAR NOT NULL, k8s_node VARCHAR NOT NULL, rx_bytes BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, pods BIGINT DEFAULT 0 NOT NULL, ready BIGINT DEFAULT 0 NOT NULL, instances VARCHAR DEFAULT '[]' NOT NULL, containers VARCHAR DEFAULT '[]' NOT NULL, PRIMARY KEY (bucket_ns, node_id))",
         hour_column: Some("bucket_ns"),
         hour_from_samples: false,
     },
     TableDef {
         name: "net_edges",
         columns: "bucket_ns, client_id, server_id, protocol, client_container, server_container, client_pod, server_pod, connections, retransmits, tx_bytes, rx_bytes, rtt_us_sum, rtt_samples, host, sql",
-        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, client_id VARCHAR NOT NULL, server_id VARCHAR NOT NULL, protocol VARCHAR NOT NULL, client_container VARCHAR DEFAULT '' NOT NULL, server_container VARCHAR DEFAULT '' NOT NULL, client_pod VARCHAR DEFAULT '' NOT NULL, server_pod VARCHAR DEFAULT '' NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, rx_bytes BIGINT NOT NULL, rtt_us_sum BIGINT NOT NULL, rtt_samples BIGINT NOT NULL, host VARCHAR DEFAULT '' NOT NULL, sql VARCHAR DEFAULT '' NOT NULL)",
+        ddl: "CREATE TABLE {t} (bucket_ns BIGINT NOT NULL, client_id VARCHAR NOT NULL, server_id VARCHAR NOT NULL, protocol VARCHAR NOT NULL, client_container VARCHAR DEFAULT '' NOT NULL, server_container VARCHAR DEFAULT '' NOT NULL, client_pod VARCHAR DEFAULT '' NOT NULL, server_pod VARCHAR DEFAULT '' NOT NULL, connections BIGINT NOT NULL, retransmits BIGINT NOT NULL, tx_bytes BIGINT NOT NULL, rx_bytes BIGINT NOT NULL, rtt_us_sum BIGINT NOT NULL, rtt_samples BIGINT NOT NULL, host VARCHAR DEFAULT '' NOT NULL, sql VARCHAR DEFAULT '' NOT NULL, PRIMARY KEY (bucket_ns, client_id, server_id, protocol, client_pod, server_pod, host, sql))",
         hour_column: Some("bucket_ns"),
         hour_from_samples: false,
     },
@@ -174,6 +174,16 @@ impl TableFiles {
     }
 
     /// Paths for the inclusive hour range `[lo, hi]`, plus every untagged file.
+    /// Remove one path from every bucket.
+    fn forget(&mut self, path: &Path) {
+        let needle = path.to_string_lossy().replace('\\', "/");
+        self.unknown.retain(|entry| entry != &needle);
+        for files in self.by_hour.values_mut() {
+            files.retain(|entry| entry != &needle);
+        }
+        self.by_hour.retain(|_, files| !files.is_empty());
+    }
+
     fn window(&self, lo: u64, hi: u64) -> Vec<String> {
         let mut out = self.unknown.clone();
         if lo <= hi {
@@ -278,6 +288,18 @@ pub(crate) struct ParquetState {
     /// endpoint, a bad credential and a refused multipart upload all fail
     /// every hour the same way. It doubles up to [`ARCHIVE_MAX_BACKOFF`].
     archive_retry: Arc<Mutex<ArchiveRetry>>,
+    /// Serialises "publish a new file" against "rewrite an hour".
+    ///
+    /// A merge lists the files of an hour, copies them, then publishes the
+    /// result and retires the inputs. A flush that lands inside that window
+    /// writes a part the merge never read, and because that part is older than
+    /// the published final the read-side "newest final wins" rule hides it —
+    /// its rows would vanish from every query without anything failing. A
+    /// shared lock on the write side and an exclusive lock on the merge side
+    /// removes the window instead of narrowing it, which is what makes it safe
+    /// to compact the *live* hour (the hour every dashboard asks for, and the
+    /// one a ten-second flush cadence shreds into hundreds of files).
+    merge_gate: Arc<parking_lot::RwLock<()>>,
 }
 
 impl ParquetState {
@@ -293,6 +315,7 @@ impl ParquetState {
             local_ttl_ns,
             index: Arc::new(Mutex::new(FileIndex::default())),
             archive_retry: Arc::new(Mutex::new(ArchiveRetry::default())),
+            merge_gate: Arc::new(parking_lot::RwLock::new(())),
         }
     }
 
@@ -312,6 +335,19 @@ impl ParquetState {
         self.index.lock().clone()
     }
 
+    /// Drop one path from the local half of the in-memory index.
+    ///
+    /// Called before a retired file is moved out of the tree. The index is what
+    /// every query builds its statement from, so removing the entry first means
+    /// the worst case is a query that misses a row for one refresh — never a
+    /// query that names a file which is already gone.
+    fn forget_local_path(&self, path: &Path) {
+        let mut index = self.index.lock();
+        for files in index.local.values_mut() {
+            files.forget(path);
+        }
+    }
+
     pub fn save_index(&self, index: &FileIndex) -> Result<()> {
         *self.index.lock() = index.clone();
         Ok(())
@@ -323,6 +359,21 @@ impl ParquetState {
             let files = scan_local_table(&self.table_dir(def.name));
             index.local.insert(def.name.to_string(), files);
         }
+    }
+
+    /// Re-scan the local tree and publish the result.
+    ///
+    /// A writer refreshes its index as part of every flush, so it always knows
+    /// about the files it just wrote. A read-only replica never flushes, so
+    /// without this it would answer from the file list captured when it opened —
+    /// i.e. it would serve a snapshot that gets older every hour. This is the
+    /// "short delay buffer" a query frontend needs: it sees what the writer has
+    /// published, at most one scan interval late.
+    pub fn refresh_local_index(&self) {
+        let mut index = self.index.lock();
+        let mut next = index.clone();
+        self.reindex_local(&mut next);
+        *index = next;
     }
 
     /// Clear the index. Also removes the `manifest.json` written by releases
@@ -830,6 +881,13 @@ pub(crate) fn table_span(state: &ParquetState, table: &str, from_ns: u64, until_
             paths.extend(files.by_hour.get(&0).cloned().unwrap_or_default());
         }
     }
+    // A local file can be retired between the moment the index named it and the
+    // moment this statement runs — a merge or an upload finishing while a
+    // dashboard refreshes. Naming a file that is already gone fails the whole
+    // panel with "Cannot open file", so the ones that no longer exist are
+    // dropped here. Remote objects are left alone: they cannot be `stat`ed, and
+    // the archive drops them from the index before deleting the local copy.
+    paths.retain(|path| !path.starts_with('/') || std::path::Path::new(path).exists());
     if paths.is_empty() {
         return format!("{table}_hot");
     }
@@ -938,7 +996,7 @@ pub(crate) fn hour_tag() -> String {
 /// report) rows: 200 000 batches was over ten million samples, which is not a
 /// slice but minutes of `COPY`. Counting the table that dominates the cost is
 /// what makes the slice actually bounded.
-pub(crate) const FLUSH_CHUNK_ROWS: usize = 1_000_000;
+pub(crate) const FLUSH_CHUNK_ROWS: usize = 250_000;
 
 /// Copy every row currently in the hot tables into one Parquet file per table
 /// and hour, then clear them.
@@ -1184,9 +1242,38 @@ fn flush_one(
         ),
         _ => String::new(),
     };
-    conn.execute_batch(&format!("DELETE FROM {hot} {filter}"))
-        .map_err(|e| Error::Db(format!("clearing hot {}: {e}", def.name)))?;
+    if filter.is_empty() {
+        // The whole table is being drained. Replacing it beats deleting its
+        // rows — see [`reset_hot`].
+        reset_hot(conn, def)?;
+    } else {
+        conn.execute_batch(&format!("DELETE FROM {hot} {filter}"))
+            .map_err(|e| Error::Db(format!("clearing hot {}: {e}", def.name)))?;
+    }
     Ok(moved)
+}
+
+/// Empty a hot table by replacing it, never by deleting its live rows.
+///
+/// DuckDB keeps a deleted row as a tombstone inside its row group until a
+/// checkpoint rewrites that group. The hot tier is an in-memory database, and an
+/// in-memory database never checkpoints, so `DELETE FROM {t}_hot` left one
+/// tombstone per ingested row for the lifetime of the process. Every read mounts
+/// `(SELECT * FROM {t}_hot UNION ALL BY NAME SELECT * FROM read_parquet(…))`,
+/// so after an hour of ingest the scans walked more dead rows than live ones and
+/// each query got slower the longer the server had been up. Dropping the table
+/// frees the storage outright; recreating it from the same DDL `create_schema`
+/// uses is a catalogue operation, not a copy.
+fn reset_hot(conn: &Connection, def: &TableDef) -> Result<()> {
+    let hot = format!("{}_hot", def.name);
+    let ddl = def.ddl.replace("{t}", &hot);
+    // One transaction, so a reader that prepares a statement in between never
+    // sees the table missing. DuckDB invalidates a prepared statement whose
+    // table changed underneath it, and that is a retryable error — the reads
+    // that matter here already retry.
+    conn.execute_batch(&format!("BEGIN TRANSACTION; DROP TABLE IF EXISTS {hot}; {ddl}; COMMIT;"))
+        .map_err(|e| Error::Db(format!("clearing hot {}: {e}", def.name)))?;
+    Ok(())
 }
 
 /// Write the rows matching `filter` into `hour=<hour>/` and return how many.
@@ -1202,6 +1289,10 @@ fn write_hour_file(
     filter: &str,
     stamp: u128,
 ) -> Result<usize> {
+    // Held for the whole write so a merge of the live hour can never list the
+    // directory, copy it, and publish a final that predates this part — see
+    // [`ParquetState::merge_gate`].
+    let _gate = state.merge_gate.read();
     let count: i64 = conn
         .query_row(&format!("SELECT COUNT(*) FROM {hot} {filter}"), [], |r| {
             r.get(0)
@@ -1224,17 +1315,29 @@ fn write_hour_file(
         .map_err(|e| Error::Db(format!("flushing {}: {e}", def.name)))?;
     // Publish only a file we have read back. A partial COPY is then a harmless
     // `.tmp` that startup recovery removes, never a VIEW entry.
+    //
+    // The row count comes from the Parquet footer, not from a second scan of
+    // the data: `COUNT(*)` over `read_parquet` re-reads every column it was
+    // just given, which doubled the write cost of every flush and held the
+    // tenant's only write connection for seconds. A footer read still proves
+    // the file is complete and parseable — the failure this guards against, a
+    // COPY that did not finish, leaves no readable footer at all.
+    let path = tmp.to_string_lossy().replace('\\', "/");
     let rows: i64 = conn
         .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM read_parquet('{}')",
-                tmp.to_string_lossy().replace('\\', "/")
-            ),
+            &format!("SELECT sum(num_rows) FROM parquet_file_metadata('{path}')"),
             [],
-            |row| row.get(0),
+            |row| row.get::<_, Option<i64>>(0),
         )
+        .map_err(|e| Error::Db(format!("flushing {}: {e}", def.name)))?
         .unwrap_or(0);
-    if rows != count {
+    // More rows than the count means the hot table grew between the count and
+    // the COPY — a converter appending while this flush runs — and that file is
+    // still a consistent snapshot of everything up to that point. Only fewer
+    // rows mean the COPY itself lost data, which is the case worth parking a
+    // segment for. Insisting on equality turned that benign race into a parked
+    // segment and a retry that rewrote the same rows.
+    if rows < count {
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::Db(format!(
             "flushing {}: wrote {rows} rows, expected {count}",
@@ -1266,8 +1369,7 @@ fn flush_by_sample_hours(
         // Nothing hot references these rows: either they were published by an
         // earlier slice, or the store has no samples at all.
         if draining && hot_rows(conn, def.name) > 0 {
-            conn.execute_batch(&format!("DELETE FROM {hot}"))
-                .map_err(|e| Error::Db(format!("clearing hot {}: {e}", def.name)))?;
+            reset_hot(conn, def)?;
         }
         return Ok(0);
     }
@@ -1283,8 +1385,7 @@ fn flush_by_sample_hours(
         moved += write_hour_file(conn, state, def, hot, *hour, &filter, stamp)?;
     }
     if draining && hot_rows(conn, def.name) > 0 {
-        conn.execute_batch(&format!("DELETE FROM {hot}"))
-            .map_err(|e| Error::Db(format!("clearing hot {}: {e}", def.name)))?;
+        reset_hot(conn, def)?;
     }
     Ok(moved)
 }
@@ -1559,13 +1660,19 @@ pub(crate) fn archive_local(
                 if let Ok(meta) = std::fs::metadata(file) {
                     stats.bytes_reclaimed += meta.len() as usize;
                 }
-                let _ = std::fs::remove_file(file);
+                retire_file(state, Path::new(file));
                 stats.files_uploaded += 1;
             }
         }
     }
+    // Rescan the local half *before* publishing it: the files this pass
+    // retired are gone from the tree, and saving the pre-retire snapshot would
+    // put them back in the index for a moment — long enough for a query to
+    // build a statement around a path that no longer exists.
+    state.reindex_local(&mut index);
     state.save_index(&index)?;
-    // Local copies are gone; rescan so a windowed query stops naming them.
+    // Remote entries changed; refresh the local half one more time so the
+    // in-memory index matches the tree exactly.
     reindex_local(state);
     // Credentials were applied to the connection at open time.
     let _ = s3;
@@ -1593,6 +1700,16 @@ pub struct CompactStats {
 ///
 /// `current_hour` is skipped: it is still being appended to, and rewriting it
 /// on every tick would cost more than it saves. Pass [`u64::MAX`] in tests.
+/// Bytes on disk of a group of Parquet files. Used to decide whether rewriting
+/// a live hour is cheap enough to hold the merge gate for.
+fn total_bytes(files: &[String]) -> u64 {
+    files
+        .iter()
+        .filter_map(|file| std::fs::metadata(file).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 pub(crate) fn compact_local(
     conn: &Connection,
     state: &ParquetState,
@@ -1602,11 +1719,21 @@ pub(crate) fn compact_local(
     // of hours in one tick, holding the connection and spiking memory. Bound
     // each pass; the tick runs again in ten minutes and works through the rest.
     //
-    // One, not forty-eight: each merge rewrites a whole hour of Parquet while
-    // holding the tenant's only connection, and queries wait behind it. A pass
-    // that runs for minutes is indistinguishable from a hung server, and the
-    // tick comes round again in ten minutes.
-    const MAX_MERGES_PER_PASS: usize = 1;
+    // One merge per table per pass, not one per pass: a pass that merges a
+    // single hour leaves the other five tables' fragmentation in place until
+    // the next tick, and the tick only comes round in ten minutes. Six small
+    // merges hold the connection no longer than one big one, and each of them
+    // is bounded by the files that accumulated in a single hour.
+    const MAX_MERGES_PER_PASS: usize = 2 * TABLES.len();
+    // The live hour needs compaction like any other: a ten-second flush cadence
+    // drops six files a minute into it, three hundred and sixty an hour, and a
+    // query on the last hour opens every one of them. Merging on each tick
+    // would rewrite that hour for a handful of files, so wait until the parts
+    // are worth the copy, and stop rewriting it once it is big enough that the
+    // copy would stall ingest — the closed-hour merge cleans it up after the
+    // boundary anyway.
+    const OPEN_HOUR_MIN_FILES: usize = 8;
+    const OPEN_HOUR_MAX_BYTES: u64 = 1 << 30;
     let mut stats = CompactStats::default();
     'tables: for def in TABLES {
         // The on-disk tree, not the read index: compaction must see a file the
@@ -1614,11 +1741,33 @@ pub(crate) fn compact_local(
         // files exist and the merge could drop rows.
         let local = scan_local_table(&state.table_dir(def.name));
         for (hour, files) in local.by_hour {
-            if hour >= current_hour || files.len() < 2 {
+            let live = hour >= current_hour;
+            let wanted = if live {
+                files.len() >= OPEN_HOUR_MIN_FILES && total_bytes(&files) <= OPEN_HOUR_MAX_BYTES
+            } else {
+                files.len() >= 2
+            };
+            if !wanted {
                 continue;
             }
             if stats.files_written >= MAX_MERGES_PER_PASS {
                 break 'tables;
+            }
+            // A merge lists the hour's files, copies them, then publishes and
+            // retires the inputs. A flush landing in that window writes a part
+            // the merge never read, and because that part's stamp is older than
+            // the published final the read-side "newest final wins" rule hides
+            // it: rows gone, nothing failing. Completed hours cannot grow, so
+            // only the live hour needs the gate — and it is taken before the
+            // list, then the hour is re-listed underneath it, so nothing can
+            // slip into the copy.
+            let _gate = live.then(|| state.merge_gate.write());
+            let again = scan_local_table(&state.table_dir(def.name));
+            let Some(files) = again.by_hour.get(&hour).cloned() else {
+                continue;
+            };
+            if files.len() < 2 {
+                continue;
             }
             let list = files
                 .iter()
@@ -1645,15 +1794,17 @@ pub(crate) fn compact_local(
                     def.name
                 )));
             }
+            // Footer-only, for the same reason as the flush path: a merge
+            // rewrites a whole hour, and re-reading that hour just to count it
+            // doubled the cost of every compaction.
+            let path = tmp.to_string_lossy().replace('\\', "/");
             let rows: i64 = conn
                 .query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM read_parquet('{}')",
-                        tmp.to_string_lossy().replace('\\', "/")
-                    ),
+                    &format!("SELECT sum(num_rows) FROM parquet_file_metadata('{path}')"),
                     [],
-                    |row| row.get(0),
+                    |row| row.get::<_, Option<i64>>(0),
                 )
+                .map_err(|e| Error::Db(format!("compacting {} hour {hour}: {e}", def.name)))?
                 .unwrap_or(0);
             if rows <= 0 {
                 let _ = std::fs::remove_file(&tmp);
@@ -1667,7 +1818,7 @@ pub(crate) fn compact_local(
                 if let Ok(meta) = std::fs::metadata(file) {
                     stats.bytes_reclaimed += meta.len();
                 }
-                let _ = std::fs::remove_file(file);
+                retire_file(state, Path::new(file));
             }
             stats.files_merged += files.len();
             stats.files_written += 1;
@@ -1760,7 +1911,7 @@ fn merge_smallest_files(
     // rule hides the inputs until they are gone, even after a crash.
     std::fs::rename(&tmp, &target).map_err(Error::Io)?;
     for file in &chosen {
-        let _ = std::fs::remove_file(file);
+        retire_file(state, Path::new(file));
     }
     Ok(true)
 }
@@ -1773,6 +1924,14 @@ pub(crate) fn staged_bytes(state: &ParquetState) -> u64 {
             total = total.saturating_add(file.size);
         }
     }
+    // Files waiting out their grace period still occupy the volume, and the
+    // disk cap exists to bound the volume. Counting only what the index can
+    // name would let a busy tenant run five minutes ahead of its cap.
+    if let Ok(entries) = std::fs::read_dir(trash_dir(state)) {
+        for entry in entries.flatten() {
+            total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+        }
+    }
     total
 }
 
@@ -1781,6 +1940,71 @@ pub(crate) fn staged_bytes(state: &ParquetState) -> u64 {
 pub struct ArchivePruneStats {
     pub files_removed: usize,
     pub bytes_reclaimed: u64,
+}
+
+/// Directory holding files that have been published-and-retired but not yet
+/// unlinked.
+///
+/// A query builds its SQL from the in-memory index and then opens the paths it
+/// named. Deleting a file the moment it is merged or uploaded therefore fails
+/// whatever query was in flight — a 500 that says "No such file", on a file the
+/// index itself just promised. Retiring is a rename into this directory; the
+/// janitor removes entries once no query can still be holding them.
+const TRASH_DIR: &str = ".trash";
+/// How long a retired file is kept before it is unlinked. Longer than the
+/// longest query a client is allowed to run.
+pub(crate) const TRASH_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn trash_dir(state: &ParquetState) -> PathBuf {
+    state.dir.join(TRASH_DIR)
+}
+
+/// Move a published file out of the read path without unlinking it yet.
+pub(crate) fn retire_file(state: &ParquetState, path: &Path) {
+    // Make the read path stop naming it first, then move it. The other order
+    // leaves a window where the index still promises a file that is already
+    // gone, and a query that lands in it fails with "Cannot open file".
+    state.forget_local_path(path);
+    let dir = trash_dir(state);
+    if std::fs::create_dir_all(&dir).is_err() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let target = dir.join(format!("{stamp}-{name}"));
+    if std::fs::rename(path, &target).is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Delete retired files that are old enough to be unreachable.
+pub(crate) fn purge_trash(state: &ParquetState, min_age: std::time::Duration) -> usize {
+    let dir = trash_dir(state);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(min_age.max(std::time::Duration::from_millis(1)))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|modified| modified < cutoff)
+            .unwrap_or(false);
+        if old && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Enforce retention and the disk cap on committed Parquet files.
@@ -1818,11 +2042,48 @@ pub(crate) fn prune_archives(
             file
         }));
     }
+    // Over the cap, retired files are the cheapest thing to reclaim: they are
+    // already unreachable from the index, so nothing is lost by deleting them
+    // now instead of after their grace period.
+    if let Some(cap) = max_disk_bytes
+        && staged_bytes(state) > cap
+    {
+        purge_trash(state, std::time::Duration::ZERO);
+    }
     let mut stats = ArchivePruneStats::default();
-    let cutoff_hour =
-        retention_ns.map(|retention| now_ns.saturating_sub(retention) / 1_000_000_000 / 3600);
+    let retention_hours = retention_ns.map(|retention| retention / 1_000_000_000 / 3600);
+    let wall_cutoff = retention_ns.map(|retention| now_ns.saturating_sub(retention) / 1_000_000_000 / 3600);
+    // Retention is measured from the wall clock, and the wall clock is the one
+    // input we do not control. A suspended VM resumes with a clock that can be
+    // hours or days ahead, and a retention pass in that window deletes data that
+    // is only minutes old — silently, because the files are the only copy and
+    // the cron keeps running. That is exactly the shape of a tenant losing nine
+    // hours of archives while every other signal looked healthy.
+    //
+    // So a file has to be old relative to *both* clocks: the wall clock and the
+    // newest data in the tenant. When they agree (the normal case) nothing
+    // changes; when the clock jumps forward, the data anchors the cutoff and
+    // only genuinely expired hours go. When a tenant stops ingesting, its newest
+    // hour goes stale with it, so the wall clock takes over again and the old
+    // hours still expire.
+    let newest_hour = files.iter().filter_map(|file| file.hour).max();
+    let cutoff_hour = match (wall_cutoff, newest_hour, retention_hours) {
+        (Some(wall), Some(newest), Some(span)) => Some(wall.min(newest.saturating_sub(span))),
+        (Some(wall), None, Some(_)) | (Some(wall), _, None) => Some(wall),
+        _ => None,
+    };
+    if let (Some(wall), Some(anchored)) = (wall_cutoff, cutoff_hour)
+        && wall.saturating_sub(anchored) > 24
+    {
+        warn!(
+            wall_cutoff_hour = wall,
+            anchored_cutoff_hour = anchored,
+            "the clock is far ahead of the newest archive; retention is anchored to the data"
+        );
+    }
     let remove = |file: &LocalFile, stats: &mut ArchivePruneStats| {
-        if std::fs::remove_file(&file.path).is_ok() {
+        retire_file(state, &file.path);
+        if !file.path.exists() {
             stats.files_removed += 1;
             stats.bytes_reclaimed += file.size;
         }
@@ -1893,6 +2154,16 @@ pub(crate) fn prune_archives(
     }
     // Whole hour files disappeared; a windowed query must stop naming them.
     reindex_local(state);
+    // Under cap pressure the grace period cannot be honoured: the files this
+    // pass just retired are already unreachable from the index, and keeping
+    // them for five minutes would mean the cap is not a cap. A query that was
+    // mid-flight on one of them re-reads the index and retries.
+    if let Some(cap) = max_disk_bytes
+        && staged_bytes(state) > cap
+    {
+        let purged = purge_trash(state, std::time::Duration::ZERO);
+        stats.files_removed += purged;
+    }
     Ok(stats)
 }
 

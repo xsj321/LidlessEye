@@ -102,6 +102,21 @@ pub trait ServiceMapStore {
         step_ns: u64,
     ) -> Result<Vec<MapHistoryPoint>, Self::Error>;
 
+    /// The pods and containers behind one node, as of the newest bucket before
+    /// `until_ns`.
+    ///
+    /// The map carries counts only: a pod name would otherwise be repeated in
+    /// every bucket of every node the map draws, for a panel nobody has opened.
+    /// A store that cannot answer this returns the empty default, and the panel
+    /// shows counts without names.
+    fn net_node_detail(
+        &self,
+        _node: &str,
+        _until_ns: u64,
+    ) -> Result<(Vec<InstanceInfo>, Vec<String>), Self::Error> {
+        Ok((Vec::new(), Vec::new()))
+    }
+
     /// Counters of edges incident to a node, bucketed by `step_ns`.
     ///
     /// `protocol`, when set, restricts the buckets to edges carrying that
@@ -168,6 +183,17 @@ impl<T: ServiceMapStore + ?Sized> ServiceMapStore for std::sync::Arc<T> {
         step_ns: u64,
     ) -> Result<Vec<MapHistoryPoint>, Self::Error> {
         T::net_node_history(self.as_ref(), node, from_ns, until_ns, step_ns)
+    }
+
+    // Every other method here forwards, so this one has to as well: the caller
+    // holds an `Arc<Store>`, and a missing forward silently answers with the
+    // trait's empty default instead of the store's rows.
+    fn net_node_detail(
+        &self,
+        node: &str,
+        until_ns: u64,
+    ) -> Result<(Vec<InstanceInfo>, Vec<String>), Self::Error> {
+        T::net_node_detail(self.as_ref(), node, until_ns)
     }
 
     fn net_edge_history(
@@ -826,6 +852,13 @@ pub struct MapHistory {
     /// a round-trip time exists.
     #[serde(default)]
     pub edges: Vec<MapHistoryPoint>,
+    /// Pods behind the node, filled only for the panel that asked for this one
+    /// node. The map itself carries no names.
+    #[serde(default)]
+    pub instances: Vec<InstanceInfo>,
+    /// Container names behind the node, for the same reason.
+    #[serde(default)]
+    pub containers: Vec<String>,
 }
 
 /// Per-bucket history of one node over `[from_ns, until_ns)`.
@@ -852,8 +885,12 @@ pub fn servicemap_history<S: ServiceMapStore>(
             protocol: protocol_name.to_string(),
             edges: points.clone(),
             points,
+            ..Default::default()
         });
     }
+    // The detail is a second, tiny read for this one node. A store that cannot
+    // answer it (older data, no agent names) still returns a usable history.
+    let (instances, containers) = store.net_node_detail(node, until_ns).unwrap_or_default();
     Ok(MapHistory {
         node: node.to_string(),
         from_ns,
@@ -862,6 +899,8 @@ pub fn servicemap_history<S: ServiceMapStore>(
         protocol: protocol_name.to_string(),
         points: store.net_node_history(node, from_ns, until_ns, step_ns)?,
         edges: store.net_edge_history(node, from_ns, until_ns, step_ns, protocol)?,
+        instances,
+        containers,
     })
 }
 

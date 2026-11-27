@@ -16,6 +16,7 @@ import { formatClockRange } from "@/lib/format";
 import { rangeLabel, resolveWindow } from "@/lib/time";
 import { useT } from "@/lib/i18n";
 import { dashboardStore } from "@/lib/store";
+import { ALLOCATORS, type AllocatorMode } from "@/lib/store";
 import { RANGES } from "@/lib/time";
 import { useDashboard } from "@/lib/use-dashboard";
 import { cn } from "@/lib/utils";
@@ -46,6 +47,7 @@ function Field({
 export function Toolbar() {
   const state = useDashboard();
   const { view, type, profileTypes, groupBy, labelNames, range, mode, auto, filters } = state;
+  const { allocator, allocatorMode } = state;
   // A relative range keeps `fromNs`/`untilNs` at zero until the brush moves;
   // the window the query actually ran against is what this line reports.
   const window = resolveWindow(state);
@@ -107,6 +109,72 @@ export function Toolbar() {
           </SelectContent>
         </Select>
       </Field>
+
+      {/* Allocator frames are already in the stored CPU stacks, so this is a
+          filter over what was recorded, not a different collection. It stays
+          hidden outside the flame graph: self/inclusive only mean something
+          when a call path is on screen. */}
+      {view === "flamegraph" && state.type === "cpu" ? (
+        <>
+          <Field label={t("Allocator")} className="gap-1.5">
+            <Switch
+              checked={Boolean(allocator)}
+              onCheckedChange={(checked) =>
+                dashboardStore.setAllocator(checked ? allocator || "any" : "")
+              }
+              aria-label={t("Allocator view")}
+              id="allocator-toggle"
+            />
+          </Field>
+          {allocator ? (
+            <>
+              <Field label={t("Family")}>
+                <Select
+                  value={allocator}
+                  onValueChange={(value) => dashboardStore.setAllocator(value)}
+                >
+                  <SelectTrigger
+                    size="sm"
+                    id="allocator-family"
+                    className="w-32"
+                    aria-label={t("Allocator family")}
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {ALLOCATORS.map((name) => (
+                      <SelectItem key={name} value={name}>
+                        {name === "any" ? t("all allocators") : name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field label={t("Mode")}>
+                <Select
+                  value={allocatorMode}
+                  onValueChange={(value) =>
+                    dashboardStore.setAllocatorMode(value as AllocatorMode)
+                  }
+                >
+                  <SelectTrigger
+                    size="sm"
+                    id="allocator-mode"
+                    className="w-28"
+                    aria-label={t("Allocator mode")}
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="inclusive">{t("Inclusive")}</SelectItem>
+                    <SelectItem value="self">{t("Self")}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+            </>
+          ) : null}
+        </>
+      ) : null}
 
       <Field label={t("Range")}>
         <Select
