@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 resolver = "3"
 members = [
     "crates/lidlesseye-core",
@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -22,11 +22,11 @@ keywords = ["profiling", "ebpf", "flamegraph", "observability"]
 categories = ["development-tools::profiling", "network-programming"]
 
 [workspace.dependencies]
-lidlesseye-core = { path = "crates/lidlesseye-core", version = "0.2.0" }
-lidlesseye-ebpf = { path = "crates/lidlesseye-ebpf", version = "0.2.0" }
-lidlesseye-server = { path = "crates/lidlesseye-server", version = "0.2.0" }
-lidlesseye-servicemap = { path = "crates/lidlesseye-servicemap", version = "0.2.0" }
-lidlesseye-mcp = { path = "crates/lidlesseye-mcp", version = "0.2.0" }
+lidlesseye-core = { path = "crates/lidlesseye-core", version = "0.2.3" }
+lidlesseye-ebpf = { path = "crates/lidlesseye-ebpf", version = "0.2.3" }
+lidlesseye-server = { path = "crates/lidlesseye-server", version = "0.2.3" }
+lidlesseye-servicemap = { path = "crates/lidlesseye-servicemap", version = "0.2.3" }
+lidlesseye-mcp = { path = "crates/lidlesseye-mcp", version = "0.2.3" }
 
 anyhow = "1.0.104"
 bincode = "1.3.3"
@@ -41,7 +41,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 # library. `libduckdb-sys` fetches the official `libduckdb.so` into OUT_DIR at
 # build time, so the first build needs network access (or DUCKDB_LIB_DIR
 # pointing at a vendored copy), and the binary needs that .so on the loader
-# path at runtime — the release image installs it under /usr/local/lib.
+# path at runtime 鈥?the release image installs it under /usr/local/lib.
 # Switching to `features = ["bundled"]` yields a self-contained binary, but
 # compiles the whole C++ engine: tens of minutes and several GB of RAM on a
 # cold cache.
@@ -73,7 +73,7 @@ lto = "thin"
 codegen-units = 1
 # Keep the symbol table: the profiler resolves user-space addresses against
 # `.symtab`, and `strip = "symbols"` left every frame inside our own binary
-# unnamed — the folded stacks then showed neighbouring libc exports
+# unnamed 鈥?the folded stacks then showed neighbouring libc exports
 # (`opendir`, `pthread_condattr_setpshared`) for addresses that were never
 # those functions. Dropping debuginfo only costs a few megabytes.
 strip = "debuginfo"

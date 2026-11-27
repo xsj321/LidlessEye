@@ -1043,6 +1043,7 @@ pub async fn servicemap(
     let caller = state.authorize(&headers)?;
     let now = now_ns();
     let (from, until) = params.range(now)?;
+    let selector = params.selector()?;
     let Some(store) = maybe_store(&state, &caller).await else {
         return Ok(Json(ServiceMap {
             from_ns: from,
@@ -1050,15 +1051,67 @@ pub async fn servicemap(
             ..Default::default()
         }));
     };
+    let runtime_source = store.clone();
     let _slot = state.read_slot().await?;
     let started = Instant::now();
-    let map = state
+    let mut map = state
         .query_guard(store.clone())
         .run(move || lidlesseye_core::servicemap(&store, from, until))
         .await
         .map_err(ApiError::from)?;
     state.record_query(&caller.tenant, started);
+
+    // The map answers "who talks to whom"; the profiler labels say which
+    // language was reachable behind each node. Filling it here keeps both the
+    // map and the drawer's neighbourhood on one source of truth.
+    let languages = runtime_by_workload(&state, runtime_source, selector, from, until).await;
+    for node in &mut map.nodes {
+        if node.namespace.is_empty() || node.workload.is_empty() {
+            continue;
+        }
+        let key = format!("{}/{}", node.namespace, node.workload);
+        if let Some(runtime) = languages.get(&key) {
+            node.runtime = runtime.clone();
+        }
+    }
     Ok(Json(map))
+}
+
+/// Which language a workload's reader reported, keyed by `namespace/workload`.
+///
+/// The label is the evidence: `go-runtime` and `jvm-jfr` come from the runtime
+/// reporting for itself, `bpftime-userspace` from the allocator interposer. A
+/// workload that only ever produced kernel CPU samples has no entry, and the
+/// UI shows a dash rather than guessing from an image name.
+async fn runtime_by_workload(
+    state: &AppState,
+    store: Arc<Store>,
+    selector: lidlesseye_core::Selector,
+    from: u64,
+    until: u64,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let rows = state
+        .query_guard(store.clone())
+        .run(move || store.series(from, until, &selector))
+        .await;
+    let Ok(rows) = rows else {
+        return out;
+    };
+    for row in rows {
+        let runtime = match row.labels.get("profile_source").map(String::as_str) {
+            Some("go-runtime") => "go",
+            Some("jvm-jfr") => "jvm",
+            Some("bpftime-userspace") => "native",
+            _ => match row.profile_type.as_str() {
+                "alloc_space" | "inuse_space" | "inuse_objects" | "alloc_objects" => "native",
+                _ => continue,
+            },
+        };
+        out.entry(row.service_name.clone())
+            .or_insert_with(|| runtime.to_string());
+    }
+    out
 }
 
 /// `GET /api/v1/servicemap/history`
@@ -1336,7 +1389,70 @@ pub async fn memory_coverage(
     // whatever the reader batched up, and calling it "samples" would overstate
     // what this endpoint knows.
     let mut folded: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    // The row every workload starts from, whichever profile type arrives first:
+    // a workload can show up through `inuse_space` before any allocation sample
+    // is flushed, and it still belongs on the page.
+    let base_row = |name: &str, start_ns: u64, end_ns: u64| -> Value {
+        json!({
+            "workload": name,
+            "enabled": enabled.iter().any(|enabled| enabled == name),
+            "requested_alloc_bytes": 0u64,
+            "inuse_bytes": 0u64,
+            "batches": 0u64,
+            "sampling_interval": Value::Null,
+            "sampling_label": Value::Null,
+            "reader": Value::Null,
+            // Which language the reader found. `null` means "not seen yet",
+            // which is different from "no runtime": a workload whose only
+            // series are CPU samples from the kernel profiler tells us nothing
+            // about what runs inside it.
+            "runtime": Value::Null,
+            "first_seen_ns": start_ns,
+            "last_seen_ns": end_ns,
+            "coverage": Value::Null,
+            "coverage_note": "the reader has not reported how many processes it reached",
+        })
+    };
     for row in rows {
+        // The runtime comes from whichever reader produced the series: the Go
+        // heap reader, the JFR reader or the userspace allocator. Kernel CPU
+        // samples carry no such label, so they are not evidence of a language.
+        let runtime = match row.labels.get("profile_source").map(String::as_str) {
+            Some("go-runtime") => Some("go"),
+            Some("jvm-jfr") => Some("jvm"),
+            Some("bpftime-userspace") => Some("native"),
+            _ => match row.profile_type.as_str() {
+                "alloc_space" | "inuse_space" | "inuse_objects" | "alloc_objects" => Some("native"),
+                _ => None,
+            },
+        };
+
+        if row.profile_type == "inuse_space" {
+            let entry = folded
+                .entry(row.service_name.clone())
+                .or_insert_with(|| base_row(&row.service_name, row.start_ns, row.end_ns));
+            let inuse = entry["inuse_bytes"].as_u64().unwrap_or(0) + row.total_value;
+            entry["inuse_bytes"] = json!(inuse);
+            entry["first_seen_ns"] = json!(
+                entry["first_seen_ns"]
+                    .as_u64()
+                    .unwrap_or(row.start_ns)
+                    .min(row.start_ns)
+            );
+            entry["last_seen_ns"] = json!(
+                entry["last_seen_ns"]
+                    .as_u64()
+                    .unwrap_or(row.end_ns)
+                    .max(row.end_ns)
+            );
+            if entry["runtime"].is_null()
+                && let Some(runtime) = runtime
+            {
+                entry["runtime"] = json!(runtime);
+            }
+            continue;
+        }
+
         if row.profile_type != "alloc_space" {
             continue;
         }
@@ -1352,25 +1468,14 @@ pub async fn memory_coverage(
             .filter(|interval| *interval > 0);
         let reader = row.labels.get("alloc.reader").cloned();
 
-        let entry = folded.entry(row.service_name.clone()).or_insert_with(|| {
-            json!({
-                "workload": row.service_name,
-                "enabled": enabled.iter().any(|name| *name == row.service_name),
-                "requested_alloc_bytes": 0u64,
-                "batches": 0u64,
-                "sampling_interval": Value::Null,
-                "sampling_label": Value::Null,
-                "reader": Value::Null,
-                "first_seen_ns": row.start_ns,
-                "last_seen_ns": row.end_ns,
-                // Which processes were seen, which were injected, and why the
-                // rest were skipped lives in the agent: it holds the target pod
-                // and the injection result. Until it reports that back, the
-                // field says so instead of guessing.
-                "coverage": Value::Null,
-                "coverage_note": "the reader has not reported how many processes it reached",
-            })
-        });
+        let entry = folded
+            .entry(row.service_name.clone())
+            .or_insert_with(|| base_row(&row.service_name, row.start_ns, row.end_ns));
+        if entry["runtime"].is_null()
+            && let Some(runtime) = runtime
+        {
+            entry["runtime"] = json!(runtime);
+        }
         let bytes = entry["requested_alloc_bytes"].as_u64().unwrap_or(0) + row.total_value;
         entry["requested_alloc_bytes"] = json!(bytes);
         let batches = entry["batches"].as_u64().unwrap_or(0) + row.batch_count as u64;
@@ -1405,10 +1510,12 @@ pub async fn memory_coverage(
             "workload": workload,
             "enabled": enabled.iter().any(|name| *name == workload),
             "requested_alloc_bytes": 0u64,
+            "inuse_bytes": 0u64,
             "batches": 0u64,
             "sampling_interval": Value::Null,
             "sampling_label": Value::Null,
             "reader": Value::Null,
+            "runtime": Value::Null,
             "first_seen_ns": report.at_ns,
             "last_seen_ns": report.at_ns,
             "coverage": Value::Null,
@@ -1448,6 +1555,12 @@ pub async fn memory_coverage(
 
     Ok(Json(json!({
         "tenant": caller.tenant.to_string(),
+        // The window these totals cover, echoed back so the page and the API
+        // cannot disagree about what "requested" means without anyone noticing:
+        // an inflated row is either a wide window or a bug, and the reader of
+        // the page can tell which from these two numbers.
+        "from_ns": from,
+        "until_ns": until,
         "workloads": workloads,
         "enabled_workloads": enabled,
     }))

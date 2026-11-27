@@ -4324,6 +4324,9 @@ impl Store {
                 // for the one node whose panel was opened.
                 instances: Vec::new(),
                 containers: Vec::new(),
+                // Filled by the API layer from the profile labels: the map
+                // store has no notion of which language a stack belongs to.
+                runtime: String::new(),
             });
         }
         let query_ms = query_started.elapsed().as_millis() as u64;

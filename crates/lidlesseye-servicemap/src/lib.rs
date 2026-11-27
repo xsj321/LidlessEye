@@ -583,6 +583,10 @@ pub struct MapNode {
     /// panel. Empty for the outside world and for a ClusterIP service.
     #[serde(default)]
     pub containers: Vec<String>,
+    /// Language the profiler reached inside this node: `go`, `jvm`, `native`,
+    /// or empty when only kernel frames arrived (which says nothing about it).
+    #[serde(default)]
+    pub runtime: String,
 }
 
 /// An aggregated edge in a query response.

@@ -269,10 +269,17 @@ export function EdgeLayer({
   }
 
   const taken: Rect[] = [];
+  // An edge whose far end lies outside the drawing has no card to arrive at:
+  // it renders as a stub with a label on it, which reads as a broken edge. The
+  // layout knows its own size, so drop those here instead of letting the
+  // container clip them into fragments.
+  const onCanvas = (box: { x: number; y: number }) =>
+    box.x >= 0 && box.y >= 0 && box.x <= width && box.y <= height;
   const drawn = edges.flatMap((edge) => {
     const from = boxes.get(edge.client);
     const to = boxes.get(edge.server);
     if (!from || !to) return [];
+    if (!onCanvas(from) || !onCanvas(to)) return [];
     const path = edgePath(from, to, bow?.(edge));
     const rate = edgeRate(edge, windowSec);
     const rateText = formatRate(rate);

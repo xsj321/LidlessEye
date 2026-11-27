@@ -30,8 +30,30 @@ const TONE_COLOR = {
   muted: "#6b7585",
 } as const;
 
-function StatusGlyph({ tone }: { tone: keyof typeof TONE_COLOR }) {
-  const color = TONE_COLOR[tone];
+/**
+ * The language the profiler reached, as a two-to-three letter tag.
+ *
+ * Deliberately not an image-derived guess: `go` and `jvm` mean the runtime
+ * reported for itself, `c` means the allocator interposer answered. A node with
+ * neither is drawn without a tag.
+ */
+const RUNTIME_TAG: Record<string, string> = { go: "go", jvm: "jvm", native: "c" };
+
+export function RuntimeGlyph({ runtime }: { runtime: string }) {
+  const tag = RUNTIME_TAG[runtime];
+  if (!tag) return null;
+  return (
+    <span
+      data-testid="node-runtime"
+      title={`${runtime} runtime reported for this workload`}
+      className="shrink-0 rounded-sm border border-border/70 px-1 font-mono text-[8px] leading-3 text-muted-foreground"
+    >
+      {tag}
+    </span>
+  );
+}
+
+function StatusGlyph({ tone }: { tone: keyof typeof TONE_COLOR }) {  const color = TONE_COLOR[tone];
   return (
     <svg viewBox="0 0 12 12" className="size-3 shrink-0" aria-hidden="true">
       {tone === "ok" ? <circle cx="6" cy="6" r="4" fill={color} /> : null}
@@ -184,6 +206,10 @@ export const NodeCard = memo(function NodeCard({
             {traffic}
           </div>
         </div>
+        {/* Which language the profiler actually reached. Absent for nodes that
+            only ever produced kernel frames, where the honest answer is "not
+            known" rather than a guess from the image name. */}
+        {node.runtime ? <RuntimeGlyph runtime={node.runtime} /> : null}
         <StatusGlyph tone={tone} />
       </div>
       {/* CPU share, as a bar: a tint would have to fight the kind colour for

@@ -127,6 +127,8 @@ export interface ServiceMapNode {
   instances?: ServiceInstance[];
   /** Container names of the workload's pods, for the per-container rows. */
   containers?: string[];
+  /** Language the profiler reached: `go`, `jvm`, `native`, or absent. */
+  runtime?: string;
 }
 
 export interface ServiceMapEdge {
@@ -202,6 +204,8 @@ export interface MapHistoryPayload {
   instances?: ServiceInstance[];
   /** Container names behind this node, for the per-container rows. */
   containers?: string[];
+  /** Language the profiler reached: `go`, `jvm`, `native`, or absent. */
+  runtime?: string;
 }
 
 /**
@@ -309,12 +313,25 @@ export interface DirectivesPayload {
 }
 
 /** One workload's allocation profile and the evidence behind it. */
+/**
+ * The language a reader found inside a workload.
+ *
+ * It is a fact about what the profiler reached, not about the image: a Go
+ * binary that also reports eBPF CPU samples still shows `go` here only because
+ * the Go heap reader answered for it.
+ */
+export type MemoryRuntime = "go" | "jvm" | "native";
+
 export interface MemoryCoverageRow {
   workload: string;
   /** Whether the operator still has this workload's reader switched on. */
   enabled: boolean;
   /** Estimated bytes allocated in the window (samples × interval, summed). */
   requested_alloc_bytes: number;
+  /** Bytes the heap still holds right now: the last `inuse_space` reading. */
+  inuse_bytes: number;
+  /** Language the reader found inside the workload, inferred from its series. */
+  runtime: MemoryRuntime | null;
   /** Ingested reports, not recorded stacks: the reader batches those up. */
   batches: number;
   sampling_interval: number | null;
@@ -356,6 +373,9 @@ export interface MemoryCoverage {
 
 export interface MemoryCoveragePayload {
   tenant: string;
+  /** Window the totals cover, echoed by the server so the page can show it. */
+  from_ns?: number;
+  until_ns?: number;
   enabled_workloads: string[];
   workloads: MemoryCoverageRow[];
 }

@@ -44,6 +44,7 @@ import {
 } from "@/lib/servicemap-graph";
 import type { ServiceMapNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { RuntimeGlyph } from "./node-card";
 
 /** All sizes in world pixels at scale 1; the view scales the layer, not the card. */
 export const NEIGHBOR_CARD = {
@@ -256,6 +257,7 @@ export const NeighborCard = memo(function NeighborCard({
             {meta}
           </p>
         </hgroup>
+        {node.runtime ? <RuntimeGlyph runtime={node.runtime} /> : null}
         <StatusGlyph tone={tone} />
         {/* Traffic with no container attribution ends on the header edge, so
             the curve still terminates on a visible port. */}
@@ -414,6 +416,10 @@ export const NeighborCard = memo(function NeighborCard({
                 <span className="neighbor-trim min-w-0 flex-1 truncate font-mono text-[10px] text-foreground/90">
                   {container.name}
                 </span>
+                {/* The container inherits the language of the workload: the
+                    profiler resolves a stack to a pod, not to a process tree,
+                    so claiming a different language per row would invent it. */}
+                {node.runtime ? <RuntimeGlyph runtime={node.runtime} /> : null}
                 <span className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground">
                   {container.rate > 0 ? formatRate(container.rate) : ""}
                 </span>

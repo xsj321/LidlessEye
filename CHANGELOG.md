@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [0.2.3] - 2026-11-27
+
+### Added
+
+- **Language on both surfaces.** `GET /api/v1/memory/coverage` and
+  `GET /api/v1/servicemap` now report the runtime behind a workload (`go`,
+  `jvm`, `native`) derived from the reader's `profile_source` label, and both
+  the Memory table and the map cards/containers show it as an icon. A workload
+  whose only samples are kernel frames reports no language rather than a guess.
+- **In-use memory on the Memory page.** `inuse_bytes` is folded from the
+  `inuse_space` series next to `requested_alloc_bytes`, so a Go or JVM workload
+  shows what it currently holds, not only what it ever asked for. Native
+  (allocator-sampled) workloads report in-use only when the reader can follow
+  frees, so the column stays `–` instead of a zero that looks measured.
+- **The memory window is echoed back.** `GET /api/v1/memory/coverage` returns
+  `from_ns`/`until_ns` and the page prints the window it is describing.
+
+### Fixed
+
+- **The Memory page ignored the time picker.** It queried `dataRange` — the
+  extent of everything stored — so "Last hour" silently meant "since the
+  beginning" and cumulative readers (correctly) reported a lifetime total:
+  `node-profiles` showed 72 GiB requested over one day under a one-hour label.
+  It now asks for the toolbar window and shows it, which makes the number
+  self-explaining.
+- **Edges with one end off the canvas.** The neighbourhood graph drew an edge
+  whenever both anchors existed, including when the peer card was clamped
+  outside the visible area, leaving a label floating with nothing attached.
+  Edges are now dropped when either end is outside the canvas.
+
 ## [0.2.0] - 2026-11-27
 
 The product release: trusted data, reliability, persistence, active/standby and

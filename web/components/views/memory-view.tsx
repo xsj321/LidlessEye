@@ -1,7 +1,7 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { Coffee, Cpu, Boxes, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -18,10 +18,12 @@ import { iso } from "@/lib/time";
 import type {
   CapabilityPayload,
   MemoryCoveragePayload,
+  MemoryCoverageRow,
   MemoryPoint,
   MemoryProcessRow,
 } from "@/lib/types";
 import { useDashboard } from "@/lib/use-dashboard";
+import { dashboardStore } from "@/lib/store";
 
 /**
  * What the native allocation numbers rest on.
@@ -34,7 +36,15 @@ import { useDashboard } from "@/lib/use-dashboard";
  * and is shown as "not reported yet" rather than guessed.
  */
 export function MemoryView() {
-  const { dataRange } = useDashboard();
+  // The window comes from the toolbar, not from `dataRange`: the latter is the
+  // extent of everything stored, so using it made "Last hour" silently mean
+  // "since the beginning" and the cumulative readers reported a lifetime total
+  // under a one-hour label.
+  const time = useDashboard();
+  const window = useMemo(
+    () => dashboardStore.resolveWindow(),
+    [time.range, time.mode, time.domainFrom, time.domainUntil],
+  );
   const [data, setData] = useState<MemoryCoveragePayload | null>(null);
   // Reader states come from the agent, not from the switchboard: a workload
   // can be switched on and still have no reader attached, and the page has to
@@ -63,8 +73,8 @@ export function MemoryView() {
     },
     [capabilities],
   );
-  const from = dataRange?.from;
-  const until = dataRange?.until;
+  const from = window.from;
+  const until = window.until;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -131,6 +141,12 @@ export function MemoryView() {
         {capabilities?.capabilities.reduce((sum, entry) => sum + (entry.pods_reported ?? 0), 0) ?? 0} pods ·{" "}
         {capabilities?.capabilities.reduce((sum, entry) => sum + (entry.attached ?? 0), 0) ?? 0} processes ·{" "}
         {capabilities?.capabilities.filter((entry) => entry.state === "active").length ?? 0} readers active
+        {/* The window the totals cover. Cumulative readers keep one running
+            total per series, so a wider window genuinely reports more bytes;
+            without this line an inflated row looks like a double count. */}
+        {data?.from_ns && data?.until_ns
+          ? ` · window ${formatRelative(data.from_ns)} → ${formatRelative(data.until_ns)}`
+          : ""}
       </p>
 
       <h3 className="text-xs font-medium text-muted-foreground">Native allocation (L1)</h3>
@@ -138,7 +154,9 @@ export function MemoryView() {
         <TableHeader>
           <TableRow>
             <TableHead>Workload</TableHead>
+            <TableHead>Language</TableHead>
             <TableHead className="text-right">Requested</TableHead>
+            <TableHead className="text-right">In use</TableHead>
             <TableHead className="text-right">Batches</TableHead>
             <TableHead>Sampling</TableHead>
             <TableHead>Reader</TableHead>
@@ -163,8 +181,14 @@ export function MemoryView() {
                 }
               >
                 <TableCell className="font-mono text-xs">{row.workload}</TableCell>
+              <TableCell>
+                <RuntimeBadge runtime={row.runtime} />
+              </TableCell>
               <TableCell className="text-right tabular-nums">
                 {formatBytes(row.requested_alloc_bytes)}
+              </TableCell>
+              <TableCell className="text-right tabular-nums">
+                {row.inuse_bytes ? formatBytes(row.inuse_bytes) : "–"}
               </TableCell>
               <TableCell className="text-right tabular-nums">{row.batches}</TableCell>
               <TableCell className="text-xs text-muted-foreground">
@@ -210,7 +234,7 @@ export function MemoryView() {
               </TableRow>
               {open === row.workload ? (
                 <TableRow data-testid="memory-detail">
-                  <TableCell colSpan={11} className="bg-muted/30">
+                  <TableCell colSpan={13} className="bg-muted/30">
                     <h4 className="mb-1 text-[11px] font-medium text-muted-foreground">
                       Process memory (L0)
                     </h4>
@@ -223,7 +247,7 @@ export function MemoryView() {
           ))}
           {!rows.length && !loading ? (
             <TableRow>
-              <TableCell colSpan={11} className="text-xs text-muted-foreground">
+              <TableCell colSpan={13} className="text-xs text-muted-foreground">
                 No allocation profile in this window. Switch a workload's native
                 reader on from the service map, or widen the range.
               </TableCell>
@@ -249,6 +273,27 @@ export function MemoryView() {
         </p>
       </div>
     </div>
+  );
+}
+/**
+ * The language the profiler reached inside a workload.
+ *
+ * A dash is deliberate: the kernel profiler samples every language equally, so
+ * a workload that only ever reported CPU frames has no language to show. Making
+ * that look like "unknown" would suggest the reader failed, which is not what
+ * happened.
+ */
+function RuntimeBadge({ runtime }: { runtime: MemoryCoverageRow["runtime"] }) {
+  if (!runtime) {
+    return <span className="text-xs text-muted-foreground">–</span>;
+  }
+  const Icon = runtime === "jvm" ? Coffee : runtime === "go" ? Boxes : Cpu;
+  const label = runtime === "jvm" ? "JVM" : runtime === "go" ? "Go" : "native";
+  return (
+    <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+      <Icon aria-hidden className="size-3.5" />
+      {label}
+    </span>
   );
 }
 /**
