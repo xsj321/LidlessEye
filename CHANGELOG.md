@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [0.3.2] - 2026-11-27
+
+### Added
+
+- **The flamegraph canvas has an accessible name.** Frames only exist as
+  pixels, so assistive technology had nothing to announce. The canvas is now
+  `role="img"` with a label that states the total and points at the text
+  alternative (the frame list and the export), which is what the accessibility
+  guidance asks for on complex charts.
+
 ## [0.3.1] - 2026-11-27
 
 ### Fixed

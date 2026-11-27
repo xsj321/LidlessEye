@@ -206,6 +206,13 @@ export function GraphWorkspace({
   const scrollRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const graphRef = useRef<GraphRenderer | null>(null);
+  // The frames live only in pixels, so the canvas carries a name a screen
+  // reader can announce and points at the text alternative (the frame list and
+  // the export) instead of being a silent box.
+  const canvasLabel =
+    "total" in payload && typeof payload.total === "number"
+      ? `Flamegraph totalling ${formatValue(payload.total, payload.unit)}. The same numbers are available in the frame list below and in the export.`
+      : `Flamegraph comparing two windows. The same numbers are available in the frame list below and in the export.`;
   const tooltipRef = useRef<HTMLDivElement>(null);
   const posRef = useRef({ x: 0, y: 0 });
   const hoverRef = useRef<FlameHover | null>(null);
@@ -460,7 +467,15 @@ export function GraphWorkspace({
       <div className="flex min-h-0 flex-col gap-2 md:flex-row">
         <div className="flex min-w-0 flex-1 flex-col gap-1.5">
           <div ref={scrollRef} className="fg-scroll rounded-md border bg-background/40">
-            <canvas ref={canvasRef} className="fg-canvas" />
+            <canvas
+              ref={canvasRef}
+              className="fg-canvas"
+              // The frames live only in pixels, so the canvas carries a name a
+              // screen reader can announce and points at the text alternative
+              // (the frame list and the export) instead of being a silent box.
+              role="img"
+              aria-label={canvasLabel}
+            />
           </div>
 
           <div className="fg-legend flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
