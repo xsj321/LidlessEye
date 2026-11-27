@@ -51,6 +51,24 @@ export function formatDuration(ns: number): string {
   return `${sign}${v}ns`;
 }
 
+/**
+ * A duration in milliseconds, always the same unit.
+ *
+ * The service map compares values next to each other — a card's CPU beside a
+ * neighbour's, an edge's latency beside its rate — and `formatDuration`'s
+ * unit-switching is right for a total but wrong for a column: "1m33s" next to
+ * "0.22ms" reads as two different kinds of number. Milliseconds throughout,
+ * with a thousands separator once it gets long, keeps them comparable.
+ */
+export function formatMillis(ns: number): string {
+  if (!Number.isFinite(ns)) return "–";
+  const ms = ns / 1e6;
+  if (ms === 0) return "0 ms";
+  if (Math.abs(ms) >= 1000) return `${Math.round(ms).toLocaleString("en-US")} ms`;
+  if (Math.abs(ms) >= 100) return `${ms.toFixed(0)} ms`;
+  return `${ms.toFixed(ms >= 10 ? 1 : 2)} ms`;
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes)) return "–";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];

@@ -11,7 +11,17 @@
 // bracket narrows or moves the window without touching the domain. The compare
 // view keeps two windows (baseline and comparison) in the same domain.
 
-export type RangeMode = "relative" | "absolute";
+export type RangeMode = "relative" | "absolute" | "instant";
+
+/**
+ * How far back a point-in-time query looks.
+ *
+ * "Everything at 10:20" is not a zero-width window: a sample that describes
+ * that instant was flushed some time before it. One minute covers the 10 s
+ * server flush plus a reader's own buffering at either end, and stays narrow
+ * enough that the answer is a snapshot rather than a trend.
+ */
+export const INSTANT_SPAN_NS = 5 * 60 * 1e9;
 
 export const RANGES: ReadonlyArray<readonly [string, string]> = [
   ["5m", "Last 5 minutes"],
@@ -63,6 +73,13 @@ export function rangeLabel(preset: string): string {
 
 /** The range chosen first: a relative preset, or the absolute inputs. */
 export function resolveDomain(state: TimeState): Window {
+  if (state.mode === "instant") {
+    // The instant lives in `domainUntil`; the visible domain is the chosen
+    // range ending there, so the histogram shows where the snapshot sits.
+    const at = state.domainUntil > 0 ? state.domainUntil : nowNs();
+    const span = Math.max(durationNs(state.range), INSTANT_SPAN_NS);
+    return { from: at - span, until: at };
+  }
   if (state.mode === "absolute" && state.domainUntil > state.domainFrom) {
     return { from: state.domainFrom, until: state.domainUntil };
   }
@@ -80,6 +97,12 @@ export function resolveDomain(state: TimeState): Window {
  * drift used to show up as a large fake diff.
  */
 export function resolveWindow(state: TimeState, domain: Window = resolveDomain(state)): Window {
+  if (state.mode === "instant") {
+    // A snapshot ignores the brush: the brush is what moved you in time, not
+    // how much of it the answer covers.
+    const span = Math.min(INSTANT_SPAN_NS, Math.max(1e9, domain.until - domain.from));
+    return { from: domain.until - span, until: domain.until };
+  }
   if (!state.fromNs || !state.untilNs || state.untilNs <= state.fromNs) return domain;
   const span = Math.min(state.untilNs - state.fromNs, domain.until - domain.from);
   let from = state.fromNs;

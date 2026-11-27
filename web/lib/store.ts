@@ -560,6 +560,33 @@ export class DashboardStore {
     this.afterTimeChange();
   }
 
+  /**
+   * Snapshot mode: one instant, and the query window is the minute before it.
+   *
+   * The instant is stored in `domainUntil` so every existing consumer of the
+   * timerange keeps working: the histogram still has a domain, the URL still
+   * has one number to carry, and the brush moves the instant without also
+   * having to describe a width.
+   */
+  setInstant(at: number) {
+    // A window that ends *now* is empty: the newest batch is still open, so a
+    // batch only counts once it is complete. Standing two minutes back puts the
+    // instant on data that exists, which is what "the state at 10:20" means to
+    // someone reading the page.
+    const anchor = Math.min(Math.round(at), Math.round((Date.now() - 120_000) * 1e6));
+    this.state = {
+      ...this.state,
+      mode: "instant",
+      domainFrom: Math.round(anchor - 3_600_000_000_000),
+      domainUntil: anchor,
+      fromNs: 0,
+      untilNs: 0,
+      baseFromNs: 0,
+      baseUntilNs: 0,
+    };
+    this.afterTimeChange();
+  }
+
   /** Switched with the Relative/Absolute control. */
   setMode(mode: RangeMode) {
     if (mode === this.state.mode) return;

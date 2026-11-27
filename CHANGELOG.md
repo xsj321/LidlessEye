@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [0.2.7] - 2026-11-27
+
+### Added
+
+- **Point-in-time mode.** The time range picker gained a third mode beside
+  Relative and Absolute: name an instant (10:20) and the map and the memory page
+  both answer for that moment instead of for a range. The window is the five
+  minutes before the instant and the instant is held two minutes back when you
+  pick "now", because a batch only counts once it is complete — a window that
+  ended at the current second returned nothing, which is how the first version
+  of this shipped and why the map looked empty.
+
+### Changed
+
+- **Durations on the service map are milliseconds, one unit.** Cards and the
+  drawer used `formatDuration`, which switches between `1m33s`, `26.0 s` and
+  `0.22 ms` depending on magnitude; side by side that reads as different kinds
+  of number. `formatMillis` is used for every duration there now, while rates
+  keep their `/s` and `/min` suffixes because a frequency is not a duration.
+
+### Fixed
+
+- The service map view memoised its window on the payload, so a time change
+  between two payloads kept querying the old window.
+
 ## [0.2.3] - 2026-11-27
 
 ### Added

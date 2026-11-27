@@ -24,6 +24,7 @@ import { cn } from "@/lib/utils";
 /** Radix Select cannot hold an empty string, so "none" needs a placeholder. */
 const NO_GROUP = "__none__";
 const CUSTOM_RANGE = "custom";
+const INSTANT_RANGE = "instant";
 
 function Field({
   label,
@@ -178,10 +179,19 @@ export function Toolbar() {
 
       <Field label={t("Range")}>
         <Select
-          value={mode === "absolute" ? CUSTOM_RANGE : range}
+          value={
+            mode === "instant" ? INSTANT_RANGE : mode === "absolute" ? CUSTOM_RANGE : range
+          }
           onValueChange={(value) => {
             if (value === CUSTOM_RANGE) {
               dashboardStore.setMode("absolute");
+              return;
+            }
+            if (value === INSTANT_RANGE) {
+              // A snapshot needs an instant; "now" is the only one the picker
+              // can offer without a second control, and the histogram brush
+              // moves it from there.
+              dashboardStore.setInstant(Date.now() * 1e6);
               return;
             }
             dashboardStore.setRelativeRange(value);
@@ -196,6 +206,7 @@ export function Toolbar() {
                 {t(label)}
               </SelectItem>
             ))}
+            <SelectItem value={INSTANT_RANGE}>{t("Point in time")}</SelectItem>
             <SelectItem value={CUSTOM_RANGE}>{t("Custom range")}</SelectItem>
           </SelectContent>
         </Select>

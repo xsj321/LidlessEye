@@ -204,9 +204,14 @@ export function ServiceMapView() {
   // with the clock, and a window that changes on every render would make the
   // panel's data hook re-query in a loop. Declared before the empty-state
   // return so the hook order does not change when the first payload lands.
+  const time = useDashboard();
   const range = useMemo(
     () => (map ? dashboardStore.resolveWindow() : { from: 0, until: 0 }),
-    [map],
+    // The window must be recomputed when the *time* changes, not only when a
+    // payload arrives: a snapshot request went out with the previous window
+    // because `map` was still null on the render where the mode changed, and
+    // the panel then showed "no traffic" for a minute that had traffic.
+    [map, time.mode, time.range, time.domainFrom, time.domainUntil, time.fromNs, time.untilNs],
   );
 
   if (!map) {

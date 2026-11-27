@@ -13,7 +13,7 @@
 // reading as a stack instead of a ragged edge.
 
 import { layeredLayout } from "./servicemap-layout";
-import { formatCount, formatDuration } from "./format";
+import { formatCount, formatMillis } from "./format";
 import type { LabelFilter, NodeKind, ServiceMapEdge, ServiceMapNode } from "./types";
 
 /** Card geometry, in pixels. */
@@ -103,7 +103,7 @@ export function nodeTraffic(node: ServiceMapNode, windowSec: number): string {
   const parts: string[] = [];
   const connections = node.connections ?? 0;
   if (connections > 0 && windowSec > 0) parts.push(formatRate(connections / windowSec));
-  if ((node.cpu_ns ?? 0) > 0) parts.push(formatDuration(node.cpu_ns ?? 0));
+  if ((node.cpu_ns ?? 0) > 0) parts.push(formatMillis(node.cpu_ns ?? 0));
   return parts.join(" · ") || "—";
 }
 

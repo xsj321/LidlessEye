@@ -182,6 +182,33 @@ function Brush({
   );
 }
 
+/**
+ * The instant a snapshot is taken at.
+ *
+ * One field, because the width is not a choice: a snapshot is always the minute
+ * before the moment you name, so that the readers' buffering cannot make the
+ * same moment look different on two pages.
+ */
+function InstantInput({ domain, t }: { domain: Window; t: (key: string) => string }) {
+  const at = domain.until;
+  return (
+    <div className="flex items-center gap-1.5" id="instant-range" data-testid="instant-range">
+      <input
+        type="datetime-local"
+        step="1"
+        className="h-7 rounded-md border border-input bg-transparent px-2 text-xs"
+        value={toLocalInput(at)}
+        onChange={(event) => {
+          const next = fromLocalInput(event.target.value);
+          if (next) dashboardStore.setInstant(next);
+        }}
+        aria-label={t("Point in time")}
+      />
+      <span className="text-[11px] text-muted-foreground">{t("snapshot of the minute before")}</span>
+    </div>
+  );
+}
+
 function AbsoluteRangeInputs({
   domain,
   t,
@@ -319,6 +346,9 @@ export function TimeBar() {
           value={state.mode}
           onValueChange={(value) => {
             if (value === "relative" || value === "absolute") dashboardStore.setMode(value);
+            // A snapshot needs a moment, and the only one the switch can name
+            // is now; the brush moves it from there.
+            if (value === "instant") dashboardStore.setInstant(nowNs());
           }}
           aria-label={t("How the time range is chosen")}
         >
@@ -328,6 +358,9 @@ export function TimeBar() {
           <ToggleGroupItem value="absolute" data-mode="absolute" className="h-7 px-2 text-xs">
             {t("Absolute")}
           </ToggleGroupItem>
+          <ToggleGroupItem value="instant" data-mode="instant" className="h-7 px-2 text-xs">
+            {t("Point in time")}
+          </ToggleGroupItem>
         </ToggleGroup>
 
         {/* The relative picker sits right next to the mode switch; both answer
@@ -335,6 +368,11 @@ export function TimeBar() {
         {state.mode === "relative" ? <TimeRangePicker /> : null}
 
         {state.mode === "absolute" ? <AbsoluteRangeInputs domain={domain} t={t} /> : null}
+
+        {/* One instant, and the answer is the minute before it: the same
+            timestamps the map and the memory page read, so "10:20" means the
+            same thing on both. */}
+        {state.mode === "instant" ? <InstantInput domain={domain} t={t} /> : null}
 
         {/* The map's brush used to answer one question — "when was there
             traffic?" — with one number. The agent records three counters per
