@@ -68,7 +68,11 @@ function frameColor(name: string, depth: number): string {
   // legible while giving each frame an edge; the hue still derives from the
   // name, so the same function keeps the same colour across views.
   const hue = HUES[hash % HUES.length] + (depth % 3) * 1.5;
-  const light = 48 + ((hash >> 8) % 11);
+  // Measured, not guessed: with the label ink at rgba(12, 10, 8, 0.92) the
+  // old 48–58 % band bottoms out at 2.26:1 on the blue end, which fails the
+  // WCAG AA 4.5:1 floor for text. 66–76 % measures 5.02:1 in the worst case
+  // (hue 245) and still keeps cool hues apart from the warm diff colours.
+  const light = 66 + ((hash >> 8) % 11);
   return `hsl(${hue} 62% ${light}%)`;
 }
 

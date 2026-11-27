@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [0.3.1] - 2026-11-27
+
+### Fixed
+
+- **The flamegraph fills now clear the WCAG AA text-contrast floor.** Measured
+  rather than eyeballed: with the label ink at `rgba(12, 10, 8, 0.92)` the old
+  48–58 % lightness band bottomed out at **2.26:1** on the blue end
+  (`hsl(245 62% 48%)`), well under the 4.5:1 required for text. The band is
+  66–76 % now, which measures **5.02:1** in the same worst case and still keeps
+  cool hues distinguishable from the warm diff colours.
+
 ## [0.3.0] - 2026-11-27
 
 ### Added
