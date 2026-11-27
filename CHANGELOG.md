@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the
 `0.x` series may still change the HTTP surface between minor versions, and the
 Rust API follows the same rule.
 
+## [0.3.3] - 2026-11-27
+
+### Added
+
+- **`docs/canvas-accessibility.md`** records why the flamegraph keeps the
+  standard accessibility route (`role="img"` plus the frame list and export as
+  text alternatives) instead of the experimental HTML-in-Canvas API, with the
+  conditions that would make us revisit it: the API reaching Baseline in at
+  least two engines, or a request to move keyboard focus between individual
+  frames.
+
+### Changed
+
+- `.mwgrc` opts this project into the `modern-web-guidance` volatile-feature
+  guidance (`allowVolatileFeatures: true`), so the canvas guidance can be
+  retrieved and re-evaluated without a manual unlock each time.
+
 ## [0.3.2] - 2026-11-27
 
 ### Added
